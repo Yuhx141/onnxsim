@@ -205,8 +205,9 @@ provide authentication; use DDS security or a trusted ROS2 domain on shared
 networks.
 
 The bridge exposes `health` and `capabilities` for ROS2 discovery/selection;
-tensor and profile data remain binary rather than being converted to ROS
-messages.
+both services query the selected worker, while tensor and profile data remain
+binary rather than being converted to ROS messages. The `capabilities` service
+returns the worker's manifest JSON in its `TriggerResponse.message` field.
 
 Set `publish_profile:=true` (the default) to additionally publish a compact
 JSON profile summary on the `profile_topic` (default: `profile`). The `result`

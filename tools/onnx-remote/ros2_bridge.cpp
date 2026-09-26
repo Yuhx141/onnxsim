@@ -60,29 +60,56 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     health_ = create_service<Trigger>(
         "health", [this](const std::shared_ptr<Trigger::Request>,
                          std::shared_ptr<Trigger::Response> response) {
-          const int fd = onnx_remote::connect_tcp_timeout(
-              host_, static_cast<uint16_t>(port_), connect_timeout_ms_);
-          if (fd < 0) {
+          onnx_remote::Response capabilities;
+          std::string error;
+          if (!query_capabilities(capabilities, error)) {
             response->success = false;
-            response->message = "remote worker is unreachable";
+            response->message = error.empty() ? "remote worker is unreachable"
+                                               : error;
             return;
           }
-          onnx_remote::set_socket_io_timeout(fd, io_timeout_ms_);
-          onnx_remote::close_socket(fd);
           response->success = true;
-          response->message = "remote worker is reachable";
+          response->message = "remote worker is ready";
         });
     capabilities_ = create_service<
-        Trigger>("capabilities", [](const std::shared_ptr<Trigger::Request>,
+        Trigger>("capabilities", [this](const std::shared_ptr<Trigger::Request>,
                                     std::shared_ptr<Trigger::Response>
                                         response) {
-      response->success = true;
-      response->message =
-          R"({"schema_version":1,"transport":"onnx-remote-v5","payload":"binary-uint8","profiling":["off","summary","detailed"],"operations":["run","compile","load_compiled","run_compiled"],"tensor_dtypes":["float32","float16","bfloat16","int8","uint8","int16","uint16","int32","int64","uint32","uint64","double","bool"]})";
+      onnx_remote::Response capabilities;
+      std::string error;
+      response->success = query_capabilities(capabilities, error);
+      response->message = response->success
+                              ? capabilities.manifest
+                              : (error.empty() ? "capability query failed"
+                                               : error);
     });
   }
 
  private:
+  bool query_capabilities(onnx_remote::Response& response,
+                          std::string& error) const {
+    const int fd = onnx_remote::connect_tcp_timeout(
+        host_, static_cast<uint16_t>(port_), connect_timeout_ms_);
+    if (fd < 0) {
+      error = "remote worker capability connection failed";
+      return false;
+    }
+    onnx_remote::set_socket_io_timeout(fd, io_timeout_ms_);
+    onnx_remote::Request request;
+    request.op = "capabilities";
+    const bool sent = onnx_remote::send_request(fd, request, error);
+    const bool received = sent &&
+                          onnx_remote::receive_response(fd, response, error);
+    onnx_remote::close_socket(fd);
+    if (!received) return false;
+    if (!response.ok) {
+      error = response.error.empty() ? "remote worker is not ready"
+                                     : response.error;
+      return false;
+    }
+    return true;
+  }
+
   static std::string json_string(const std::string& json,
                                  const std::string& key) {
     const std::string marker = "\"" + key + "\":\"";
