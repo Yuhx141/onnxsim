@@ -10,7 +10,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -147,12 +146,14 @@ bool read_file(const fs::path& path, std::vector<uint8_t>& bytes, std::string& e
 }
 
 bool read_text(const fs::path& path, std::string& text) {
-  std::ifstream input(path, std::ios::binary);
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
   if (!input) return false;
-  std::ostringstream stream;
-  stream << input.rdbuf();
-  text = stream.str();
-  return text.size() <= kMaxManifestBytes;
+  const auto end = input.tellg();
+  if (end < 0 || static_cast<uint64_t>(end) > kMaxManifestBytes) return false;
+  text.resize(static_cast<size_t>(end));
+  input.seekg(0);
+  if (!text.empty()) input.read(text.data(), end);
+  return static_cast<bool>(input) || text.empty();
 }
 
 bool write_file(const fs::path& path, const std::vector<uint8_t>& bytes,
@@ -409,8 +410,17 @@ Response compile(const Request& request, const Options& options) {
   if (!options.cache_dir.empty()) {
     std::error_code ec;
     fs::create_directories(options.cache_dir, ec);
-    if (!ec) publish_cache(artifact_path, manifest_path, complete_path,
-                           response.artifact, response.manifest, error);
+    if (ec) {
+      response.ok = false;
+      response.error = "cannot create cache directory: " + ec.message();
+      return response;
+    }
+    if (!publish_cache(artifact_path, manifest_path, complete_path,
+                       response.artifact, response.manifest, error)) {
+      response.ok = false;
+      response.error = error.empty() ? "cannot publish compiler cache entry" : error;
+      return response;
+    }
     enforce_cache_limit(options);
   }
   return response;
