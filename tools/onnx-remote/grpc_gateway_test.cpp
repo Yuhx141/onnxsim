@@ -12,8 +12,12 @@ using namespace onnx_remote;
 using namespace onnx_remote::grpc_gateway;
 using onnxsim::remote::v1::CapabilitiesRequest;
 using onnxsim::remote::v1::CapabilitiesResponse;
+using onnxsim::remote::v1::CompileRequest;
+using onnxsim::remote::v1::CompileResponse;
 using onnxsim::remote::v1::ExecuteRequest;
 using onnxsim::remote::v1::ExecuteResponse;
+using onnxsim::remote::v1::LoadArtifactRequest;
+using onnxsim::remote::v1::LoadArtifactResponse;
 using onnxsim::remote::v1::OnnxSimExecutor;
 using onnxsim::remote::v1::PROFILING_DETAILED;
 
@@ -21,29 +25,46 @@ namespace {
 
 constexpr uint16_t kWorkerPort = 39671;
 
-void serve_one_request() {
+void serve_requests() {
   const int listener = listen_tcp(kWorkerPort, 1);
   assert(listener >= 0);
-  const int fd = accept_tcp(listener);
-  assert(fd >= 0);
+  for (int i = 0; i < 3; ++i) {
+    const int fd = accept_tcp(listener);
+    assert(fd >= 0);
 
-  Request request;
-  Response response;
-  std::string error;
-  assert(receive_request(fd, request, error));
-  response.request_id = request.request_id;
-  response.ok = request.op == "identity" && request.inputs.size() == 1;
-  if (response.ok) response.outputs = request.inputs;
-  else response.error = "unexpected gateway smoke request";
-  assert(send_response(fd, response, error));
-  close_socket(fd);
+    Request request;
+    Response response;
+    std::string error;
+    assert(receive_request(fd, request, error));
+    response.request_id = request.request_id;
+    if (request.op == "identity" && request.inputs.size() == 1) {
+      response.ok = true;
+      response.outputs = request.inputs;
+      response.profile.push_back(
+          ProfileEvent{"worker_identity", "remote", 4, 9, "smoke"});
+    } else if (request.op == "compile" && !request.model.empty()) {
+      response.ok = true;
+      response.artifact_id = "smoke-artifact";
+      response.artifact = {9, 8, 7};
+      response.manifest = "{\"target\":\"smoke\"}";
+    } else if (request.op == "load_compiled" &&
+               request.artifact_id == "smoke-artifact" &&
+               request.artifact == std::vector<uint8_t>({9, 8, 7})) {
+      response.ok = true;
+      response.artifact_id = request.artifact_id;
+    } else {
+      response.error = "unexpected gateway smoke request: " + request.op;
+    }
+    assert(send_response(fd, response, error));
+    close_socket(fd);
+  }
   close_socket(listener);
 }
 
 }  // namespace
 
 int main() {
-  std::thread worker(serve_one_request);
+  std::thread worker(serve_requests);
 
   Options options;
   options.worker_host = "127.0.0.1";
@@ -91,6 +112,29 @@ int main() {
   assert(response.outputs(0).raw_data().size() == sizeof(values));
   assert(std::memcmp(response.outputs(0).raw_data().data(), values,
                      sizeof(values)) == 0);
+  assert(response.profile_size() == 1);
+  assert(response.profile(0).name() == "worker_identity");
+
+  CompileRequest compile_request;
+  compile_request.set_request_id(18);
+  compile_request.set_model("serialized-model");
+  CompileResponse compile_response;
+  grpc::ClientContext compile_context;
+  status = stub->Compile(&compile_context, compile_request, &compile_response);
+  assert(status.ok());
+  assert(compile_response.ok());
+  assert(compile_response.artifact_id() == "smoke-artifact");
+  assert(compile_response.artifact() == std::string("\x09\x08\x07", 3));
+
+  LoadArtifactRequest load_request;
+  load_request.set_request_id(19);
+  load_request.set_artifact_id(compile_response.artifact_id());
+  load_request.set_artifact(compile_response.artifact());
+  LoadArtifactResponse load_response;
+  grpc::ClientContext load_context;
+  status = stub->LoadArtifact(&load_context, load_request, &load_response);
+  assert(status.ok());
+  assert(load_response.ok());
 
   server->Shutdown();
   worker.join();
