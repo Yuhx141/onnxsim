@@ -66,23 +66,19 @@ def _retarget_schedule_names(
     Retarget the sidecar by IO position while leaving the model and its MCode
     untouched.
     """
-    if len(model.graph.input) != len(source.graph.input) or len(
-        model.graph.output
-    ) != len(source.graph.output):
-        # Calibration-free comparison templates may expose an additional
-        # constant/runtime input that is not present in the source UOp graph.
-        # Their generated sidecar is still useful for inspection, but cannot
-        # be positionally retargeted.
+    if len(model.graph.output) != len(source.graph.output) or len(model.graph.input) < len(
+        source.graph.input
+    ):
         return
     rename = {
-        new.name: old.name
-        for old, new in zip(model.graph.input, source.graph.input)
+        old.name: new.name
+        for old, new in zip(source.graph.input, model.graph.input)
         if old.name != new.name
     }
     rename.update(
         {
-            new.name: old.name
-            for old, new in zip(model.graph.output, source.graph.output)
+            old.name: new.name
+            for old, new in zip(source.graph.output, model.graph.output)
             if old.name != new.name
         }
     )
@@ -111,6 +107,46 @@ def _retarget_schedule_names(
                 else int(spec.type.tensor_type.elem_type)
             )
             entry["nbytes"] = math.prod(entry["shape"]) * 4
+
+    # A measured template may expose a broadcast/helper tensor as an extra
+    # runtime input even when the source UOp represented it as a scalar
+    # constant.  Give it a real allocation and thread it into the one emitted
+    # neu-mode kernel; AXCL has no implicit broadcast input at this boundary.
+    extra_inputs = list(model.graph.input[len(source.graph.input) :])
+    if extra_inputs:
+        allocations = retargeted.setdefault("allocations", [])
+        used_end = max(
+            (int(item["offset"]) + int(item["nbytes"]) for item in allocations),
+            default=0,
+        )
+        for spec in extra_inputs:
+            shape = [int(dim.dim_value) for dim in spec.type.tensor_type.shape.dim]
+            nbytes = math.prod(shape) * 4
+            offset = (used_end + 63) // 64 * 64
+            allocations.append(
+                {
+                    "first_kernel": 0,
+                    "last_kernel": len(retargeted["kernels"]) - 1,
+                    "name": spec.name,
+                    "nbytes": nbytes,
+                    "offset": offset,
+                }
+            )
+            retargeted["inputs"].append(
+                {
+                    "elem_type": 15
+                    if spec.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+                    else int(spec.type.tensor_type.elem_type),
+                    "kind": "input",
+                    "name": spec.name,
+                    "nbytes": nbytes,
+                    "shape": shape,
+                }
+            )
+            used_end = offset + nbytes
+        retargeted["memory_size"] = max(int(retargeted["memory_size"]), used_end)
+        if len(retargeted["kernels"]) == 1 and len(model.graph.node) == 1:
+            retargeted["kernels"][0]["inputs"] = list(model.graph.node[0].input)
     schedule.clear()
     schedule.update(retargeted)
 

@@ -846,6 +846,7 @@ def test_onnx_misc_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
     "op, input_shape, template_key",
     [
         ("Greater", (16, 64, 112, 112), "GreaterCast:16x64x112x112"),
+        ("Less", (1024, 9, 3136), "LessCast:1024x9x3136"),
     ],
 )
 def test_onnx_comparison_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
@@ -874,7 +875,10 @@ def test_onnx_comparison_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
     ) as session:
         loaded = session.load(axmodel, str(schedule))
         try:
-            (got,) = session.run(loaded, [x])
+            inputs = [x]
+            if op == "Less":
+                inputs.append(np.zeros((1024, 1, 3136), dtype=np.float32))
+            (got,) = session.run(loaded, inputs)
         finally:
             session.unload(loaded)
 
