@@ -19,6 +19,32 @@ using UInt8MultiArray = std_msgs::msg::UInt8MultiArray;
 using String = std_msgs::msg::String;
 using Trigger = std_srvs::srv::Trigger;
 
+static std::string json_escape(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (const unsigned char ch : value) {
+    switch (ch) {
+      case '"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\b': escaped += "\\b"; break;
+      case '\f': escaped += "\\f"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\r': escaped += "\\r"; break;
+      case '\t': escaped += "\\t"; break;
+      default:
+        if (ch < 0x20) {
+          constexpr char hex[] = "0123456789abcdef";
+          escaped += "\\u00";
+          escaped += hex[ch >> 4];
+          escaped += hex[ch & 0x0f];
+        } else {
+          escaped += static_cast<char>(ch);
+        }
+    }
+  }
+  return escaped;
+}
+
 class OnnxRemoteBridge final : public rclcpp::Node {
  public:
   OnnxRemoteBridge() : Node("onnx_remote_bridge") {
@@ -150,10 +176,11 @@ class OnnxRemoteBridge final : public rclcpp::Node {
 
   void announce() {
     String message;
-    message.data = "{\"schema_version\":1,\"runner_id\":\"" + runner_id_ +
-                   "\",\"host\":\"" + advertise_host_ +
+    message.data = "{\"schema_version\":1,\"runner_id\":\"" +
+                   json_escape(runner_id_) + "\",\"host\":\"" +
+                   json_escape(advertise_host_) +
                    "\",\"port\":" + std::to_string(port_) + ",\"target\":\"" +
-                   discovery_target_ +
+                   json_escape(discovery_target_) +
                    "\",\"transport\":\"onnx-remote-v5\",\"ready\":true,"
                    "\"ttl_ms\":" + std::to_string(discovery_timeout_ms_) + ","
                    "\"profiling\":[\"off\",\"summary\",\"detailed\"]}";

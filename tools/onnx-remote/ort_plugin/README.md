@@ -5,10 +5,12 @@ adapter and its install-time contract. The adapter is compiled into the
 `onnxsim` library when `ONNXSIM_REMOTE_ORT_EP=ON`; it is not currently a
 standalone public ORT plugin shared library.
 
-The implementation uses ORT's internal C++ `IExecutionProvider` interface and
-therefore must be built against the matching ORT source checkout. Consumers
-should use the manifest to reject incompatible ORT versions before loading the
-onnxsim library. Provider options are documented in
+The implementation uses ORT's legacy internal C++ `IExecutionProvider` interface
+and therefore must be built against a matching ORT source checkout that still
+contains `core/framework/execution_provider.h`. Current public ORT source
+releases such as 1.29 do not expose that header; CMake rejects them before
+compilation. Consumers should use the manifest to reject incompatible ORT
+versions before loading the onnxsim library. Provider options are documented in
 `tools/onnx-remote/README.md` and include `host`, `port`, timeout values,
 `profiling`, and `supported_ops`.
 

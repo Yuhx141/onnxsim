@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "name": "onnxsim_remote",
-  "status": "source_abi_adapter",
-  "ort_version": "1.29.0",
+  "status": "legacy_source_abi_adapter",
+  "ort_version": "requires_legacy_internal_ep_headers",
   "entrypoint": "onnxsim::ort_remote::CreateRemoteExecutionProviderFromOptions",
   "registration": "internal_cpp",
   "public_plugin_entrypoints": [],

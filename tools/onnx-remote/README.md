@@ -57,7 +57,7 @@ runner discovered by ROS2/DORA:
 
 There is an optional source-level ONNX Runtime EP in
 `onnx_remote_execution_provider.{h,cpp}`. It is deliberately pinned to the ORT
-source ABI (the current repository version is 1.29.0): ORT's
+source ABI: ORT's
 `IExecutionProvider` and `NodeComputeInfo` are internal headers and are not in
 the public prebuilt SDK. Enable it only in a build that has the matching ORT
 source checkout:
@@ -66,8 +66,14 @@ source checkout:
 cmake -S . -B build-ort-ep \
   -DONNXSIM_BUILTIN_ORT=ON -DONNXSIM_REMOTE_TRANSPORT=ON \
   -DONNXSIM_REMOTE_ORT_EP=ON \
-  -DONNXSIM_ORT_SOURCE_DIR=/path/to/onnxruntime-1.29.0
+  -DONNXSIM_ORT_SOURCE_DIR=/path/to/compatible-legacy-onnxruntime
 ```
+
+This is intentionally a configure-time compatibility check. Current public ORT
+source releases such as 1.29 do not expose the legacy internal header used by
+this adapter, so they fail early with a precise diagnostic instead of producing
+an apparently usable but ABI-incompatible build. The public `OrtEp` plugin path
+is a separate implementation and is not claimed by this adapter yet.
 
 The provider partitions `Identity`, `Relu`, `Add`, and `Mul` by default and
 executes float32 tensors through the dependency-free worker. Unsupported ops
