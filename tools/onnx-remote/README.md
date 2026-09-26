@@ -218,6 +218,13 @@ the JSON topic is intended for ROS tools and lightweight profiling UIs.
 Native consumers can call `profile_chrome_trace_json()` on a response to emit
 Chrome Trace Event Format for Perfetto or `chrome://tracing`; timestamps remain
 worker-relative microseconds and therefore do not require clock synchronization.
+For ROS2/DORA response payloads captured as raw bytes, the dependency-free
+receiver converts them without Python or protobuf:
+
+```sh
+build/onnx-remote/onnx-remote-profile-dump \
+  --input response.bin --format chrome > trace.json
+```
 
 `onnx-remote-mock-runner` and `onnx-remote-attach-test` provide a vendor-free
 test of the compiled-artifact handshake. The mock stores opaque artifact bytes

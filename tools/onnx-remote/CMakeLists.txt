@@ -41,6 +41,10 @@ target_link_libraries(onnx-remote-mock-runner PRIVATE onnx_remote_transport)
 add_executable(onnx-remote-attach-test remote_attach_test.cpp)
 target_link_libraries(onnx-remote-attach-test PRIVATE onnx_remote_transport)
 
+add_executable(onnx-remote-profile-dump remote_profile_dump.cpp)
+target_link_libraries(onnx-remote-profile-dump PRIVATE onnx_remote_transport)
+install(TARGETS onnx-remote-profile-dump RUNTIME DESTINATION bin)
+
 # The schema is source-only and does not pull protobuf or gRPC into the
 # default build.  Install it so an optional host-side gateway can generate
 # bindings with the toolchain available on that host.
