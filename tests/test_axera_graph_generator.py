@@ -2,8 +2,8 @@ import json
 import os
 import sys
 
-import onnx
 import numpy as np
+import onnx
 import pytest
 
 _AXERA = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "axera")
