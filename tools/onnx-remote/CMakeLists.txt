@@ -24,6 +24,7 @@ else()
   find_package(Threads REQUIRED)
   target_link_libraries(onnx_remote_transport PUBLIC Threads::Threads)
 endif()
+install(TARGETS onnx_remote_transport ARCHIVE DESTINATION lib)
 
 add_executable(onnx-remote-worker remote_worker.cpp)
 target_link_libraries(onnx-remote-worker PRIVATE onnx_remote_transport)

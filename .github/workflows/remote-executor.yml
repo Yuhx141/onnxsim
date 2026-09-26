@@ -117,5 +117,6 @@ jobs:
       - name: Verify installed package metadata
         run: |
           cmake --install build/onnx-remote-grpc --prefix "$RUNNER_TEMP/onnx-remote-install"
+          test -f "$RUNNER_TEMP/onnx-remote-install/lib/libonnx_remote_transport.a"
           test -f "$RUNNER_TEMP/onnx-remote-install/share/onnx-remote/ort-plugin/onnxsim_remote_ep.manifest.json"
           test -f "$RUNNER_TEMP/onnx-remote-install/include/onnx-remote/remote_profile.h"
