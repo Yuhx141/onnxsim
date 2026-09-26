@@ -66,6 +66,9 @@ executes float32 tensors through the dependency-free worker. Unsupported ops
 remain on the normal CPU EP. `Options::profiling` forwards worker events into
 onnxsim's profiler. Applications using ORT's internal provider registration
 API can construct it with `onnxsim::ort_remote::CreateRemoteExecutionProvider`.
+Registration maps can use `host`, `port`, `connect_timeout_ms`,
+`io_timeout_ms`, `profiling=off|summary|detailed`, and comma-separated
+`supported_ops`; use `OptionsFromProviderOptions` to parse them.
 This is a software/reference EP and does not require Snapdragon, AX8850, QNN,
 or TensorRT hardware.
 

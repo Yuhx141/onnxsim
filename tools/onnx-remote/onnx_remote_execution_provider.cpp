@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -66,6 +67,33 @@ std::string RemoteOperation(const std::string &onnx_op) {
   if (onnx_op == "Mul")
     return "mul";
   return {};
+}
+
+void ParseInteger(const onnxruntime::ProviderOptions &options, const char *key,
+                  int &value) {
+  const auto it = options.find(key);
+  if (it == options.end())
+    return;
+  try {
+    value = std::stoi(it->second);
+  } catch (const std::exception &) {
+    throw std::invalid_argument(std::string("invalid remote EP option ") + key);
+  }
+}
+
+void ParsePort(const onnxruntime::ProviderOptions &options, const char *key,
+               uint16_t &value) {
+  const auto it = options.find(key);
+  if (it == options.end())
+    return;
+  try {
+    const unsigned long parsed = std::stoul(it->second);
+    if (parsed > 65535)
+      throw std::out_of_range("port");
+    value = static_cast<uint16_t>(parsed);
+  } catch (const std::exception &) {
+    throw std::invalid_argument(std::string("invalid remote EP option ") + key);
+  }
 }
 
 class RemoteExecutionProvider final : public onnxruntime::IExecutionProvider {
@@ -184,7 +212,19 @@ public:
     onnxruntime::ProviderOptions options;
     options["host"] = options_.host;
     options["port"] = std::to_string(options_.port);
+    options["connect_timeout_ms"] = std::to_string(options_.connect_timeout_ms);
+    options["io_timeout_ms"] = std::to_string(options_.io_timeout_ms);
     options["profiling"] = std::to_string(static_cast<int>(options_.profiling));
+    std::vector<std::string> supported_ops(options_.supported_ops.begin(),
+                                           options_.supported_ops.end());
+    std::sort(supported_ops.begin(), supported_ops.end());
+    std::string ops;
+    for (const auto &op : supported_ops) {
+      if (!ops.empty())
+        ops += ',';
+      ops += op;
+    }
+    options["supported_ops"] = std::move(ops);
     return options;
   }
 
@@ -198,6 +238,46 @@ private:
 std::unique_ptr<onnxruntime::IExecutionProvider>
 CreateRemoteExecutionProvider(const Options &options) {
   return std::make_unique<RemoteExecutionProvider>(options);
+}
+
+Options OptionsFromProviderOptions(
+    const onnxruntime::ProviderOptions &provider_options) {
+  Options options;
+  if (const auto it = provider_options.find("host");
+      it != provider_options.end()) {
+    options.host = it->second;
+  }
+  ParsePort(provider_options, "port", options.port);
+  ParseInteger(provider_options, "connect_timeout_ms",
+               options.connect_timeout_ms);
+  ParseInteger(provider_options, "io_timeout_ms", options.io_timeout_ms);
+  if (const auto it = provider_options.find("profiling");
+      it != provider_options.end()) {
+    if (it->second == "summary" || it->second == "1") {
+      options.profiling = onnx_remote::ProfilingLevel::Summary;
+    } else if (it->second == "detailed" || it->second == "2") {
+      options.profiling = onnx_remote::ProfilingLevel::Detailed;
+    } else if (it->second != "off" && it->second != "0") {
+      throw std::invalid_argument("invalid remote EP option profiling");
+    }
+  }
+  if (const auto it = provider_options.find("supported_ops");
+      it != provider_options.end()) {
+    options.supported_ops.clear();
+    std::stringstream stream(it->second);
+    for (std::string op; std::getline(stream, op, ',');) {
+      if (!op.empty())
+        options.supported_ops.insert(std::move(op));
+    }
+  }
+  return options;
+}
+
+std::unique_ptr<onnxruntime::IExecutionProvider>
+CreateRemoteExecutionProviderFromOptions(
+    const onnxruntime::ProviderOptions &provider_options) {
+  return CreateRemoteExecutionProvider(
+      OptionsFromProviderOptions(provider_options));
 }
 
 } // namespace onnxsim::ort_remote

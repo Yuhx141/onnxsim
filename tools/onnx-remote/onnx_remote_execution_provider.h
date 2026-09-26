@@ -31,6 +31,14 @@ struct Options {
 std::unique_ptr<onnxruntime::IExecutionProvider>
 CreateRemoteExecutionProvider(const Options &options = {});
 
+// Parse the string map used by ORT provider registration. Unknown keys are
+// ignored so the same map can carry application-level settings.
+Options OptionsFromProviderOptions(const onnxruntime::ProviderOptions &options);
+
+std::unique_ptr<onnxruntime::IExecutionProvider>
+CreateRemoteExecutionProviderFromOptions(
+    const onnxruntime::ProviderOptions &options);
+
 } // namespace onnxsim::ort_remote
 
 #endif // ONNXSIM_REMOTE_ORT_EP
