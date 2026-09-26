@@ -54,6 +54,18 @@ cmake --build build/onnx-remote-grpc --target onnx_remote_grpc
 This option is deliberately off by default and is intended for a host-side
 gateway, not an embedded runner.
 
+The generated build also provides `onnx-remote-grpc-gateway`. It accepts the
+same native worker endpoint used by the C++ client:
+
+```sh
+build/onnx-remote-grpc/onnx-remote-grpc-gateway \
+  --listen 0.0.0.0:50051 --worker-host 127.0.0.1 --worker-port 39501
+```
+
+The initial gateway uses insecure gRPC credentials for trusted local networks.
+Put it behind a TLS/authenticated reverse proxy or add gRPC credentials before
+exposing it beyond a trusted ROS2/DORA domain.
+
 An actual gRPC service should translate `Execute` to
 `onnx_remote::Request`/`Response` and retain the native transport as the
 canonical embedded path. A KServe V2 adapter can map `ModelInfer` to

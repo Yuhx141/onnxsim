@@ -83,6 +83,11 @@ if (ONNXSIM_REMOTE_GRPC)
               ${ONNXSIM_GRPC_PROTO_CPP} ${ONNXSIM_GRPC_SERVICE_CPP})
   target_include_directories(onnx_remote_grpc PUBLIC ${ONNXSIM_GRPC_GEN_DIR})
   target_link_libraries(onnx_remote_grpc PUBLIC protobuf::libprotobuf gRPC::grpc++)
+  add_executable(onnx-remote-grpc-gateway grpc_gateway.cpp grpc_gateway_main.cpp)
+  target_include_directories(onnx-remote-grpc-gateway PRIVATE ${ONNXSIM_GRPC_GEN_DIR})
+  target_link_libraries(onnx-remote-grpc-gateway PRIVATE
+                        onnx_remote_transport onnx_remote_grpc gRPC::grpc++)
+  install(TARGETS onnx-remote-grpc-gateway RUNTIME DESTINATION bin)
   install(TARGETS onnx_remote_grpc ARCHIVE DESTINATION lib)
   install(FILES ${ONNXSIM_GRPC_PROTO_H} ${ONNXSIM_GRPC_SERVICE_H}
           DESTINATION include/onnx-remote/grpc)
