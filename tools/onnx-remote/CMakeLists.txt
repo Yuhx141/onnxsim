@@ -95,6 +95,16 @@ if (ONNXSIM_REMOTE_GRPC)
   target_include_directories(onnx-remote-grpc-gateway PRIVATE ${ONNXSIM_GRPC_GEN_DIR})
   target_link_libraries(onnx-remote-grpc-gateway PRIVATE
                         onnx_remote_transport onnx_remote_grpc gRPC::grpc++)
+  if (BUILD_TESTING)
+    add_executable(onnx-remote-grpc-gateway-test grpc_gateway.cpp
+                   grpc_gateway_test.cpp)
+    target_include_directories(onnx-remote-grpc-gateway-test PRIVATE
+                               ${ONNXSIM_GRPC_GEN_DIR})
+    target_link_libraries(onnx-remote-grpc-gateway-test PRIVATE
+                          onnx_remote_transport onnx_remote_grpc gRPC::grpc++)
+    add_test(NAME onnx-remote-grpc-gateway-smoke
+             COMMAND onnx-remote-grpc-gateway-test)
+  endif()
   install(TARGETS onnx-remote-grpc-gateway RUNTIME DESTINATION bin)
   install(TARGETS onnx_remote_grpc ARCHIVE DESTINATION lib)
   install(FILES ${ONNXSIM_GRPC_PROTO_H} ${ONNXSIM_GRPC_SERVICE_H}

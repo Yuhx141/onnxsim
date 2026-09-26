@@ -40,10 +40,13 @@
             zlib.dev
             icu
             icu.dev
+            zstd
+            zstd.out
           ];
           shellHook = ''
             export ROS_DISTRO=humble
             export ROS_VERSION=2
+            export LD_LIBRARY_PATH="${pkgs.zstd.out}/lib:''${LD_LIBRARY_PATH:-}"
             echo "onnx-remote ROS2 shell: build with -DONNXSIM_REMOTE_ROS2=ON"
           '';
         };
