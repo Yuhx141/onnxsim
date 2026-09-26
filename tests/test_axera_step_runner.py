@@ -548,8 +548,11 @@ def test_training_step_matmul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path)
     schedule = tmp_path / "training_matmul_36.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule), matmul_calibration)
     rng = np.random.default_rng(1965)
-    x = rng.uniform(-0.02, 0.02, a_shape).astype(np.float32)
-    z = rng.uniform(-0.02, 0.02, b_shape).astype(np.float32)
+    # Keep the product inside this training segment's uint8 output range;
+    # the step calibration has a nonzero output zero point and saturates on
+    # the wider standalone MatMul probe range.
+    x = rng.uniform(-0.002, 0.002, a_shape).astype(np.float32)
+    z = rng.uniform(-0.002, 0.002, b_shape).astype(np.float32)
 
     with axcl_session.AXSession(subdir=f"training_matmul_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))

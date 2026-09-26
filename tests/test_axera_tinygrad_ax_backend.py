@@ -529,7 +529,9 @@ def test_compile_onnx_maxpool_through_uop_to_mcode(tmp_path):
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
-    _, meta = misc.load_template("MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1")
+    template_model, meta = misc.load_template(
+        "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1"
+    )
     schedule = tmp_path / "onnx_maxpool.schedule.json"
     generated = onnx.load_from_string(
         axb.compile_onnx(
@@ -539,8 +541,12 @@ def test_compile_onnx_maxpool_through_uop_to_mcode(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert [value.name for value in generated.graph.input] == ["x"]
-    assert [value.name for value in generated.graph.output] == ["y"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "maxpool"
 
 
@@ -566,7 +572,7 @@ def test_compile_onnx_reducemean_through_uop_to_mcode(tmp_path):
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
-    _, meta = misc.load_template("ReduceMean:16x512x7x7:axes2,3:k1")
+    template_model, meta = misc.load_template("ReduceMean:16x512x7x7:axes2,3:k1")
     schedule = tmp_path / "onnx_reducemean.schedule.json"
     generated = onnx.load_from_string(
         axb.compile_onnx(
@@ -576,8 +582,12 @@ def test_compile_onnx_reducemean_through_uop_to_mcode(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert [value.name for value in generated.graph.input] == ["x"]
-    assert [value.name for value in generated.graph.output] == ["y"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducemean"
 
 
@@ -599,7 +609,7 @@ def test_compile_onnx_reducesum_through_uop_to_mcode(tmp_path):
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
-    _, meta = misc.load_template("ReduceSum:16x1000:axes0:k1")
+    template_model, meta = misc.load_template("ReduceSum:16x1000:axes0:k1")
     schedule = tmp_path / "onnx_reducesum.schedule.json"
     generated = onnx.load_from_string(
         axb.compile_onnx(
@@ -609,8 +619,12 @@ def test_compile_onnx_reducesum_through_uop_to_mcode(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert [value.name for value in generated.graph.input] == ["x"]
-    assert [value.name for value in generated.graph.output] == ["y"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
 
 
@@ -632,7 +646,7 @@ def test_compile_onnx_softmax_through_uop_to_mcode(tmp_path):
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
-    _, meta = misc.load_template("Softmax:16x1000:axis1")
+    template_model, meta = misc.load_template("Softmax:16x1000:axis1")
     schedule = tmp_path / "onnx_softmax.schedule.json"
     generated = onnx.load_from_string(
         axb.compile_onnx(
@@ -642,8 +656,12 @@ def test_compile_onnx_softmax_through_uop_to_mcode(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert [value.name for value in generated.graph.input] == ["x"]
-    assert [value.name for value in generated.graph.output] == ["y"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "softmax"
 
 
@@ -664,7 +682,7 @@ def test_compile_onnx_unary_through_uop_to_mcode(tmp_path, op, shape, template):
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
-    _, meta = misc.load_template(template)
+    template_model, meta = misc.load_template(template)
     schedule = tmp_path / f"onnx_{op.lower()}.schedule.json"
     generated = onnx.load_from_string(
         axb.compile_onnx(
@@ -674,8 +692,12 @@ def test_compile_onnx_unary_through_uop_to_mcode(tmp_path, op, shape, template):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert [value.name for value in generated.graph.input] == ["x"]
-    assert [value.name for value in generated.graph.output] == ["y"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
 
 
@@ -1149,9 +1171,14 @@ def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert [value.name for value in generated.graph.input] == ["x", "z"]
-    assert [value.name for value in generated.graph.output] == ["y"]
-    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
+    emitted_schedule = json.loads(schedule.read_text())
+    assert [value.name for value in generated.graph.input] == [
+        item["name"] for item in emitted_schedule["inputs"]
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        item["name"] for item in emitted_schedule["outputs"]
+    ]
+    assert emitted_schedule["kernels"][0]["chain"] == "matmul"
 
 
 def test_compile_onnx_live_matmul_through_uop_to_mcode(tmp_path):
@@ -1190,9 +1217,14 @@ def test_compile_onnx_live_matmul_through_uop_to_mcode(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert [value.name for value in generated.graph.input] == ["x", "z"]
-    assert [value.name for value in generated.graph.output] == ["y"]
-    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
+    emitted_schedule = json.loads(schedule.read_text())
+    assert [value.name for value in generated.graph.input] == [
+        item["name"] for item in emitted_schedule["inputs"]
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        item["name"] for item in emitted_schedule["outputs"]
+    ]
+    assert emitted_schedule["kernels"][0]["chain"] == "matmul"
 
 
 def test_lower_tinygrad_rank2_gemm_uop_to_onnx():

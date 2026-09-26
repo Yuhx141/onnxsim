@@ -124,18 +124,27 @@ def _retarget_model_names(model: onnx.ModelProto, source: onnx.ModelProto) -> No
     input/output contract.  Only positional public IO names are changed;
     extra side outputs exposed by a measured template remain untouched.
     """
-    # The measured 1x1 Neg program carries its source tensor names in the
-    # compiled ``neu mode`` metadata.  Unlike the other current unary
-    # templates, renaming those values changes AXCL setup (0x80300709) even
-    # though the ONNX graph remains structurally equivalent.  Keep the
-    # measured names and retarget the sidecar schedule below instead.
+    # Some measured misc ``neu mode`` programs carry their source tensor names
+    # in compiled metadata.  Renaming those values changes AXCL setup
+    # (0x80300709) even though the ONNX graph remains structurally equivalent.
+    # Keep those measured names and retarget the sidecar schedule below; all
+    # other graph forms continue through the positional source retargeting.
+    name_sensitive_ops = {
+        "Neg",
+        "Log",
+        "Softmax",
+        "ReduceMean",
+        "ReduceSum",
+        "MaxPool",
+        "Greater",
+        "Less",
+        "MatMul",
+        "Gemm",
+    }
     if (
         len(model.graph.node) == 1
         and model.graph.node[0].op_type == "neu mode"
-        and len(model.graph.input) == 1
-        and len(model.graph.output) == 1
-        and model.graph.input[0].name.startswith("distill__div_")
-        and model.graph.output[0].name.startswith("distill__neg_")
+        and any(node.op_type in name_sensitive_ops for node in source.graph.node)
     ):
         return
     if len(model.graph.input) != len(source.graph.input) or len(
