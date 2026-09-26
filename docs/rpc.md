@@ -94,10 +94,10 @@ python -m onnxsim.rpc server --port 9090 --key pixel --tracker host:9190     # r
   per loaded model, so `time_evaluator` excludes session creation) and with onnxsim's pure-Python
   reference evaluator otherwise. `providers=[...]` selects onnxruntime execution providers, and is
   checked against what the server actually has.
-- **Where it runs.** The server is Python, so the target needs Python, `onnx` and ideally
-  `onnxruntime`: Linux boards and servers, containers, Termux. Stock Android has no Python, so
-  the phone in this repo's Hexagon experiments would need either Termux or a native server that
-  speaks the same protocol (it is deliberately small: see below) -- not provided yet.
+- **Where it runs.** This high-level Python RPC server needs Python, `onnx` and ideally
+  `onnxruntime`: Linux boards and servers, containers, Termux. Stock Android has no Python;
+  use the dependency-free native worker under `tools/onnx-remote` for the binary v5 transport
+  and remote EP path instead.
 
 ## API
 
