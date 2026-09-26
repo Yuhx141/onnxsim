@@ -712,6 +712,59 @@ def test_onnx_constant_broadcast_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm
 
 
 @needs_device
+def test_frozen_conv_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+    """Run the frozen-weight Conv UOp route without a Pulsar2 build."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import tinygrad_ax_backend as axb
+
+    input_shape = (16, 64, 56, 56)
+    output_shape = input_shape
+    weights = np.zeros((64, 64, 3, 3), dtype=np.float32)
+    bias = np.zeros((64,), dtype=np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Conv", ["x", "w", "b"], ["y"], pads=[1, 1, 1, 1], strides=[1, 1]
+                )
+            ],
+            "frozen_conv_to_uop_vm",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, input_shape
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, output_shape
+                )
+            ],
+            [numpy_helper.from_array(weights, "w"), numpy_helper.from_array(bias, "b")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "frozen_conv_to_uop.schedule.json"
+    axmodel = axb.compile_onnx(
+        model,
+        str(schedule),
+        {"scales": {"x": 0.01, "y": 0.02}, "zero_points": {"x": 127, "y": 125}},
+    )
+    x = np.zeros(input_shape, dtype=np.float32)
+    with axcl_session.AXSession(subdir=f"uop_frozen_conv_{tmp_path.name}") as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x])
+        finally:
+            session.unload(loaded)
+    assert got.shape == output_shape
+    # The measured output zero-point need not decode to float zero; with zero
+    # input and zero weights, the useful invariant is a finite uniform result.
+    assert np.isfinite(got).all()
+    assert float(np.ptp(got)) == 0.0
+
+
+@needs_device
 @pytest.mark.parametrize("op", ["Sub", "Mul", "Div"])
 def test_onnx_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, op):
     """Run the remaining same-shape binary UOps through AXCL VM."""
