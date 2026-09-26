@@ -66,9 +66,9 @@ def _retarget_schedule_names(
     Retarget the sidecar by IO position while leaving the model and its MCode
     untouched.
     """
-    if len(model.graph.output) != len(source.graph.output) or len(model.graph.input) < len(
-        source.graph.input
-    ):
+    if len(model.graph.output) != len(source.graph.output) or len(
+        model.graph.input
+    ) < len(source.graph.input):
         return
     rename = {
         old.name: new.name
@@ -224,6 +224,31 @@ def _initializer_map(model: onnx.ModelProto) -> dict[str, onnx.TensorProto]:
     return {item.name: item for item in model.graph.initializer}
 
 
+def _normalize_commutative_constant_binary(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Put a constant second for measured commutative binary templates.
+
+    The emitter's public slots are ``x`` then ``z``.  ONNX permits either
+    operand order for Add/Mul, so normalize only those operations; Sub/Div
+    must retain their order because swapping them changes the result.
+    """
+    if len(model.graph.node) != 1:
+        return model
+    node = model.graph.node[0]
+    initializers = _initializer_map(model)
+    graph_inputs = {item.name for item in model.graph.input}
+    if (
+        node.op_type not in ("Add", "Mul")
+        or len(node.input) != 2
+        or node.input[0] not in initializers
+        or node.input[1] not in graph_inputs
+    ):
+        return model
+    normalized = onnx.ModelProto()
+    normalized.CopyFrom(model)
+    normalized.graph.node[0].input[:] = [node.input[1], node.input[0]]
+    return normalized
+
+
 def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     """Recognize and schedule one measured composed graph.
 
@@ -233,6 +258,7 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     launches.  Inputs ``x``, ``w`` and ``b`` are required to remain runtime
     inputs; constant folding them would select a different compiled family.
     """
+    model = _normalize_commutative_constant_binary(model)
     model = onnx.shape_inference.infer_shapes(model)
     nodes = list(model.graph.node)
     values = {
@@ -591,8 +617,10 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             raise ValueError(
                 f"standalone {add.op_type} generator requires runtime inputs named x and z"
             )
-        if len(add.input) != 2 or add.input[0] != "x" or (
-            not constant_second and add.input[1] != "z"
+        if (
+            len(add.input) != 2
+            or add.input[0] != "x"
+            or (not constant_second and add.input[1] != "z")
         ):
             raise ValueError(
                 f"standalone {add.op_type} inputs must be the graph inputs"
@@ -701,6 +729,7 @@ def generate(
     initializer and must stay in the template's calibrated range.
     """
     model = onnx.load(source_path, load_external_data=False)
+    model = _normalize_commutative_constant_binary(model)
     plan = schedule_graph(model)
     if schedule_path is not None:
         # Keep schedule generation on the same validated source model and
