@@ -103,6 +103,7 @@ public:
       if (node == nullptr ||
           (!node->Domain().empty() && node->Domain() != "ai.onnx") ||
           options_.supported_ops.count(node->OpType()) == 0 ||
+          onnx_remote::remote_operation_name(node->OpType()).empty() ||
           !node->GetExecutionProviderType().empty()) {
         continue;
       }

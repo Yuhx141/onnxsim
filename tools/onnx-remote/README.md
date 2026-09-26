@@ -69,6 +69,8 @@ API can construct it with `onnxsim::ort_remote::CreateRemoteExecutionProvider`.
 Registration maps can use `host`, `port`, `connect_timeout_ms`,
 `io_timeout_ms`, `profiling=off|summary|detailed`, and comma-separated
 `supported_ops`; use `OptionsFromProviderOptions` to parse them.
+Only operations with a reference transport mapping are claimable; adding an
+unknown name to `supported_ops` therefore leaves that node on the CPU EP.
 With ORT's internal C++ session API, registration is the normal EP flow:
 
 ```cpp
