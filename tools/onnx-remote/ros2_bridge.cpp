@@ -130,6 +130,17 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     return std::atoi(json.c_str() + value_start);
   }
 
+  static bool json_bool(const std::string& json, const std::string& key,
+                        bool fallback = false) {
+    const std::string marker = "\"" + key + "\":";
+    const size_t start = json.find(marker);
+    if (start == std::string::npos) return fallback;
+    const size_t value_start = start + marker.size();
+    if (json.compare(value_start, 4, "true") == 0) return true;
+    if (json.compare(value_start, 5, "false") == 0) return false;
+    return fallback;
+  }
+
   void publish_profile(const onnx_remote::Response& response) {
     if (!publish_profile_ || profile_ == nullptr || response.profile.empty()) return;
     String message;
@@ -143,7 +154,8 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                    "\",\"host\":\"" + advertise_host_ +
                    "\",\"port\":" + std::to_string(port_) + ",\"target\":\"" +
                    discovery_target_ +
-                   "\",\"transport\":\"onnx-remote-v5\","
+                   "\",\"transport\":\"onnx-remote-v5\",\"ready\":true,"
+                   "\"ttl_ms\":" + std::to_string(discovery_timeout_ms_) + ","
                    "\"profiling\":[\"off\",\"summary\",\"detailed\"]}";
     discovery_->publish(std::move(message));
   }
@@ -152,6 +164,8 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     if (!auto_discover_) return;
     const std::string id = json_string(message->data, "runner_id");
     if (id.empty() || id == runner_id_) return;
+    if (json_string(message->data, "transport") != "onnx-remote-v5" ||
+        !json_bool(message->data, "ready")) return;
     const std::string target = json_string(message->data, "target");
     if (!discovery_target_.empty() && target != discovery_target_) return;
     const std::string host = json_string(message->data, "host");
@@ -160,6 +174,10 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     host_ = host;
     port_ = port;
     last_discovery_ = std::chrono::steady_clock::now();
+    const int advertised_ttl = json_int(message->data, "ttl_ms");
+    discovered_timeout_ms_ = advertised_ttl > 0
+                                 ? std::min(discovery_timeout_ms_, advertised_ttl)
+                                 : discovery_timeout_ms_;
     discovered_ = true;
     RCLCPP_INFO(get_logger(), "auto-discovered runner %s at %s:%d", id.c_str(),
                 host_.c_str(), port_);
@@ -169,7 +187,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     if (!auto_discover_ || !discovered_ || discovery_timeout_ms_ <= 0) return;
     const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - last_discovery_);
-    if (age.count() <= discovery_timeout_ms_) return;
+    if (age.count() <= discovered_timeout_ms_) return;
     RCLCPP_WARN(get_logger(), "discovered runner expired after %ld ms",
                 static_cast<long>(age.count()));
     host_ = configured_host_;
@@ -240,6 +258,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   int announce_period_ms_ = 5000;
   int discovery_timeout_ms_ = 15000;
   bool discovered_ = false;
+  int discovered_timeout_ms_ = 15000;
   bool publish_profile_ = true;
   std::chrono::steady_clock::time_point last_discovery_{};
   std::string discovery_topic_;
