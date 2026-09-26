@@ -35,6 +35,10 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
+    if name == "tvm_compat":
+        import importlib
+
+        return importlib.import_module(".tvm_compat", __name__)
     if name == "RPCServer":
         from .server import RPCServer
 
