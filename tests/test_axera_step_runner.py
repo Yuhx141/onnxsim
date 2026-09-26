@@ -614,6 +614,47 @@ def test_onnx_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
 
 
 @needs_device
+def test_onnx_constant_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+    """Stage an ONNX initializer as the second AX binary runtime slot."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import binary_op_scale_emit as bse
+    import tinygrad_ax_backend as axb
+
+    shape = (1, 64)
+    z = np.full(shape, 0.2, dtype=np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Add", ["x", "z"], ["y"])],
+            "onnx_constant_add_to_uop_vm",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+            [onnx.numpy_helper.from_array(z, "z")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template("Add", shape, {"x": 0, "y": 0, "z": 0})
+    calibration = {"scales": meta["scales"], "zero_points": meta["zero_points"]}
+    schedule = tmp_path / "onnx_constant_add_to_uop.schedule.json"
+    axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(0.0, 0.2, shape).astype(np.float32)
+
+    with axcl_session.AXSession(
+        subdir=f"uop_constant_add_{tmp_path.name}"
+    ) as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x, z])
+        finally:
+            session.unload(loaded)
+
+    np.testing.assert_allclose(
+        got, x + z, atol=float(meta["scales"]["y"]) * 1.5, rtol=0
+    )
+
+
+@needs_device
 @pytest.mark.parametrize("op", ["Sub", "Mul", "Div"])
 def test_onnx_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, op):
     """Run the remaining same-shape binary UOps through AXCL VM."""

@@ -115,11 +115,14 @@ def _retarget_schedule_names(
     extra_inputs = list(model.graph.input[len(source.graph.input) :])
     if extra_inputs:
         allocations = retargeted.setdefault("allocations", [])
+        existing_inputs = {entry["name"] for entry in retargeted.get("inputs", ())}
         used_end = max(
             (int(item["offset"]) + int(item["nbytes"]) for item in allocations),
             default=0,
         )
         for spec in extra_inputs:
+            if spec.name in existing_inputs:
+                continue
             shape = [int(dim.dim_value) for dim in spec.type.tensor_type.shape.dim]
             nbytes = math.prod(shape) * 4
             offset = (used_end + 63) // 64 * 64
@@ -144,6 +147,7 @@ def _retarget_schedule_names(
                 }
             )
             used_end = offset + nbytes
+            existing_inputs.add(spec.name)
         retargeted["memory_size"] = max(int(retargeted["memory_size"]), used_end)
         if len(retargeted["kernels"]) == 1 and len(model.graph.node) == 1:
             retargeted["kernels"][0]["inputs"] = list(model.graph.node[0].input)
@@ -575,21 +579,30 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         )
     if len(nodes) == 1 and nodes[0].op_type in ("Add", "Sub", "Mul", "Div"):
         add = nodes[0]
-        if len(model.graph.input) != 2 or [item.name for item in model.graph.input] != [
-            "x",
-            "z",
-        ]:
+        init = _initializer_map(model)
+        runtime_inputs = [item.name for item in model.graph.input]
+        constant_second = (
+            len(runtime_inputs) == 1
+            and runtime_inputs == ["x"]
+            and len(add.input) == 2
+            and add.input[1] in init
+        )
+        if not constant_second and runtime_inputs != ["x", "z"]:
             raise ValueError(
                 f"standalone {add.op_type} generator requires runtime inputs named x and z"
             )
-        if len(add.input) != 2 or tuple(values.get(name, ()) for name in add.input) != (
-            values.get("x", ()),
-            values.get("z", ()),
+        if len(add.input) != 2 or add.input[0] != "x" or (
+            not constant_second and add.input[1] != "z"
         ):
             raise ValueError(
                 f"standalone {add.op_type} inputs must be the graph inputs"
             )
-        input_shapes = (values.get("x", ()), values.get("z", ()))
+        input_shapes = (
+            values.get("x", ()),
+            tuple(int(dim) for dim in init[add.input[1]].dims)
+            if constant_second
+            else values.get("z", ()),
+        )
         if not all(input_shapes):
             raise ValueError(f"standalone {add.op_type} requires static input shapes")
         try:
@@ -694,7 +707,29 @@ def generate(
 
         import schedule_ir
 
-        schedule = schedule_ir.build(model)
+        schedule_model = model
+        # schedule_ir deliberately excludes ONNX initializers from its
+        # allocation graph.  Constant binary templates, however, consume the
+        # initializer through a second runtime slot, so present that slot as
+        # a graph input while constructing the sidecar.
+        if (
+            len(model.graph.node) == 1
+            and model.graph.node[0].op_type in ("Add", "Sub", "Mul", "Div")
+            and len(model.graph.node[0].input) == 2
+            and model.graph.node[0].input[1] in _initializer_map(model)
+        ):
+            schedule_model = onnx.ModelProto()
+            schedule_model.CopyFrom(model)
+            initializer = _initializer_map(schedule_model)[model.graph.node[0].input[1]]
+            del schedule_model.graph.initializer[:]
+            schedule_model.graph.input.append(
+                onnx.helper.make_tensor_value_info(
+                    initializer.name,
+                    initializer.data_type,
+                    list(initializer.dims),
+                )
+            )
+        schedule = schedule_ir.build(schedule_model)
         with open(schedule_path, "w", encoding="utf-8") as stream:
             json.dump(schedule.to_json(), stream, indent=2, sort_keys=True)
             stream.write("\n")

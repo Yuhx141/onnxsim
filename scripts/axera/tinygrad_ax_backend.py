@@ -2804,6 +2804,31 @@ def compile_onnx(
             )
             with open(output, "rb") as stream:
                 return stream.read()
+    # tinygrad imports an initializer binary operand as a CONST UOp, which is
+    # intentionally not ALLOC-backed.  The measured AX binary program still
+    # requires two runtime tensor slots, so keep the UOp import as validation
+    # but route this source-aware case through graph_generator; its schedule
+    # exposes the initializer as a staged helper input instead of embedding it
+    # into the MCode model.
+    if (
+        len(source_model.graph.node) == 1
+        and source_model.graph.node[0].op_type in bse.OPS
+        and len(source_model.graph.input) == 1
+        and len(source_model.graph.node[0].input) == 2
+        and source_model.graph.node[0].input[1]
+        in {item.name for item in source_model.graph.initializer}
+    ):
+        import graph_generator
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "constant_binary.onnx")
+            output = os.path.join(directory, "constant_binary.axmodel")
+            onnx.save(source_model, source)
+            graph_generator.generate(
+                source, output, schedule_path=schedule_path, calibration=calibration
+            )
+            with open(output, "rb") as stream:
+                return stream.read()
     return compile_uop(root, schedule_path=schedule_path, calibration=calibration)
 
 
