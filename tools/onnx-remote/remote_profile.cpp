@@ -12,10 +12,21 @@ std::string json_escape(const std::string& value) {
     switch (character) {
       case '"': escaped += "\\\""; break;
       case '\\': escaped += "\\\\"; break;
+      case '\b': escaped += "\\b"; break;
+      case '\f': escaped += "\\f"; break;
       case '\n': escaped += "\\n"; break;
       case '\r': escaped += "\\r"; break;
       case '\t': escaped += "\\t"; break;
-      default: escaped.push_back(character); break;
+      default:
+        if (static_cast<unsigned char>(character) < 0x20) {
+          static constexpr char hex[] = "0123456789abcdef";
+          escaped += "\\u00";
+          escaped.push_back(hex[(static_cast<unsigned char>(character) >> 4) & 0xf]);
+          escaped.push_back(hex[static_cast<unsigned char>(character) & 0xf]);
+        } else {
+          escaped.push_back(character);
+        }
+        break;
     }
   }
   return escaped;

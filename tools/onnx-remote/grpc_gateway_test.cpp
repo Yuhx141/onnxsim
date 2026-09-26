@@ -92,6 +92,13 @@ int main() {
   assert(capability_response.ready());
   assert(capability_response.protocol() == "onnx-remote-v5");
 
+  ExecuteRequest invalid_request;
+  invalid_request.set_op(std::string(kMaxOpBytes + 1, 'x'));
+  ExecuteResponse invalid_response;
+  grpc::ClientContext invalid_context;
+  status = stub->Execute(&invalid_context, invalid_request, &invalid_response);
+  assert(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+
   ExecuteRequest request;
   request.set_request_id(17);
   request.set_op("identity");

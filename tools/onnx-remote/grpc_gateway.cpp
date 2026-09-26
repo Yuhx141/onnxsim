@@ -113,6 +113,12 @@ Service::Service(Options options) : options_(std::move(options)) {}
 
 grpc::Status Service::Execute(grpc::ServerContext*, const ExecuteRequest* request,
                               ExecuteResponse* response) {
+  if (request->op().empty() || request->op().size() > kMaxOpBytes)
+    return invalid("operation is empty or exceeds transport limit");
+  if (request->artifact_id().size() > kMaxArtifactIdBytes)
+    return invalid("artifact_id exceeds transport limit");
+  if (request->inputs_size() > static_cast<int>(kMaxTensors))
+    return invalid("too many input tensors");
   NativeRequest native;
   native.request_id = request->request_id();
   native.op = request->op();
@@ -158,6 +164,10 @@ grpc::Status Service::Compile(grpc::ServerContext*, const CompileRequest* reques
 grpc::Status Service::LoadArtifact(grpc::ServerContext*, const LoadArtifactRequest* request,
                                    LoadArtifactResponse* response) {
   if (request->artifact_id().empty()) return invalid("artifact_id is required");
+  if (request->artifact_id().size() > kMaxArtifactIdBytes)
+    return invalid("artifact_id exceeds transport limit");
+  if (request->artifact().size() > static_cast<int64_t>(kMaxArtifactBytes))
+    return invalid("artifact exceeds transport limit");
   NativeRequest native;
   native.request_id = request->request_id();
   native.op = "load_compiled";

@@ -74,6 +74,18 @@ int main() {
   assert(profile.find("qnn_execute") != std::string::npos);
   assert(profile.find("\"duration_us\":34") != std::string::npos);
 
+  Response escaped_response;
+  escaped_response.request_id = 9;
+  escaped_response.profile.push_back(ProfileEvent{
+      "quote\\\"\\backslash", "line\nfeed", 1, 2,
+      "tab\tbackspace\bformfeed\fcontrol\x01"});
+  const std::string escaped_profile = profile_json(escaped_response);
+  assert(escaped_profile.find("quote\\\\\\\"\\\\backslash") !=
+         std::string::npos);
+  assert(escaped_profile.find("line\\nfeed") != std::string::npos);
+  assert(escaped_profile.find("tab\\tbackspace\\bformfeed\\fcontrol\\u0001") !=
+         std::string::npos);
+
   Request invalid = request;
   invalid.op.assign(kMaxOpBytes + 1, 'x');
   assert(!encode_request_payload(invalid, payload, error));
