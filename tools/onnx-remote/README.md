@@ -148,8 +148,10 @@ transport.  The reference worker deliberately does not pretend to be that EP
 yet.
 
 Set `ONNXSIM_DORA_ANNOUNCE=1` and declare optional `status` and `capabilities`
-outputs to publish readiness and the binary protocol capability document. The
-adapter also accepts `ONNXSIM_DORA_CONNECT_TIMEOUT_MS` and
+outputs to query and publish actual worker readiness and the worker's capability
+document. If the worker is unavailable, `status` reports `unavailable` and the
+capabilities output contains a short error object. The adapter also accepts
+`ONNXSIM_DORA_CONNECT_TIMEOUT_MS` and
 `ONNXSIM_DORA_IO_TIMEOUT_MS` for unreliable links.
 
 ## ROS2 bridge

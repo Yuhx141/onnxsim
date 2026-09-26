@@ -41,6 +41,29 @@ int env_timeout(const char* name, int fallback) {
                                            : fallback;
 }
 
+bool query_capabilities(Response& response, std::string& error) {
+  const int fd = connect_tcp_timeout(
+      env_string("ONNXSIM_DORA_REMOTE_HOST", "127.0.0.1"), env_port(),
+      env_timeout("ONNXSIM_DORA_CONNECT_TIMEOUT_MS", 2000));
+  if (fd < 0) {
+    error = "DORA adapter: capability connection failed";
+    return false;
+  }
+  set_socket_io_timeout(fd, env_timeout("ONNXSIM_DORA_IO_TIMEOUT_MS", 0));
+  Request request;
+  request.op = "capabilities";
+  const bool sent = send_request(fd, request, error);
+  const bool received = sent && receive_response(fd, response, error);
+  close_socket(fd);
+  if (!received) return false;
+  if (!response.ok) {
+    error = response.error.empty() ? "DORA adapter: worker is not ready"
+                                   : response.error;
+    return false;
+  }
+  return true;
+}
+
 bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
              uint64_t& request_id, Response& response_out,
              std::string& error) {
@@ -88,18 +111,21 @@ int main() {
   }
 
   if (std::getenv("ONNXSIM_DORA_ANNOUNCE") != nullptr) {
-    const char status[] =
-        "{\"status\":\"ready\",\"protocol\":\"onnx-remote-v5\",\"tensor_"
-        "dtypes\":[\"float32\",\"float16\",\"bfloat16\",\"int8\",\"uint8\","
-        "\"int16\",\"uint16\",\"int32\",\"int64\",\"uint32\",\"uint64\","
-        "\"double\",\"bool\"]}";
-    const char capabilities[] =
-        "{\"schema_version\":1,\"payload\":\"binary-uint8\","
-        "\"operations\":[\"run\",\"compile\",\"load_compiled\","
-        "\"run_compiled\"]}";
-    dora_send_output(context, "status", 6, status, sizeof(status) - 1);
-    dora_send_output(context, "capabilities", 12, capabilities,
-                     sizeof(capabilities) - 1);
+    Response worker_capabilities;
+    std::string capability_error;
+    const bool ready = query_capabilities(worker_capabilities, capability_error);
+    const std::string status = ready
+        ? "{\"status\":\"ready\",\"protocol\":\"onnx-remote-v5\"}"
+        : "{\"status\":\"unavailable\",\"protocol\":\"onnx-remote-v5\"}";
+    dora_send_output(context, "status", 6, status.data(), status.size());
+    if (ready && !worker_capabilities.manifest.empty()) {
+      dora_send_output(context, "capabilities", 12,
+                       worker_capabilities.manifest.data(),
+                       worker_capabilities.manifest.size());
+    } else {
+      const std::string error = "{\"ready\":false,\"error\":\"worker unavailable\"}";
+      dora_send_output(context, "capabilities", 12, error.data(), error.size());
+    }
   }
 
   for (;;) {
