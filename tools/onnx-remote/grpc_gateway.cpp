@@ -187,12 +187,20 @@ grpc::Status Service::LoadArtifact(grpc::ServerContext*, const LoadArtifactReque
 
 grpc::Status Service::GetCapabilities(grpc::ServerContext*, const CapabilitiesRequest* request,
                                       CapabilitiesResponse* response) {
+  NativeRequest native;
+  native.request_id = request->request_id();
+  native.op = "capabilities";
+  NativeResponse native_response;
+  grpc::Status status = roundtrip(options_, std::move(native), native_response);
+  if (!status.ok()) return status;
   response->set_request_id(request->request_id());
-  response->set_ready(true);
-  response->set_runner_id(options_.runner_id);
+  response->set_ready(native_response.ok);
+  response->set_runner_id(native_response.artifact_id.empty()
+                              ? options_.runner_id
+                              : native_response.artifact_id);
   response->set_protocol("onnx-remote-v5");
   response->set_max_message_bytes(kMaxMessageBytes);
-  response->set_profiling(true);
+  response->set_profiling(native_response.ok);
   for (const auto& op : options_.supported_ops) response->add_supported_ops(op);
   for (const char* dtype : {"FLOAT", "FLOAT16", "BFLOAT16", "INT8", "UINT8",
                             "INT16", "UINT16", "INT32", "UINT32", "INT64",

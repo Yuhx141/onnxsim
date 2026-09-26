@@ -28,7 +28,7 @@ constexpr uint16_t kWorkerPort = 39671;
 void serve_requests() {
   const int listener = listen_tcp(kWorkerPort, 1);
   assert(listener >= 0);
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < 4; ++i) {
     const int fd = accept_tcp(listener);
     assert(fd >= 0);
 
@@ -37,7 +37,11 @@ void serve_requests() {
     std::string error;
     assert(receive_request(fd, request, error));
     response.request_id = request.request_id;
-    if (request.op == "identity" && request.inputs.size() == 1) {
+    if (request.op == "capabilities") {
+      response.ok = true;
+      response.artifact_id = "smoke-runner";
+      response.manifest = "{\"ready\":true}";
+    } else if (request.op == "identity" && request.inputs.size() == 1) {
       response.ok = true;
       response.outputs = request.inputs;
       response.profile.push_back(
@@ -91,6 +95,7 @@ int main() {
   assert(status.ok());
   assert(capability_response.ready());
   assert(capability_response.protocol() == "onnx-remote-v5");
+  assert(capability_response.runner_id() == "smoke-runner");
 
   ExecuteRequest invalid_request;
   invalid_request.set_op(std::string(kMaxOpBytes + 1, 'x'));
