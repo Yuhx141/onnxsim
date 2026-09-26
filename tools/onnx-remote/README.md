@@ -130,6 +130,10 @@ minimal dataflow declares `run` as the node input and `result` as its output.
 The DORA node API carries raw UInt8 messages; tensor and profile serialization
 remain the same as the dependency-free transport.
 
+Set `ONNXSIM_DORA_PUBLISH_PROFILE=1` and declare an optional `profile` output
+to publish the same compact JSON profile summary used by the ROS2 bridge. The
+`result` output continues to carry the complete binary profile events.
+
 The next integration layer can make an ONNX Runtime plugin EP claim a maximal
 supported subgraph and send it as an operation/model handle over this
 transport.  The reference worker deliberately does not pretend to be that EP
@@ -195,6 +199,11 @@ networks.
 The bridge exposes `health` and `capabilities` for ROS2 discovery/selection;
 tensor and profile data remain binary rather than being converted to ROS
 messages.
+
+Set `publish_profile:=true` (the default) to additionally publish a compact
+JSON profile summary on the `profile_topic` (default: `profile`). The `result`
+topic remains the lossless binary response, including the same profile events;
+the JSON topic is intended for ROS tools and lightweight profiling UIs.
 
 `onnx-remote-mock-runner` and `onnx-remote-attach-test` provide a vendor-free
 test of the compiled-artifact handshake. The mock stores opaque artifact bytes

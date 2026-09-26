@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "remote_profile.h"
 #include "remote_transport.h"
 
 using namespace std::chrono_literals;
@@ -36,7 +37,12 @@ class OnnxRemoteBridge final : public rclcpp::Node {
         declare_parameter<int>("discovery_timeout_ms", 15000);
     advertise_host_ = declare_parameter<std::string>("advertise_host", host_);
     runner_id_ = declare_parameter<std::string>("runner_id", get_name());
+    publish_profile_ = declare_parameter<bool>("publish_profile", true);
+    profile_topic_ = declare_parameter<std::string>("profile_topic", "profile");
     result_ = create_publisher<UInt8MultiArray>("result", rclcpp::QoS(10));
+    if (publish_profile_) {
+      profile_ = create_publisher<String>(profile_topic_, rclcpp::QoS(10));
+    }
     discovery_ = create_publisher<String>(
         discovery_topic_, rclcpp::QoS(1).transient_local().reliable());
     discovery_sub_ = create_subscription<String>(
@@ -95,6 +101,13 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     if (start == std::string::npos) return 0;
     const size_t value_start = start + marker.size();
     return std::atoi(json.c_str() + value_start);
+  }
+
+  void publish_profile(const onnx_remote::Response& response) {
+    if (!publish_profile_ || profile_ == nullptr || response.profile.empty()) return;
+    String message;
+    message.data = onnx_remote::profile_json(response);
+    profile_->publish(std::move(message));
   }
 
   void announce() {
@@ -163,6 +176,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                     request.request_id);
       return;
     }
+    publish_profile(response);
     std::vector<uint8_t> payload;
     if (!onnx_remote::encode_response_payload(response, payload, error)) {
       publish_error(error);
@@ -199,12 +213,15 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   int announce_period_ms_ = 5000;
   int discovery_timeout_ms_ = 15000;
   bool discovered_ = false;
+  bool publish_profile_ = true;
   std::chrono::steady_clock::time_point last_discovery_{};
   std::string discovery_topic_;
   std::string discovery_target_;
   std::string advertise_host_;
   std::string runner_id_;
+  std::string profile_topic_;
   rclcpp::Publisher<UInt8MultiArray>::SharedPtr result_;
+  rclcpp::Publisher<String>::SharedPtr profile_;
   rclcpp::Publisher<String>::SharedPtr discovery_;
   rclcpp::Subscription<UInt8MultiArray>::SharedPtr run_;
   rclcpp::Subscription<String>::SharedPtr discovery_sub_;

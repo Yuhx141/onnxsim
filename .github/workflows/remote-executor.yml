@@ -95,3 +95,22 @@ jobs:
         run: python -m pip install pytest
       - name: Run dependency-light tests
         run: python -m pytest -q tests/test_qnn_compat_cli.py tests/test_trt_compile_cli.py tests/test_remote_manifest.py
+
+  grpc-gateway:
+    name: optional gRPC gateway
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install gRPC toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgrpc++-dev protobuf-compiler-grpc \
+            libabsl-dev libre2-dev libc-ares-dev zlib1g-dev
+      - name: Configure
+        run: |
+          cmake -S tools/onnx-remote -B build/onnx-remote-grpc \
+            -DONNXSIM_REMOTE_GRPC=ON -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build/onnx-remote-grpc -j2
+      - name: Test
+        run: ctest --test-dir build/onnx-remote-grpc --output-on-failure

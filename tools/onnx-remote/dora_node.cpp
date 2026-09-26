@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "remote_profile.h"
 #include "remote_transport.h"
 
 using namespace onnx_remote;
@@ -41,7 +42,8 @@ int env_timeout(const char* name, int fallback) {
 }
 
 bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
-             uint64_t& request_id, std::string& error) {
+             uint64_t& request_id, Response& response_out,
+             std::string& error) {
   Request request;
   if (!decode_request_payload(data, size, request, error)) return false;
   request_id = request.request_id;
@@ -53,12 +55,11 @@ bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
     return false;
   }
   set_socket_io_timeout(fd, env_timeout("ONNXSIM_DORA_IO_TIMEOUT_MS", 0));
-  Response response;
   const bool sent = send_request(fd, request, error);
-  const bool received = sent && receive_response(fd, response, error);
+  const bool received = sent && receive_response(fd, response_out, error);
   close_socket(fd);
   if (!received) return false;
-  return encode_response_payload(response, result, error);
+  return encode_response_payload(response_out, result, error);
 }
 
 void report_error(void* context, const std::string& error,
@@ -125,14 +126,20 @@ int main() {
     if (is_run && data != nullptr) {
       std::vector<uint8_t> result;
       uint64_t request_id = 0;
+      Response response;
       std::string error;
       if (forward(reinterpret_cast<const uint8_t*>(data), data_len, result,
-                  request_id, error)) {
+                  request_id, response, error)) {
         if (dora_send_output(context, "result", 6,
                              reinterpret_cast<const char*>(result.data()),
                              result.size()) != 0) {
           report_error(context, "DORA adapter: result output failed",
                        request_id);
+        }
+        if (std::getenv("ONNXSIM_DORA_PUBLISH_PROFILE") != nullptr &&
+            !response.profile.empty()) {
+          const std::string profile = profile_json(response);
+          dora_send_output(context, "profile", 7, profile.data(), profile.size());
         }
       } else {
         report_error(context,

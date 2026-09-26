@@ -1,4 +1,5 @@
 #include "remote_transport.h"
+#include "remote_profile.h"
 
 #include <cassert>
 #include <cstdint>
@@ -69,6 +70,9 @@ int main() {
   assert(decoded_response.artifact_id == response.artifact_id);
   assert(decoded_response.artifact == response.artifact);
   assert(decoded_response.manifest == response.manifest);
+  const std::string profile = profile_json(response);
+  assert(profile.find("qnn_execute") != std::string::npos);
+  assert(profile.find("\"duration_us\":34") != std::string::npos);
 
   Request invalid = request;
   invalid.op.assign(kMaxOpBytes + 1, 'x');
