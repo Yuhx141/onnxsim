@@ -4,6 +4,7 @@
 #include <atomic>
 #include <algorithm>
 #include <csignal>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -32,6 +34,50 @@ struct Options {
 };
 
 std::atomic<uint64_t> cache_write_counter{0};
+
+class CacheLock final {
+ public:
+  CacheLock() = default;
+  CacheLock(const CacheLock&) = delete;
+  CacheLock& operator=(const CacheLock&) = delete;
+  ~CacheLock() {
+    if (owned_) fs::remove_all(path_);
+  }
+
+  bool acquire(const fs::path& path, std::string& error) {
+    path_ = path;
+    for (int attempt = 0; attempt < 600; ++attempt) {
+      std::error_code ec;
+      if (fs::create_directory(path_, ec)) {
+        owned_ = true;
+        return true;
+      }
+      if (ec && ec != std::errc::file_exists) {
+        error = "cannot create cache lock " + path_.string() + ": " +
+                ec.message();
+        return false;
+      }
+
+      // A process crash must not permanently strand one artifact. The long
+      // grace period avoids stealing a lock from a slow proprietary compiler.
+      const auto modified = fs::last_write_time(path_, ec);
+      if (!ec) {
+        const auto age = fs::file_time_type::clock::now() - modified;
+        if (age > std::chrono::minutes(10)) {
+          fs::remove_all(path_, ec);
+          continue;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    error = "timed out waiting for cache lock " + path_.string();
+    return false;
+  }
+
+ private:
+  fs::path path_;
+  bool owned_ = false;
+};
 
 std::string hex_u64(uint64_t value) {
   static constexpr char kHex[] = "0123456789abcdef";
@@ -266,8 +312,11 @@ Response compile(const Request& request, const Options& options) {
   const fs::path artifact_path = options.cache_dir / (key + ".artifact");
   const fs::path manifest_path = options.cache_dir / (key + ".manifest");
   const fs::path complete_path = options.cache_dir / (key + ".complete");
-  if (!options.cache_dir.empty() && fs::exists(artifact_path) &&
-      fs::exists(manifest_path) && fs::exists(complete_path)) {
+  auto load_cached = [&](bool clean_invalid) {
+    if (options.cache_dir.empty() || !fs::exists(artifact_path) ||
+        !fs::exists(manifest_path) || !fs::exists(complete_path)) {
+      return false;
+    }
     std::string error;
     std::string marker;
     if (read_file(artifact_path, response.artifact, error) &&
@@ -276,16 +325,35 @@ Response compile(const Request& request, const Options& options) {
         marker == cache_content_digest(response.artifact, response.manifest) + "\n") {
       response.ok = true;
       response.artifact_id = key;
-      return response;
+      return true;
     }
-    // A stale or interrupted entry is never trusted. It is removed before
-    // recompilation so a failed publish cannot be mistaken for a cache hit.
     response.artifact.clear();
     response.manifest.clear();
+    if (!clean_invalid) return false;
+    // A stale or interrupted entry is never trusted. It is removed before
+    // recompilation so a failed publish cannot be mistaken for a cache hit.
     std::error_code stale_ec;
     fs::remove(complete_path, stale_ec);
     fs::remove(artifact_path, stale_ec);
     fs::remove(manifest_path, stale_ec);
+    return false;
+  };
+  if (load_cached(false)) return response;
+
+  CacheLock cache_lock;
+  if (!options.cache_dir.empty()) {
+    std::error_code cache_ec;
+    fs::create_directories(options.cache_dir, cache_ec);
+    if (cache_ec) {
+      response.error = "cannot create cache directory: " + cache_ec.message();
+      return response;
+    }
+    if (!cache_lock.acquire(options.cache_dir / (key + ".lock"),
+                            response.error)) {
+      return response;
+    }
+    // Another compiler process may have completed this key while we waited.
+    if (load_cached(true)) return response;
   }
 
   fs::path work_dir;
