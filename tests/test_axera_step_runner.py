@@ -625,7 +625,7 @@ def test_onnx_constant_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     z = np.array(0.2, dtype=np.float32)
     model = onnx.helper.make_model(
         onnx.helper.make_graph(
-            [onnx.helper.make_node("Add", ["x", "z"], ["y"])],
+            [onnx.helper.make_node("Add", ["z", "x"], ["y"])],
             "onnx_constant_add_to_uop_vm",
             [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
             [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
@@ -670,7 +670,7 @@ def test_onnx_constant_broadcast_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm
     import tinygrad_ax_backend as axb
 
     shape = (1, 64)
-    z = np.full((64,), z_value, dtype=np.float32)
+    z = np.array(z_value, dtype=np.float32)
     model = onnx.helper.make_model(
         onnx.helper.make_graph(
             [onnx.helper.make_node(op, ["x", "z"], ["y"])],
@@ -687,7 +687,7 @@ def test_onnx_constant_broadcast_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm
     axmodel = axb.compile_onnx(model, str(schedule), calibration)
     rng = np.random.default_rng(1965)
     x = rng.uniform(*x_bounds, shape).astype(np.float32)
-    z_full = np.broadcast_to(z, shape).copy()
+    z_full = np.full(shape, float(z), dtype=np.float32)
 
     with axcl_session.AXSession(
         subdir=f"uop_constant_{op.lower()}_broadcast_{tmp_path.name}"

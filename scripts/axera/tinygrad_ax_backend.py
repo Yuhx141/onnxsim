@@ -2815,9 +2815,23 @@ def compile_onnx(
         and source_model.graph.node[0].op_type in bse.OPS
         and len(source_model.graph.input) == 1
         and len(source_model.graph.node[0].input) == 2
-        and source_model.graph.node[0].input[1]
-        in {item.name for item in source_model.graph.initializer}
     ):
+        binary = source_model.graph.node[0]
+        initializer_names = {item.name for item in source_model.graph.initializer}
+        if binary.input[0] in initializer_names:
+            if binary.op_type not in ("Add", "Mul") or binary.input[1] not in {
+                item.name for item in source_model.graph.input
+            }:
+                return compile_uop(root, schedule_path=schedule_path, calibration=calibration)
+            normalized = onnx.ModelProto()
+            normalized.CopyFrom(source_model)
+            normalized.graph.node[0].input[:] = [binary.input[1], binary.input[0]]
+            source_model = normalized
+            binary = source_model.graph.node[0]
+        if binary.input[1] not in {
+            item.name for item in source_model.graph.initializer
+        }:
+            return compile_uop(root, schedule_path=schedule_path, calibration=calibration)
         import graph_generator
 
         with tempfile.TemporaryDirectory() as directory:
