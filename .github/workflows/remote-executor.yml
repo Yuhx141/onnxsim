@@ -54,6 +54,7 @@ jobs:
           trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
           sleep 0.2
           build/onnx-remote/onnx-remote-client --self-test
+          build/onnx-remote/onnx-remote-client --capabilities 127.0.0.1 39501 | grep -q '"ready":true'
       - name: Compiled artifact attach smoke test
         run: |
           build/onnx-remote/onnx-remote-mock-runner --port 39510 >"${RUNNER_TEMP}/mock-runner.log" 2>&1 &

@@ -31,6 +31,19 @@ static Response execute(const Request& r) {
     fn();
     profile(r.op.c_str(), begin, micros_since(started) - begin);
   };
+  if (r.op == "capabilities") {
+    out.artifact_id = "reference-worker";
+    out.manifest =
+        "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
+        "\"runner_id\":\"reference-worker\",\"ready\":true,"
+        "\"supported_ops\":[\"identity\",\"relu\",\"add\",\"mul\"],"
+        "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\","
+        "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","
+        "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\"],"
+        "\"profiling\":true}";
+    out.ok = true;
+    return out;
+  }
   if (r.op == "identity") {
     if (r.inputs.size() != 1) { out.error = "identity expects one input"; return out; }
     execute_op([&] { out.outputs = r.inputs; }); out.ok = true; return out;

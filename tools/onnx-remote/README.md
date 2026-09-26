@@ -45,6 +45,14 @@ Run that smoke test while the worker is running:
 ./build/onnx-remote/onnx-remote-client --self-test
 ```
 
+The reference worker also serves a dependency-free capability document over
+the same transport. This is useful before sending a model or selecting a
+runner discovered by ROS2/DORA:
+
+```sh
+./build/onnx-remote/onnx-remote-client --capabilities runner.local 39501
+```
+
 ## ONNX Runtime Execution Provider adapter
 
 There is an optional source-level ONNX Runtime EP in
