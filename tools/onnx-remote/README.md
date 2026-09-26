@@ -268,6 +268,10 @@ it can validate the artifact ID against compiler version, SDK, driver, chip,
 and ABI, then reuse or reject it. `send_compiled_artifact=true` is the safe
 stateless default; a later load/attach handshake can send only `artifact_id`
 once the worker confirms its cache.
+When `send_compiled_artifact=false`, `attach_compiled_artifact=true` is
+required; otherwise the executor rejects the configuration before issuing a
+compiled run instead of sending an artifact-less request to a stateless
+runner.
 
 ### Standalone compiler service
 

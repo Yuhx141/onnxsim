@@ -22,9 +22,25 @@ using onnxruntime::common::Status;
 std::string JsonEscape(const std::string &value) {
   std::string result;
   for (const char c : value) {
-    if (c == '"' || c == '\\')
-      result.push_back('\\');
-    result.push_back(c);
+    switch (c) {
+    case '"': result += "\\\""; break;
+    case '\\': result += "\\\\"; break;
+    case '\b': result += "\\b"; break;
+    case '\f': result += "\\f"; break;
+    case '\n': result += "\\n"; break;
+    case '\r': result += "\\r"; break;
+    case '\t': result += "\\t"; break;
+    default:
+      if (static_cast<unsigned char>(c) < 0x20) {
+        static constexpr char hex[] = "0123456789abcdef";
+        result += "\\u00";
+        result.push_back(hex[(static_cast<unsigned char>(c) >> 4) & 0xf]);
+        result.push_back(hex[static_cast<unsigned char>(c) & 0xf]);
+      } else {
+        result.push_back(c);
+      }
+      break;
+    }
   }
   return result;
 }

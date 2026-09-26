@@ -35,6 +35,12 @@ std::string JsonEscape(const std::string& value) {
       case '\\':
         escaped += "\\\\";
         break;
+      case '\b':
+        escaped += "\\b";
+        break;
+      case '\f':
+        escaped += "\\f";
+        break;
       case '\n':
         escaped += "\\n";
         break;
@@ -45,7 +51,14 @@ std::string JsonEscape(const std::string& value) {
         escaped += "\\t";
         break;
       default:
-        escaped += c;
+        if (static_cast<unsigned char>(c) < 0x20) {
+          static constexpr char hex[] = "0123456789abcdef";
+          escaped += "\\u00";
+          escaped.push_back(hex[(static_cast<unsigned char>(c) >> 4) & 0xf]);
+          escaped.push_back(hex[static_cast<unsigned char>(c) & 0xf]);
+        } else {
+          escaped += c;
+        }
         break;
     }
   }
@@ -103,6 +116,12 @@ class RemoteModelExecutor final : public ModelExecutor {
         next_request_id.fetch_add(1, std::memory_order_relaxed);
     request.profiling = options_.profiling;
     if (options_.compile_model) {
+      if (!options_.send_compiled_artifact &&
+          !options_.attach_compiled_artifact) {
+        throw std::runtime_error(
+            "remote executor compiled mode requires either "
+            "send_compiled_artifact or attach_compiled_artifact");
+      }
       const auto artifact = GetOrCompile(serialized);
       request.op = options_.compiled_operation;
       request.artifact_id = artifact->id;
