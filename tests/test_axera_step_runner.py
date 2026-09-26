@@ -622,7 +622,7 @@ def test_onnx_constant_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     import tinygrad_ax_backend as axb
 
     shape = (1, 64)
-    z = np.full(shape, 0.2, dtype=np.float32)
+    z = np.array(0.2, dtype=np.float32)
     model = onnx.helper.make_model(
         onnx.helper.make_graph(
             [onnx.helper.make_node("Add", ["x", "z"], ["y"])],
@@ -639,18 +639,19 @@ def test_onnx_constant_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     axmodel = axb.compile_onnx(model, str(schedule), calibration)
     rng = np.random.default_rng(1965)
     x = rng.uniform(0.0, 0.2, shape).astype(np.float32)
+    z_full = np.full(shape, float(z), dtype=np.float32)
 
     with axcl_session.AXSession(
         subdir=f"uop_constant_add_{tmp_path.name}"
     ) as session:
         loaded = session.load(axmodel, str(schedule))
         try:
-            (got,) = session.run(loaded, [x, z])
+            (got,) = session.run(loaded, [x, z_full])
         finally:
             session.unload(loaded)
 
     np.testing.assert_allclose(
-        got, x + z, atol=float(meta["scales"]["y"]) * 1.5, rtol=0
+        got, x + z_full, atol=float(meta["scales"]["y"]) * 1.5, rtol=0
     )
 
 

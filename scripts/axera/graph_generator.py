@@ -599,9 +599,11 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             )
         input_shapes = (
             values.get("x", ()),
-            tuple(int(dim) for dim in init[add.input[1]].dims)
-            if constant_second
-            else values.get("z", ()),
+            (
+                tuple(int(dim) for dim in init[add.input[1]].dims) or (1,)
+                if constant_second
+                else values.get("z", ())
+            ),
         )
         if not all(input_shapes):
             raise ValueError(f"standalone {add.op_type} requires static input shapes")
@@ -726,7 +728,7 @@ def generate(
                 onnx.helper.make_tensor_value_info(
                     initializer.name,
                     initializer.data_type,
-                    list(initializer.dims),
+                    list(initializer.dims) or [1],
                 )
             )
         schedule = schedule_ir.build(schedule_model)
