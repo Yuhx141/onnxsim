@@ -124,3 +124,16 @@ jobs:
           test -f "$RUNNER_TEMP/onnx-remote-install/lib/libonnx_remote_transport.a"
           test -f "$RUNNER_TEMP/onnx-remote-install/share/onnx-remote/ort-plugin/onnxsim_remote_ep.manifest.json"
           test -f "$RUNNER_TEMP/onnx-remote-install/include/onnx-remote/remote_profile.h"
+
+  dora-compile:
+    name: DORA adapter compile contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure dependency-free DORA stub build
+        run: |
+          cmake -S tools/onnx-remote -B build/onnx-remote-dora \
+            -DONNXSIM_REMOTE_DORA=ON \
+            -DONNXSIM_REMOTE_DORA_STUB=ON
+      - name: Build DORA adapter
+        run: cmake --build build/onnx-remote-dora --target onnx-remote-dora-node -j2

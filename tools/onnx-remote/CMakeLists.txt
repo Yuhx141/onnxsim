@@ -5,12 +5,25 @@ include(CTest)
 
 option(ONNX_REMOTE_AXCL "Build the AXCL-backed remote worker" OFF)
 option(ONNXSIM_REMOTE_DORA "Build the DORA node adapter" OFF)
+option(ONNXSIM_REMOTE_DORA_STUB
+       "Use the dependency-free DORA C API stub for adapter compile tests" OFF)
 option(ONNXSIM_REMOTE_ROS2 "Build the optional ROS2 binary bridge" OFF)
 option(ONNXSIM_REMOTE_GRPC "Generate the optional host-side gRPC bindings" OFF)
 set(DORA_NODE_API_INCLUDE_DIR "" CACHE PATH
     "DORA C node API include directory (contains node_api.h)")
 set(DORA_NODE_API_LIBRARY "" CACHE FILEPATH
     "DORA C node API static library")
+
+if (ONNXSIM_REMOTE_DORA_STUB)
+  if (NOT ONNXSIM_REMOTE_DORA)
+    message(FATAL_ERROR "ONNXSIM_REMOTE_DORA_STUB requires ONNXSIM_REMOTE_DORA=ON")
+  endif()
+  add_library(onnx_remote_dora_api_stub STATIC
+              test/dora_node_api_stub/node_api.cpp)
+  set(DORA_NODE_API_INCLUDE_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/dora_node_api_stub")
+  set(DORA_NODE_API_LIBRARY onnx_remote_dora_api_stub)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
