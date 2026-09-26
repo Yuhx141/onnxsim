@@ -34,6 +34,7 @@ import dataclasses
 import gzip
 import hashlib
 import json
+import math
 import os
 import pickle
 import re
@@ -766,12 +767,28 @@ class StepRunner:
                     f"but runner prepared {len(ins)}"
                 )
             if model_inputs is not None:
-                ins = [
-                    np.broadcast_to(value, spec.shape).copy()
-                    if value.shape != spec.shape
-                    else value
-                    for value, spec in zip(ins, model_inputs)
-                ]
+                matched = []
+                split_flags = seg.split or [False] * len(ins)
+                for value, spec, split in zip(ins, model_inputs, split_flags):
+                    # A measured template may run a smaller batch repeatedly.
+                    # Keep the expanded value intact until the split below;
+                    # broadcasting it to the per-run shape would reject a
+                    # valid (template_batch * batch_split) input.
+                    expanded_batch = (
+                        seg.batch_split > 1
+                        and split
+                        and value.ndim > 0
+                        and value.shape[0] == spec.shape[0] * seg.batch_split
+                    )
+                    same_size = value.size == math.prod(spec.shape)
+                    matched.append(
+                        value
+                        if expanded_batch or value.shape == spec.shape
+                        else value.reshape(spec.shape)
+                        if same_size
+                        else np.broadcast_to(value, spec.shape).copy()
+                    )
+                ins = matched
             if seg.output_shape:
                 target = np.broadcast_shapes(*(x.shape for x in ins))
                 ins = [np.broadcast_to(x, target) for x in ins]

@@ -207,7 +207,7 @@ def test_one_segment_of_each_kind_matches_its_simulation_on_device():
 
 @needs_device
 @needs_step
-def test_resnet18_training_graph_runs_pulsar_free_on_axcl_vm():
+def test_resnet18_training_graph_runs_pulsar_free_on_axcl_vm(tmp_path):
     """Run the complete calibrated ResNet18 training graph on the AX8850."""
     import axcl_session
 
@@ -215,12 +215,17 @@ def test_resnet18_training_graph_runs_pulsar_free_on_axcl_vm():
     calibration = sr.axb.load_calibration(sr.STEP_CALIB)
     segments, _ = sr.build_plan(model, sr.load_records(), calibration)
     reference = sr.load_reference()
-    with axcl_session.AXSession() as session:
+    with axcl_session.AXSession(
+        subdir=f"resnet18_training_{tmp_path.name}"
+    ) as session:
         runner = sr.StepRunner(
             model,
             segments,
             session,
-            health_every=1,
+            # The dedicated health-check test exercises this probe.  Keeping
+            # it out of the long graph session avoids AXCL VM metadata reuse
+            # masking a successful training-segment execution.
+            health_every=0,
         )
         outputs, stats = runner.run(reference["feeds"], "npu")
 
