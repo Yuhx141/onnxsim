@@ -1,13 +1,18 @@
 """TVM compatibility wrapper tests without requiring the optional TVM wheel."""
 
+import importlib.util
 import sys
 import types
+from pathlib import Path
 
-import pytest
 
-pytest.importorskip("onnx")
-
-from onnxsim.rpc import tvm_compat
+_SPEC = importlib.util.spec_from_file_location(
+    "tvm_compat", Path(__file__).parents[1] / "onnxsim" / "rpc" / "tvm_compat.py"
+)
+assert _SPEC and _SPEC.loader
+tvm_compat = importlib.util.module_from_spec(_SPEC)
+sys.modules["tvm_compat"] = tvm_compat
+_SPEC.loader.exec_module(tvm_compat)
 
 
 class _Session:

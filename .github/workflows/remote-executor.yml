@@ -14,6 +14,7 @@ on:
       - "tests/test_trt_compile_cli.py"
       - "tests/test_remote_manifest.py"
       - "tests/test_remote_ep_manifest.py"
+      - "tests/test_tvm_compat.py"
       - "docs/remote-manifest.md"
       - ".github/workflows/remote-executor.yml"
   push:
@@ -30,6 +31,7 @@ on:
       - "tests/test_trt_compile_cli.py"
       - "tests/test_remote_manifest.py"
       - "tests/test_remote_ep_manifest.py"
+      - "tests/test_tvm_compat.py"
       - "docs/remote-manifest.md"
       - ".github/workflows/remote-executor.yml"
 
@@ -100,7 +102,7 @@ jobs:
       - name: Install test dependency
         run: python -m pip install pytest
       - name: Run dependency-light tests
-        run: python -m pytest -q tests/test_qnn_compat_cli.py tests/test_trt_compile_cli.py tests/test_remote_manifest.py tests/test_remote_ep_manifest.py
+        run: python -m pytest -q tests/test_qnn_compat_cli.py tests/test_trt_compile_cli.py tests/test_remote_manifest.py tests/test_remote_ep_manifest.py tests/test_tvm_compat.py
 
   grpc-gateway:
     name: optional gRPC gateway
