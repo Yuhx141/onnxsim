@@ -1,8 +1,10 @@
 #include "grpc_gateway.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -22,7 +24,16 @@ uint16_t port_value(const char* text, const char* name) {
 void usage(const char* program) {
   std::cerr << "usage: " << program
             << " [--listen HOST:PORT] [--worker-host HOST]"
-               " [--worker-port PORT] [--runner-id ID]\n";
+               " [--worker-port PORT] [--runner-id ID]"
+               " [--tls-cert FILE --tls-key FILE [--tls-ca FILE]]\n";
+}
+
+std::string read_file(const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("cannot read " + path);
+  std::ostringstream contents;
+  contents << input.rdbuf();
+  return contents.str();
 }
 
 }  // namespace
@@ -41,6 +52,12 @@ int main(int argc, char** argv) {
         options.worker_port = port_value(argv[++i], "worker port");
       } else if (argument == "--runner-id" && i + 1 < argc) {
         options.runner_id = argv[++i];
+      } else if (argument == "--tls-cert" && i + 1 < argc) {
+        options.tls_certificate = argv[++i];
+      } else if (argument == "--tls-key" && i + 1 < argc) {
+        options.tls_private_key = argv[++i];
+      } else if (argument == "--tls-ca" && i + 1 < argc) {
+        options.tls_client_ca = argv[++i];
       } else if (argument == "--help") {
         usage(argv[0]);
         return 0;
@@ -56,7 +73,33 @@ int main(int argc, char** argv) {
 
   onnx_remote::grpc_gateway::Service service(std::move(options));
   grpc::ServerBuilder builder;
-  builder.AddListeningPort(listen, grpc::InsecureServerCredentials());
+  std::shared_ptr<grpc::ServerCredentials> credentials;
+  if (service.options().tls_certificate.empty() &&
+      service.options().tls_private_key.empty() &&
+      service.options().tls_client_ca.empty()) {
+    credentials = grpc::InsecureServerCredentials();
+  } else {
+    if (service.options().tls_certificate.empty() ||
+        service.options().tls_private_key.empty()) {
+      std::cerr << "--tls-cert and --tls-key must be supplied together\n";
+      return 2;
+    }
+    try {
+      grpc::SslServerCredentialsOptions tls;
+      tls.pem_key_cert_pairs.push_back({
+          read_file(service.options().tls_private_key),
+          read_file(service.options().tls_certificate)});
+      if (!service.options().tls_client_ca.empty()) {
+        tls.pem_root_certs = read_file(service.options().tls_client_ca);
+        tls.force_client_auth = true;
+      }
+      credentials = grpc::SslServerCredentials(tls);
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << '\n';
+      return 2;
+    }
+  }
+  builder.AddListeningPort(listen, credentials);
   builder.RegisterService(&service);
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
   if (!server) {

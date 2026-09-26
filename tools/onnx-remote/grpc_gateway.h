@@ -17,6 +17,9 @@ struct Options {
   int io_timeout_ms = 30000;
   std::string runner_id = "onnxsim-grpc-gateway";
   std::vector<std::string> supported_ops = {"identity", "relu", "add", "mul"};
+  std::string tls_certificate;
+  std::string tls_private_key;
+  std::string tls_client_ca;
 };
 
 class Service final : public onnxsim::remote::v1::OnnxSimExecutor::Service {
@@ -39,6 +42,8 @@ class Service final : public onnxsim::remote::v1::OnnxSimExecutor::Service {
       grpc::ServerContext* context,
       const onnxsim::remote::v1::CapabilitiesRequest* request,
       onnxsim::remote::v1::CapabilitiesResponse* response) override;
+
+  const Options& options() const { return options_; }
 
  private:
   Options options_;

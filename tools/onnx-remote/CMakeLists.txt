@@ -47,7 +47,13 @@ install(FILES proto/onnxsim_remote.proto proto/README.md
         DESTINATION share/onnx-remote/proto)
 
 if (ONNXSIM_REMOTE_GRPC)
-  find_package(Protobuf CONFIG REQUIRED)
+  # Prefer a package config when the host distribution provides one, but also
+  # support CMake's FindProtobuf module (common on Debian/Ubuntu and ROS
+  # workspaces).
+  find_package(Protobuf CONFIG QUIET)
+  if (NOT Protobuf_FOUND)
+    find_package(Protobuf REQUIRED)
+  endif()
   find_package(gRPC CONFIG REQUIRED)
 
   if (TARGET protobuf::protoc)

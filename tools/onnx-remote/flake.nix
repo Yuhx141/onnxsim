@@ -28,6 +28,8 @@
             ros.std-msgs
             ros.std-srvs
             ros.ros2cli
+            protobuf
+            grpc
           ];
           shellHook = ''
             export ROS_DISTRO=humble

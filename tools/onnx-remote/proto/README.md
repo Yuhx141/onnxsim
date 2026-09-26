@@ -54,6 +54,10 @@ cmake --build build/onnx-remote-grpc --target onnx_remote_grpc
 This option is deliberately off by default and is intended for a host-side
 gateway, not an embedded runner.
 
+The repository's `flake.nix` development shell includes protobuf and gRPC in
+addition to the ROS2 packages, so the same command can be used there without
+adding those libraries to the constrained worker.
+
 The generated build also provides `onnx-remote-grpc-gateway`. It accepts the
 same native worker endpoint used by the C++ client:
 
@@ -62,9 +66,16 @@ build/onnx-remote-grpc/onnx-remote-grpc-gateway \
   --listen 0.0.0.0:50051 --worker-host 127.0.0.1 --worker-port 39501
 ```
 
-The initial gateway uses insecure gRPC credentials for trusted local networks.
-Put it behind a TLS/authenticated reverse proxy or add gRPC credentials before
-exposing it beyond a trusted ROS2/DORA domain.
+For a direct TLS listener, provide a PEM certificate and private key:
+
+```sh
+build/onnx-remote-grpc/onnx-remote-grpc-gateway \
+  --listen 0.0.0.0:50051 --tls-cert server.crt --tls-key server.key
+```
+
+Add `--tls-ca clients-ca.crt` to require client certificates. Without TLS
+options the gateway uses insecure credentials for local development only; do
+not expose that mode beyond a trusted ROS2/DORA or Tailscale network.
 
 An actual gRPC service should translate `Execute` to
 `onnx_remote::Request`/`Response` and retain the native transport as the
