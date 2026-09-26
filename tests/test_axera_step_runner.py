@@ -655,6 +655,55 @@ def test_onnx_constant_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
 
 
 @needs_device
+@pytest.mark.parametrize(
+    "op, x_bounds, z_value",
+    [("Sub", (0.2, 0.3), 0.15), ("Mul", (0.1, 0.3), 0.2), ("Div", (0.1, 0.3), 0.2)],
+)
+def test_onnx_constant_broadcast_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
+    tmp_path, op, x_bounds, z_value
+):
+    """Run constant broadcast Sub/Mul/Div through staged AX inputs."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import binary_op_scale_emit as bse
+    import tinygrad_ax_backend as axb
+
+    shape = (1, 64)
+    z = np.full((64,), z_value, dtype=np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node(op, ["x", "z"], ["y"])],
+            f"onnx_constant_{op.lower()}_broadcast_to_uop_vm",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+            [onnx.numpy_helper.from_array(z, "z")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template(op, shape, {"x": 0, "y": 0, "z": 0})
+    calibration = {"scales": meta["scales"], "zero_points": meta["zero_points"]}
+    schedule = tmp_path / f"onnx_constant_{op.lower()}_broadcast.schedule.json"
+    axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(*x_bounds, shape).astype(np.float32)
+    z_full = np.broadcast_to(z, shape).copy()
+
+    with axcl_session.AXSession(
+        subdir=f"uop_constant_{op.lower()}_broadcast_{tmp_path.name}"
+    ) as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x, z_full])
+        finally:
+            session.unload(loaded)
+
+    want = {"Sub": x - z_full, "Mul": x * z_full, "Div": x / z_full}[op]
+    np.testing.assert_allclose(
+        got, want, atol=float(meta["scales"]["y"]) * 1.5, rtol=0
+    )
+
+
+@needs_device
 @pytest.mark.parametrize("op", ["Sub", "Mul", "Div"])
 def test_onnx_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, op):
     """Run the remaining same-shape binary UOps through AXCL VM."""
