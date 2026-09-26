@@ -40,6 +40,7 @@ import re
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -550,7 +551,8 @@ def drop_unemittable(
     keep, blobs = [], {}
     if emit_cache_dir:
         os.makedirs(emit_cache_dir, exist_ok=True)
-    for seg in segs:
+
+    def emit_one(seg: Segment) -> tuple[Segment, bytes | None, Exception | None]:
         try:
             cache_path = None
             if emit_cache_dir:
@@ -575,20 +577,33 @@ def drop_unemittable(
                     with open(cache_path, "rb") as f:
                         blob = f.read()
                     onnx.load_model_from_string(blob)
-                    blobs[seg.name] = blob
                 else:
                     blob = seg.emit().SerializeToString()
                     tmp = f"{cache_path}.tmp-{os.getpid()}"
                     with open(tmp, "wb") as f:
                         f.write(blob)
                     os.replace(tmp, cache_path)
-                    blobs[seg.name] = blob
             else:
-                blobs[seg.name] = seg.emit().SerializeToString()
+                blob = seg.emit().SerializeToString()
+            return seg, blob, None
         except Exception as exc:
+            return seg, None, exc
+
+    # Emission is CPU-bound serialization/retargeting work and each segment
+    # owns its output buffer.  Keep the result collection in input order so
+    # plans and reports remain deterministic, while avoiding a long serial
+    # preparation tail for the training graph.  A small fixed pool avoids
+    # overwhelming the host when a graph has many elementwise segments.
+    workers = min(8, max(1, len(segs)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="axera-emit") as pool:
+        results = list(pool.map(emit_one, segs))
+    for seg, blob, error in results:
+        if error is not None:
             for n in seg.nodes:
-                host[n] = f"covered, but the emitter refused: {exc}"
+                host[n] = f"covered, but the emitter refused: {error}"
             continue
+        assert blob is not None
+        blobs[seg.name] = blob
         keep.append(seg)
     return keep, blobs
 
