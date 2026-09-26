@@ -136,7 +136,10 @@ bool publish_cache(const fs::path& artifact_path, const fs::path& manifest_path,
   const fs::path artifact_tmp = artifact_path.string() + suffix;
   const fs::path manifest_tmp = manifest_path.string() + suffix;
   const fs::path complete_tmp = complete_path.string() + suffix;
-  fs::remove(complete_path);
+  // Do not remove an existing completion marker before the replacement is
+  // ready. A second compiler process may still be serving that valid entry;
+  // replacing the marker only after artifact and manifest publication keeps
+  // readers from observing an intentionally incomplete cache state.
   if (!write_file(artifact_tmp, artifact, error)) return false;
   {
     std::ofstream output(manifest_tmp, std::ios::binary | std::ios::trunc);

@@ -51,4 +51,24 @@ std::string profile_json(const Response& response) {
   return json.str();
 }
 
+std::string profile_chrome_trace_json(const Response& response) {
+  std::ostringstream json;
+  json << "{\"displayTimeUnit\":\"us\",\"schema_version\":1,"
+       << "\"protocol\":\"onnx-remote-v5\",\"request_id\":"
+       << response.request_id << ",\"traceEvents\":[";
+  for (size_t i = 0; i < response.profile.size(); ++i) {
+    if (i != 0) json << ',';
+    const auto& event = response.profile[i];
+    json << "{\"name\":\"" << json_escape(event.name)
+         << "\",\"cat\":\"" << json_escape(event.category)
+         << "\",\"ph\":\"X\",\"ts\":" << event.start_us
+         << ",\"dur\":" << event.duration_us
+         << ",\"pid\":1,\"tid\":\""
+         << json_escape(event.category) << "\",\"args\":{\"detail\":\""
+         << json_escape(event.detail) << "\"}}";
+  }
+  json << "]}";
+  return json.str();
+}
+
 }  // namespace onnx_remote

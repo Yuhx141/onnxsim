@@ -85,6 +85,11 @@ int main() {
   assert(escaped_profile.find("line\\nfeed") != std::string::npos);
   assert(escaped_profile.find("tab\\tbackspace\\bformfeed\\fcontrol\\u0001") !=
          std::string::npos);
+  const std::string trace = profile_chrome_trace_json(response);
+  assert(trace.find("\"displayTimeUnit\":\"us\"") != std::string::npos);
+  assert(trace.find("\"ph\":\"X\"") != std::string::npos);
+  assert(trace.find("\"ts\":12") != std::string::npos);
+  assert(trace.find("\"dur\":34") != std::string::npos);
 
   Request invalid = request;
   invalid.op.assign(kMaxOpBytes + 1, 'x');
