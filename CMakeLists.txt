@@ -235,6 +235,8 @@ if (ONNXSIM_REMOTE_ORT_EP)
                              "${ONNXSIM_ORT_SOURCE_DIR}/include"
                              "${CMAKE_CURRENT_SOURCE_DIR}/tools/onnx-remote")
   target_link_libraries(onnxsim onnx_remote_transport)
+  install(FILES tools/onnx-remote/onnx_remote_execution_provider.h
+          DESTINATION include/onnxsim/remote)
 endif()
 
 # ~50 self-contained LLM/PTQ quantization- and pruning-algorithm entry points
