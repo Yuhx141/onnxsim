@@ -618,8 +618,9 @@ def test_onnx_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
 
 @needs_device
 @pytest.mark.parametrize("op", ["Add", "Mul"])
+@pytest.mark.parametrize("route", ["compile_onnx", "graph_generator"])
 def test_onnx_constant_commutative_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
-    tmp_path, op
+    tmp_path, op, route
 ):
     """Stage an initializer after normalizing commutative AX binary inputs."""
     pytest.importorskip("tinygrad")
@@ -642,13 +643,27 @@ def test_onnx_constant_commutative_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
     _, meta = bse.load_template(op, shape, {"x": 0, "y": 0, "z": 0})
     calibration = {"scales": meta["scales"], "zero_points": meta["zero_points"]}
     schedule = tmp_path / f"onnx_constant_{op.lower()}_to_uop.schedule.json"
-    axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    if route == "compile_onnx":
+        axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    else:
+        import graph_generator
+
+        source = tmp_path / f"onnx_constant_{op.lower()}_to_uop.onnx"
+        output = tmp_path / f"onnx_constant_{op.lower()}_to_uop.axmodel"
+        onnx.save(model, source)
+        graph_generator.generate(
+            str(source),
+            str(output),
+            schedule_path=str(schedule),
+            calibration=calibration,
+        )
+        axmodel = output.read_bytes()
     rng = np.random.default_rng(1965)
     x = rng.uniform(0.0, 0.2, shape).astype(np.float32)
     z_full = np.full(shape, float(z), dtype=np.float32)
 
     with axcl_session.AXSession(
-        subdir=f"uop_constant_{op.lower()}_{tmp_path.name}"
+        subdir=f"uop_constant_{route}_{op.lower()}_{tmp_path.name}"
     ) as session:
         loaded = session.load(axmodel, str(schedule))
         try:
