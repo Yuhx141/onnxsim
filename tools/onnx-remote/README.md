@@ -132,6 +132,15 @@ cmake -S tools/onnx-remote -B build/onnx-remote \
 cmake --build build/onnx-remote --target onnx-remote-dora-node
 ```
 
+CI and dependency-minimal environments can compile-check the adapter against
+the checked-in API stub (this does not emulate a DORA runtime):
+
+```sh
+cmake -S tools/onnx-remote -B build/onnx-remote-dora \
+  -DONNXSIM_REMOTE_DORA=ON -DONNXSIM_REMOTE_DORA_STUB=ON
+cmake --build build/onnx-remote-dora --target onnx-remote-dora-node
+```
+
 Set `ONNXSIM_DORA_REMOTE_HOST` and `ONNXSIM_DORA_REMOTE_PORT` in the node's
 environment to select the native worker (defaults are `127.0.0.1:39501`). A
 minimal dataflow declares `run` as the node input and `result` as its output.
