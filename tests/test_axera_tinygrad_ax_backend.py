@@ -679,6 +679,30 @@ def test_compile_onnx_unary_through_uop_to_mcode(tmp_path, op, shape, template):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
 
 
+def test_compile_onnx_neg_preserves_name_sensitive_template_io(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Neg", ["x"], ["y"])],
+            "onnx_neg",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 1])],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1])],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = misc.load_template("Neg:1x1")
+    schedule = tmp_path / "onnx_neg.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [value.name for value in generated.graph.input] == ["distill__div_14"]
+    assert [value.name for value in generated.graph.output] == ["distill__neg_15"]
+    assert json.loads(schedule.read_text())["inputs"][0]["name"] == "distill__div_14"
+
+
 def test_lower_and_compile_tinygrad_broadcast_binary_uop(tmp_path):
     Tensor = pytest.importorskip("tinygrad").Tensor
 
