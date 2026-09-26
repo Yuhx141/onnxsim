@@ -712,7 +712,8 @@ def test_onnx_constant_broadcast_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm
 
 
 @needs_device
-def test_frozen_conv_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+@pytest.mark.parametrize("route", ["compile_onnx", "graph_generator"])
+def test_frozen_conv_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, route):
     """Run the frozen-weight Conv UOp route without a Pulsar2 build."""
     pytest.importorskip("tinygrad")
     import axcl_session
@@ -745,13 +746,29 @@ def test_frozen_conv_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
     schedule = tmp_path / "frozen_conv_to_uop.schedule.json"
-    axmodel = axb.compile_onnx(
-        model,
-        str(schedule),
-        {"scales": {"x": 0.01, "y": 0.02}, "zero_points": {"x": 127, "y": 125}},
-    )
+    calibration = {
+        "scales": {"x": 0.01, "y": 0.02},
+        "zero_points": {"x": 127, "y": 125},
+    }
+    if route == "compile_onnx":
+        axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    else:
+        import graph_generator
+
+        source = tmp_path / "frozen_conv_to_uop.onnx"
+        output = tmp_path / "frozen_conv_to_uop.axmodel"
+        onnx.save(model, source)
+        graph_generator.generate(
+            str(source),
+            str(output),
+            schedule_path=str(schedule),
+            calibration=calibration,
+        )
+        axmodel = output.read_bytes()
     x = np.zeros(input_shape, dtype=np.float32)
-    with axcl_session.AXSession(subdir=f"uop_frozen_conv_{tmp_path.name}") as session:
+    with axcl_session.AXSession(
+        subdir=f"uop_frozen_conv_{route}_{tmp_path.name}"
+    ) as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x])
