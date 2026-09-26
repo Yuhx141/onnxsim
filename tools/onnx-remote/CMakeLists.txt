@@ -9,6 +9,13 @@ option(ONNXSIM_REMOTE_DORA_STUB
        "Use the dependency-free DORA C API stub for adapter compile tests" OFF)
 option(ONNXSIM_REMOTE_ROS2 "Build the optional ROS2 binary bridge" OFF)
 option(ONNXSIM_REMOTE_GRPC "Generate the optional host-side gRPC bindings" OFF)
+option(ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN
+       "Build the public OrtEp remote execution-provider plugin"
+       OFF)
+set(ONNXSIM_ORT_PUBLIC_INCLUDE_DIR "" CACHE PATH
+    "ONNX Runtime public include directory for the OrtEp plugin")
+set(ONNXSIM_ORT_PUBLIC_LIBRARY "" CACHE FILEPATH
+    "Optional ONNX Runtime library to link into the OrtEp plugin")
 set(DORA_NODE_API_INCLUDE_DIR "" CACHE PATH
     "DORA C node API include directory (contains node_api.h)")
 set(DORA_NODE_API_LIBRARY "" CACHE FILEPATH
@@ -31,6 +38,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(onnx_remote_transport STATIC remote_transport.cpp remote_profile.cpp)
 target_include_directories(onnx_remote_transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if (ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN)
+  set_target_properties(onnx_remote_transport PROPERTIES
+                        POSITION_INDEPENDENT_CODE ON)
+endif()
 if (WIN32)
   target_link_libraries(onnx_remote_transport PUBLIC ws2_32)
 else()
@@ -38,6 +49,42 @@ else()
   target_link_libraries(onnx_remote_transport PUBLIC Threads::Threads)
 endif()
 install(TARGETS onnx_remote_transport ARCHIVE DESTINATION lib)
+
+if (ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN)
+  if (NOT ONNXSIM_ORT_PUBLIC_INCLUDE_DIR OR
+      NOT EXISTS "${ONNXSIM_ORT_PUBLIC_INCLUDE_DIR}/onnxruntime_cxx_api.h" OR
+      NOT EXISTS "${ONNXSIM_ORT_PUBLIC_INCLUDE_DIR}/onnxruntime_ep_c_api.h")
+    message(FATAL_ERROR
+      "ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN requires a public ORT include "
+      "directory containing onnxruntime_cxx_api.h and onnxruntime_ep_c_api.h")
+  endif()
+  add_library(onnxsim_remote_ep SHARED ort_plugin/public_remote_ep.cpp)
+  target_compile_definitions(onnxsim_remote_ep PRIVATE ORT_API_MANUAL_INIT)
+  target_include_directories(onnxsim_remote_ep PRIVATE
+                             ${ONNXSIM_ORT_PUBLIC_INCLUDE_DIR})
+  target_link_libraries(onnxsim_remote_ep PRIVATE onnx_remote_transport)
+  if (ONNXSIM_ORT_PUBLIC_LIBRARY)
+    target_link_libraries(onnxsim_remote_ep PRIVATE
+                          ${ONNXSIM_ORT_PUBLIC_LIBRARY})
+    add_executable(onnxsim_remote_ep_load_test
+                   ort_plugin/public_ep_load_test.cpp)
+    add_executable(onnxsim_remote_ep_run_test
+                   ort_plugin/public_ep_run_test.cpp)
+    target_include_directories(onnxsim_remote_ep_load_test PRIVATE
+                               ${ONNXSIM_ORT_PUBLIC_INCLUDE_DIR})
+    target_include_directories(onnxsim_remote_ep_run_test PRIVATE
+                               ${ONNXSIM_ORT_PUBLIC_INCLUDE_DIR})
+    target_link_libraries(onnxsim_remote_ep_load_test PRIVATE
+                          ${ONNXSIM_ORT_PUBLIC_LIBRARY})
+    target_link_libraries(onnxsim_remote_ep_run_test PRIVATE
+                          ${ONNXSIM_ORT_PUBLIC_LIBRARY})
+    add_test(NAME onnxsim-remote-public-ep-load
+             COMMAND onnxsim_remote_ep_load_test
+                     $<TARGET_FILE:onnxsim_remote_ep>)
+  endif()
+  set_target_properties(onnxsim_remote_ep PROPERTIES OUTPUT_NAME onnxsim_remote_ep)
+  install(TARGETS onnxsim_remote_ep LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+endif()
 
 add_executable(onnx-remote-worker remote_worker.cpp)
 target_link_libraries(onnx-remote-worker PRIVATE onnx_remote_transport)

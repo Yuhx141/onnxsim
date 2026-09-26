@@ -129,6 +129,54 @@ jobs:
           test -f "$RUNNER_TEMP/onnx-remote-install/share/onnx-remote/ort-plugin/onnxsim_remote_ep.manifest.json"
           test -f "$RUNNER_TEMP/onnx-remote-install/include/onnx-remote/remote_profile.h"
 
+  ort-public-ep:
+    name: public ORT EP plugin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download public ORT SDK
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-1.29.0.tgz \
+            --output "$RUNNER_TEMP/onnxruntime.tgz"
+          tar -xzf "$RUNNER_TEMP/onnxruntime.tgz" -C "$RUNNER_TEMP"
+      - name: Configure public plugin
+        run: |
+          cmake -S tools/onnx-remote -B build/onnx-remote-public-ep \
+            -DONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN=ON \
+            -DONNXSIM_ORT_PUBLIC_INCLUDE_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-1.29.0/include" \
+            -DONNXSIM_ORT_PUBLIC_LIBRARY="$RUNNER_TEMP/onnxruntime-linux-x64-1.29.0/lib/libonnxruntime.so" \
+            -DBUILD_TESTING=ON
+      - name: Build public plugin and tests
+        run: |
+          cmake --build build/onnx-remote-public-ep --target \
+            onnxsim_remote_ep onnxsim_remote_ep_load_test \
+            onnxsim_remote_ep_run_test -j2
+      - name: Test plugin discovery
+        env:
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.29.0/lib
+        run: ctest --test-dir build/onnx-remote-public-ep -R public-ep --output-on-failure
+      - name: Test remote execution through public EP
+        env:
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.29.0/lib
+          ONNXSIM_REMOTE_EP_HOST: 127.0.0.1
+          ONNXSIM_REMOTE_EP_PORT: 39501
+          ONNXSIM_REMOTE_EP_PROFILING: detailed
+          ONNXSIM_REMOTE_EP_PROFILE_FILE: ${{ runner.temp }}/public-ep-profile.json
+        run: |
+          build/onnx-remote-public-ep/onnx-remote-worker --port 39501 \
+            >"$RUNNER_TEMP/public-ep-worker.log" 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
+            build/onnx-remote-public-ep/libonnxsim_remote_ep.so \
+            scripts/convertmodel/test/webgpu_kernel_add.onnx \
+            "$RUNNER_TEMP/public-ep-ort-profile"
+          test -s "$RUNNER_TEMP/public-ep-profile.json"
+          grep -q '"name":"add"' "$RUNNER_TEMP/public-ep-profile.json"
+          ls "$RUNNER_TEMP"/public-ep-ort-profile*.json
+
   dora-compile:
     name: DORA adapter compile contract
     runs-on: ubuntu-24.04

@@ -9,10 +9,13 @@ MANIFEST = Path(__file__).parents[1] / "tools" / "onnx-remote" / "ort_plugin" / 
 
 def test_remote_ep_manifest_is_explicit_about_legacy_abi():
     manifest = json.loads(MANIFEST.read_text())
-    assert manifest["status"] == "legacy_source_abi_adapter"
+    assert manifest["status"] == "public_plugin_and_legacy_source_adapter"
     assert manifest["registration"] == "internal_cpp"
-    assert manifest["public_plugin_entrypoints"] == []
-    assert manifest["ort_version"] == "requires_legacy_internal_ep_headers"
-    assert manifest["public_plugin_migration"]["api"] == "onnxruntime_ep_c_api.h"
+    assert manifest["public_plugin_entrypoints"] == [
+        "CreateEpFactories",
+        "ReleaseEpFactory",
+    ]
+    assert manifest["ort_version"] == "public_plugin_requires_ort_1.29_plus"
+    assert manifest["public_plugin"]["api"] == "onnxruntime_ep_c_api.h"
     assert manifest["transport"]["protocol"] == "onnx-remote-v5"
     assert set(manifest["profiling"]["levels"]) == {"off", "summary", "detailed"}

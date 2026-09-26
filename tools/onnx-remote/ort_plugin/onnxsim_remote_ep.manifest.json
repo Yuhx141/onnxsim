@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "name": "onnxsim_remote",
-  "status": "legacy_source_abi_adapter",
-  "ort_version": "requires_legacy_internal_ep_headers",
+  "status": "public_plugin_and_legacy_source_adapter",
+  "ort_version": "public_plugin_requires_ort_1.29_plus",
   "entrypoint": "onnxsim::ort_remote::CreateRemoteExecutionProviderFromOptions",
   "registration": "internal_cpp",
-  "public_plugin_entrypoints": [],
+  "public_plugin_entrypoints": ["CreateEpFactories", "ReleaseEpFactory"],
   "supported_ops": ["Identity", "Relu", "Add", "Mul"],
   "tensor_types": ["float32"],
   "profiling": {
@@ -18,9 +18,10 @@
     "default_host": "127.0.0.1",
     "default_port": 39501
   },
-  "public_plugin_migration": {
-    "required_exports": ["CreateEpFactories", "ReleaseEpFactory"],
+  "public_plugin": {
+    "library": "onnxsim_remote_ep",
     "api": "onnxruntime_ep_c_api.h",
-    "blocked_by": "matching public ORT EP C API headers and an OrtEp implementation"
+    "configuration": "ONNXSIM_REMOTE_EP_HOST,ONNXSIM_REMOTE_EP_PORT,ONNXSIM_REMOTE_EP_PROFILING",
+    "runtime_test": "onnxsim_remote_ep_run_test"
   }
 }

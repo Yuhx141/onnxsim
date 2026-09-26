@@ -72,8 +72,25 @@ cmake -S . -B build-ort-ep \
 This is intentionally a configure-time compatibility check. Current public ORT
 source releases such as 1.29 do not expose the legacy internal header used by
 this adapter, so they fail early with a precise diagnostic instead of producing
-an apparently usable but ABI-incompatible build. The public `OrtEp` plugin path
-is a separate implementation and is not claimed by this adapter yet.
+an apparently usable but ABI-incompatible build. The standalone public `OrtEp`
+plugin is built separately with `ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN=ON` and a
+public ORT SDK include/library:
+
+```bash
+cmake -S tools/onnx-remote -B build-public-ep \
+  -DONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN=ON \
+  -DONNXSIM_ORT_PUBLIC_INCLUDE_DIR=/path/to/onnxruntime/include \
+  -DONNXSIM_ORT_PUBLIC_LIBRARY=/path/to/onnxruntime/lib/libonnxruntime.so
+cmake --build build-public-ep --target onnxsim_remote_ep
+```
+
+The plugin exports `CreateEpFactories`/`ReleaseEpFactory`, advertises the
+reference remote ops, and uses the same environment variables for endpoint and
+profiling configuration. The public SDK path is covered by the optional load
+and remote-execution tests in the remote CMake project. When ORT profiling is
+enabled, the plugin also reports the returned remote kernel events through
+`OrtEpProfilerImpl`; `ONNXSIM_REMOTE_EP_PROFILE_FILE` remains available for a
+transport-native JSON copy.
 
 The provider partitions `Identity`, `Relu`, `Add`, and `Mul` by default and
 executes float32 tensors through the dependency-free worker. Unsupported ops
