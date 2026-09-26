@@ -45,6 +45,30 @@ Run that smoke test while the worker is running:
 ./build/onnx-remote/onnx-remote-client --self-test
 ```
 
+## ONNX Runtime Execution Provider adapter
+
+There is an optional source-level ONNX Runtime EP in
+`onnx_remote_execution_provider.{h,cpp}`. It is deliberately pinned to the ORT
+source ABI (the current repository version is 1.29.0): ORT's
+`IExecutionProvider` and `NodeComputeInfo` are internal headers and are not in
+the public prebuilt SDK. Enable it only in a build that has the matching ORT
+source checkout:
+
+```bash
+cmake -S . -B build-ort-ep \
+  -DONNXSIM_BUILTIN_ORT=ON -DONNXSIM_REMOTE_TRANSPORT=ON \
+  -DONNXSIM_REMOTE_ORT_EP=ON \
+  -DONNXSIM_ORT_SOURCE_DIR=/path/to/onnxruntime-1.29.0
+```
+
+The provider partitions `Identity`, `Relu`, `Add`, and `Mul` by default and
+executes float32 tensors through the dependency-free worker. Unsupported ops
+remain on the normal CPU EP. `Options::profiling` forwards worker events into
+onnxsim's profiler. Applications using ORT's internal provider registration
+API can construct it with `onnxsim::ort_remote::CreateRemoteExecutionProvider`.
+This is a software/reference EP and does not require Snapdragon, AX8850, QNN,
+or TensorRT hardware.
+
 ## Design constraints
 
 * bounded message size and tensor count;

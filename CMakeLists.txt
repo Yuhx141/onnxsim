@@ -43,6 +43,9 @@ option(ONNXSIM_TESTS "Build the dependency-free C++ unit tests (e.g. sym_expr)" 
 option(ONNXSIM_REMOTE_TRANSPORT "Build the dependency-free remote tensor transport and reference worker" OFF)
 option(ONNXSIM_REMOTE_DORA "Build the optional DORA C node adapter" OFF)
 option(ONNXSIM_BUILTIN_REMOTE_EXECUTOR "Bundle the native remote ModelExecutor (requires ONNXSIM_REMOTE_TRANSPORT)" OFF)
+option(ONNXSIM_REMOTE_ORT_EP "Build the optional ONNX Runtime remote Execution Provider adapter (requires matching ORT source headers)" OFF)
+set(ONNXSIM_ORT_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/onnxruntime-1.29.0" CACHE PATH
+    "ONNX Runtime source tree used by ONNXSIM_REMOTE_ORT_EP")
 option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding to the page's onnxruntime-web instead of compiling and linking ONNX Runtime into the module" OFF)
 if (EMSCRIPTEN)
   option(ONNXSIM_WASM_HOOKABLE_EXECUTOR "Build the hookable JavaScript ModelExecutor bridge in the default WASM module" ON)
@@ -178,6 +181,18 @@ endif()
 if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR AND NOT ONNXSIM_REMOTE_TRANSPORT)
   message(FATAL_ERROR "ONNXSIM_BUILTIN_REMOTE_EXECUTOR requires ONNXSIM_REMOTE_TRANSPORT=ON")
 endif()
+if (ONNXSIM_REMOTE_ORT_EP AND NOT ONNXSIM_BUILTIN_ORT)
+  message(FATAL_ERROR "ONNXSIM_REMOTE_ORT_EP requires ONNXSIM_BUILTIN_ORT=ON")
+endif()
+if (ONNXSIM_REMOTE_ORT_EP AND NOT ONNXSIM_REMOTE_TRANSPORT)
+  message(FATAL_ERROR "ONNXSIM_REMOTE_ORT_EP requires ONNXSIM_REMOTE_TRANSPORT=ON")
+endif()
+if (ONNXSIM_REMOTE_ORT_EP AND
+    NOT EXISTS "${ONNXSIM_ORT_SOURCE_DIR}/onnxruntime/core/framework/execution_provider.h")
+  message(FATAL_ERROR
+    "ONNXSIM_REMOTE_ORT_EP needs an ORT source checkout with internal EP headers. "
+    "Set ONNXSIM_ORT_SOURCE_DIR to the matching ORT ${ONNXSIM_ORT_VERSION} source tree.")
+endif()
 if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR AND EMSCRIPTEN)
   message(FATAL_ERROR "ONNXSIM_BUILTIN_REMOTE_EXECUTOR is not supported for Emscripten")
 endif()
@@ -210,6 +225,16 @@ add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/par
 if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR)
   target_sources(onnxsim PRIVATE onnxsim/remote_executor.cpp)
   target_compile_definitions(onnxsim PUBLIC ONNXSIM_BUILTIN_REMOTE_EXECUTOR)
+endif()
+if (ONNXSIM_REMOTE_ORT_EP)
+  target_sources(onnxsim PRIVATE
+                 tools/onnx-remote/onnx_remote_execution_provider.cpp)
+  target_compile_definitions(onnxsim PUBLIC ONNXSIM_REMOTE_ORT_EP)
+  target_include_directories(onnxsim PRIVATE
+                             "${ONNXSIM_ORT_SOURCE_DIR}"
+                             "${ONNXSIM_ORT_SOURCE_DIR}/include"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/tools/onnx-remote")
+  target_link_libraries(onnxsim onnx_remote_transport)
 endif()
 
 # ~50 self-contained LLM/PTQ quantization- and pruning-algorithm entry points

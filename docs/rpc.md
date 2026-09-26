@@ -170,6 +170,24 @@ was judged out of proportion for what onnxsim needs (running ONNX models and fol
 If interop with an existing TVM RPC server is needed, TVM's own client can be used alongside: the
 two are independent.
 
+For applications that already compile a TVM module, `onnxsim.rpc.tvm_compat`
+provides a small version-tolerant wrapper around the installed TVM Python
+client. It delegates the native handshake, tracker allocation, and PackedFunc
+marshalling to TVM itself:
+
+```python
+from onnxsim.rpc import tvm_compat
+
+with tvm_compat.connect_tracker("tracker", 9190, "hexagon") as session:
+    session.upload("model.so")
+    module = session.load_module("model.so")
+    module.get_function("run")(...)
+```
+
+This supports the TVM version installed by the application, but does not make
+a TVM RPC server an ONNX executor. The binary onnxsim-v5 transport remains the
+portable protocol for the remote EP and compiler/runner services.
+
 ## Security
 
 A server executes whatever ONNX model a client sends. It binds to loopback by default; the key is

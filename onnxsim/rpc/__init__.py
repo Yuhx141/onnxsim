@@ -30,6 +30,7 @@ __all__ = [
     "connect",
     "connect_tracker",
     "remote_executor",
+    "tvm_compat",
 ]
 
 
