@@ -4,8 +4,10 @@
 
 #include <emscripten/val.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -210,13 +212,27 @@ struct JsModelExecutor : public ModelExecutor {
     size_t m = 0;   // index into out_meta
     size_t off = 0; // byte offset into out_blob
     while (m < out_meta.size()) {
+      if (out_meta.size() - m < 2) {
+        throw std::runtime_error(
+            "onnxruntime-web executor: truncated output metadata");
+      }
       const int32_t onnx_dtype = static_cast<int32_t>(out_meta[m++]);
       const int32_t ndim = static_cast<int32_t>(out_meta[m++]);
+      if (ndim < 0 || ndim > 8 ||
+          static_cast<size_t>(ndim) > out_meta.size() - m) {
+        throw std::runtime_error(
+            "onnxruntime-web executor: invalid output rank metadata");
+      }
       onnx::TensorProto tp;
       tp.set_data_type(static_cast<onnx::TensorProto::DataType>(onnx_dtype));
       int64_t numel = 1;
       for (int32_t d = 0; d < ndim; d++) {
         const int64_t dim = static_cast<int64_t>(out_meta[m++]);
+        if (dim < 0 ||
+            (dim != 0 && numel > std::numeric_limits<int64_t>::max() / dim)) {
+          throw std::runtime_error(
+              "onnxruntime-web executor: invalid output dimensions");
+        }
         tp.add_dims(dim);
         numel *= dim;
       }
@@ -226,9 +242,14 @@ struct JsModelExecutor : public ModelExecutor {
             "onnxruntime-web executor: unsupported output dtype " +
             std::to_string(onnx_dtype));
       }
-      const size_t nbytes =
-          static_cast<size_t>(numel) * onnxsim::dlpack::SizeOf(dl);
-      if (off + nbytes > out_blob.size()) {
+      const size_t element_size = onnxsim::dlpack::SizeOf(dl);
+      if (static_cast<uint64_t>(numel) >
+          std::numeric_limits<size_t>::max() / element_size) {
+        throw std::runtime_error(
+            "onnxruntime-web executor: output byte size overflow");
+      }
+      const size_t nbytes = static_cast<size_t>(numel) * element_size;
+      if (nbytes > out_blob.size() - std::min(off, out_blob.size())) {
         throw std::runtime_error(
             "onnxruntime-web executor: output blob shorter than its metadata "
             "implies");
@@ -237,6 +258,11 @@ struct JsModelExecutor : public ModelExecutor {
       off += nbytes;
       outputs.emplace_back(
           onnxsim::dlpack::FromTensorProtoOwning(std::move(tp)));
+    }
+    if (outputs.size() != static_cast<size_t>(model.graph().output_size()) ||
+        off != out_blob.size()) {
+      throw std::runtime_error(
+          "onnxruntime-web executor: output metadata/blob count mismatch");
     }
     return outputs;
   }

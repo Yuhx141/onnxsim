@@ -109,10 +109,26 @@ export function makeOrtRunner(ort, { providers = ["wasm"] } = {}) {
     let off = 0; // byte offset into inputsData
     let i = 0; // input index
     while (m < inputsMeta.length) {
+      if (inputsMeta.length - m < 2) {
+        throw new Error("onnxruntime-web executor: truncated input metadata");
+      }
       const dataType = inputsMeta[m++];
       const ndim = inputsMeta[m++];
+      if (!Number.isInteger(ndim) || ndim < 0 || ndim > 8 ||
+          ndim > inputsMeta.length - m) {
+        throw new Error("onnxruntime-web executor: invalid input rank metadata");
+      }
       const dims = [];
-      for (let d = 0; d < ndim; d++) dims.push(inputsMeta[m++]);
+      for (let d = 0; d < ndim; d++) {
+        const dim = inputsMeta[m++];
+        if (!Number.isSafeInteger(dim) || dim < 0) {
+          throw new Error("onnxruntime-web executor: invalid input dimensions");
+        }
+        dims.push(dim);
+      }
+      if (i >= inputNames.length) {
+        throw new Error("onnxruntime-web executor: too many input tensors");
+      }
       const entry = ONNX_DTYPE_TO_ORT[dataType];
       if (!entry) {
         throw new Error(
@@ -121,10 +137,16 @@ export function makeOrtRunner(ort, { providers = ["wasm"] } = {}) {
       }
       const [type, Ctor] = entry;
       const byteLen = elementCount(dims) * Ctor.BYTES_PER_ELEMENT;
+      if (!Number.isSafeInteger(byteLen) || byteLen > inputsData.byteLength - off) {
+        throw new Error("onnxruntime-web executor: input blob is too short");
+      }
       const sub = inputsData.subarray(off, off + byteLen);
       off += byteLen;
       feeds[inputNames[i]] = new ort.Tensor(type, typedFromBytes(Ctor, sub), dims);
       i++;
+    }
+    if (i !== inputNames.length || off !== inputsData.byteLength) {
+      throw new Error("onnxruntime-web executor: input metadata/blob mismatch");
     }
 
     const results = await session.run(feeds);
