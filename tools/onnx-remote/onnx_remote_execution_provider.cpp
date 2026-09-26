@@ -56,6 +56,18 @@ void CopyFromWire(const onnx_remote::Tensor &source, Ort::Value &destination) {
   std::copy(source.data.begin(), source.data.end(), data);
 }
 
+std::string RemoteOperation(const std::string &onnx_op) {
+  if (onnx_op == "Identity")
+    return "identity";
+  if (onnx_op == "Relu")
+    return "relu";
+  if (onnx_op == "Add")
+    return "add";
+  if (onnx_op == "Mul")
+    return "mul";
+  return {};
+}
+
 class RemoteExecutionProvider final : public onnxruntime::IExecutionProvider {
 public:
   explicit RemoteExecutionProvider(Options options)
@@ -100,7 +112,7 @@ public:
           Ort::KernelContext context(raw);
           onnx_remote::Request request;
           request.request_id = next_request_id_++;
-          request.op = op;
+          request.op = RemoteOperation(op);
           request.profiling = options_.profiling;
           const size_t input_count = context.GetInputCount();
           request.inputs.reserve(input_count);
