@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+// Optional gRPC control-plane schema for onnxsim's remote executor.
+//
+// This file is intentionally not required by the native transport.  A small
+// runner can continue to use remote_transport.h without protobuf or gRPC.
+// Hosts and gateways may generate bindings from this schema when they need a
+// typed RPC API.  The field layout mirrors the v5 binary protocol; payloads
+// are deliberately raw bytes rather than TensorProto messages.
+package onnxsim.remote.v1;
+
+service OnnxSimExecutor {
+  // Execute one operation or subgraph.  `op` is a backend operation/model
+  // handle; `artifact_id` can refer to a previously loaded compiled artifact.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Compile an ONNX ModelProto on a compiler host.  The returned artifact is
+  // opaque to onnxsim and is normally handed to a separate execution host.
+  rpc Compile(CompileRequest) returns (CompileResponse);
+
+  // Upload an artifact to a runner's persistent cache.  Repeating a load with
+  // the same artifact ID is idempotent when the bytes and manifest match.
+  rpc LoadArtifact(LoadArtifactRequest) returns (LoadArtifactResponse);
+
+  // Lightweight capability and liveness query for ROS2/DORA gateways.
+  rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+}
+
+message Tensor {
+  string name = 1;
+  // ONNX TensorProto.DataType numeric value (FLOAT=1, INT64=7, etc.).
+  uint32 dtype = 2;
+  repeated int64 shape = 3;
+  // Little-endian, flattened row-major tensor bytes.  For FLOAT (dtype=1),
+  // this is IEEE-754 binary32, matching the native protocol's float vector.
+  bytes raw_data = 4;
+}
+
+message ProfileEvent {
+  string name = 1;
+  string category = 2;
+  uint64 start_us = 3;
+  uint64 duration_us = 4;
+  string detail = 5;
+}
+
+message ExecuteRequest {
+  uint64 request_id = 1;
+  string op = 2;
+  string artifact_id = 3;
+  repeated Tensor inputs = 4;
+  ProfilingLevel profiling = 5;
+  // Small control values only; large model/artifact data belongs in the
+  // dedicated compile/load RPCs.
+  map<string, string> parameters = 6;
+}
+
+message ExecuteResponse {
+  uint64 request_id = 1;
+  bool ok = 2;
+  string error = 3;
+  repeated Tensor outputs = 4;
+  repeated ProfileEvent profile = 5;
+}
+
+message CompileRequest {
+  uint64 request_id = 1;
+  bytes model = 2; // serialized ONNX ModelProto
+  string target = 3;
+  string compiler_id = 4;
+  ProfilingLevel profiling = 5;
+  map<string, string> parameters = 6;
+}
+
+message CompileResponse {
+  uint64 request_id = 1;
+  bool ok = 2;
+  string error = 3;
+  string artifact_id = 4;
+  bytes artifact = 5;
+  string manifest = 6;
+  repeated ProfileEvent profile = 7;
+}
+
+message LoadArtifactRequest {
+  uint64 request_id = 1;
+  string artifact_id = 2;
+  bytes artifact = 3;
+  string manifest = 4;
+}
+
+message LoadArtifactResponse {
+  uint64 request_id = 1;
+  bool ok = 2;
+  string error = 3;
+  bool already_present = 4;
+}
+
+message CapabilitiesRequest {
+  uint64 request_id = 1;
+}
+
+message CapabilitiesResponse {
+  uint64 request_id = 1;
+  bool ready = 2;
+  string runner_id = 3;
+  string protocol = 4;
+  repeated string supported_ops = 5;
+  repeated string supported_dtypes = 6;
+  uint64 max_message_bytes = 7;
+  bool profiling = 8;
+}
+
+enum ProfilingLevel {
+  PROFILING_OFF = 0;
+  PROFILING_SUMMARY = 1;
+  PROFILING_DETAILED = 2;
+}

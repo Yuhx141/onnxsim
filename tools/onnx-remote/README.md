@@ -207,6 +207,21 @@ send each constant-folding submodel to a worker without Python. The worker may
 run that model with native ONNX Runtime, an accelerator compiler, or translate
 it to a device-specific model handle.
 
+## Optional gRPC schema
+
+For hosts that need generated RPC clients, `proto/onnxsim_remote.proto` defines
+a small `OnnxSimExecutor` service for compile, artifact load, execute, and
+capability queries. It intentionally does not make protobuf/gRPC a dependency
+of the native worker: generated bindings belong in an optional gateway or
+compiler/runner service. The messages use the same raw little-endian tensor
+layout and bounded profiling fields as the v5 binary transport.
+
+This is a lighter contract than KServe V2 and is the preferred API for
+onnxsim-specific compile/load/run workflows. A later KServe adapter can map
+`ModelInfer` to `Execute` at the gateway, while ROS2 or DORA remains the
+discovery/control plane. Keep model and artifact bytes in their dedicated RPC
+fields; `parameters` is reserved for small options.
+
 ## External compiler contract
 
 The simple path remains the default:
