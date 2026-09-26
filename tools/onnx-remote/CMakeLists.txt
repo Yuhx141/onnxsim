@@ -40,6 +40,10 @@ add_executable(onnx-remote-attach-test remote_attach_test.cpp)
 target_link_libraries(onnx-remote-attach-test PRIVATE onnx_remote_transport)
 
 if (BUILD_TESTING)
+  add_executable(onnx-remote-op-mapping-test remote_op_mapping_test.cpp)
+  target_link_libraries(onnx-remote-op-mapping-test PRIVATE onnx_remote_transport)
+  add_test(NAME onnx-remote-op-mapping COMMAND onnx-remote-op-mapping-test)
+
   add_executable(onnx-remote-transport-test remote_transport_test.cpp)
   target_link_libraries(onnx-remote-transport-test PRIVATE onnx_remote_transport)
   add_test(NAME onnx-remote-transport-roundtrip

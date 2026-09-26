@@ -12,6 +12,7 @@
 #include "core/framework/compute_capability.h"
 #include "core/session/onnxruntime_cxx_api.h"
 #include "profiler.h"
+#include "remote_op_mapping.h"
 
 namespace onnxsim::ort_remote {
 namespace {
@@ -55,18 +56,6 @@ void CopyFromWire(const onnx_remote::Tensor &source, Ort::Value &destination) {
   }
   float *data = destination.GetTensorMutableData<float>();
   std::copy(source.data.begin(), source.data.end(), data);
-}
-
-std::string RemoteOperation(const std::string &onnx_op) {
-  if (onnx_op == "Identity")
-    return "identity";
-  if (onnx_op == "Relu")
-    return "relu";
-  if (onnx_op == "Add")
-    return "add";
-  if (onnx_op == "Mul")
-    return "mul";
-  return {};
 }
 
 void ParseInteger(const onnxruntime::ProviderOptions &options, const char *key,
@@ -140,7 +129,7 @@ public:
           Ort::KernelContext context(raw);
           onnx_remote::Request request;
           request.request_id = next_request_id_++;
-          request.op = RemoteOperation(op);
+          request.op = onnx_remote::remote_operation_name(op);
           request.profiling = options_.profiling;
           const size_t input_count = context.GetInputCount();
           request.inputs.reserve(input_count);
