@@ -50,6 +50,8 @@ if (ONNXSIM_REMOTE_GRPC)
   # Prefer a package config when the host distribution provides one, but also
   # support CMake's FindProtobuf module (common on Debian/Ubuntu and ROS
   # workspaces).
+  find_package(absl CONFIG REQUIRED)
+  find_package(ZLIB REQUIRED)
   find_package(Protobuf CONFIG QUIET)
   if (NOT Protobuf_FOUND)
     find_package(Protobuf REQUIRED)

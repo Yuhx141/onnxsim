@@ -30,6 +30,16 @@
             ros.ros2cli
             protobuf
             grpc
+            abseil-cpp
+            abseil-cpp.dev
+            re2
+            re2.dev
+            c-ares
+            c-ares.dev
+            zlib
+            zlib.dev
+            icu
+            icu.dev
           ];
           shellHook = ''
             export ROS_DISTRO=humble
