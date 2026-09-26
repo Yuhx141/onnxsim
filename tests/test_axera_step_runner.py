@@ -215,9 +215,7 @@ def test_resnet18_training_graph_runs_pulsar_free_on_axcl_vm(tmp_path):
     calibration = sr.axb.load_calibration(sr.STEP_CALIB)
     segments, _ = sr.build_plan(model, sr.load_records(), calibration)
     reference = sr.load_reference()
-    with axcl_session.AXSession(
-        subdir=f"resnet18_training_{tmp_path.name}"
-    ) as session:
+    with axcl_session.AXSession(subdir=f"resnet18_training_{tmp_path.name}") as session:
         runner = sr.StepRunner(
             model,
             segments,
@@ -646,9 +644,7 @@ def test_onnx_constant_add_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     x = rng.uniform(0.0, 0.2, shape).astype(np.float32)
     z_full = np.full(shape, float(z), dtype=np.float32)
 
-    with axcl_session.AXSession(
-        subdir=f"uop_constant_add_{tmp_path.name}"
-    ) as session:
+    with axcl_session.AXSession(subdir=f"uop_constant_add_{tmp_path.name}") as session:
         loaded = session.load(axmodel, str(schedule))
         try:
             (got,) = session.run(loaded, [x, z_full])
@@ -704,9 +700,7 @@ def test_onnx_constant_broadcast_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm
             session.unload(loaded)
 
     want = {"Sub": x - z_full, "Mul": x * z_full, "Div": x / z_full}[op]
-    np.testing.assert_allclose(
-        got, want, atol=float(meta["scales"]["y"]) * 1.5, rtol=0
-    )
+    np.testing.assert_allclose(got, want, atol=float(meta["scales"]["y"]) * 1.5, rtol=0)
 
 
 @needs_device
