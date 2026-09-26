@@ -69,6 +69,17 @@ API can construct it with `onnxsim::ort_remote::CreateRemoteExecutionProvider`.
 Registration maps can use `host`, `port`, `connect_timeout_ms`,
 `io_timeout_ms`, `profiling=off|summary|detailed`, and comma-separated
 `supported_ops`; use `OptionsFromProviderOptions` to parse them.
+With ORT's internal C++ session API, registration is the normal EP flow:
+
+```cpp
+onnxruntime::InferenceSession session(session_options, env);
+session.RegisterExecutionProvider(
+    onnxsim::ort_remote::CreateRemoteExecutionProviderFromOptions(options));
+```
+
+The public `Ort::SessionOptions` API does not expose arbitrary internal EP
+objects; applications using only the public ABI should package this adapter as
+an ORT plugin EP instead.
 This is a software/reference EP and does not require Snapdragon, AX8850, QNN,
 or TensorRT hardware.
 
