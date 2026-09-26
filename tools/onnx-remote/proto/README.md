@@ -42,6 +42,18 @@ protoc -I tools/onnx-remote/proto \
   tools/onnx-remote/proto/onnxsim_remote.proto
 ```
 
+The standalone CMake project can generate a reusable static binding target when
+protobuf and gRPC development packages are installed:
+
+```sh
+cmake -S tools/onnx-remote -B build/onnx-remote-grpc \
+  -DONNXSIM_REMOTE_GRPC=ON
+cmake --build build/onnx-remote-grpc --target onnx_remote_grpc
+```
+
+This option is deliberately off by default and is intended for a host-side
+gateway, not an embedded runner.
+
 An actual gRPC service should translate `Execute` to
 `onnx_remote::Request`/`Response` and retain the native transport as the
 canonical embedded path. A KServe V2 adapter can map `ModelInfer` to

@@ -6,6 +6,7 @@ include(CTest)
 option(ONNX_REMOTE_AXCL "Build the AXCL-backed remote worker" OFF)
 option(ONNXSIM_REMOTE_DORA "Build the DORA node adapter" OFF)
 option(ONNXSIM_REMOTE_ROS2 "Build the optional ROS2 binary bridge" OFF)
+option(ONNXSIM_REMOTE_GRPC "Generate the optional host-side gRPC bindings" OFF)
 set(DORA_NODE_API_INCLUDE_DIR "" CACHE PATH
     "DORA C node API include directory (contains node_api.h)")
 set(DORA_NODE_API_LIBRARY "" CACHE FILEPATH
@@ -44,6 +45,48 @@ target_link_libraries(onnx-remote-attach-test PRIVATE onnx_remote_transport)
 # bindings with the toolchain available on that host.
 install(FILES proto/onnxsim_remote.proto proto/README.md
         DESTINATION share/onnx-remote/proto)
+
+if (ONNXSIM_REMOTE_GRPC)
+  find_package(Protobuf CONFIG REQUIRED)
+  find_package(gRPC CONFIG REQUIRED)
+
+  if (TARGET protobuf::protoc)
+    set(ONNXSIM_PROTOC "$<TARGET_FILE:protobuf::protoc>")
+  else()
+    find_program(ONNXSIM_PROTOC protoc REQUIRED)
+  endif()
+  if (TARGET gRPC::grpc_cpp_plugin)
+    set(ONNXSIM_GRPC_CPP_PLUGIN "$<TARGET_FILE:gRPC::grpc_cpp_plugin>")
+  else()
+    find_program(ONNXSIM_GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
+  endif()
+
+  set(ONNXSIM_GRPC_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/grpc")
+  set(ONNXSIM_GRPC_PROTO_CPP "${ONNXSIM_GRPC_GEN_DIR}/onnxsim_remote.pb.cc")
+  set(ONNXSIM_GRPC_PROTO_H "${ONNXSIM_GRPC_GEN_DIR}/onnxsim_remote.pb.h")
+  set(ONNXSIM_GRPC_SERVICE_CPP "${ONNXSIM_GRPC_GEN_DIR}/onnxsim_remote.grpc.pb.cc")
+  set(ONNXSIM_GRPC_SERVICE_H "${ONNXSIM_GRPC_GEN_DIR}/onnxsim_remote.grpc.pb.h")
+  add_custom_command(
+    OUTPUT ${ONNXSIM_GRPC_PROTO_CPP} ${ONNXSIM_GRPC_PROTO_H}
+           ${ONNXSIM_GRPC_SERVICE_CPP} ${ONNXSIM_GRPC_SERVICE_H}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${ONNXSIM_GRPC_GEN_DIR}
+    COMMAND ${ONNXSIM_PROTOC}
+            --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+            --cpp_out=${ONNXSIM_GRPC_GEN_DIR}
+            --grpc_out=${ONNXSIM_GRPC_GEN_DIR}
+            --plugin=protoc-gen-grpc=${ONNXSIM_GRPC_CPP_PLUGIN}
+            onnxsim_remote.proto
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/proto/onnxsim_remote.proto
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/proto
+    VERBATIM)
+  add_library(onnx_remote_grpc STATIC
+              ${ONNXSIM_GRPC_PROTO_CPP} ${ONNXSIM_GRPC_SERVICE_CPP})
+  target_include_directories(onnx_remote_grpc PUBLIC ${ONNXSIM_GRPC_GEN_DIR})
+  target_link_libraries(onnx_remote_grpc PUBLIC protobuf::libprotobuf gRPC::grpc++)
+  install(TARGETS onnx_remote_grpc ARCHIVE DESTINATION lib)
+  install(FILES ${ONNXSIM_GRPC_PROTO_H} ${ONNXSIM_GRPC_SERVICE_H}
+          DESTINATION include/onnx-remote/grpc)
+endif()
 
 if (BUILD_TESTING)
   add_executable(onnx-remote-op-mapping-test remote_op_mapping_test.cpp)
