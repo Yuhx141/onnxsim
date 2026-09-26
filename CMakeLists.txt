@@ -191,7 +191,7 @@ if (ONNXSIM_REMOTE_ORT_EP AND
     NOT EXISTS "${ONNXSIM_ORT_SOURCE_DIR}/onnxruntime/core/framework/execution_provider.h")
   message(FATAL_ERROR
     "ONNXSIM_REMOTE_ORT_EP needs an ORT source checkout with internal EP headers. "
-    "Set ONNXSIM_ORT_SOURCE_DIR to the matching ORT ${ONNXSIM_ORT_VERSION} source tree.")
+    "Set ONNXSIM_ORT_SOURCE_DIR to the matching ORT 1.29.0 source tree.")
 endif()
 if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR AND EMSCRIPTEN)
   message(FATAL_ERROR "ONNXSIM_BUILTIN_REMOTE_EXECUTOR is not supported for Emscripten")
