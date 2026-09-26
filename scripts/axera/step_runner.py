@@ -735,6 +735,28 @@ class StepRunner:
         m = self.session.load(self.emitted(seg))
         try:
             ins = [np.asarray(env[t], dtype=np.float32) for t in seg.inputs]
+            model_inputs = getattr(m, "inputs", None)
+            if model_inputs is not None and len(model_inputs) > len(ins):
+                initializer = {
+                    item.name: numpy_helper.to_array(item)
+                    for item in self.model.graph.initializer
+                }
+                for node_name in seg.nodes:
+                    for tensor in self.by_name[node_name].input:
+                        if tensor not in seg.inputs and tensor in initializer:
+                            ins.append(np.asarray(initializer[tensor], dtype=np.float32))
+            if model_inputs is not None and len(ins) != len(model_inputs):
+                raise ValueError(
+                    f"segment {seg.name} emitted {len(m.inputs)} inputs, "
+                    f"but runner prepared {len(ins)}"
+                )
+            if model_inputs is not None:
+                ins = [
+                    np.broadcast_to(value, spec.shape).copy()
+                    if value.shape != spec.shape
+                    else value
+                    for value, spec in zip(ins, model_inputs)
+                ]
             if seg.output_shape:
                 target = np.broadcast_shapes(*(x.shape for x in ins))
                 ins = [np.broadcast_to(x, target) for x in ins]
