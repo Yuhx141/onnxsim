@@ -137,3 +137,17 @@ jobs:
             -DONNXSIM_REMOTE_DORA_STUB=ON
       - name: Build DORA adapter
         run: cmake --build build/onnx-remote-dora --target onnx-remote-dora-node -j2
+
+  ros2-compile:
+    name: ROS2 bridge compile contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Build ROS2 bridge in nix-ros-overlay shell
+        working-directory: tools/onnx-remote
+        run: |
+          nix develop --accept-flake-config --command bash -lc '
+            cmake -S . -B build/ros2 -DONNXSIM_REMOTE_ROS2=ON -DBUILD_TESTING=ON
+            cmake --build build/ros2 --target onnx-remote-ros2-bridge -j2
+          '
