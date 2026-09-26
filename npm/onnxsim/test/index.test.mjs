@@ -169,7 +169,10 @@ try {
     ort.env.wasm.proxy = false;
     const ortRunner = makeOrtRunner(ort);
     await setModelExecutorRunner(async (...args) => {
-      return ortRunner(...args);
+      const result = await ortRunner(...args);
+      assert.ok(Array.isArray(result.profile));
+      assert.equal(result.profile[0].name, "ort_web_run");
+      return result;
     });
     const input = new Uint8Array(readFileSync(FIXTURE));
     const { model } = await simplify(input, { constantFolding: true });

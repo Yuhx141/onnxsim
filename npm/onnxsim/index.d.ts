@@ -42,7 +42,18 @@ export type ModelExecutorRunner = (
   modelBytes: Uint8Array,
   inputsData: Uint8Array,
   inputsMeta: Float64Array,
-) => Promise<{ data: Uint8Array; meta: Float64Array }> | { data: Uint8Array; meta: Float64Array };
+) =>
+  | Promise<{ data: Uint8Array; meta: Float64Array; profile?: ExecutorProfileEvent[] }>
+  | { data: Uint8Array; meta: Float64Array; profile?: ExecutorProfileEvent[] };
+
+/** Optional runner-side profile event, anchored into onnxsim's trace. */
+export interface ExecutorProfileEvent {
+  name: string;
+  category: string;
+  start_us: number;
+  duration_us: number;
+  detail?: string;
+}
 
 /**
  * Simplify a serialized ONNX model.

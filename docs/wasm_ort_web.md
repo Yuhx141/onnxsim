@@ -28,8 +28,10 @@ const result = await simplify(model);
 
 The callback may forward the batched payload to a remote runner, WebGPU, a
 worker, or an embedded accelerator. It returns `{ data, meta }`, synchronously
-or as a Promise. The legacy `runtime.onnxsimOrtWebRun` property remains
-accepted for compatibility.
+or as a Promise. It may also return `profile: [{name, category, start_us,
+duration_us, detail}]`; those runner-relative events are anchored into
+onnxsim's Chrome/Perfetto trace when profiling is enabled. The legacy
+`runtime.onnxsimOrtWebRun` property remains accepted for compatibility.
 
 ## What this is
 
@@ -82,7 +84,9 @@ round trips is O(1) rather than O(tensors × fields):
   `inputsData` is every feed's raw little-endian bytes concatenated and
   `inputsMeta` is a `Float64Array` of `[dtype, ndim, dims...]` per feed
   (`dtype` = ONNX `TensorProto.DataType`).
-- **Output**: `{ data: Uint8Array, meta: Float64Array }` in the same layout.
+- **Output**: `{ data: Uint8Array, meta: Float64Array, profile?: ProfileEvent[] }`
+  in the same layout. Profile timestamps are microseconds relative to the
+  runner invocation.
 - Tensors are **positional** — no names cross. Input i binds to
   `session.inputNames[i]`; outputs are emitted in `session.outputNames` order.
   Both equal the sub-model's graph input/output order, which is how the built-in

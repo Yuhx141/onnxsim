@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "dlpack_bridge.h"
+#include "profiler.h"
 
 // wasm is always little-endian; the (de)serialization below memcpy's typed data
 // to/from raw little-endian bytes, so bail loudly if that ever stops holding.
@@ -29,11 +30,13 @@ using emscripten::val;
 //   async (modelBytes: Uint8Array,
 //          inputsData: Uint8Array,      // all feed bytes concatenated
 //          inputsMeta: Float64Array)    // [dtype, ndim, dims...] per feed
-//     => Promise<{ data: Uint8Array, meta: Float64Array }>  // same layout
+//     => Promise<{ data: Uint8Array, meta: Float64Array,
+//                  profile?: ProfileEvent[] }>  // same layout
 // `dtype` is the ONNX TensorProto.DataType enum value; tensor bytes are raw
 // little-endian element data. Tensors are positional (no names cross).
 constexpr const char *kRunnerProp = "onnxsimModelExecutorRun";
 constexpr const char *kLegacyRunnerProp = "onnxsimOrtWebRun";
+constexpr size_t kMaxRunnerProfileEvents = 256;
 
 // Copy `len` bytes at `data` into a fresh JS-owned Uint8Array. Constructing
 // `new Uint8Array(view)` from a view over the wasm heap copies the bytes into a
@@ -78,6 +81,43 @@ std::vector<double> JsF64ToVector(const val &arr) {
     dest.call<void>("set", arr);
   }
   return out;
+}
+
+std::string JsonEscape(const std::string &value) {
+  std::string escaped;
+  for (const char c : value) {
+    if (c == '"' || c == '\\')
+      escaped.push_back('\\');
+    escaped.push_back(c);
+  }
+  return escaped;
+}
+
+void RecordRunnerProfile(const val &result, uint64_t anchor_us) {
+  auto &profiler = onnxsim::Profiler::Instance();
+  if (!profiler.enabled())
+    return;
+  const val profile = result["profile"];
+  if (profile.isUndefined() || profile.isNull())
+    return;
+  const size_t count = profile["length"].as<size_t>();
+  if (count > kMaxRunnerProfileEvents) {
+    throw std::runtime_error("hookable WASM executor: too many profile events");
+  }
+  for (size_t i = 0; i < count; ++i) {
+    const val event = profile[i];
+    const std::string name = event["name"].as<std::string>();
+    const std::string category = event["category"].as<std::string>();
+    const uint64_t start_us = event["start_us"].as<uint64_t>();
+    const uint64_t duration_us = event["duration_us"].as<uint64_t>();
+    const val detail_value = event["detail"];
+    const std::string detail = detail_value.isUndefined()
+                                   ? std::string{}
+                                   : detail_value.as<std::string>();
+    profiler.RecordExternalEvent(
+        name, category, anchor_us + start_us, duration_us,
+        detail.empty() ? "{}" : "{\"detail\":\"" + JsonEscape(detail) + "\"}");
+  }
 }
 
 // A ModelExecutor that evaluates each constant-folding sub-model with
@@ -150,7 +190,12 @@ struct JsModelExecutor : public ModelExecutor {
     // Run onnxruntime-web and block on its Promise. val::await() unwinds the
     // wasm stack via Asyncify and resumes here once the Promise settles; a
     // rejected Promise surfaces as a C++ exception.
+    const uint64_t profile_anchor =
+        onnxsim::Profiler::Instance().enabled()
+            ? onnxsim::Profiler::Instance().ElapsedMicros()
+            : 0;
     val result = runner(js_model, js_data, js_meta).await();
+    RecordRunnerProfile(result, profile_anchor);
 
     // The runner returns { data, meta } in the same batched layout, with
     // outputs in graph-output order (which is how RunOps names them

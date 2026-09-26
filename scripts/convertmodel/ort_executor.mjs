@@ -16,7 +16,8 @@
 //          inputsData: Uint8Array,     // all input tensors' bytes, concatenated
 //          inputsMeta: Float64Array)   // [dtype, ndim, dims...] per input
 //     => Promise<{ data: Uint8Array,   // all output tensors' bytes, concatenated
-//                  meta: Float64Array }>// [dtype, ndim, dims...] per output
+//                  meta: Float64Array, // [dtype, ndim, dims...] per output
+//                  profile?: ProfileEvent[] }>
 //
 // `dtype` is the ONNX TensorProto.DataType enum value; tensor bytes are raw
 // little-endian element data. Tensors are positional: input i binds to
@@ -54,6 +55,12 @@ const ORT_TYPE_TO_ONNX = {
   uint64: 13,
 };
 
+function clockMs() {
+  return typeof globalThis.performance?.now === "function"
+    ? globalThis.performance.now()
+    : Date.now();
+}
+
 // Reinterpret a Uint8Array's bytes as `Ctor` elements. The bytes come from a
 // slice of the concatenated input blob, so the byte offset may not be aligned
 // to the element size; fall back to a copy (onto a fresh 0-offset buffer) when
@@ -88,6 +95,7 @@ function elementCount(dims) {
 // correctness does not depend on the provider.
 export function makeOrtRunner(ort, { providers = ["wasm"] } = {}) {
   return async function onnxsimOrtWebRun(modelBytes, inputsData, inputsMeta) {
+    const started = clockMs();
     const session = await ort.InferenceSession.create(modelBytes, {
       executionProviders: providers,
       graphOptimizationLevel: "disabled",
@@ -150,6 +158,18 @@ export function makeOrtRunner(ort, { providers = ["wasm"] } = {}) {
     if (typeof session.release === "function") {
       await session.release();
     }
-    return { data, meta: new Float64Array(meta) };
+    return {
+      data,
+      meta: new Float64Array(meta),
+      profile: [
+        {
+          name: "ort_web_run",
+          category: "ort-web",
+          start_us: 0,
+          duration_us: Math.max(0, Math.round((clockMs() - started) * 1000)),
+          detail: "InferenceSession.create+run",
+        },
+      ],
+    };
   };
 }
