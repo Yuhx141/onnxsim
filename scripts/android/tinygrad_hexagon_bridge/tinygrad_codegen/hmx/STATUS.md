@@ -30,8 +30,19 @@ Full rebuild + phone run each:
 
 Both on by default, so neither is available as a win. They size what a new mechanism has to beat.
 
-`HMX_RQ=0` is **not** a usable measurement: without the requant the kernel falls back to a scalar
-path and measures 526,475 us (24x slower), which says nothing about the requant's cost.
+**The requant's cost is still not measured**, and two attempts to measure it both failed:
+
+- `HMX_RQ=0` drops the epilogue, which makes the accumulator unreachable from the store, so
+  `_hmx_bail(9)` fires and the kernel falls back to scalar: 526,475 us (24x slower). That says
+  nothing about the requant.
+- `HMX_RQ_PROBE` (added to the fork) keeps the :cm path and drops only the requantize rows, but
+  on the phone it came out **slower** than the baseline - 22,508 us against 22,208 - and on
+  hexagon-sim it does not finish in 40 minutes. Removing rows reshapes the surrounding codegen
+  (the addq folding and the store chain), and that costs more than the requant saves, so the
+  delta is not the requant's cost. The flag is kept with a comment saying not to read a number
+  off it.
+
+To price it properly, keep the epilogue and replace only its body. Not written.
 
 ## Measurement traps, both mine
 
@@ -69,8 +80,13 @@ far outside the expected class, so the emulation is wrong. It needs a real measu
 
 ## Open, in order of value
 
-1. The layer4 3x3 convs, 34.7% of phone time, not yet touched.
-2. Decide the `QC_FAST` accuracy trade, then measure it properly.
+1. Decide the `QC_FAST` accuracy trade - which first needs the requant's true cost, which in turn
+   needs a probe that replaces the epilogue body rather than removing it.
+2. The layer4 3x3 convs are 34.7% of phone time, and LAYER4_CONVS.md shows they are *not*
+   obviously broken: 1.00x wasted MACs, better than the stem per MAC, weight path already on the
+   quad optimisation. `HMX_I8_QUAD_A=0` on the phone says the activation pack is worth only
+   0.5 ms of the 3.4 ms, so the remainder is per-op fixed cost that the existing bisection
+   attributes to the requant.
 3. The five quarantined HMX oracle files. Root cause is **not** a kernel bug: the captured 1x1
    and 3x3 kernels both complete when run directly (284k pcycles in 12.7 s; 254M insns, 97 s), and
    the whole test body completes outside pytest. Only under pytest does the simulator child die,
