@@ -96,10 +96,23 @@ def build_resnet_coverage(model: Any, **kwargs: Any) -> ResNetCoverage:
 
 
 def coverage_to_dict(coverage: ResNetCoverage) -> Mapping[str, Any]:
+    """Serialize static lowering coverage without implying device execution.
+
+    ``lowered`` and ``fused`` describe the planner's operator inventory. They
+    do not establish that an artifact exists, that a runner selected it, or
+    that the node ran on hardware. Device execution must be reported from a
+    runtime result that has those facts.
+    """
     return {
+        "coverage_scope": "static_codegen_plan",
         "semantic_nodes": coverage.semantic_nodes,
         "covered_nodes": coverage.covered_nodes,
         "coverage_percent": coverage.coverage_percent,
+        "hardware_execution_coverage": {
+            "status": "not_measured_by_static_planner",
+            "covered_nodes": None,
+            "coverage_percent": None,
+        },
         "uncovered_ops": list(coverage.uncovered_ops),
         "entries": [
             {
@@ -109,6 +122,7 @@ def coverage_to_dict(coverage: ResNetCoverage) -> Mapping[str, Any]:
                 "kernel_kind": entry.kernel_kind,
                 "fused_group": list(entry.fused_group),
                 "status": entry.status,
+                "execution_status": "not_assessed",
                 "input_qdq_edges": [edge.output_name for edge in entry.input_edges],
                 "output_qdq_edge": entry.output_edge.output_name if entry.output_edge else None,
             }

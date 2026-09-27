@@ -67,23 +67,35 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     initializers = {str(item.name): numpy_helper.to_array(item) for item in model.graph.initializer}
     conv_indices = block.main_conv_indices
     conv_nodes = [nodes[index] for index in conv_indices]
-    if block.skip_conv_index is not None:
-        raise ValueError("the first fused implementation only supports identity residual blocks")
+    projection = block.skip_conv_index is not None
     input_shape = tuple(int(v) for v in block.conv_plans[0].input_shape)
     output_shape = tuple(int(v) for v in block.conv_plans[2].output_shape)
     batch, channels, height, width = input_shape
+    out_batch, output_channels, output_height, output_width = output_shape
     mid_channels = int(block.conv_plans[1].weight_shape[0])
-    if batch != 1 or output_shape != input_shape:
-        raise ValueError("fused identity blocks require batch one and equal input/output shapes")
-    if height < 3 or width < 1 or mid_channels < 2 or mid_channels % 2:
-        raise ValueError("fused block dimensions require H>=3, W>=1, and an even inner channel count")
+    if batch != 1 or out_batch != 1:
+        raise ValueError("fused bottleneck blocks require batch one")
+    if not projection and output_shape != input_shape:
+        raise ValueError("identity bottleneck blocks require equal input/output shapes")
+    if height < 1 or width < 1 or mid_channels < 2 or mid_channels % 2:
+        raise ValueError("fused block dimensions require positive H/W and an even inner channel count")
     if (block.conv_plans[0].weight_shape[2:] != (1, 1)
             or block.conv_plans[1].weight_shape[2:] != (3, 3)
             or block.conv_plans[2].weight_shape[2:] != (1, 1)):
         raise ValueError("supported bottleneck kernels are 1x1, 3x3, 1x1")
-    if any(tuple(plan.stride) != (1, 1) or tuple(plan.dilation) != (1, 1) or plan.groups != 1
-           for plan in block.conv_plans[:3]):
-        raise ValueError("identity bottleneck convolutions require stride/dilation one and group one")
+    conv2_stride = tuple(block.conv_plans[1].stride)
+    if (tuple(block.conv_plans[0].stride) != (1, 1)
+            or tuple(block.conv_plans[2].stride) != (1, 1)
+            or conv2_stride not in {(1, 1), (2, 2)}
+            or any(tuple(plan.dilation) != (1, 1) or plan.groups != 1 for plan in block.conv_plans[:3])):
+        raise ValueError("supported main path requires unit conv1/conv3 stride, conv2 stride one or two, unit dilation, and group one")
+    expected_spatial = tuple(
+        (input_shape[2 + axis] + block.conv_plans[1].pads[axis] + block.conv_plans[1].pads[axis + 2] - 3)
+        // conv2_stride[axis] + 1
+        for axis in range(2)
+    )
+    if (output_height, output_width) != expected_spatial:
+        raise ValueError("conv2 output shape does not match its 3x3 stride/padding formula")
     if tuple(block.conv_plans[1].pads) != (1, 1, 1, 1):
         raise ValueError("the 3x3 bottleneck convolution requires symmetric one-pixel padding")
     if any(tuple(plan.pads) != (0, 0, 0, 0) for plan in (block.conv_plans[0], block.conv_plans[2])):
@@ -105,7 +117,21 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     if input_edge is None or input_edge.op_type != "DequantizeLinear":
         raise ValueError("block activation must have a static DequantizeLinear input")
     add_inputs = [edges.get(str(name)) for name in add_node.input]
-    if not any(
+    skip_node = nodes[block.skip_conv_index] if projection else None
+    skip_quantizer = (
+        _quantizer_after(str(skip_node.output[0]), nodes, consumers, edges) if skip_node is not None else None
+    )
+    if projection:
+        skip_plan = block.conv_plans[3]
+        if (skip_plan.node_index != block.skip_conv_index or skip_plan.input_shape != input_shape
+                or skip_plan.output_shape != output_shape or tuple(skip_plan.stride) != conv2_stride
+                or tuple(skip_plan.dilation) != (1, 1) or skip_plan.groups != 1
+                or skip_plan.weight_shape[2:] != (1, 1) or tuple(skip_plan.pads) != (0, 0, 0, 0)):
+            raise ValueError("projection path requires a matching unpadded 1x1 Conv with conv2 stride")
+        if not any(edge is not None and edge.op_type == "DequantizeLinear"
+                   and edge.input_name == skip_quantizer.output_name for edge in add_inputs):
+            raise ValueError("projection residual Add must consume the skip Conv's quantized output")
+    elif not any(
         edge is not None and edge.op_type == "DequantizeLinear" and edge.input_name == input_edge.input_name
         for edge in add_inputs
     ):
@@ -158,13 +184,53 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         bias_accumulators.append(rounded_bias.astype(np.int32))
         activation_scales.append(output_scale)
 
+    skip_weight = skip_bias = None
+    skip_shift = None
+    skip_output_scale = None
+    if projection:
+        node = skip_node
+        activation_edge = edges.get(str(node.input[0]))
+        weight_edge = edges.get(str(node.input[1]))
+        bias_edge = edges.get(str(node.input[2])) if len(node.input) > 2 else None
+        if activation_edge is None or weight_edge is None or bias_edge is None:
+            raise ValueError(f"{node.name}: expected static projection QDQ activation, weight, and bias")
+        act_scale, act_zero = _single_q_params(activation_edge, f"{node.name} activation")
+        weight_scale, weight_zero = _single_q_params(weight_edge, f"{node.name} weight")
+        bias_scale, bias_zero = _single_q_params(bias_edge, f"{node.name} bias")
+        skip_output_scale, skip_output_zero = _single_q_params(skip_quantizer, f"{node.name} output")
+        if (act_zero != input_zero or not math.isclose(act_scale, input_scale, rel_tol=1e-6)
+                or activation_edge.input_name != input_edge.input_name
+                or weight_zero != 0 or bias_zero != 0 or skip_output_zero != 128
+                or activation_edge.params.dtype != "u8" or weight_edge.params.dtype != "i8"
+                or bias_edge.params.dtype != "i8"):
+            raise ValueError(f"{node.name}: unsupported projection QDQ zero points or dtypes")
+        if bias_edge.input_name not in initializers or weight_edge.input_name not in initializers:
+            raise ValueError(f"{node.name}: projection weights and bias must be static initializers")
+        skip_weight = np.asarray(initializers[weight_edge.input_name], dtype=np.int8)
+        bias_raw = np.asarray(initializers[bias_edge.input_name], dtype=np.int32).reshape(-1)
+        if bias_raw.size != skip_weight.shape[0] or skip_weight.shape != tuple(skip_plan.weight_shape):
+            raise ValueError(f"{node.name}: projection weight/bias shape mismatch")
+        product_scale = act_scale * weight_scale
+        accum_bias = bias_raw.astype(np.float64) * bias_scale / product_scale
+        rounded_bias = np.rint(accum_bias)
+        if not np.allclose(accum_bias, rounded_bias, rtol=1e-6, atol=1e-6):
+            raise ValueError(f"{node.name}: projection bias cannot be represented as an exact integer accumulator")
+        if np.any(rounded_bias < np.iinfo(np.int32).min) or np.any(rounded_bias > np.iinfo(np.int32).max):
+            raise ValueError(f"{node.name}: projection bias overflows int32 accumulator")
+        skip_bias = rounded_bias.astype(np.int32)
+        skip_shift = _power_of_two_shift(skip_output_scale / product_scale, f"{node.name} requantization")
+
     final_scale, final_zero = _single_q_params(final_quantizer, "residual output")
     conv3_scale, conv3_zero = _single_q_params(quantizers[2], "conv3 output")
     if final_zero != 128 or conv3_zero != 128:
         raise ValueError("the fused residual requires uint8 output zero point 128")
     residual_shift = _power_of_two_exponent(conv3_scale / final_scale, "residual branch scale ratio")
     input_shift = _power_of_two_exponent(input_scale / final_scale, "identity branch scale ratio")
-    if max(abs(residual_shift), abs(input_shift)) > 8:
+    skip_residual_shift = (
+        _power_of_two_exponent(skip_output_scale / final_scale, "projection branch scale ratio")
+        if projection else input_shift
+    )
+    if max(abs(residual_shift), abs(skip_residual_shift), abs(input_shift)) > 8:
         raise ValueError("residual scale exponents outside [-8, 8] are not supported")
     final_dequantizer = next(
         (
@@ -182,7 +248,22 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     b1, b2, b3 = bias_accumulators
     # Keep per-core working sets below the 64 KiB AIE tile memory while
     # leaving enough room under the shim's 16 simultaneously live BDs.
-    max_chunk_bytes = 36864
+    # The producer tile owns the input, Conv1 staging output, skip output,
+    # and one weight slot. Bound the slot by the remaining 64 KiB tile memory
+    # after reserving the default 4 KiB worker stack.
+    tile_memory_bytes = 65536
+    worker_stack_bytes = 4096
+    live_tensor_bytes = (
+        int(np.prod(input_shape))
+        + int(np.prod((1, mid_channels, height, width)))
+        + (int(np.prod(output_shape)) if projection else 0)
+    )
+    max_chunk_bytes = min(36864, tile_memory_bytes - worker_stack_bytes - live_tensor_bytes)
+    if max_chunk_bytes <= 0:
+        raise ValueError(
+            f"{block.prefix}: full-tensor producer buffers need {live_tensor_bytes} bytes; "
+            f"the 64 KiB tile has no remaining space for its stack and weight slot"
+        )
 
     def choose_chunks(outputs: int, weight_bytes_per_output: int) -> int:
         for count in range(1, outputs + 1):
@@ -193,6 +274,7 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         raise ValueError("could not divide weight stage into DMA-sized output-channel chunks")
 
     c1_chunks = choose_chunks(w1.shape[0], w1.shape[1])
+    skip_chunks = choose_chunks(skip_weight.shape[0], int(np.prod(skip_weight.shape[1:]))) if projection else 0
     c2_worker_outputs = mid_channels // 2
     c2_chunks = choose_chunks(c2_worker_outputs, w2.shape[1] * w2.shape[2] * w2.shape[3])
     c3_chunks = choose_chunks(w3.shape[0], w3.shape[1])
@@ -202,6 +284,14 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     for index in range(c1_chunks):
         sl = slice(index * c1_rows, (index + 1) * c1_rows)
         chunks.append((w1[sl], b1[sl]))
+    skip_chunk_start = len(chunks)
+    if projection:
+        skip_rows = skip_weight.shape[0] // skip_chunks
+        for index in range(skip_chunks):
+            sl = slice(index * skip_rows, (index + 1) * skip_rows)
+            chunks.append((skip_weight[sl], skip_bias[sl]))
+    else:
+        skip_rows = 0
     for worker in range(2):
         for index in range(c2_chunks):
             start = worker * c2_worker_outputs + index * c2_rows
@@ -263,6 +353,24 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         "chunk_output_counts": (c1_rows, c2_rows, c3_rows),
         "residual_shift": residual_shift,
         "input_shift": input_shift,
+        "projection": projection,
+        "skip_chunk_count": skip_chunks,
+        "skip_chunk_rows": skip_rows,
+        "skip_chunk_sizes": tuple(chunk_sizes[skip_chunk_start:skip_chunk_start + skip_chunks]),
+        "skip_chunk_offsets": tuple(offsets[skip_chunk_start:skip_chunk_start + skip_chunks]),
+        "skip_output_shift": skip_shift,
+        "main_residual_shift": residual_shift,
+        "skip_residual_shift": skip_residual_shift,
+        "input_height": height,
+        "input_width": width,
+        "input_channels": channels,
+        "output_height": output_height,
+        "output_width": output_width,
+        "output_channels": output_channels,
+        "conv2_stride": conv2_stride,
+        "skip_output_scale": skip_output_scale,
+        "skip_output_zero_point": 128 if projection else None,
+        "parameter_stage_order": ("conv1", "skip", "conv2a", "conv2b", "conv3") if projection else ("conv1", "conv2a", "conv2b", "conv3"),
     }
 
 

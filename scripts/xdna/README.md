@@ -160,13 +160,17 @@ runner can compose multiple non-overlapping blocks in one run by repeating
 identity blocks fused and retained exact ONNX Runtime output; the execution
 counts dropped to 46 CPU Conv calls, one XDNA Conv call, and 194 host ops.
 
-The current NPU2 data mover limits each stage's static weight descriptor to
-65,532 bytes; larger channel configurations such as `/layer2/layer2.1` are
-rejected during binding. Split weight streaming is needed to go beyond that
-limit. Downsample/stride-changing residual blocks and non-power-of-two scales
-are also unsupported. This is not yet a graph-wide speedup: the scalar
-integer kernel is a correctness baseline, and the existing 91-dispatch graph
-schedule remains planning metadata rather than one executable XDNA program.
+The NPU2 data mover limits a single weight descriptor to 65,532 bytes. The
+fused path streams weights in bounded chunks, and the binder now covers
+projection/downsample residuals with power-of-two QDQ scales. The four
+projection blocks bind with tile-memory-aware skip chunks. The
+`/layer2/layer2.1` identity block remains an on-device exactness checkpoint.
+Small spatial identity blocks at H=2 and H=1 also matched the reference on
+device. Projection execution still needs full-model hardware validation; its
+larger blocks use smaller chunks to fit the producer tile. This is not yet
+graph-wide device execution: the scalar
+integer kernel is a correctness baseline, and the 91-dispatch graph schedule
+remains planning metadata rather than one executable XDNA program.
 
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
 hybrid Conv layers and skips their unused im2col staging. Converted constant
@@ -204,6 +208,36 @@ live-buffer size, and the operator lowerings still required. This gives the
 future fused runtime a graph IR plus a buffer and dependency contract. Regions are explicitly marked
 `planning_only_not_executable`; current XDNA execution still uses individual
 Conv kernels and host-side operators.
+
+### From planned regions to device-resident execution
+
+The connected regions above describe dependencies; they do not imply that one
+XDNA kernel can execute every listed operator. A graph runner must separately
+bind each planned instruction to a supported device kernel and retain each
+internal tensor in an XRT allocation until its final consumer. The present
+runner instead copies activations through host memory between its executable
+fused-block calls, and runs the remaining operations on the host.
+
+A practical implementation sequence is:
+
+1. Extend block lowering to projection/downsample residuals and the small
+   spatial tails, preserving the ONNX QDQ scale and zero-point at every edge.
+2. Add a device-buffer schedule for consecutive supported blocks. Allocate
+   edge tensors once, launch each block against those allocations, and read
+   back only graph outputs. Keep host fallback boundaries explicit where an
+   operator has no device lowering.
+3. Lower the stem pooling, residual/activation cases outside blocks, global
+   average pool, flatten, and classifier. Then let the scheduler join the
+   resulting instructions into one graph-level device schedule.
+4. Mark a region executable only when every instruction has a device binding
+   and every internal edge has a device-resident buffer plan. Keep planned
+   node coverage, executable node coverage, and measured device execution as
+   separate report fields.
+
+This staged schedule avoids treating a connected ONNX component as proof of
+hardware fusion. It also gives each step a checkable milestone: exact
+quantized edge values first, then no host activation copies between device
+instructions, then full graph output agreement and end-to-end timing.
 
 ## Real-device benchmark
 
