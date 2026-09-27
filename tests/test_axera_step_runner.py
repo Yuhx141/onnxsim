@@ -258,6 +258,26 @@ def test_shape_expanded_add_segment_runs_on_axcl_vm():
 
 @needs_device
 @needs_step
+def test_constant_mul_fixed_frame_runs_on_axcl_vm():
+    """Unsigned constant Mul uses staged data with the native x128 frame."""
+    import axcl_session
+
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, _ = sr.build_plan(model, sr.load_records(), calib)
+    seg = next(s for s in segments if "constant from" in s.detail)
+    reference = sr.load_reference()
+    with axcl_session.AXSession(subdir="constant_mul_fixed_frame") as session:
+        _, stats = sr.StepRunner(model, [seg], session, health_every=0).run(
+            reference["feeds"], "npu"
+        )
+    assert len(stats) == 1
+    assert not stats[0].error, stats[0]
+    assert stats[0].max_lsb <= 16.0, stats[0]
+
+
+@needs_device
+@needs_step
 def test_resnet18_training_graph_runs_pulsar_free_on_axcl_vm(tmp_path):
     """Run the complete calibrated ResNet18 training graph on the AX8850."""
     import axcl_session

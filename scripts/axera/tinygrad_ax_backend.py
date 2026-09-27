@@ -1427,6 +1427,21 @@ def plan_at_calibration(
                         cls, zz = alternate, candidate
                         break
             if cls not in hits:
+                # Constant positive Mul operands can use the measured
+                # x128/y128/z128 frame when the result remains unsigned.
+                # The runner stages the initializer using the frame's z128
+                # scale; signed outputs are excluded because they feed the
+                # separate MatMul int8 path.
+                if (
+                    op == "Mul"
+                    and attrs.get("form") == "const"
+                    and not bool(calib["tensors"][rec["outputs"][0]].get("signed"))
+                    and "x128,y128,z128" in hits
+                ):
+                    return "covered", (
+                        "ElementwiseScaleEdit (x128,y128,z128) fixed-frame "
+                        f"constant from ({cls})"
+                    )
                 # The scalar Add in the decomposed loss path has no native
                 # (1,1) x0 template, but the validated (1,128) x0 program
                 # is lane-independent.  Replicate the scalar inputs across
