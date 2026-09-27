@@ -19,7 +19,9 @@ service OnnxSimExecutor {
   rpc Compile(CompileRequest) returns (CompileResponse);
 
   // Upload an artifact to a runner's persistent cache.  Repeating a load with
-  // the same artifact ID is idempotent when the bytes and manifest match.
+  // the same artifact ID and bytes is idempotent. The manifest is carried
+  // for gateway-local bookkeeping only; native v5 load requests forward
+  // the artifact ID and bytes.
   rpc LoadArtifact(LoadArtifactRequest) returns (LoadArtifactResponse);
 
   // Lightweight capability and liveness query for ROS2/DORA gateways.

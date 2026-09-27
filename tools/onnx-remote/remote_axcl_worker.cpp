@@ -94,6 +94,7 @@ static uint64_t elapsed_us(const std::chrono::steady_clock::time_point& start) {
 
 static Response execute_axmodel(const Request& request) {
   Response response;
+  response.request_id = request.request_id;
   const auto started = std::chrono::steady_clock::now();
   auto add_profile = [&](const char* name, uint64_t begin, uint64_t duration,
                          const char* detail) {
@@ -178,18 +179,35 @@ static Response execute_axmodel(const Request& request) {
 }
 
 static Response execute_request(const Request& request) {
+  if (request.op == "capabilities") {
+    Response response;
+    response.request_id = request.request_id;
+    response.ok = true;
+    response.artifact_id = "axcl-worker";
+    response.manifest =
+        "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
+        "\"runner_id\":\"axcl-worker\",\"ready\":true,"
+        "\"graph_execution\":false,"
+        "\"supported_ops\":[\"load_compiled\",\"run_compiled\"],"
+        "\"supported_dtypes\":[\"FLOAT\"],"
+        "\"profiling\":true}";
+    return response;
+  }
   if (request.op != "run_compiled" && request.op != "load_compiled")
     return execute_axmodel(request);
   Request cached = request;
+  cached.request_id = request.request_id;
   std::string error;
   fs::path artifact_path;
   if (!materialize_artifact(request, artifact_path, error)) {
     Response response;
+    response.request_id = request.request_id;
     response.error = error;
     return response;
   }
   if (request.op == "load_compiled") {
     Response response;
+    response.request_id = request.request_id;
     response.ok = true;
     response.artifact_id = request.artifact_id;
     return response;

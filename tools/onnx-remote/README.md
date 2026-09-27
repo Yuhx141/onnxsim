@@ -569,6 +569,11 @@ This is the runner-side cache/load handshake used by the AX8850 path. A
 stateless runner can skip the load operation and continue sending bytes with
 each `run_compiled` request.
 
+The worker answers `capabilities` as a non-graph compiled-artifact runner
+(`load_compiled`/`run_compiled`, float32), so ROS2/DORA discovery can verify
+it and capability-gated dispatch can reject it when graph execution is
+required.
+
 The model is loaded for each request in this first correctness-oriented
 adapter.  That is deliberately simple and isolates model-load failures; a
 persistent model cache should be added once the wire protocol is exercised on
