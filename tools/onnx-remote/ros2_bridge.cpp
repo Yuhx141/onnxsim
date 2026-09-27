@@ -54,8 +54,11 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                           "remote_port");
     configured_host_ = host_;
     configured_port_ = port_;
-    connect_timeout_ms_ = declare_parameter<int>("connect_timeout_ms", 2000);
-    io_timeout_ms_ = declare_parameter<int>("io_timeout_ms", 0);
+    connect_timeout_ms_ = validate_timeout(
+        declare_parameter<int>("connect_timeout_ms", 2000),
+        "connect_timeout_ms");
+    io_timeout_ms_ = validate_timeout(declare_parameter<int>("io_timeout_ms", 0),
+                                      "io_timeout_ms");
     auto_discover_ = declare_parameter<bool>("auto_discover", false);
     discovery_topic_ = declare_parameter<std::string>("discovery_topic",
                                                       "onnx_remote/runners");
@@ -130,6 +133,13 @@ class OnnxRemoteBridge final : public rclcpp::Node {
       throw std::invalid_argument(std::string(parameter) +
                                   " must be between 1 and 65535");
     return port;
+  }
+
+  static int validate_timeout(int timeout, const char* parameter) {
+    if (timeout < 0)
+      throw std::invalid_argument(std::string(parameter) +
+                                  " must be zero or positive");
+    return timeout;
   }
 
   bool query_capabilities_at(const std::string& host, int port,
