@@ -104,6 +104,7 @@ Response execute(const Request& request, SessionCache& cache) {
     response.manifest =
         "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
         "\"runner_id\":\"ort-cpu-worker\",\"ready\":true,"
+        "\"graph_execution\":true,"
         "\"supported_ops\":[\"subgraph\",\"onnx\"],"
         "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\","
         "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","

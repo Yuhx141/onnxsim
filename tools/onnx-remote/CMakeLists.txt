@@ -45,7 +45,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(onnx_remote_transport STATIC remote_transport.cpp remote_profile.cpp)
+add_library(onnx_remote_transport STATIC remote_transport.cpp remote_profile.cpp
+            remote_capabilities.cpp)
 target_include_directories(onnx_remote_transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if (ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN)
   set_target_properties(onnx_remote_transport PROPERTIES
@@ -143,7 +144,7 @@ target_link_libraries(onnx-remote-profile-fixture PRIVATE onnx_remote_transport)
 # bindings with the toolchain available on that host.
 install(FILES proto/onnxsim_remote.proto proto/README.md
         DESTINATION share/onnx-remote/proto)
-install(FILES remote_transport.h remote_profile.h
+install(FILES remote_transport.h remote_profile.h remote_capabilities.h
         DESTINATION include/onnx-remote)
 install(FILES ort_plugin/onnxsim_remote_ep.manifest.json ort_plugin/README.md
         DESTINATION share/onnx-remote/ort-plugin)

@@ -1,5 +1,6 @@
 #include "remote_transport.h"
 #include "remote_profile.h"
+#include "remote_capabilities.h"
 
 #include <cassert>
 #include <cstdint>
@@ -9,6 +10,19 @@
 using namespace onnx_remote;
 
 int main() {
+  CapabilitySummary capabilities;
+  std::string capability_error;
+  assert(parse_capability_manifest(
+      "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
+      "\"runner_id\":\"ort-cpu-worker\",\"graph_execution\":true,"
+      "\"profiling\":true}", capabilities, capability_error));
+  assert(capabilities.graph_execution);
+  assert(capabilities.profiling);
+  assert(capabilities.runner_id == "ort-cpu-worker");
+  assert(!parse_capability_manifest(
+      "{\"schema_version\":2,\"protocol\":\"onnx-remote-v5\","
+      "\"runner_id\":\"old-worker\"}", capabilities, capability_error));
+
   Request request;
   request.request_id = 42;
   request.op = "run_compiled";

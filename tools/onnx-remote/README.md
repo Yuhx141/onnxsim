@@ -145,6 +145,9 @@ an ORT or C++ runtime dependency.
 It also answers the native `capabilities` request with an ORT CPU runner
 manifest, so ROS2/DORA discovery can verify and select it like the reference
 worker.
+Graph-capable manifests set `graph_execution:true`; host dispatchers should
+prefer this capability for serialized `subgraph` requests instead of building
+another operator allow-list.
 
 `onnx-remote-ort-worker-test MODEL.onnx PORT` runs the same float32 model
 locally through ORT and compares every output with the remote subgraph result,
