@@ -8,6 +8,7 @@
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/u_int8_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -49,7 +50,8 @@ class OnnxRemoteBridge final : public rclcpp::Node {
  public:
   OnnxRemoteBridge() : Node("onnx_remote_bridge") {
     host_ = declare_parameter<std::string>("remote_host", "127.0.0.1");
-    port_ = declare_parameter<int>("remote_port", 39501);
+    port_ = validate_port(declare_parameter<int>("remote_port", 39501),
+                          "remote_port");
     configured_host_ = host_;
     configured_port_ = port_;
     connect_timeout_ms_ = declare_parameter<int>("connect_timeout_ms", 2000);
@@ -123,6 +125,13 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   }
 
  private:
+  static int validate_port(int port, const char* parameter) {
+    if (port <= 0 || port > 65535)
+      throw std::invalid_argument(std::string(parameter) +
+                                  " must be between 1 and 65535");
+    return port;
+  }
+
   bool query_capabilities_at(const std::string& host, int port,
                              onnx_remote::Response& response,
                              std::string& error) const {
