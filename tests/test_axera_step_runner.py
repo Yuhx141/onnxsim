@@ -483,6 +483,75 @@ def test_onnx_matmul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
 
 
 @needs_device
+def test_onnx_gemm_beta_zero_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+    """Run beta-zero Gemm after its bias-free MatMul canonicalization."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import matmul_record_emit as mre
+    import tinygrad_ax_backend as axb
+
+    a_shape, b_shape = (16, 1000), (1000, 512)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Gemm",
+                    ["x", "z", "b"],
+                    ["y"],
+                    alpha=1.0,
+                    beta=0.0,
+                    transA=0,
+                    transB=0,
+                )
+            ],
+            "onnx_gemm_beta_zero_to_uop_vm",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, a_shape
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, b_shape
+                ),
+                onnx.helper.make_tensor_value_info("b", onnx.TensorProto.FLOAT, [512]),
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, (16, 512)
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, quant = mre.STANDALONE_MATMUL_TEMPLATES[(a_shape, b_shape)]
+    old = mre.load_scales(os.path.join(mre.STEP_TEMPLATE_DIR, quant))
+    names = list(old)
+    calibration = {
+        "scales": {"x": old[names[0]][0], "z": old[names[1]][0], "y": old[names[2]][0]},
+        "zero_points": {
+            "x": old[names[0]][1],
+            "z": old[names[1]][1],
+            "y": old[names[2]][1],
+        },
+    }
+    schedule = tmp_path / "onnx_gemm_beta_zero.schedule.json"
+    axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(-0.02, 0.02, a_shape).astype(np.float32)
+    z = rng.uniform(-0.02, 0.02, b_shape).astype(np.float32)
+    with axcl_session.AXSession(
+        subdir=f"uop_gemm_beta_zero_{tmp_path.name}"
+    ) as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x, z])
+        finally:
+            session.unload(loaded)
+    np.testing.assert_allclose(
+        got, x @ z, atol=calibration["scales"]["y"] * 1.5, rtol=0
+    )
+
+
+@needs_device
 @needs_step
 def test_training_step_matmul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     """Run one live-operand MatMul shape taken from the training step."""
