@@ -170,7 +170,7 @@ jobs:
         run: |
           cmake --build build/onnx-remote-public-ep --target \
             onnxsim_remote_ep onnxsim_remote_ep_load_test \
-            onnxsim_remote_ep_run_test -j2
+            onnxsim_remote_ep_run_test onnx-remote-worker -j2
       - name: Test plugin discovery
         env:
           LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.29.0/lib
@@ -183,6 +183,7 @@ jobs:
           ONNXSIM_REMOTE_EP_PROFILING: detailed
           ONNXSIM_REMOTE_EP_PROFILE_FILE: ${{ runner.temp }}/public-ep-profile.json
         run: |
+          test -x build/onnx-remote-public-ep/onnx-remote-worker
           build/onnx-remote-public-ep/onnx-remote-worker --port 39501 \
             >"$RUNNER_TEMP/public-ep-worker.log" 2>&1 &
           worker_pid=$!

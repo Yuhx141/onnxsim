@@ -5,7 +5,6 @@ import sys
 import types
 from pathlib import Path
 
-
 _SPEC = importlib.util.spec_from_file_location(
     "tvm_compat", Path(__file__).parents[1] / "onnxsim" / "rpc" / "tvm_compat.py"
 )
