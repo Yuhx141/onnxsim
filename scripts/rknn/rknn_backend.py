@@ -107,6 +107,14 @@ finally:
 # the host-CPU simulator regardless of this value). rk3588 is the flagship
 # SoC RKNN Model Zoo (the downstream project already using onnxsim, see the
 # top-level README) targets most of its examples at.
+# Rockchip's target names are passed straight to rknn-toolkit2.  Keep the
+# existing rk3588 default for the PC-simulator compatibility suite, but make
+# the RV1106/Luckfox target a first-class documented option:
+#
+#   RKNN_TARGET_PLATFORM=rv1106 python scripts/rknn/run_rknn_compat.py
+#
+# RV1106 is the RKNN target for the Luckfox Pico family (including the
+# rv1106g3 image used by the on-device benchmark).
 TARGET_PLATFORM = os.environ.get("RKNN_TARGET_PLATFORM", "rk3588")
 
 RKNN_AVAILABLE = False

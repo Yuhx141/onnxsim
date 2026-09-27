@@ -1,5 +1,120 @@
 # Rockchip RKNN integration check
 
+## Luckfox RV1106 target
+
+The connected Luckfox image is a Rockchip RV1106G3 Buildroot system with the
+RKNPU driver and `librknnmrt.so` installed. Compile its models on the host with
+the RV1106 target:
+
+```python
+from rknn.api import RKNN
+
+rknn = RKNN(verbose=False)
+rknn.config(target_platform="rv1106")
+rknn.load_onnx(model="simplified.onnx")
+rknn.build(do_quantization=False)
+rknn.export_rknn("model.rknn")
+rknn.release()
+```
+
+Then benchmark real NPU execution on the board:
+
+```bash
+python scripts/rknn/benchmark_luckfox.py model.rknn \\
+  --host 192.168.0.238 --input-shape 1,3,224,224
+```
+
+`benchmark_luckfox.py` uploads the compiled model and the dependency-free
+`luckfox_rknn_runner.py`; the latter calls the board's `librknnmrt.so` through
+ctypes and reports min/mean/p50/p95/max latency. SSH authentication is left to
+the normal `ssh`/`scp` configuration. The stock Buildroot image documents
+`root`/`luckfox` as its default account; use an SSH key or agent for unattended
+benchmark runs.
+
+For a repeatable local smoke suite, build two small calibrated INT8 models:
+
+```bash
+python scripts/rknn/build_luckfox_models.py \\
+  --output-dir /tmp/luckfox-rv1106-models
+```
+
+RV1106 rejects floating-point-only RKNN builds, so the builder supplies a
+small calibration set and uses `do_quantization=True`. The measured board
+results are recorded in [`bench/RESULTS_luckfox_rv1106.md`](../../bench/RESULTS_luckfox_rv1106.md).
+
+To quantize with onnxsim first, use:
+
+```bash
+python scripts/rknn/build_luckfox_models.py \
+  --output-dir /tmp/luckfox-rv1106-onnxsim \
+  --onnxsim-quantize
+```
+
+This emits full-graph INT8 QDQ ONNX, leaving `Relu` and
+`GlobalAveragePool` outside the QDQ regions. RKNN recognizes it as a
+pre-quantized QAT model and the builder uses `do_quantization=False`; both
+models compiled and ran on the connected RV1106. RKNN optimization level 3 is
+used for this path. Model-specific accuracy and latency checks are still
+needed because level 3 may alter numerical behavior.
+
+The builder also runs [`check_rv1106_compat.py`](check_rv1106_compat.py) after
+simplification. It reports unsupported or unknown operators before invoking
+RKNN, while retaining warnings for partial operators and grouped convolutions
+that require a real compiler probe:
+
+```bash
+python scripts/rknn/check_rv1106_compat.py model.onnx \
+  --output model.rv1106.legalized.onnx
+```
+
+The checker is based on Rockchip's published
+[`RKNNToolKit2_OP_Support-2.3.2.md`](https://github.com/airockchip/rknn-toolkit2/blob/master/doc/RKNNToolKit2_OP_Support-2.3.2.md)
+and the RV1103/RV1106 compiler constraint table. It is a preflight gate, not
+a replacement for RKNN's target compiler.
+
+For dense NPU throughput experiments, build a larger Conv workload:
+
+```bash
+python scripts/rknn/build_rv1106_peak.py \
+  --output-dir /tmp/luckfox-rv1106-peak \
+  --channels 64 --layers 8 --size 224
+```
+
+The measured stress results are included in the benchmark report. They are
+intended to expose sustained throughput and memory/clock ceilings, not to
+represent an application model.
+
+Standard ImageNet models can be compiled with:
+
+```bash
+python scripts/rknn/build_rv1106_imagenet.py resnet18.onnx \
+  --output-dir /tmp/luckfox-rv1106-imagenet
+```
+
+The runner supports `--output-format native` for models whose output uses
+RV1106's packed native layout. ResNet-18 and MobileNetV2 measurements are
+recorded in the benchmark report.
+
+Toolkit2 2.3.2 rejects `quantized_dtype="w4a16"` for the RV1106 target, so
+INT4 is not currently an available RV1106 deployment path. The connected
+image also does not expose NPU clock controls; see the benchmark report for
+the negative checks.
+
+The other onnxsim INT4 route was also probed. `quantize_weight_only_int4`
+produces standard ONNX block-wise `DequantizeLinear` + `MatMul` QDQ, which is
+valid for ONNX Runtime and other weight-only backends. RKNN-Toolkit2 2.3.2
+loads that graph as QAT, but RV1106 rejects the required
+`do_quantization=False` build; enabling calibration instead returns to the
+ordinary INT8 path. `com.microsoft::MatMulNBits` is likewise not an RV1106
+operator. The RV1106 compatibility checker now reports both forms before
+conversion.
+
+The host SDK is already the latest public `rknn-toolkit2` 2.3.2. Its public
+changelog documents W4A16 for RK3576, not RV1106, so updating the host SDK
+does not unlock INT4 on this board. The board's runtime library/driver is a
+separate vendor image component; no compatible public RV1106 runtime upgrade
+was available to install remotely during this check.
+
 Verifies that `onnxsim`'s output still converts and runs through
 [`rknn-toolkit2`](https://pypi.org/project/rknn-toolkit2/), Rockchip's real
 ONNX -> RKNN converter for the RK35xx/RV1106 NPU line -- the same toolchain
@@ -101,6 +216,8 @@ pip install rknn-toolkit2       # brings its own onnxruntime/numpy/torch
 pip install .                   # or install an onnxsim wheel
 
 python scripts/rknn/run_rknn_compat.py --output rknn-compat.csv
+# Select the Luckfox/RV1106 compiler target explicitly:
+python scripts/rknn/run_rknn_compat.py --target-platform rv1106
 ```
 
 The in-tree smoke test `tests/test_rknn_compat.py` reuses this harness and is
