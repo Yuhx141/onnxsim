@@ -83,6 +83,20 @@ class OnnxRemoteBridge final : public rclcpp::Node {
         "publish_profile_events", false);
     profile_event_topic_ = declare_parameter<std::string>(
         "profile_event_topic", "profile_events");
+    // Best-effort startup probe so the first announcements already carry
+    // the graph_execution hint. Failure leaves the hint empty; later
+    // capability queries refresh it. This uses the configured connect
+    // timeout and never prevents the bridge from starting.
+    {
+      onnx_remote::Response capabilities;
+      std::string error;
+      onnx_remote::CapabilitySummary summary;
+      if (query_capabilities_at(host_, port_, capabilities, error) &&
+          onnx_remote::parse_capability_manifest(
+              capabilities.manifest, summary, error)) {
+        announced_graph_execution_ = summary.graph_execution;
+      }
+    }
     result_ = create_publisher<UInt8MultiArray>("result", rclcpp::QoS(10));
     if (publish_profile_) {
       profile_ = create_publisher<String>(profile_topic_, rclcpp::QoS(10));

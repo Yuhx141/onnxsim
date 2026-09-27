@@ -189,7 +189,7 @@ jobs:
           trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
           sleep 0.2
           build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
-            build/onnx-remote-public-ep/libonnxsim_remote_ep.so \
+            "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
             scripts/convertmodel/test/webgpu_kernel_add.onnx \
             "$RUNNER_TEMP/public-ep-ort-profile"
           test -s "$RUNNER_TEMP/public-ep-profile.json"
@@ -198,7 +198,7 @@ jobs:
           ONNXSIM_REMOTE_EP_SUPPORTED_OPS=Relu \
           ONNXSIM_REMOTE_EP_EXPECT_REMOTE=0 \
           build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
-            build/onnx-remote-public-ep/libonnxsim_remote_ep.so \
+            "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
             scripts/convertmodel/test/webgpu_kernel_add.onnx \
             "$RUNNER_TEMP/public-ep-cpu-fallback-profile"
 
