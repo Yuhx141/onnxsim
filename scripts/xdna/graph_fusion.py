@@ -181,6 +181,23 @@ def _value_metadata(model: Any) -> tuple[dict[str, tuple[int, ...]], dict[str, i
     for value in getattr(graph, "initializer", ()):
         shapes[str(value.name)] = tuple(int(d) for d in value.dims)
         sizes[str(value.name)] = type_bytes.get(int(getattr(value, "data_type", 0)), 0)
+    constant_ints: dict[str, tuple[int, ...]] = {}
+    try:
+        from onnx import numpy_helper
+        for value in getattr(graph, "initializer", ()):
+            constant_ints[str(value.name)] = tuple(int(x) for x in numpy_helper.to_array(value).reshape(-1))
+    except (ImportError, TypeError, ValueError):
+        pass
+    for node in graph.node:
+        if str(node.op_type) != "Constant" or not node.output:
+            continue
+        attrs = _attributes(node)
+        raw = attrs.get("value")
+        if isinstance(raw, (tuple, list)):
+            try:
+                constant_ints[str(node.output[0])] = tuple(int(x) for x in raw)
+            except (TypeError, ValueError):
+                pass
     for plan in plan_all_convs(model):
         output = str(graph.node[plan.node_index].output[0])
         shapes.setdefault(output, plan.output_shape)
@@ -218,6 +235,44 @@ def _value_metadata(model: Any) -> tuple[dict[str, tuple[int, ...]], dict[str, i
                 attrs = {a.name: int(a.i) for a in node.attribute if getattr(a, "name", "") == "axis"}
                 axis = attrs.get("axis", 1)
                 shape = (prod(source_shape[:axis]), prod(source_shape[axis:]))
+            elif op == "Reshape" and source_shape is not None and len(node.input) > 1:
+                target = constant_ints.get(str(node.input[1]))
+                if target:
+                    allowzero = any(
+                        str(attr.name) == "allowzero" and int(getattr(attr, "i", 0)) != 0
+                        for attr in node.attribute
+                    )
+                    resolved = [
+                        source_shape[axis] if dim == 0 and not allowzero and axis < len(source_shape) else dim
+                        for axis, dim in enumerate(target)
+                    ]
+                    unknown = [axis for axis, dim in enumerate(resolved) if dim == -1]
+                    if len(unknown) <= 1 and all(dim > 0 or dim == -1 for dim in resolved):
+                        known = prod(dim for dim in resolved if dim != -1)
+                        if unknown and known and prod(source_shape) % known == 0:
+                            resolved[unknown[0]] = prod(source_shape) // known
+                        if all(dim > 0 for dim in resolved) and prod(resolved) == prod(source_shape):
+                            shape = tuple(resolved)
+            elif op == "Transpose" and source_shape is not None:
+                attrs = {str(a.name): tuple(int(x) for x in a.ints) for a in node.attribute if str(a.name) == "perm"}
+                perm = attrs.get("perm", tuple(reversed(range(len(source_shape)))))
+                if sorted(perm) == list(range(len(source_shape))):
+                    shape = tuple(source_shape[axis] for axis in perm)
+            elif op == "Concat" and node.input:
+                input_shapes = [shapes.get(str(value)) for value in node.input]
+                if input_shapes and all(item is not None for item in input_shapes):
+                    rank = len(input_shapes[0])
+                    axis = next((int(a.i) for a in node.attribute if str(a.name) == "axis"), 0)
+                    axis = axis + rank if axis < 0 else axis
+                    if 0 <= axis < rank and all(len(item) == rank for item in input_shapes):
+                        compatible = all(
+                            all(input_shapes[j][dim] == input_shapes[0][dim] for dim in range(rank) if dim != axis)
+                            for j in range(1, len(input_shapes))
+                        )
+                        if compatible:
+                            dims = list(input_shapes[0])
+                            dims[axis] = sum(item[axis] for item in input_shapes)
+                            shape = tuple(dims)
             elif op == "Gemm" and len(node.input) > 1:
                 left, right = shapes.get(str(node.input[0])), shapes.get(str(node.input[1]))
                 if left and right and len(left) == len(right) == 2:

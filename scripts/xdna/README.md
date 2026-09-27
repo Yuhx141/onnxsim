@@ -234,11 +234,13 @@ passed for 1,024- and 16,384-element tensors. The graph runner does not yet bind
 these artifacts; full-model ReLU execution remains covered by the existing
 fused bottleneck or host path.
 
-`Flatten` is emitted as a zero-copy contiguous tensor view, with its axis and
-input/output shapes carried in the operation record. It requires no AIE
+`Flatten` and `Reshape` are emitted as zero-copy contiguous tensor views, with
+their input/output shapes carried in the operation record. They require no AIE
 instruction artifact; the future runner can preserve the same device buffer
-and update only the logical shape. Other reshape/permutation operations remain
-kernel-required until their layout constraints are checked.
+and update only the logical shape. Static shape inference now propagates
+Reshape targets, Transpose permutations, and Concat dimensions through the
+graph, which also improves buffer-lifetime estimates. Transpose still requires
+a data-movement kernel.
 
 ### From planned regions to device-resident execution
 

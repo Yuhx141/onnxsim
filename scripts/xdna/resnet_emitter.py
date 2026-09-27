@@ -140,7 +140,7 @@ _OP_LOWERINGS = {
     "AveragePool": "nchw_average_pool",
     "GlobalAveragePool": "nchw_global_average_pool",
     "Flatten": "contiguous_tensor_view",
-    "Reshape": "view_or_reorder",
+    "Reshape": "contiguous_tensor_view",
     "Transpose": "tensor_permutation",
     "Concat": "tensor_concatenation",
     "QuantizeLinear": "quantize_linear_edge",
@@ -172,7 +172,7 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             output_shapes=tuple(shapes.get(str(value)) for value in node.output if value),
             status=(
                 "compilable_iron_kernel" if op == "Relu"
-                else "zero_copy_device_view" if op == "Flatten"
+                else "zero_copy_device_view" if op in {"Flatten", "Reshape"}
                 else "descriptor_only_native_kernel_required" if op in _OP_LOWERINGS
                 else "unsupported"
             ),
