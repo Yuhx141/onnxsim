@@ -82,6 +82,12 @@ message ModelInferRequest {
   repeated Tensor inputs = 4;
   ProfilingLevel profiling = 5;
   map<string, string> parameters = 6;
+  // Serialized ONNX ModelProto for graph execution. Empty for unary
+  // model-handle inference. Bounded by the native transport's message limit.
+  // Prefer Execute for new onnxsim-specific compile/load/run workflows;
+  // this field keeps graph execution reachable through the KServe-style
+  // mapping at the gateway boundary.
+  bytes model = 7;
 }
 
 message ModelInferResponse {

@@ -31,11 +31,11 @@ constexpr uint16_t kCompilerPort = 39672;
 void serve_requests() {
   const int listener = listen_tcp(kWorkerPort, 1);
   assert(listener >= 0);
-  // Six requests: capabilities, identity execute, subgraph execute with
-  // model bytes, identity ModelInfer, one load, and one repeated load.
-  // Compile is served by the compiler fake so the test proves gateway
-  // routing to a separate compiler endpoint.
-  for (int i = 0; i < 6; ++i) {
+  // Seven requests: capabilities, identity execute, subgraph execute with
+  // model bytes, identity ModelInfer, graph ModelInfer with model bytes,
+  // one load, and one repeated load. Compile is served by the compiler fake
+  // so the test proves gateway routing to a separate compiler endpoint.
+  for (int i = 0; i < 7; ++i) {
     const int fd = accept_tcp(listener);
     assert(fd >= 0);
 
@@ -224,6 +224,29 @@ int main() {
                      sizeof(values)) == 0);
   assert(subgraph_response.profile_size() == 1);
   assert(subgraph_response.profile(0).name() == "worker_subgraph");
+
+  ModelInferRequest graph_infer_request;
+  graph_infer_request.set_id("infer-graph");
+  graph_infer_request.set_model_name("subgraph");
+  graph_infer_request.set_model("graph");
+  onnxsim::remote::v1::Tensor* graph_infer_input =
+      graph_infer_request.add_inputs();
+  graph_infer_input->set_dtype(1);
+  graph_infer_input->add_shape(2);
+  graph_infer_input->set_raw_data(reinterpret_cast<const char*>(values),
+                                  sizeof(values));
+  ModelInferResponse graph_infer_response;
+  grpc::ClientContext graph_infer_context;
+  status = stub->ModelInfer(&graph_infer_context, graph_infer_request,
+                            &graph_infer_response);
+  assert(status.ok());
+  assert(graph_infer_response.ok());
+  assert(graph_infer_response.id() == "infer-graph");
+  assert(graph_infer_response.outputs_size() == 1);
+  assert(std::memcmp(graph_infer_response.outputs(0).raw_data().data(), values,
+                     sizeof(values)) == 0);
+  assert(graph_infer_response.profile_size() == 1);
+  assert(graph_infer_response.profile(0).name() == "worker_subgraph");
 
   ModelInferRequest infer_request;
   infer_request.set_id("infer-1");

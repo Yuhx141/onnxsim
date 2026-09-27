@@ -325,6 +325,9 @@ grpc::Status Service::ModelInfer(grpc::ServerContext*,
   if (operation != request->parameters().end() && !operation->second.empty())
     native.op = operation->second;
   native.profiling = profiling_level(request->profiling());
+  if (request->model().size() > kMaxMessageBytes)
+    return invalid("model exceeds transport limit");
+  native.model.assign(request->model().begin(), request->model().end());
   native.inputs.reserve(request->inputs_size());
   for (const auto& input : request->inputs()) {
     Tensor tensor;
