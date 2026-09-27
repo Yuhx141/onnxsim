@@ -15,10 +15,10 @@ client                         worker
 ```
 
 The first worker is a reference implementation for transport tests.  It
-implements `identity` for every protocol dtype and `relu`, `add`, and `mul`
-over float32 tensors.  It is not intended to be the production accelerator
-backend.  An AXCL worker can replace the operation callback while keeping the
-wire format unchanged.
+implements `identity` for every protocol dtype and `relu`, `add`, `mul`,
+`sub`, `div`, `max`, and `min` over float32 tensors.  It is not intended to
+be the production accelerator backend.  An AXCL worker can replace the
+operation callback while keeping the wire format unchanged.
 
 ## Build
 
