@@ -153,6 +153,43 @@ def _compile_global_avgpool(
     return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
 
 
+def _compile_maxpool(params: dict[str, Any], device: str, output_dir: Path) -> dict[str, str]:
+    pads = tuple(int(value) for value in params["pads"])
+    key = (
+        f"maxpool2d_nchw_f32_c{params['channels']}_i{params['input_height']}x{params['input_width']}"
+        f"_o{params['output_height']}x{params['output_width']}"
+        f"_k{params['kernel_height']}x{params['kernel_width']}"
+        f"_s{params['stride_height']}x{params['stride_width']}"
+        f"_p{'_'.join(str(value) for value in pads)}_tr{params['tile_output_rows']}"
+    )
+    xclbin = output_dir / f"{key}.xclbin"
+    insts = output_dir / f"{key}.insts.bin"
+    design = Path(__file__).with_name("maxpool_design.py")
+    command = [
+        sys.executable, str(design), "--dev", device,
+        "--channels", str(params["channels"]),
+        "--input-height", str(params["input_height"]),
+        "--input-width", str(params["input_width"]),
+        "--output-height", str(params["output_height"]),
+        "--output-width", str(params["output_width"]),
+        "--kernel-height", str(params["kernel_height"]),
+        "--kernel-width", str(params["kernel_width"]),
+        "--stride-height", str(params["stride_height"]),
+        "--stride-width", str(params["stride_width"]),
+        "--tile-output-rows", str(params["tile_output_rows"]),
+        "--pad-top", str(pads[0]), "--pad-left", str(pads[1]),
+        "--pad-bottom", str(pads[2]), "--pad-right", str(pads[3]),
+        "--xclbin-path", str(xclbin), "--insts-path", str(insts),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.returncode:
+        raise RuntimeError(f"IRON MaxPool compile failed for {key}:\n{completed.stdout}\n{completed.stderr}")
+    missing = [str(path) for path in (xclbin, insts) if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"compiler reported success but did not create: {', '.join(missing)}")
+    return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
@@ -196,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     compiled_qadd: dict[tuple[Any, ...], dict[str, str]] = {}
     compiled_mul: dict[tuple[int, float], dict[str, str]] = {}
     compiled_gap: dict[tuple[int, int, int], dict[str, str]] = {}
+    compiled_pool: dict[tuple[Any, ...], dict[str, str]] = {}
     report = dict(render_build_manifest(plan, model=model, columns=args.columns, source=str(args.example)))
     fused_relu_indices = {
         int(index)
@@ -212,6 +250,20 @@ def main(argv: list[str] | None = None) -> int:
         if artifact is None:
             artifact = _compile_global_avgpool(*cache_key, args.device, args.artifact_dir)
             compiled_gap[cache_key] = artifact
+        item["compiled_artifact"] = artifact
+        item["compile_status"] = "compiled"
+    for item in report["operation_kernels"]:
+        if item["status"] != "compilable_maxpool_f32":
+            continue
+        params = item["parameters"]
+        cache_key = tuple(
+            (key, tuple(value) if isinstance(value, list) else value)
+            for key, value in sorted(params.items()) if key != "input_name"
+        )
+        artifact = compiled_pool.get(cache_key)
+        if artifact is None:
+            artifact = _compile_maxpool(params, args.device, args.artifact_dir)
+            compiled_pool[cache_key] = artifact
         item["compiled_artifact"] = artifact
         item["compile_status"] = "compiled"
     for item in report["operation_kernels"]:
@@ -283,13 +335,13 @@ def main(argv: list[str] | None = None) -> int:
     report["compile_all_specs"] = args.compile_all
     report["optimize_small_m"] = args.optimize_small_m
     report["compile_device"] = args.device
-    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu) + len(compiled_qadd) + len(compiled_mul) + len(compiled_gap)
-    report["compiled_operator_kernel_count"] = len(compiled_relu) + len(compiled_qadd) + len(compiled_mul) + len(compiled_gap)
+    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu) + len(compiled_qadd) + len(compiled_mul) + len(compiled_gap) + len(compiled_pool)
+    report["compiled_operator_kernel_count"] = len(compiled_relu) + len(compiled_qadd) + len(compiled_mul) + len(compiled_gap) + len(compiled_pool)
     report["graph_runtime_blockers"] = [
         "NCHW im2col packing and logical-to-padded GEMM staging",
         "QDQ scale/zero-point conversion and Conv bias/requantization",
         "runtime dispatch wiring for compiled standalone operators",
-        "MaxPool, generic QDQ conversion, and tensor-layout kernels",
+        "generic QDQ conversion and tensor-layout kernels",
     ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

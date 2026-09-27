@@ -253,8 +253,16 @@ for 2,048 elements. Broadcasts by non-scalar tensors remain unsupported.
 Batch-one NCHW float32 `GlobalAveragePool` now lowers to a channel-tiled AIE
 reduction. Each tile reads contiguous channel planes and emits their means;
 the 2,048-channel, 7×7 shape compiled and matched NumPy on the NPU. A 1×1
-spatial input is emitted as a zero-copy view. MaxPool and general AveragePool
-remain native-kernel gaps.
+spatial input is emitted as a zero-copy view.
+
+Batch-one NCHW float32 2D `MaxPool` with unit dilation and floor output sizing
+now lowers to a row-streamed kernel. Codegen records the original padding and
+the runtime must supply `-inf`-padded input rows; the kernel streams row slabs
+so the full activation does not need to fit in core memory. Both the ResNet
+quicktest 16×16→8×8 pool and the standard 112×112→56×56 stem pool compiled and
+matched NumPy on the NPU. General `AveragePool`, MaxPool indices, and other data
+types remain unsupported. Compiled pooling artifacts still need graph-runner
+dispatch wiring.
 
 `Flatten` and `Reshape` are emitted as zero-copy contiguous tensor views, with
 their input/output shapes carried in the operation record. They require no AIE

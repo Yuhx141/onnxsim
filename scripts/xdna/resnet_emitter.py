@@ -231,6 +231,7 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
         mul_identity = False
         gap = None
         gap_identity = False
+        maxpool = None
         qadd_inputs = tuple(str(value) for value in node.input if value)
         qadd_outputs = tuple(str(value) for value in node.output if value)
         qadd_node_indices: Tuple[int, ...] = (node_index,)
@@ -327,6 +328,45 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
                         "tile_channels": tile_channels,
                         "dtype": "float32",
                     }
+        if op == "MaxPool" and len(node.input) == 1 and len(node.output) == 1:
+            input_name, output_name = str(node.input[0]), str(node.output[0])
+            input_shape = shapes.get(input_name)
+            output_shape = shapes.get(output_name)
+            attrs = _attributes(node)
+            kernel_shape = tuple(int(value) for value in attrs.get("kernel_shape", ()))
+            strides = tuple(int(value) for value in attrs.get("strides", (1, 1)))
+            dilations = tuple(int(value) for value in attrs.get("dilations", (1, 1)))
+            pads = tuple(int(value) for value in attrs.get("pads", (0, 0, 0, 0)))
+            if (
+                input_name in float32_values
+                and input_shape is not None and len(input_shape) == 4 and input_shape[0] == 1
+                and output_shape is not None and len(output_shape) == 4 and output_shape[0] == 1
+                and len(kernel_shape) == 2 and len(strides) == 2 and len(dilations) == 2
+                and len(pads) == 4 and all(value > 0 for value in kernel_shape + strides)
+                and dilations == (1, 1) and int(attrs.get("ceil_mode", 0)) == 0
+                and output_shape[1] == input_shape[1]
+            ):
+                _, channels, in_h, in_w = input_shape
+                _, _, out_h, out_w = output_shape
+                expected_h = (in_h + pads[0] + pads[2] - kernel_shape[0]) // strides[0] + 1
+                expected_w = (in_w + pads[1] + pads[3] - kernel_shape[1]) // strides[1] + 1
+                tile_rows = next((tile for tile in (8, 4, 2, 1) if out_h % tile == 0), 1)
+                if (out_h, out_w) == (expected_h, expected_w):
+                    maxpool = {
+                        "channels": channels,
+                        "input_height": in_h + pads[0] + pads[2],
+                        "input_width": in_w + pads[1] + pads[3],
+                        "output_height": out_h,
+                        "output_width": out_w,
+                        "kernel_height": kernel_shape[0],
+                        "kernel_width": kernel_shape[1],
+                        "stride_height": strides[0],
+                        "stride_width": strides[1],
+                        "tile_output_rows": tile_rows,
+                        "pads": list(pads),
+                        "pad_value": "-inf",
+                        "dtype": "float32",
+                    }
         result.append(OperationArtifactSpec(
             node_index=node_index,
             node_name=dispatch.node_names[0],
@@ -334,6 +374,7 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             lowering=(
                 "quantized_add_relu_u8" if qadd is not None
                 else "global_avgpool_nchw_f32" if gap is not None
+                else "maxpool2d_nchw_f32" if maxpool is not None
                 else "identity_device_view" if gap_identity
                 else "identity_device_view" if mul_identity
                 else "mul_scalar_f32" if mul_scalar is not None
@@ -347,6 +388,7 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             status=(
                 "compilable_quantized_add_relu" if qadd is not None
                 else "compilable_global_avgpool_f32" if gap is not None
+                else "compilable_maxpool_f32" if maxpool is not None
                 else "zero_copy_device_view" if gap_identity
                 else "zero_copy_device_view" if mul_identity
                 else "compilable_mul_scalar_f32" if mul_scalar is not None
@@ -360,6 +402,7 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             ),
             parameters=(
                 {**gap, "input_name": str(node.input[0])} if gap is not None
+                else {**maxpool, "input_name": str(node.input[0])} if maxpool is not None
                 else mul_scalar
             ),
         ))
