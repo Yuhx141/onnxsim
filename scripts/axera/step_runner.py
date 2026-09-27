@@ -213,6 +213,35 @@ def _segment_for(
     def q(ts):
         return [qparams_of(calib, t) for t in ts]
 
+    # Exact algebraic reduction for optimizer masks that are literally all
+    # ones.  The live and output quantization records must match, otherwise
+    # removing the binary would change the graph's quantization boundary.
+    if (
+        op == "Mul"
+        and rec.get("attrs", {}).get("form") == "const"
+        and rec.get("attrs", {}).get("constant_input") is not None
+    ):
+        const_index = int(rec["attrs"]["constant_input"])
+        const_name = ins[const_index]
+        live_name = ins[1 - const_index]
+        value = inits.get(const_name)
+        if (
+            value is not None
+            and np.all(np.asarray(value) == 1)
+            and qparams_of(calib, live_name) == qparams_of(calib, outs[0])
+        ):
+            return Segment(
+                name,
+                "algebraic_identity",
+                [name],
+                [live_name],
+                outs,
+                "Mul by an all-ones initializer reduced to Identity",
+                lambda: None,
+                q([live_name]),
+                q(outs),
+            )
+
     if detail.startswith("matmul_record_emit.recalibrate"):
         entry = mre.step_template(name)
         tmpl = mre.load_model(entry["axmodel"])
@@ -903,6 +932,9 @@ class StepRunner:
                 ):
                     env[t] = v
             if seg is not None and mode != "float" and self.fire_at[seg.name] == k:
+                if seg.kind == "algebraic_identity":
+                    env[seg.outputs[0]] = env[seg.inputs[0]]
+                    continue
                 st = SegStat(seg.name, seg.kind, len(seg.nodes))
                 t1 = time.time()
                 sim = self._sim(seg, env) if (mode == "sim" or check) else None
