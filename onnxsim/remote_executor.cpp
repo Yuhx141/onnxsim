@@ -296,8 +296,13 @@ class RemoteModelExecutor final : public ModelExecutor {
 
   std::shared_ptr<const CompiledArtifact> GetOrCompile(
       const std::string& serialized) const {
+    std::unique_lock<std::mutex> cache_lock(cache_mu_, std::defer_lock);
     if (options_.cache_compiled_models) {
-      std::lock_guard<std::mutex> lock(cache_mu_);
+      // Keep the per-executor cache lock through compilation and optional
+      // attachment. This is intentionally a simple single-flight policy:
+      // concurrent folds for the same model cannot duplicate an expensive
+      // external compiler invocation or race a runner-side load.
+      cache_lock.lock();
       const auto it = compiled_cache_.find(serialized);
       if (it != compiled_cache_.end()) return it->second;
     }
@@ -365,7 +370,6 @@ class RemoteModelExecutor final : public ModelExecutor {
     // the artifact, a later retry must compile/attach again rather than
     // reusing an artifact that onnxsim believes is resident remotely.
     if (options_.cache_compiled_models) {
-      std::lock_guard<std::mutex> lock(cache_mu_);
       compiled_cache_[serialized] = artifact;
     }
     return artifact;
