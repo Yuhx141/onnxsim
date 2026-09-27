@@ -27,6 +27,9 @@ if (ONNXSIM_REMOTE_DORA_STUB)
   endif()
   add_library(onnx_remote_dora_api_stub STATIC
               test/dora_node_api_stub/node_api.cpp)
+  target_include_directories(onnx_remote_dora_api_stub PRIVATE
+                             "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(onnx_remote_dora_api_stub PUBLIC onnx_remote_transport)
   set(DORA_NODE_API_INCLUDE_DIR
       "${CMAKE_CURRENT_SOURCE_DIR}/test/dora_node_api_stub")
   set(DORA_NODE_API_LIBRARY onnx_remote_dora_api_stub)

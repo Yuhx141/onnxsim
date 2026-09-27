@@ -165,6 +165,21 @@ cmake -S tools/onnx-remote -B build/onnx-remote-dora \
 cmake --build build/onnx-remote-dora --target onnx-remote-dora-node
 ```
 
+The same stub can exercise the forwarding path against the reference worker,
+without installing DORA. Set `ONNXSIM_DORA_STUB_RUNTIME=1`; it injects a
+synthetic `relu` input into the node and validates the binary response,
+including request correlation and output values. For example:
+
+```sh
+ONNXSIM_DORA_STUB_RUNTIME=1 \
+  build/onnx-remote-dora/onnx-remote-worker --port 39501 &
+ONNXSIM_DORA_STUB_RUNTIME=1 \
+  build/onnx-remote-dora/onnx-remote-dora-node
+```
+
+This is a transport/adapter integration test only; it does not emulate DORA's
+actual graph scheduler or discovery daemon.
+
 Set `ONNXSIM_DORA_REMOTE_HOST` and `ONNXSIM_DORA_REMOTE_PORT` in the node's
 environment to select the native worker (defaults are `127.0.0.1:39501`). A
 minimal dataflow declares `run` as the node input and `result` as its output.
