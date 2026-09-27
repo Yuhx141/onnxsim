@@ -231,6 +231,11 @@ build/onnx-remote-ros2-bridge --ros-args \
   -p discovery_topic:=onnx_remote/runners
 ```
 
+Discovery verifies each candidate by querying its native `capabilities`
+operation before selecting it (`verify_discovery:=true` by default). Set it to
+false only when the announced endpoint is intentionally unavailable during
+startup; the first tensor request will then perform the connectivity check.
+
 The announcing bridge can advertise a Tailscale address or DNS name with
 `advertise_host:=100.x.y.z`. Discovery is only the ROS2 control plane; tensor
 payloads still use the binary `run`/`result` topics and the selected bridge's

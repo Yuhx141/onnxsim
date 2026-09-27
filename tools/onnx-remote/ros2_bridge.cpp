@@ -58,6 +58,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     discovery_topic_ = declare_parameter<std::string>("discovery_topic",
                                                       "onnx_remote/runners");
     discovery_target_ = declare_parameter<std::string>("discovery_target", "");
+    verify_discovery_ = declare_parameter<bool>("verify_discovery", true);
     announce_period_ms_ = declare_parameter<int>("announce_period_ms", 5000);
     discovery_timeout_ms_ =
         declare_parameter<int>("discovery_timeout_ms", 15000);
@@ -112,10 +113,11 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   }
 
  private:
-  bool query_capabilities(onnx_remote::Response& response,
-                          std::string& error) const {
+  bool query_capabilities_at(const std::string& host, int port,
+                             onnx_remote::Response& response,
+                             std::string& error) const {
     const int fd = onnx_remote::connect_tcp_timeout(
-        host_, static_cast<uint16_t>(port_), connect_timeout_ms_);
+        host, static_cast<uint16_t>(port), connect_timeout_ms_);
     if (fd < 0) {
       error = "remote worker capability connection failed";
       return false;
@@ -134,6 +136,11 @@ class OnnxRemoteBridge final : public rclcpp::Node {
       return false;
     }
     return true;
+  }
+
+  bool query_capabilities(onnx_remote::Response& response,
+                          std::string& error) const {
+    return query_capabilities_at(host_, port_, response, error);
   }
 
   static std::string json_string(const std::string& json,
@@ -205,6 +212,16 @@ class OnnxRemoteBridge final : public rclcpp::Node {
       if (age.count() <= discovered_timeout_ms_) {
         // Keep a live lease stable instead of switching based on DDS delivery
         // order when multiple matching runners announce periodically.
+        return;
+      }
+    }
+    if (verify_discovery_) {
+      onnx_remote::Response capabilities;
+      std::string error;
+      if (!query_capabilities_at(host, port, capabilities, error)) {
+        RCLCPP_WARN(get_logger(),
+                    "ignoring discovered runner %s at %s:%d: %s", id.c_str(),
+                    host.c_str(), port, error.c_str());
         return;
       }
     }
@@ -294,6 +311,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   int connect_timeout_ms_;
   int io_timeout_ms_;
   bool auto_discover_;
+  bool verify_discovery_ = true;
   int announce_period_ms_ = 5000;
   int discovery_timeout_ms_ = 15000;
   bool discovered_ = false;
