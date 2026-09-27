@@ -152,13 +152,22 @@ python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
 It matched both `/layer1/layer1.1` and `/layer1/layer1.2` exactly at their
 quantized boundaries, including their different requantization shifts and
 residual scale ratios. Explicit 4×4 spatial specialization also compiles.
-The generalized binder accepts batch-one identity blocks with height at least
-3, 1×1/3×3/1×1 kernels, symmetric padding, even inner channels, uint8 activations with zero
-point 128, int8 weights, and power-of-two requantization ratios. The graph
+The generalized binder accepts batch-one identity and projection blocks with
+1×1/3×3/1×1 main-path kernels, symmetric padding, even inner channels, uint8
+activations with zero point 128, int8 weights, and power-of-two requantization
+ratios. Identity blocks support height one and above. The graph
 runner can compose multiple non-overlapping blocks in one run by repeating
 `--fused-block PREFIX XCLBIN INSTS`. The quicktest graph ran with both layer1
 identity blocks fused and retained exact ONNX Runtime output; the execution
 counts dropped to 46 CPU Conv calls, one XDNA Conv call, and 194 host ops.
+
+All 16 ResNet bottlenecks, including the four projection blocks, now run on
+XDNA. Adjacent blocks reuse their raw activation buffers on device: a full
+quicktest run reported 15 device-resident handoffs, one edge readback, and
+exact ONNX Runtime output. With the stem Conv on CPU and the classifier-side
+operators on the host, one timed iteration measured 189.4 ms after a 1.33 s
+cold run. The 16 bottleneck calls accounted for 186.1 ms, so this validates
+coverage and data movement rather than a speedup target.
 
 The NPU2 data mover limits a single weight descriptor to 65,532 bytes. The
 fused path streams weights in bounded chunks, and the binder now covers
@@ -166,10 +175,8 @@ projection/downsample residuals with power-of-two QDQ scales. The four
 projection blocks bind with tile-memory-aware skip chunks. The
 `/layer2/layer2.1` identity block remains an on-device exactness checkpoint.
 Small spatial identity blocks at H=2 and H=1 also matched the reference on
-device. Projection execution still needs full-model hardware validation; its
-larger blocks use smaller chunks to fit the producer tile. This is not yet
-graph-wide device execution: the scalar
-integer kernel is a correctness baseline, and the 91-dispatch graph schedule
+device. Full graph execution is still incomplete: the stem, pooling, and
+classifier-side operators run on the host, and the 91-dispatch graph schedule
 remains planning metadata rather than one executable XDNA program.
 
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial

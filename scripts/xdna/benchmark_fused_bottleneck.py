@@ -256,7 +256,7 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     live_tensor_bytes = (
         int(np.prod(input_shape))
         + int(np.prod((1, mid_channels, height, width)))
-        + (int(np.prod(output_shape)) if projection else 0)
+        + int(np.prod(output_shape))
     )
     max_chunk_bytes = min(36864, tile_memory_bytes - worker_stack_bytes - live_tensor_bytes)
     if max_chunk_bytes <= 0:

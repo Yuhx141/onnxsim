@@ -188,6 +188,7 @@ class XDNAResNetRunner:
         self._profile: dict[str, float] = {}
         self._device_readback_cache: dict[int, np.ndarray] = {}
         self._conv_times: list[dict[str, Any]] = []
+        self._fused_times: list[dict[str, Any]] = []
         self._workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
         # ONNX weights are constants. Keep their padded GEMM layout so steady
         # state inference only packs the changing activation matrix.
@@ -239,6 +240,7 @@ class XDNAResNetRunner:
                 "parameters": block_parameters,
                 "output": block_output,
                 "kernel": self._kernel(str(xclbin), str(insts)),
+                "xclbin": str(xclbin),
             }
             for index in covered:
                 self._fused_nodes[index] = (prefix, index == start_index)
@@ -542,10 +544,18 @@ class XDNAResNetRunner:
 
         launch_start = time.perf_counter()
         block["kernel"](block_input, block["parameters"], block["output"])
+        kernel_ms = (time.perf_counter() - launch_start) * 1000.0
         self._profile["fused_bottleneck_kernel_call_ms"] = (
             self._profile.get("fused_bottleneck_kernel_call_ms", 0.0)
-            + (time.perf_counter() - launch_start) * 1000.0
+            + kernel_ms
         )
+        self._fused_times.append({
+            "prefix": binding["block"].prefix,
+            "input_shape": list(binding["input_shape"]),
+            "output_shape": list(binding["output_shape"]),
+            "device_resident_input": isinstance(activation, _DeviceValue),
+            "elapsed_ms": kernel_ms,
+        })
 
         output_shape = tuple(int(value) for value in binding["output_shape"])
         device_output = _DeviceValue(
@@ -580,6 +590,7 @@ class XDNAResNetRunner:
         self._profile = {}
         self._device_readback_cache = {}
         self._conv_times = []
+        self._fused_times = []
         self._precomputed_relu_nodes: set[int] = set()
         values = dict(self.arrays)
         values.update(inputs)
@@ -727,6 +738,8 @@ def main() -> int:
         "model": str(args.model),
         "graph_dispatches": runner.codegen.estimated_dispatches,
         "execution_counts": runner._executed,
+        "unique_fused_xclbins_used": len({item["xclbin"] for item in runner._fused_blocks.values()}),
+        "fused_block_timings": runner._fused_times,
         "profile_ms": runner._profile,
         "slowest_conv_nodes": sorted(
             runner._conv_times, key=lambda item: item["elapsed_ms"], reverse=True
