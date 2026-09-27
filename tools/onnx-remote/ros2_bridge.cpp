@@ -59,6 +59,10 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                                                       "onnx_remote/runners");
     discovery_target_ = declare_parameter<std::string>("discovery_target", "");
     verify_discovery_ = declare_parameter<bool>("verify_discovery", true);
+    publish_discovery_status_ =
+        declare_parameter<bool>("publish_discovery_status", true);
+    discovery_status_topic_ = declare_parameter<std::string>(
+        "discovery_status_topic", "onnx_remote/discovery_status");
     announce_period_ms_ = declare_parameter<int>("announce_period_ms", 5000);
     discovery_timeout_ms_ =
         declare_parameter<int>("discovery_timeout_ms", 15000);
@@ -75,6 +79,10 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     discovery_sub_ = create_subscription<String>(
         discovery_topic_, rclcpp::QoS(10).transient_local().reliable(),
         [this](const String::SharedPtr message) { discover(message); });
+    if (publish_discovery_status_) {
+      discovery_status_ = create_publisher<String>(discovery_status_topic_,
+                                                   rclcpp::QoS(10));
+    }
     announce_timer_ = create_wall_timer(
         std::chrono::milliseconds(std::max(100, announce_period_ms_)),
         [this]() {
@@ -181,6 +189,23 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     profile_->publish(std::move(message));
   }
 
+  void publish_discovery_status(const std::string& state,
+                                const std::string& runner_id,
+                                const std::string& host, int port,
+                                const std::string& error = {}) {
+    if (!publish_discovery_status_ || discovery_status_ == nullptr) return;
+    String message;
+    message.data = "{\"schema_version\":1,\"state\":\"" +
+                   json_escape(state) + "\",\"runner_id\":\"" +
+                   json_escape(runner_id) + "\",\"host\":\"" +
+                   json_escape(host) + "\",\"port\":" +
+                   std::to_string(port);
+    if (!error.empty())
+      message.data += ",\"error\":\"" + json_escape(error) + "\"";
+    message.data += "}";
+    discovery_status_->publish(std::move(message));
+  }
+
   void announce() {
     String message;
     message.data = "{\"schema_version\":1,\"runner_id\":\"" +
@@ -219,6 +244,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
       onnx_remote::Response capabilities;
       std::string error;
       if (!query_capabilities_at(host, port, capabilities, error)) {
+        publish_discovery_status("rejected", id, host, port, error);
         RCLCPP_WARN(get_logger(),
                     "ignoring discovered runner %s at %s:%d: %s", id.c_str(),
                     host.c_str(), port, error.c_str());
@@ -234,6 +260,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                                  : discovery_timeout_ms_;
     discovered_ = true;
     discovered_runner_id_ = id;
+    publish_discovery_status("selected", id, host_, port_);
     RCLCPP_INFO(get_logger(), "auto-discovered runner %s at %s:%d", id.c_str(),
                 host_.c_str(), port_);
   }
@@ -245,8 +272,13 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     if (age.count() <= discovered_timeout_ms_) return;
     RCLCPP_WARN(get_logger(), "discovered runner expired after %ld ms",
                 static_cast<long>(age.count()));
+    const std::string expired_runner_id = discovered_runner_id_;
+    const std::string expired_host = host_;
+    const int expired_port = port_;
     host_ = configured_host_;
     port_ = configured_port_;
+    publish_discovery_status("expired", expired_runner_id, expired_host,
+                             expired_port);
     discovered_ = false;
     discovered_runner_id_.clear();
   }
@@ -312,6 +344,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   int io_timeout_ms_;
   bool auto_discover_;
   bool verify_discovery_ = true;
+  bool publish_discovery_status_ = true;
   int announce_period_ms_ = 5000;
   int discovery_timeout_ms_ = 15000;
   bool discovered_ = false;
@@ -320,6 +353,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   bool publish_profile_ = true;
   std::chrono::steady_clock::time_point last_discovery_{};
   std::string discovery_topic_;
+  std::string discovery_status_topic_;
   std::string discovery_target_;
   std::string advertise_host_;
   std::string runner_id_;
@@ -327,6 +361,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   rclcpp::Publisher<UInt8MultiArray>::SharedPtr result_;
   rclcpp::Publisher<String>::SharedPtr profile_;
   rclcpp::Publisher<String>::SharedPtr discovery_;
+  rclcpp::Publisher<String>::SharedPtr discovery_status_;
   rclcpp::Subscription<UInt8MultiArray>::SharedPtr run_;
   rclcpp::Subscription<String>::SharedPtr discovery_sub_;
   rclcpp::TimerBase::SharedPtr announce_timer_;

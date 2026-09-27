@@ -249,6 +249,14 @@ After the lease expires, the next matching announcement is selected and the
 bridge returns to its configured `remote_host`/`remote_port` if no replacement
 appears.
 
+Discovery transitions are published as JSON diagnostics on
+`onnx_remote/discovery_status` by default. Override the topic with
+`discovery_status_topic:=...`, or disable it with
+`publish_discovery_status:=false`. Messages have `schema_version: 1` and a
+`state` of `selected`, `rejected`, or `expired`, together with the runner ID,
+host, and port; rejected messages also include an `error` string. This topic is
+only a control/status surface: tensor and profile payloads remain binary.
+
 The bridge exposes `health` and `capabilities` for ROS2 discovery/selection;
 both services query the selected worker, while tensor and profile data remain
 binary rather than being converted to ROS messages. The `capabilities` service
