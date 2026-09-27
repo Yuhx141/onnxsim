@@ -1643,13 +1643,33 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         )
 
     def lower_matmul(node):
+        def const_mul(value, candidate):
+            if candidate.op is not Ops.MUL or len(candidate.src) != 2:
+                return None
+            left, right = candidate.src
+            if left.op is Ops.CONST and float(left.arg) == value:
+                return right
+            if right.op is Ops.CONST and float(right.arg) == value:
+                return left
+            return None
+
         bias = None
         if node.op is Ops.ADD and len(node.src) == 2:
             candidate, other = node.src
-            if candidate.op is Ops.REDUCE and other.op is Ops.ALLOC:
+            if const_mul(0.0, candidate) is not None:
+                # ONNX Gemm with beta=0 still arrives from tinygrad as an
+                # explicit zero-scaled bias allocation.  It is semantically
+                # inactive, so remove only this exact wrapper.
+                node = other
+            elif const_mul(0.0, other) is not None:
+                node = candidate
+            elif candidate.op is Ops.REDUCE and other.op is Ops.ALLOC:
                 node, bias = candidate, other
             elif other.op is Ops.REDUCE and candidate.op is Ops.ALLOC:
                 node, bias = other, candidate
+        reduced = const_mul(1.0, node)
+        if reduced is not None and reduced.op is Ops.REDUCE:
+            node = reduced
         if node.op is not Ops.REDUCE or node.arg[0] is not Ops.ADD or node.arg[1] != 1:
             return None
         if not node.src or node.src[0].op is not Ops.PERMUTE:

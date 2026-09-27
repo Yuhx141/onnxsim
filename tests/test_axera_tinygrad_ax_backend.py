@@ -1236,6 +1236,43 @@ def test_lower_tinygrad_rank2_gemm_uop_to_onnx():
     assert [value.name for value in lowered.graph.input] == ["x", "z", "b"]
 
 
+def test_lower_onnx_gemm_beta_zero_to_matmul_uop():
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Gemm",
+                    ["x", "z", "b"],
+                    ["y"],
+                    alpha=1.0,
+                    beta=0.0,
+                    transA=0,
+                    transB=0,
+                )
+            ],
+            "gemm_beta_zero_to_uop",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 1000]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, [1000, 512]
+                ),
+                onnx.helper.make_tensor_value_info("b", onnx.TensorProto.FLOAT, [512]),
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 512]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    lowered = axb.lower_uop_to_onnx(axb.onnx_to_uop(model))
+    assert [node.op_type for node in lowered.graph.node] == ["MatMul"]
+    assert [value.name for value in lowered.graph.input] == ["x", "z"]
+
+
 def test_lower_tinygrad_stem_conv_uop_to_onnx():
     from tinygrad import Tensor
 
