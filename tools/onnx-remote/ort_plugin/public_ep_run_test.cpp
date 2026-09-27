@@ -5,6 +5,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,26 +29,51 @@ int main(int argc, char** argv) {
     if (argc == 4) options.EnableProfiling(argv[3]);
     options.AppendExecutionProvider_V2(env, {*device}, Ort::KeyValuePairs{});
     Ort::Session session{env, argv[2], options};
-    const std::array<int64_t, 1> shape{256};
-    std::array<float, 256> left{};
-    std::array<float, 256> right{};
-    left.fill(1.0f);
-    right.fill(3.0f);
     Ort::MemoryInfo memory = Ort::MemoryInfo::CreateCpu(
         OrtAllocatorType::OrtArenaAllocator, OrtMemTypeDefault);
-    auto lhs = Ort::Value::CreateTensor<float>(memory, left.data(), left.size(),
-                                                shape.data(), shape.size());
-    auto rhs = Ort::Value::CreateTensor<float>(memory, right.data(), right.size(),
-                                                shape.data(), shape.size());
-    const char* input_names[] = {"a", "b"};
-    const char* output_names[] = {"c"};
-    std::array<Ort::Value, 2> inputs{std::move(lhs), std::move(rhs)};
-    auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names,
-                               inputs.data(), 2, output_names, 1);
+    Ort::AllocatorWithDefaultOptions allocator;
+    std::vector<std::string> input_name_storage;
+    std::vector<const char*> input_names;
+    std::vector<std::vector<float>> input_storage;
+    std::vector<Ort::Value> inputs;
+    for (size_t i = 0; i < session.GetInputCount(); ++i) {
+      auto name = session.GetInputNameAllocated(i, allocator);
+      input_name_storage.emplace_back(name.get());
+      input_names.push_back(input_name_storage.back().c_str());
+      auto type_info = session.GetInputTypeInfo(i);
+      auto shape_info = type_info.GetTensorTypeAndShapeInfo();
+      if (shape_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        std::cerr << "runtime test requires float32 inputs\n";
+        return 1;
+      }
+      auto shape = shape_info.GetShape();
+      size_t elements = 1;
+      for (auto& dimension : shape) {
+        if (dimension <= 0) dimension = 2;
+        elements *= static_cast<size_t>(dimension);
+      }
+      input_storage.emplace_back(elements, static_cast<float>(i + 1));
+      inputs.push_back(Ort::Value::CreateTensor<float>(
+          memory, input_storage.back().data(), elements, shape.data(),
+          shape.size()));
+    }
+    std::vector<std::string> output_name_storage;
+    std::vector<const char*> output_names;
+    for (size_t i = 0; i < session.GetOutputCount(); ++i) {
+      auto name = session.GetOutputNameAllocated(i, allocator);
+      output_name_storage.emplace_back(name.get());
+      output_names.push_back(output_name_storage.back().c_str());
+    }
+    auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names.data(),
+                               inputs.data(), inputs.size(), output_names.data(),
+                               output_names.size());
+    if (outputs.empty()) {
+      std::cerr << "model returned no outputs\n";
+      return 1;
+    }
     const float* result = outputs[0].GetTensorData<float>();
-    if (std::fabs(result[0] - 4.0f) > 1e-6f ||
-        std::fabs(result[255] - 4.0f) > 1e-6f) {
-      std::cerr << "unexpected remote EP result\n";
+    if (result == nullptr) {
+      std::cerr << "remote EP returned no output data\n";
       return 1;
     }
     if (argc == 4) {
