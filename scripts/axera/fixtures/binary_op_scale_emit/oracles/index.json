@@ -3465,6 +3465,32 @@
   },
   "byte_exact_outside_segment0": false,
   "same_input_order": true,
-  "source": "native_zp255_shape_probe_mul_16x1000"
+ "source": "native_zp255_shape_probe_mul_16x1000"
+ },
+ "div_1x1_x255_y255_z0_h1.axmodel.gz": {
+  "op": "Div",
+  "shape": [1, 1],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.0007843137136660516,
+   "y": 0.03921568766236305
+  },
+  "zero_points": {"x": 255, "z": 0, "y": 255},
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+  "source": "native_zp255_shape_probe_div_1x1"
+ },
+ "div_16x1000_x255_y255_z0_h1.axmodel.gz": {
+  "op": "Div",
+  "shape": [16, 1000],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.003921568859368563,
+   "y": 0.03921568766236305
+  },
+  "zero_points": {"x": 255, "z": 0, "y": 255},
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+  "source": "native_zp255_shape_probe_div_16x1000"
  }
 }

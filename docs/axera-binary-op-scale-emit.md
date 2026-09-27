@@ -85,7 +85,8 @@ inventory now also covers Add `[1,1]`, Mul `[1,1]`/`[16,1000]` at
 `x255,y255,z0`, and the earlier Mul `[1,1]` shape. Remaining shape outliers
 include Mul `[1024,9,3136]`/`[16,64,112,112]`.
 Each (op, shape) has the available zero-point classes, normally
-`x0,y0,z0` and `x128,y128,z128`; Mul additionally has `x255,y255,z0`;
+`x0,y0,z0` and `x128,y128,z128`; Mul and Div additionally have
+`x255,y255,z0` on the validated `[1,1]`/`[16,1000]` shapes;
 Div uses `x128,y128,z0` because the step's denominators (`sqrt(v)+eps`) are
 positive. Each class got a template and a held-out Pulsar2 build at another
 calibration, with ranges `[1.3, 0.7]` against `[2.1, 0.9]` (`[0.37, 0.29]` or

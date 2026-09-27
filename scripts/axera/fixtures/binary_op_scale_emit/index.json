@@ -3302,6 +3302,30 @@
    "z": 0,
    "y": 255
   },
-  "source": "native_zp255_shape_probe_mul_16x1000"
+ "source": "native_zp255_shape_probe_mul_16x1000"
+ },
+ "Div:1x1:x255,y255,z0": {
+  "file": "div_1x1_x255_y255_z0.axmodel.gz",
+  "op": "Div",
+  "shape": [1, 1],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.0007843137136660516,
+   "y": 0.03921568766236305
+  },
+  "zero_points": {"x": 255, "z": 0, "y": 255},
+  "source": "native_zp255_shape_probe_div_1x1"
+ },
+ "Div:16x1000:x255,y255,z0": {
+  "file": "div_16x1000_x255_y255_z0.axmodel.gz",
+  "op": "Div",
+  "shape": [16, 1000],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.003921568859368563,
+   "y": 0.03921568766236305
+  },
+  "zero_points": {"x": 255, "z": 0, "y": 255},
+  "source": "native_zp255_shape_probe_div_16x1000"
  }
 }

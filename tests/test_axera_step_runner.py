@@ -877,6 +877,8 @@ def test_onnx_constant_first_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
         ("div", "div_1x1_x128_y128_z0", (1, 1), -0.5, 0.5, -1.0),
         ("mul", "mul_1x1_x255_y255_z0", (1, 1), -0.5, 0.25, -0.125),
         ("mul", "mul_16x1000_x255_y255_z0", (16, 1000), -0.5, 0.25, -0.125),
+        ("div", "div_1x1_x255_y255_z0", (1, 1), -0.5, 0.2, -2.5),
+        ("div", "div_16x1000_x255_y255_z0", (16, 1000), -0.5, 0.5, -1.0),
     ],
 )
 def test_native_binary_shape_templates_run_on_axcl_vm(
