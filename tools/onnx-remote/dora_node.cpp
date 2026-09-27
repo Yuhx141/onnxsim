@@ -101,6 +101,12 @@ bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
 void report_error(void* context, const std::string& error,
                   uint64_t request_id = 0) {
   dora_log(context, "error", 5, error.data(), error.size());
+  if (std::getenv("ONNXSIM_DORA_ANNOUNCE") != nullptr) {
+    const std::string status = onnx_remote::dora::readiness_status(
+        false, env_string("ONNXSIM_DORA_REMOTE_HOST", "127.0.0.1"),
+        env_port(), error);
+    dora_send_output(context, "status", 6, status.data(), status.size());
+  }
   Response response;
   response.ok = false;
   response.request_id = request_id;

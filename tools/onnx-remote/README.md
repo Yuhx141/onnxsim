@@ -190,6 +190,9 @@ capabilities output contains a short error object. The adapter also accepts
 The status output uses `schema_version: 1` and includes the selected host and
 port. When the capability probe fails, its escaped error is included in both
 the status object and the `ready: false` capabilities object.
+With `ONNXSIM_DORA_ANNOUNCE=1`, later forwarding failures also publish an
+`unavailable` status event while preserving the lossless binary error response
+on `result`.
 
 ## ROS2 bridge
 
