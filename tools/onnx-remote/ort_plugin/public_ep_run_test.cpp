@@ -52,12 +52,17 @@ int main(int argc, char** argv) {
     Ort::MemoryInfo memory = Ort::MemoryInfo::CreateCpu(
         OrtAllocatorType::OrtArenaAllocator, OrtMemTypeDefault);
     Ort::AllocatorWithDefaultOptions allocator;
+    const size_t input_count = session.GetInputCount();
     std::vector<std::string> input_name_storage;
     std::vector<const char*> input_names;
+    // Reserve before taking c_str() pointers: pushing more names must not
+    // reallocate and dangle the pointers handed to Session::Run.
+    input_name_storage.reserve(input_count);
+    input_names.reserve(input_count);
     std::vector<std::vector<float>> input_storage;
     std::vector<std::vector<uint8_t>> raw_input_storage;
     std::vector<Ort::Value> inputs;
-    for (size_t i = 0; i < session.GetInputCount(); ++i) {
+    for (size_t i = 0; i < input_count; ++i) {
       auto name = session.GetInputNameAllocated(i, allocator);
       input_name_storage.emplace_back(name.get());
       input_names.push_back(input_name_storage.back().c_str());
@@ -90,7 +95,10 @@ int main(int argc, char** argv) {
     }
     std::vector<std::string> output_name_storage;
     std::vector<const char*> output_names;
-    for (size_t i = 0; i < session.GetOutputCount(); ++i) {
+    const size_t output_count = session.GetOutputCount();
+    output_name_storage.reserve(output_count);
+    output_names.reserve(output_count);
+    for (size_t i = 0; i < output_count; ++i) {
       auto name = session.GetOutputNameAllocated(i, allocator);
       output_name_storage.emplace_back(name.get());
       output_names.push_back(output_name_storage.back().c_str());

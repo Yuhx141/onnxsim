@@ -60,6 +60,10 @@ int main(int argc, char** argv) {
     std::ifstream model_file(argv[1], std::ios::binary);
     if (!model_file) throw std::runtime_error("cannot open test model");
     request.model.assign(std::istreambuf_iterator<char>(model_file), {});
+    // Reserve before taking c_str() pointers: pushing more names must not
+    // reallocate and dangle the pointers handed to Session::Run.
+    input_names.reserve(local.GetInputCount());
+    input_name_ptrs.reserve(local.GetInputCount());
     for (size_t i = 0; i < local.GetInputCount(); ++i) {
       auto name = local.GetInputNameAllocated(i, allocator);
       input_names.emplace_back(name.get());
@@ -83,6 +87,8 @@ int main(int argc, char** argv) {
     }
     std::vector<std::string> output_names;
     std::vector<const char*> output_name_ptrs;
+    output_names.reserve(local.GetOutputCount());
+    output_name_ptrs.reserve(local.GetOutputCount());
     for (size_t i = 0; i < local.GetOutputCount(); ++i) {
       auto name = local.GetOutputNameAllocated(i, allocator);
       output_names.emplace_back(name.get());
