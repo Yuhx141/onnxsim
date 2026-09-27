@@ -357,6 +357,18 @@ def _segment_for(
                 sc, _ = _scale_dict(calib, {"x": ins[0], "z": ins[1], "y": outs[0]})
                 live = ins[:2]
 
+        # ``op_values`` is the inexpensive part of the binary emitter's
+        # validation. Reject scale-collision cases during planning instead of
+        # advertising a segment that only fails when the VM loads it: a
+        # collision is a distinct Pulsar2 program family, not a retargetable
+        # instance of the selected template.
+        if op in axb.bse.OPS:
+            try:
+                values = axb.bse.op_values(op, sc)
+                axb.bse._check_distinct(values, "target")
+            except ValueError:
+                return None
+
         def emit_ew():
             return axb.EditSet([axb.ElementwiseScaleEdit(sc)]).build(key)
 

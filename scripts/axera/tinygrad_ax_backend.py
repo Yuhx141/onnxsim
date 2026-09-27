@@ -1438,6 +1438,7 @@ def plan_at_calibration(
                 if (
                     op in ("Add", "Sub")
                     and attrs.get("form") in ("same_shape", "broadcast")
+                    and cls != "x0,y0,z0"
                     and "x128,y128,z128" in hits
                 ):
                     return "covered", (

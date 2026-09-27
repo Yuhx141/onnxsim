@@ -121,10 +121,14 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     everything, _ = sr.build_plan(model, records, calib, include_unsafe=True)
     # a node inside two chains is recomputed by both: count it once
     covered = len({n for s in everything for n in s.nodes})
-    assert (
-        covered
-        == sr.axb.coverage_report(records, calibration=calib)["totals"]["covered"]
-    )
+    report_covered = sr.axb.coverage_report(records, calibration=calib)["totals"][
+        "covered"
+    ]
+    # Three binary scale-collision cases are recognized by the graph planner
+    # but intentionally stay host-side until their separate native template
+    # family is available.
+    nonemittable = sum("no runner segment" in reason for reason in host.values())
+    assert covered + nonemittable == report_covered
     unsafe = [s for s in everything if s.unsafe]
     # signed Reshapes take the Reshape -> Identity templates, so none is unsafe
     assert not any(s.kind == "reshape" for s in unsafe)
