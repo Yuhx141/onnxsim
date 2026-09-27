@@ -133,20 +133,20 @@ launches; CPU Conv execution remains its largest cost. Closing the gap
 requires graph-level XDNA fusion and moving the
 intermediate QDQ/residual operations into the device program, like Vitis does.
 
-An optional `--cpu-backend torch` uses single-threaded PyTorch CPU Conv2d for
-the small-spatial hybrid Conv layers and skips their unused im2col staging.
-On the same quicktest and 2 warmups/10 iterations, this measured 22.7 ms with
-exact output agreement against ONNX Runtime CPU (14.2x Vitis latency). It is
-opt-in because its float32 accumulations can round very long integer dot
-products on other inputs; the default NumPy integer path retains integer
-accumulation semantics.
+An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
+hybrid Conv layers and skips their unused im2col staging. Two intra-op threads
+measured 15.7 ms and 19.0 ms in repeated quicktest runs (2 warmups/10
+iterations), with exact output agreement against ONNX Runtime CPU. These runs
+were 9.8x–11.9x slower than Vitis. It is opt-in because its float32
+accumulations can round very long integer dot products on other inputs; the
+default NumPy integer path retains integer accumulation semantics.
 
 ```bash
 python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
   --cpu-small-m 64 --warmup 2 --iters 10 --json resnet-xdna-hybrid.json
 
 python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
-  --cpu-small-m 64 --cpu-backend torch --warmup 2 --iters 10 \
+  --cpu-small-m 64 --cpu-backend torch --cpu-threads 2 --warmup 2 --iters 10 \
   --json resnet-xdna-hybrid-torch.json
 ```
 

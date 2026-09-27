@@ -98,6 +98,7 @@ class XDNAResNetRunner:
         manifest: dict[str, Any],
         cpu_small_m: int = 0,
         cpu_backend: str = "numpy",
+        cpu_threads: int = 1,
     ):
         self.model = model
         self.nodes = list(model.graph.node)
@@ -105,6 +106,8 @@ class XDNAResNetRunner:
         self.optimize_small_m = bool(manifest.get("optimize_small_m", False))
         self.cpu_small_m = max(0, int(cpu_small_m))
         self.cpu_backend = cpu_backend
+        self.cpu_threads = max(1, int(cpu_threads))
+        self._torch_initialized = False
         self.codegen = build_codegen_plan(
             model, strict=True, optimize_small_m=self.optimize_small_m
         )
@@ -333,10 +336,9 @@ class XDNAResNetRunner:
             import torch
             import torch.nn.functional as torch_f
 
-            if torch.get_num_threads() > 1:
-                # Small batch-1 feature maps lose more to thread-pool
-                # coordination than they gain from CPU parallelism.
-                torch.set_num_threads(1)
+            if not self._torch_initialized:
+                torch.set_num_threads(self.cpu_threads)
+                self._torch_initialized = True
 
             attrs = _attrs(node)
             pads = tuple(int(v) for v in attrs.get("pads", (0, 0, 0, 0)))
@@ -468,6 +470,10 @@ def main() -> int:
         "--cpu-backend", choices=("numpy", "torch"), default="numpy",
         help="CPU implementation for --cpu-small-m (torch uses optimized float32 Conv2d)",
     )
+    parser.add_argument(
+        "--cpu-threads", type=int, default=2,
+        help="PyTorch intra-op CPU threads for --cpu-backend torch",
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     model = onnx.load(args.model)
@@ -477,6 +483,7 @@ def main() -> int:
         manifest,
         cpu_small_m=args.cpu_small_m,
         cpu_backend=args.cpu_backend,
+        cpu_threads=args.cpu_threads,
     )
     input_info = model.graph.input[0]
     shape = [int(dim.dim_value) or 1 for dim in input_info.type.tensor_type.shape.dim]
@@ -497,6 +504,7 @@ def main() -> int:
         "execution": "full_graph_xdna_conv_host_ops" if not args.cpu_small_m else "full_graph_hybrid_conv_host_ops",
         "cpu_small_m_threshold": args.cpu_small_m,
         "cpu_backend": args.cpu_backend,
+        "cpu_threads": args.cpu_threads if args.cpu_backend == "torch" else None,
         "model": str(args.model),
         "graph_dispatches": runner.codegen.estimated_dispatches,
         "execution_counts": runner._executed,
