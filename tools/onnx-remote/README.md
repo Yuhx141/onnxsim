@@ -353,7 +353,9 @@ build/onnx-remote/onnx-remote-compiler \
 
 The command is trusted local configuration, not request data. It must write the
 compiled artifact to `{output}` and a bounded UTF-8 manifest to `{manifest}`;
-`{input}` is the received ONNX ModelProto. A no-command service copies the
+`{input}` is the received ONNX ModelProto. `{target}` and `{compiler_id}` are
+the configured backend identity values, shell-quoted like the file paths. A
+no-command service copies the
 model into an artifact and is useful for validating networking and cache
 plumbing before installing QAIRT. A QNN wrapper can run the converter,
 backend-specific graph preparation, and context-binary generation as one

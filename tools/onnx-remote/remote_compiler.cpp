@@ -393,6 +393,8 @@ Response compile(const Request& request, const Options& options) {
     command = replace_all(command, "{output}", shell_quote(output_path.string()));
     command = replace_all(command, "{manifest}", shell_quote(manifest_output_path.string()));
     command = replace_all(command, "{target}", shell_quote(options.target));
+    command = replace_all(command, "{compiler_id}",
+                          shell_quote(options.compiler_id));
     const int status = std::system(command.c_str());
     if (status != 0) {
       response.error = "compiler command failed with status " + std::to_string(status);
@@ -445,7 +447,8 @@ bool parse_options(int argc, char** argv, Options& options) {
       std::cout << "usage: onnx-remote-compiler [--port PORT] [--cache-dir DIR]"
                    " [--target TARGET] [--compiler-id ID]"
                    " [--max-cache-bytes BYTES] [--command COMMAND]\n"
-                   "COMMAND placeholders: {input} {output} {manifest} {target}\n"
+                   "COMMAND placeholders: {input} {output} {manifest} {target}"
+                   " {compiler_id}\n"
                    "Without COMMAND, copies the model as a transport smoke-test artifact.\n";
       return false;
     } else {
