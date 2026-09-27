@@ -70,3 +70,13 @@ The dense stress graphs reach about 235 GOPS, so these realistic models leave
 substantial utilization on the table. MobileNetV2 is especially limited by its
 depthwise and pointwise workload mix plus small feature maps, rather than by
 the peak dense-convolution rate.
+
+## INT4 and clock-control checks
+
+RKNN-Toolkit2 2.3.2 rejects `quantized_dtype="w4a16"` during
+`rknn.config(target_platform="rv1106")`: `w4a16` is not supported for RV1106.
+Therefore no INT4 RKNN model can be generated through this target/toolchain.
+The board image also exposes only `/dev/rknpu` (driver v0.9.2); no NPU
+devfreq, clock, or voltage control nodes were available through sysfs. The
+235 GOPS stress result is consequently the ceiling of the current image and
+clock configuration, not a frequency-tuned silicon peak.

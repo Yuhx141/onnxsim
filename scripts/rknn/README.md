@@ -95,6 +95,11 @@ The runner supports `--output-format native` for models whose output uses
 RV1106's packed native layout. ResNet-18 and MobileNetV2 measurements are
 recorded in the benchmark report.
 
+Toolkit2 2.3.2 rejects `quantized_dtype="w4a16"` for the RV1106 target, so
+INT4 is not currently an available RV1106 deployment path. The connected
+image also does not expose NPU clock controls; see the benchmark report for
+the negative checks.
+
 Verifies that `onnxsim`'s output still converts and runs through
 [`rknn-toolkit2`](https://pypi.org/project/rknn-toolkit2/), Rockchip's real
 ONNX -> RKNN converter for the RK35xx/RV1106 NPU line -- the same toolchain

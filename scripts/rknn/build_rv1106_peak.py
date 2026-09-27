@@ -86,6 +86,8 @@ def main() -> int:
     parser.add_argument("--channels", type=int, default=64)
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--size", type=int, default=224)
+    parser.add_argument("--quantized-dtype", default="w8a8",
+                        choices=("w8a8", "w4a16"))
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     name = f"dense_c{args.channels}_l{args.layers}_{args.size}"
@@ -101,7 +103,8 @@ def main() -> int:
     rknn = RKNN(verbose=False)
     try:
         _check(rknn.config(target_platform="rv1106", mean_values=[[0, 0, 0]],
-                           std_values=[[1, 1, 1]]), "config")
+                           std_values=[[1, 1, 1]],
+                           quantized_dtype=args.quantized_dtype), "config")
         _check(rknn.load_onnx(model=simplified_path), "load_onnx")
         _check(rknn.build(do_quantization=True,
                           dataset=_dataset(args.output_dir, name, args.size)), "build")
