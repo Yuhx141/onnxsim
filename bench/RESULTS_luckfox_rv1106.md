@@ -36,3 +36,21 @@ Compared with the earlier unoptimized QDQ path, this reduces the 224x224
 model from 2.721 ms to 2.355 ms and the depthwise model from 0.544 ms to
 0.500 ms. The 224x224 result is now marginally faster than the direct RKNN
 calibration result; the depthwise result remains about 3% slower.
+
+## Dense throughput stress
+
+`build_rv1106_peak.py` generates dense 3x3 INT8 Conv chains to reduce launch
+and small-tensor overhead. These runs used direct RKNN calibration, zero-copy
+INT8/NHWC I/O, and fixed-size inputs:
+
+| Workload | Operations | Mean ms | Effective INT8 throughput |
+| --- | ---: | ---: | ---: |
+| 224x224, 64 channels, 8 Conv layers | 26.07 GOP | 109.80 | 237.4 GOPS |
+| 224x224, 128 channels, 4 Conv layers | 44.74 GOP | 190.27 | 235.1 GOPS |
+
+Widening the model did not increase throughput, so this is the current
+measured ceiling for the flashed image/toolchain configuration, not a claim of
+the silicon's theoretical peak. The board reports RV1106G3 compatibility and
+the public product specification advertises up to 1 TOPS INT8 for G3; reaching
+that figure will require confirming NPU clock/voltage state and the exact
+Rockchip benchmark methodology.

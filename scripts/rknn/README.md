@@ -72,6 +72,18 @@ The checker is based on Rockchip's published
 and the RV1103/RV1106 compiler constraint table. It is a preflight gate, not
 a replacement for RKNN's target compiler.
 
+For dense NPU throughput experiments, build a larger Conv workload:
+
+```bash
+python scripts/rknn/build_rv1106_peak.py \
+  --output-dir /tmp/luckfox-rv1106-peak \
+  --channels 64 --layers 8 --size 224
+```
+
+The measured stress results are included in the benchmark report. They are
+intended to expose sustained throughput and memory/clock ceilings, not to
+represent an application model.
+
 Verifies that `onnxsim`'s output still converts and runs through
 [`rknn-toolkit2`](https://pypi.org/project/rknn-toolkit2/), Rockchip's real
 ONNX -> RKNN converter for the RK35xx/RV1106 NPU line -- the same toolchain
