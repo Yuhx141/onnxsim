@@ -81,7 +81,9 @@ class OnnxRemoteBridge final : public rclcpp::Node {
         [this](const String::SharedPtr message) { discover(message); });
     if (publish_discovery_status_) {
       discovery_status_ = create_publisher<String>(discovery_status_topic_,
-                                                   rclcpp::QoS(10));
+                                                   rclcpp::QoS(10)
+                                                       .transient_local()
+                                                       .reliable());
     }
     announce_timer_ = create_wall_timer(
         std::chrono::milliseconds(std::max(100, announce_period_ms_)),
