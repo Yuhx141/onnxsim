@@ -132,6 +132,14 @@ target_link_libraries(onnx-remote-mock-runner PRIVATE onnx_remote_transport)
 add_executable(onnx-remote-attach-test remote_attach_test.cpp)
 target_link_libraries(onnx-remote-attach-test PRIVATE onnx_remote_transport)
 
+# These dependency-free binaries form the host-side compiler/runner bundle:
+# the compiler service produces artifacts, the mock runner supports CI and
+# constrained-host bring-up, and the client/attach test provide diagnostics
+# without requiring Python or gRPC.
+install(TARGETS onnx-remote-worker onnx-remote-client onnx-remote-compiler
+                onnx-remote-mock-runner onnx-remote-attach-test
+        RUNTIME DESTINATION bin)
+
 add_executable(onnx-remote-profile-dump remote_profile_dump.cpp)
 target_link_libraries(onnx-remote-profile-dump PRIVATE onnx_remote_transport)
 install(TARGETS onnx-remote-profile-dump RUNTIME DESTINATION bin)

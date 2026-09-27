@@ -485,6 +485,10 @@ build/onnx-remote/onnx-remote-compiler \
              --manifest {manifest} --target {target}'
 ```
 
+The dependency-free bundle installs the compiler service, reference worker,
+mock runner, client, and attach-test utilities under `bin/`; it does not
+require Python, protobuf, or gRPC on the execution host.
+
 The command is trusted local configuration, not request data. It must write the
 compiled artifact to `{output}` and a bounded UTF-8 manifest to `{manifest}`;
 `{input}` is the received ONNX ModelProto. `{target}` and `{compiler_id}` are
