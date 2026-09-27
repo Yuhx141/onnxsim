@@ -218,6 +218,13 @@ if (ONNXSIM_REMOTE_DORA)
   if (UNIX AND NOT APPLE)
     target_link_libraries(onnx-remote-dora-node PRIVATE dl m rt pthread)
   endif()
+  if (BUILD_TESTING AND ONNXSIM_REMOTE_DORA_STUB)
+    add_executable(onnx-remote-dora-status-test test/dora_status_test.cpp)
+    target_include_directories(onnx-remote-dora-status-test PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME onnx-remote-dora-status
+             COMMAND onnx-remote-dora-status-test)
+  endif()
 endif()
 
 if (ONNXSIM_REMOTE_ROS2)

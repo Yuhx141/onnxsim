@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "dora_status.h"
 #include "remote_profile.h"
 #include "remote_transport.h"
 
@@ -39,33 +40,6 @@ int env_timeout(const char* name, int fallback) {
   const long timeout = std::strtol(value, nullptr, 10);
   return timeout > 0 && timeout <= 3600000 ? static_cast<int>(timeout)
                                            : fallback;
-}
-
-std::string json_escape(const std::string& value) {
-  std::string escaped;
-  escaped.reserve(value.size() + 2);
-  for (const char c : value) {
-    switch (c) {
-      case '"': escaped += "\\\""; break;
-      case '\\': escaped += "\\\\"; break;
-      case '\b': escaped += "\\b"; break;
-      case '\f': escaped += "\\f"; break;
-      case '\n': escaped += "\\n"; break;
-      case '\r': escaped += "\\r"; break;
-      case '\t': escaped += "\\t"; break;
-      default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          static constexpr char hex[] = "0123456789abcdef";
-          escaped += "\\u00";
-          escaped.push_back(hex[(static_cast<unsigned char>(c) >> 4) & 0xf]);
-          escaped.push_back(hex[static_cast<unsigned char>(c) & 0xf]);
-        } else {
-          escaped += c;
-        }
-        break;
-    }
-  }
-  return escaped;
 }
 
 bool query_capabilities(Response& response, std::string& error) {
@@ -148,26 +122,16 @@ int main() {
     const std::string host =
         env_string("ONNXSIM_DORA_REMOTE_HOST", "127.0.0.1");
     const uint16_t port = env_port();
-    std::string status =
-        std::string("{\"schema_version\":1,\"status\":\"") +
-        (ready ? "ready" : "unavailable") +
-        "\",\"protocol\":\"onnx-remote-v5\",\"host\":\"" +
-        json_escape(host) + "\",\"port\":" + std::to_string(port);
-    if (!ready && !capability_error.empty())
-      status += ",\"error\":\"" + json_escape(capability_error) + "\"";
-    status += "}";
+    const std::string status = onnx_remote::dora::readiness_status(
+        ready, host, port, capability_error);
     dora_send_output(context, "status", 6, status.data(), status.size());
     if (ready && !worker_capabilities.manifest.empty()) {
       dora_send_output(context, "capabilities", 12,
                        worker_capabilities.manifest.data(),
                        worker_capabilities.manifest.size());
     } else {
-      const std::string reason = capability_error.empty()
-                                     ? "worker unavailable"
-                                     : capability_error;
       const std::string error =
-          "{\"schema_version\":1,\"ready\":false,\"error\":\"" +
-          json_escape(reason) + "\"}";
+          onnx_remote::dora::unavailable_capabilities(capability_error);
       dora_send_output(context, "capabilities", 12, error.data(), error.size());
     }
   }
