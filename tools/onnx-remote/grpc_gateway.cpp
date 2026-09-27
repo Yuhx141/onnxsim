@@ -145,11 +145,11 @@ void copy_profile(const ProfileEvent& source, ProtoProfile* target) {
   target->set_detail(source.detail);
 }
 
-grpc::Status roundtrip(const Options& options, NativeRequest request,
-                       NativeResponse& response) {
+grpc::Status roundtrip_to(const Options& options, const std::string& host,
+                          uint16_t port, NativeRequest request,
+                          NativeResponse& response) {
   std::string error;
-  int fd = connect_tcp_timeout(options.worker_host, options.worker_port,
-                               options.connect_timeout_ms);
+  int fd = connect_tcp_timeout(host, port, options.connect_timeout_ms);
   if (fd < 0) return unavailable("cannot connect to native worker");
   if (!set_socket_io_timeout(fd, options.io_timeout_ms) ||
       !send_request(fd, request, error) || !receive_response(fd, response, error)) {
@@ -168,6 +168,12 @@ void set_common_response(uint64_t request_id, const NativeResponse& native,
   response->set_request_id(request_id);
   response->set_ok(native.ok);
   if (!native.ok) response->set_error(native.error);
+}
+
+grpc::Status roundtrip(const Options& options, NativeRequest request,
+                       NativeResponse& response) {
+  return roundtrip_to(options, options.worker_host, options.worker_port,
+                      std::move(request), response);
 }
 
 }  // namespace
@@ -213,7 +219,13 @@ grpc::Status Service::Compile(grpc::ServerContext*, const CompileRequest* reques
   native.model.assign(request->model().begin(), request->model().end());
   native.profiling = profiling_level(request->profiling());
   NativeResponse native_response;
-  grpc::Status status = roundtrip(options_, std::move(native), native_response);
+  const std::string compiler_host = options_.compiler_host.empty()
+                                        ? options_.worker_host
+                                        : options_.compiler_host;
+  const uint16_t compiler_port =
+      options_.compiler_port == 0 ? options_.worker_port : options_.compiler_port;
+  grpc::Status status = roundtrip_to(options_, compiler_host, compiler_port,
+                                     std::move(native), native_response);
   if (!status.ok()) return status;
   set_common_response(request->request_id(), native_response, response);
   response->set_artifact_id(native_response.artifact_id);
@@ -276,7 +288,13 @@ grpc::Status Service::GetCapabilities(grpc::ServerContext*, const CapabilitiesRe
     response->set_graph_execution(capabilities.graph_execution);
     response->set_profiling(capabilities.profiling);
   }
-  for (const auto& op : options_.supported_ops) response->add_supported_ops(op);
+  // Advertise the worker's own ops when it publishes a manifest; a graph
+  // worker lists subgraph/onnx instead of the reference unary set. Fall back
+  // to the gateway default only for legacy manifests without supported_ops.
+  const std::vector<std::string>& ops = capabilities.supported_ops.empty()
+                                            ? options_.supported_ops
+                                            : capabilities.supported_ops;
+  for (const auto& op : ops) response->add_supported_ops(op);
   for (const char* dtype : {"FLOAT", "UINT8", "INT8", "UINT16", "INT16",
                             "INT32", "INT64", "BOOL", "FLOAT16", "DOUBLE",
                             "UINT32", "UINT64", "BFLOAT16"}) {

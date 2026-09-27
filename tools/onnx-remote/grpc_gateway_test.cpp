@@ -26,11 +26,15 @@ using onnxsim::remote::v1::PROFILING_DETAILED;
 namespace {
 
 constexpr uint16_t kWorkerPort = 39671;
+constexpr uint16_t kCompilerPort = 39672;
 
 void serve_requests() {
   const int listener = listen_tcp(kWorkerPort, 1);
   assert(listener >= 0);
-  for (int i = 0; i < 6; ++i) {
+  // Five requests: capabilities, identity execute, identity ModelInfer, one
+  // load, and one repeated load. Compile is served by the compiler fake so
+  // the test proves gateway routing to a separate compiler endpoint.
+  for (int i = 0; i < 5; ++i) {
     const int fd = accept_tcp(listener);
     assert(fd >= 0);
 
@@ -45,17 +49,13 @@ void serve_requests() {
       response.manifest =
           "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
           "\"runner_id\":\"smoke-runner\",\"graph_execution\":true,"
-          "\"profiling\":true}";
+          "\"profiling\":true,"
+          "\"supported_ops\":[\"subgraph\",\"onnx\"]}";
     } else if (request.op == "identity" && request.inputs.size() == 1) {
       response.ok = true;
       response.outputs = request.inputs;
       response.profile.push_back(
           ProfileEvent{"worker_identity", "remote", 4, 9, "smoke"});
-    } else if (request.op == "compile" && !request.model.empty()) {
-      response.ok = true;
-      response.artifact_id = "smoke-artifact";
-      response.artifact = {9, 8, 7};
-      response.manifest = "{\"target\":\"smoke\"}";
     } else if (request.op == "load_compiled" &&
                request.artifact_id == "smoke-artifact" &&
                request.artifact == std::vector<uint8_t>({9, 8, 7})) {
@@ -70,14 +70,41 @@ void serve_requests() {
   close_socket(listener);
 }
 
+void serve_compile() {
+  const int listener = listen_tcp(kCompilerPort, 1);
+  assert(listener >= 0);
+  const int fd = accept_tcp(listener);
+  assert(fd >= 0);
+
+  Request request;
+  Response response;
+  std::string error;
+  assert(receive_request(fd, request, error));
+  response.request_id = request.request_id;
+  if (request.op == "compile" && request.model.size() == 16) {
+    response.ok = true;
+    response.artifact_id = "smoke-artifact";
+    response.artifact = {9, 8, 7};
+    response.manifest = "{\"target\":\"smoke\"}";
+  } else {
+    response.error = "unexpected compiler smoke request: " + request.op;
+  }
+  assert(send_response(fd, response, error));
+  close_socket(fd);
+  close_socket(listener);
+}
+
 }  // namespace
 
 int main() {
   std::thread worker(serve_requests);
+  std::thread compiler(serve_compile);
 
   Options options;
   options.worker_host = "127.0.0.1";
   options.worker_port = kWorkerPort;
+  options.compiler_host = "127.0.0.1";
+  options.compiler_port = kCompilerPort;
   Service service(options);
   grpc::ServerBuilder builder;
   int grpc_port = 0;
@@ -103,13 +130,11 @@ int main() {
   assert(capability_response.runner_id() == "smoke-runner");
   assert(capability_response.graph_execution());
   assert(capability_response.profiling());
-  assert(capability_response.supported_ops_size() == 14);
-  assert(capability_response.supported_ops(8) == "abs");
-  assert(capability_response.supported_ops(9) == "neg");
-  assert(capability_response.supported_ops(10) == "sqrt");
-  assert(capability_response.supported_ops(11) == "exp");
-  assert(capability_response.supported_ops(12) == "log");
-  assert(capability_response.supported_ops(13) == "tanh");
+  // The gateway reports the worker's own graph ops, not the reference unary
+  // default list.
+  assert(capability_response.supported_ops_size() == 2);
+  assert(capability_response.supported_ops(0) == "subgraph");
+  assert(capability_response.supported_ops(1) == "onnx");
 
   ExecuteRequest invalid_request;
   invalid_request.set_op(std::string(kMaxOpBytes + 1, 'x'));
@@ -221,5 +246,6 @@ int main() {
 
   server->Shutdown();
   worker.join();
+  compiler.join();
   return 0;
 }

@@ -24,7 +24,8 @@ uint16_t port_value(const char* text, const char* name) {
 void usage(const char* program) {
   std::cerr << "usage: " << program
             << " [--listen HOST:PORT] [--worker-host HOST]"
-               " [--worker-port PORT] [--runner-id ID]"
+               " [--worker-port PORT] [--compiler-host HOST]"
+               " [--compiler-port PORT] [--runner-id ID]"
                " [--tls-cert FILE --tls-key FILE [--tls-ca FILE]]\n";
 }
 
@@ -50,6 +51,10 @@ int main(int argc, char** argv) {
         options.worker_host = argv[++i];
       } else if (argument == "--worker-port" && i + 1 < argc) {
         options.worker_port = port_value(argv[++i], "worker port");
+      } else if (argument == "--compiler-host" && i + 1 < argc) {
+        options.compiler_host = argv[++i];
+      } else if (argument == "--compiler-port" && i + 1 < argc) {
+        options.compiler_port = port_value(argv[++i], "compiler port");
       } else if (argument == "--runner-id" && i + 1 < argc) {
         options.runner_id = argv[++i];
       } else if (argument == "--tls-cert" && i + 1 < argc) {

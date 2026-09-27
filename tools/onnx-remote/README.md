@@ -409,7 +409,10 @@ This is a lighter contract than KServe V2 and is the preferred API for
 onnxsim-specific compile/load/run workflows. A later KServe adapter can map
 `ModelInfer` to `Execute` at the gateway, while ROS2 or DORA remains the
 discovery/control plane. Keep model and artifact bytes in their dedicated RPC
-fields; `parameters` is reserved for small options.
+fields; `parameters` is reserved for small options. The gateway forwards
+`Compile` to a separate `--compiler-host`/`--compiler-port` endpoint when
+configured, mirroring the native executor's compile/runner split, and reports
+the selected worker's own `supported_ops` from its capability manifest.
 
 ## External compiler contract
 

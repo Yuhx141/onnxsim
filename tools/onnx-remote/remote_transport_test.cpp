@@ -15,10 +15,14 @@ int main() {
   assert(parse_capability_manifest(
       "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
       "\"runner_id\":\"ort-cpu-worker\",\"graph_execution\":true,"
-      "\"profiling\":true}", capabilities, capability_error));
+      "\"profiling\":true,\"supported_ops\":[\"subgraph\",\"onnx\"]}",
+      capabilities, capability_error));
   assert(capabilities.graph_execution);
   assert(capabilities.profiling);
   assert(capabilities.runner_id == "ort-cpu-worker");
+  assert(capabilities.supported_ops.size() == 2);
+  assert(capabilities.supported_ops[0] == "subgraph");
+  assert(capabilities.supported_ops[1] == "onnx");
   assert(parse_capability_manifest(
       "{\n  \"schema_version\" : 1,\n"
       "  \"protocol\" : \"onnx-remote-v5\",\n"
@@ -27,6 +31,7 @@ int main() {
       capabilities, capability_error));
   assert(capabilities.runner_id == "pretty-worker");
   assert(capabilities.graph_execution);
+  assert(capabilities.supported_ops.empty());
   assert(!parse_capability_manifest(
       "{\"schema_version\":2,\"protocol\":\"onnx-remote-v5\","
       "\"runner_id\":\"old-worker\"}", capabilities, capability_error));

@@ -15,6 +15,11 @@ namespace onnx_remote::grpc_gateway {
 struct Options {
   std::string worker_host = "127.0.0.1";
   uint16_t worker_port = 39501;
+  // The compiler may run on a separate host, mirroring the native
+  // RemoteExecutorOptions split. An empty host or zero port falls back to the
+  // worker endpoint above.
+  std::string compiler_host;
+  uint16_t compiler_port = 0;
   int connect_timeout_ms = 5000;
   int io_timeout_ms = 30000;
   std::string runner_id = "onnxsim-grpc-gateway";

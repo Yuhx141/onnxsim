@@ -66,6 +66,12 @@ build/onnx-remote-grpc/onnx-remote-grpc-gateway \
   --listen 0.0.0.0:50051 --worker-host 127.0.0.1 --worker-port 39501
 ```
 
+`--compiler-host`/`--compiler-port` route `Compile` to a separate compiler
+service, mirroring the native executor's `compile_host` split. When unset,
+compilation falls back to the worker endpoint. `GetCapabilities` reports the
+selected worker's own `supported_ops` from its capability manifest, so a graph
+worker advertises `subgraph`/`onnx` instead of the reference unary default.
+
 For a direct TLS listener, provide a PEM certificate and private key:
 
 ```sh

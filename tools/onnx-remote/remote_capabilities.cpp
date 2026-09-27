@@ -21,6 +21,30 @@ size_t value_start(const std::string& json, const char* key) {
   return cursor;
 }
 
+void json_string_array(const std::string& json, const char* key,
+                       std::vector<std::string>& values, size_t limit) {
+  const size_t begin = value_start(json, key);
+  if (begin == std::string::npos || begin >= json.size() ||
+      json[begin] != '[')
+    return;
+  size_t cursor = begin + 1;
+  while (cursor < json.size() && values.size() < limit) {
+    while (cursor < json.size() &&
+           (std::isspace(static_cast<unsigned char>(json[cursor])) ||
+            json[cursor] == ',')) {
+      ++cursor;
+    }
+    if (cursor >= json.size()) return;
+    if (json[cursor] == ']') return;
+    if (json[cursor] != '"') return;
+    const size_t string_begin = cursor + 1;
+    const size_t end = json.find('"', string_begin);
+    if (end == std::string::npos || end - string_begin > 128) return;
+    values.push_back(json.substr(string_begin, end - string_begin));
+    cursor = end + 1;
+  }
+}
+
 bool json_string(const std::string& json, const char* key, std::string& value) {
   const size_t begin = value_start(json, key);
   if (begin == std::string::npos || begin >= json.size() || json[begin] != '"')
@@ -80,6 +104,8 @@ bool parse_capability_manifest(const std::string& manifest,
   // this explicitly as true.
   json_bool(manifest, "graph_execution", summary.graph_execution);
   json_bool(manifest, "profiling", summary.profiling);
+  summary.supported_ops.clear();
+  json_string_array(manifest, "supported_ops", summary.supported_ops, 64);
   return true;
 }
 
