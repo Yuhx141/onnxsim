@@ -46,6 +46,10 @@
           shellHook = ''
             export ROS_DISTRO=humble
             export ROS_VERSION=2
+            # Keep CMake's gRPC, protobuf, and Abseil package discovery on the
+            # same nixpkgs revision.  A host /usr Abseil config can otherwise
+            # be selected ahead of nix gRPC and produce link-time ABI errors.
+            export CMAKE_PREFIX_PATH="${pkgs.abseil-cpp.dev}/lib/cmake/absl:${pkgs.protobuf}/lib/cmake/protobuf:${pkgs.grpc}/lib/cmake/grpc:${pkgs.re2.dev}/lib/cmake/re2:''${CMAKE_PREFIX_PATH:-}"
             export LD_LIBRARY_PATH="${pkgs.zstd.out}/lib:''${LD_LIBRARY_PATH:-}"
             echo "onnx-remote ROS2 shell: build with -DONNXSIM_REMOTE_ROS2=ON"
           '';
