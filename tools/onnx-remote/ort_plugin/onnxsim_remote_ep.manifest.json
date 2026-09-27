@@ -5,6 +5,8 @@
   "ort_version": "public_plugin_requires_ort_1.29_plus",
   "entrypoint": "onnxsim::ort_remote::CreateRemoteExecutionProviderFromOptions",
   "registration": "internal_cpp",
+  "graph_execution": false,
+  "execution_mode": "legacy_unary_dispatch",
   "public_plugin_entrypoints": ["CreateEpFactories", "ReleaseEpFactory"],
   "supported_ops": ["Identity", "Relu", "Add", "Mul", "Sub", "Div", "Max", "Min", "Abs", "Neg", "Sqrt", "Exp", "Log", "Tanh"],
   "supported_ops_env": "ONNXSIM_REMOTE_EP_SUPPORTED_OPS",

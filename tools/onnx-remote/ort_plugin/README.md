@@ -5,6 +5,9 @@ adapter and its install-time contract. The legacy adapter is compiled into the
 `onnxsim` library when `ONNXSIM_REMOTE_ORT_EP=ON`; the public adapter is built
 as the standalone `onnxsim_remote_ep` library with
 `ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN=ON`.
+This package is a legacy unary-dispatch adapter and explicitly advertises
+`graph_execution:false`; serialized subgraph execution belongs to the separate
+ORT graph worker.
 
 The implementation uses ORT's legacy internal C++ `IExecutionProvider` interface
 and therefore must be built against a matching ORT source checkout that still

@@ -82,6 +82,7 @@ static Response execute(const Request& r) {
         "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","
         "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\","
         "\"FLOAT16\",\"BFLOAT16\"],"
+        "\"graph_execution\":false,"
         "\"profiling\":true}";
     out.ok = true;
     return out;
