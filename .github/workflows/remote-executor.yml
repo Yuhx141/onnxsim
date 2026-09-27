@@ -90,6 +90,18 @@ jobs:
           first_id=$(printf '%s\n' "$first" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
           second_id=$(printf '%s\n' "$second" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
           test -n "$first_id" && test "$first_id" = "$second_id"
+          pids=()
+          for i in 1 2 3 4; do
+            build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 \
+              "${RUNNER_TEMP}/model.onnx" >"${RUNNER_TEMP}/parallel-${i}.txt" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+          for i in 1 2 3 4; do
+            parallel_id=$(sed -n 's/^artifact_id=\([^ ]*\).*/\1/p' \
+              "${RUNNER_TEMP}/parallel-${i}.txt")
+            test "$parallel_id" = "$first_id"
+          done
           marker=$(find "${RUNNER_TEMP}/compiler-cache" -name '*.complete' -print -quit)
           artifact="${marker%.complete}.artifact"
           test -n "$marker" && test -f "$artifact"
