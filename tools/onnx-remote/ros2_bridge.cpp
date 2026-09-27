@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/u_int8_multi_array.hpp>
@@ -275,7 +276,9 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   void publish_discovery_status(const std::string& state,
                                 const std::string& runner_id,
                                 const std::string& host, int port,
-                                const std::string& error = {}) {
+                                const std::string& error = {},
+                                std::optional<bool> graph_execution =
+                                    std::nullopt) {
     if (!publish_discovery_status_ || discovery_status_ == nullptr) return;
     String message;
     message.data = "{\"schema_version\":1,\"state\":\"" +
@@ -283,6 +286,9 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                    json_escape(runner_id) + "\",\"host\":\"" +
                    json_escape(host) + "\",\"port\":" +
                    std::to_string(port);
+    if (graph_execution.has_value())
+      message.data += ",\"graph_execution\":" +
+                      std::string(*graph_execution ? "true" : "false");
     if (!error.empty())
       message.data += ",\"error\":\"" + json_escape(error) + "\"";
     message.data += "}";
@@ -334,11 +340,16 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                     host.c_str(), port, error.c_str());
         return;
       }
+      std::optional<bool> graph_execution;
+      onnx_remote::CapabilitySummary summary;
+      std::string capability_error;
+      if (onnx_remote::parse_capability_manifest(
+              capabilities.manifest, summary, capability_error)) {
+        graph_execution = summary.graph_execution;
+      }
       if (require_graph_execution_) {
-        onnx_remote::CapabilitySummary summary;
-        if (!onnx_remote::parse_capability_manifest(
-                capabilities.manifest, summary, error) ||
-            !summary.graph_execution) {
+        if (!graph_execution.has_value() || !*graph_execution) {
+          error = capability_error;
           if (error.empty()) error = "runner does not advertise graph execution";
           publish_discovery_status("rejected", id, host, port, error);
           RCLCPP_WARN(get_logger(),
@@ -347,6 +358,9 @@ class OnnxRemoteBridge final : public rclcpp::Node {
           return;
         }
       }
+      discovered_graph_execution_ = graph_execution;
+    } else {
+      discovered_graph_execution_.reset();
     }
     host_ = host;
     port_ = port;
@@ -357,7 +371,8 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                                  : discovery_timeout_ms_;
     discovered_ = true;
     discovered_runner_id_ = id;
-    publish_discovery_status("selected", id, host_, port_);
+    publish_discovery_status("selected", id, host_, port_, {},
+                             discovered_graph_execution_);
     RCLCPP_INFO(get_logger(), "auto-discovered runner %s at %s:%d", id.c_str(),
                 host_.c_str(), port_);
   }
@@ -375,9 +390,10 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     host_ = configured_host_;
     port_ = configured_port_;
     publish_discovery_status("expired", expired_runner_id, expired_host,
-                             expired_port);
+                             expired_port, {}, discovered_graph_execution_);
     discovered_ = false;
     discovered_runner_id_.clear();
+    discovered_graph_execution_.reset();
   }
 
   void forward(const UInt8MultiArray::SharedPtr& message) {
@@ -458,6 +474,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   bool discovered_ = false;
   int discovered_timeout_ms_ = 15000;
   std::string discovered_runner_id_;
+  std::optional<bool> discovered_graph_execution_;
   bool publish_profile_ = true;
   bool publish_profile_events_ = false;
   std::chrono::steady_clock::time_point last_discovery_{};
