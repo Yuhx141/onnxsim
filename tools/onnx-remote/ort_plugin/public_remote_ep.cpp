@@ -169,15 +169,15 @@ struct RemoteProfiler final : OrtEpProfilerImpl {
   std::mutex mutex;
   std::vector<Event> events;
 
-  void Record(const std::vector<onnx_remote::ProfileEvent>& remote_events,
+  void Record(const onnx_remote::Response& response,
               Clock::time_point local_start) {
     std::lock_guard<std::mutex> lock(mutex);
-    for (const auto& event : remote_events) {
+    onnx_remote::receive_profile(response, [&](const auto& event) {
       events.push_back({event.name, local_start, event.start_us,
                         static_cast<int64_t>(std::min<uint64_t>(
                             event.duration_us,
                             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())))});
-    }
+    });
   }
 
   static thread_local RemoteProfiler* active;
@@ -470,7 +470,7 @@ OrtStatus* ORT_API_CALL RemoteNodeComputeInfo::ComputeImpl(
                    "onnxsim_remote response request id mismatch");
     }
     if (auto* profiler = RemoteProfiler::active) {
-      profiler->Record(response.profile, local_start);
+      profiler->Record(response, local_start);
     }
     if (response.outputs.size() != 1) {
       return Error(api, ORT_FAIL, "onnxsim_remote returned an unexpected output count");
