@@ -133,6 +133,36 @@ launches; CPU Conv execution remains its largest cost. Closing the gap
 requires graph-level XDNA fusion and moving the
 intermediate QDQ/residual operations into the device program, like Vitis does.
 
+An experimental IRON program now fuses one supported identity bottleneck on
+device: three 3×3/1×1 Conv stages, their QDQ/requantization, residual Add, and
+ReLU. It is currently specialized for the quicktest model's
+`/layer1/layer1.1` block (NPU2, 8×8×256 input, 64 inner channels, fixed
+quantization). Compile it and pass its artifacts to the graph runner:
+
+```bash
+python3 scripts/xdna/fused_bottleneck_design.py --dev npu2 \
+  --xclbin-path layer1_1-fused.xclbin --insts-path layer1_1-fused.insts.bin
+python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
+  --cpu-small-m 64 --cpu-backend torch --cpu-threads 2 \
+  --fused-block-prefix /layer1/layer1.1 \
+  --fused-block-xclbin layer1_1-fused.xclbin \
+  --fused-block-insts layer1_1-fused.insts.bin --warmup 2 --iters 10
+```
+
+The fused block matched the ONNX Runtime quantized boundary exactly in an
+isolated check. In a full quicktest graph run it also preserved exact final
+output agreement; the graph reported one fused block, 49 CPU Conv calls, one
+XDNA Conv call, and 201 host operators. Three warmed runs averaged 24.1 ms,
+with 4.6 ms attributed to the fused block including its call and readback.
+This is an executable correctness milestone, not a graph-wide speedup: the
+kernel is a scalar integer implementation and only one identity block is
+lowered this way. Remaining fusion work includes optimizing this kernel,
+supporting downsample/stride-changing residual blocks and other shapes or
+quantization layouts, and replacing per-node CPU/host execution with a generic
+graph-region compiler and scheduler. The existing 91-dispatch graph schedule
+is still planning metadata; the runner does not yet turn those regions into
+one executable XDNA program.
+
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
 hybrid Conv layers and skips their unused im2col staging. Converted constant
 weights are cached and symmetric padding is passed directly to Conv2d. Two

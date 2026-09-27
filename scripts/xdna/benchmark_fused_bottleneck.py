@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Compile-artifact validation and benchmark for an identity ResNet block."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import onnx
+from onnx import helper, numpy_helper
+
+from qdq_runtime import QDQEdge, qdq_edge_map
+from resnet_bottleneck import BottleneckBlockPlan, plan_bottleneck_blocks
+
+
+def _single_q_params(edge: QDQEdge, label: str) -> tuple[float, int]:
+    if not edge.params.scalar:
+        raise ValueError(f"{label}: per-channel scales are not supported by this fused kernel")
+    return edge.params.scale[0], edge.params.zero_point[0]
+
+
+def _power_of_two_shift(ratio: float, label: str) -> int:
+    if ratio < 1:
+        raise ValueError(f"{label}: output scale must be >= accumulator scale")
+    shift = round(math.log2(ratio))
+    if shift < 0 or shift > 30 or not math.isclose(ratio, 2.0**shift, rel_tol=1e-6):
+        raise ValueError(f"{label}: scale ratio {ratio} is not an integer power of two")
+    return shift
+
+
+def _quantizer_after(value: str, nodes: list[Any], consumers: dict[str, list[int]], edges: dict[str, QDQEdge]) -> QDQEdge:
+    pending = [value]
+    visited: set[str] = set()
+    while pending:
+        current = pending.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        for index in consumers.get(current, ()):
+            node = nodes[index]
+            if node.op_type == "QuantizeLinear":
+                return edges[str(node.output[0])]
+            if node.op_type == "Relu":
+                pending.extend(str(output) for output in node.output)
+    raise ValueError(f"no QuantizeLinear follows {value!r} through Relu")
+
+
+def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, Any]:
+    nodes = list(model.graph.node)
+    edges = dict(qdq_edge_map(model))
+    initializers = {str(item.name): numpy_helper.to_array(item) for item in model.graph.initializer}
+    conv_indices = block.main_conv_indices
+    conv_nodes = [nodes[index] for index in conv_indices]
+    if block.skip_conv_index is not None:
+        raise ValueError("the first fused implementation only supports identity residual blocks")
+    if tuple(int(v) for v in block.conv_plans[0].input_shape[2:]) != (8, 8):
+        raise ValueError("the first fused implementation is specialized for 8x8 identity blocks")
+    channels = block.conv_plans[0].input_shape[1]
+    mid_channels = block.conv_plans[1].weight_shape[0]
+    if channels != 256 or mid_channels != 64:
+        raise ValueError(f"unsupported block channels {channels}->{mid_channels}->{channels}")
+
+    consumers: dict[str, list[int]] = {}
+    for index, node in enumerate(nodes):
+        for name in node.input:
+            if name:
+                consumers.setdefault(str(name), []).append(index)
+    quantizers = [
+        _quantizer_after(str(node.output[0]), nodes, consumers, edges)
+        for node in conv_nodes
+    ]
+    add_node = nodes[block.add_index]
+    final_quantizer = _quantizer_after(str(add_node.output[0]), nodes, consumers, edges)
+
+    input_edge = edges.get(str(conv_nodes[0].input[0]))
+    if input_edge is None or input_edge.op_type != "DequantizeLinear":
+        raise ValueError("block activation must have a static DequantizeLinear input")
+    input_scale, input_zero = _single_q_params(input_edge, "block input")
+    if input_zero != 128 or input_edge.params.dtype != "u8":
+        raise ValueError("the fused block currently requires uint8 activations with zero point 128")
+
+    activation_scales = [input_scale]
+    weight_arrays = []
+    bias_accumulators = []
+    shifts = []
+    for stage, node in enumerate(conv_nodes):
+        activation_edge = edges.get(str(node.input[0]))
+        weight_edge = edges.get(str(node.input[1]))
+        bias_edge = edges.get(str(node.input[2])) if len(node.input) > 2 else None
+        if activation_edge is None or weight_edge is None or bias_edge is None:
+            raise ValueError(f"{node.name}: expected static QDQ activation, weight, and bias")
+        act_scale, act_zero = _single_q_params(activation_edge, f"{node.name} activation")
+        weight_scale, weight_zero = _single_q_params(weight_edge, f"{node.name} weight")
+        bias_scale, bias_zero = _single_q_params(bias_edge, f"{node.name} bias")
+        output_scale, output_zero = _single_q_params(quantizers[stage], f"{node.name} output")
+        if act_zero != 128 or weight_zero != 0 or bias_zero != 0 or output_zero != 128:
+            raise ValueError(f"{node.name}: unsupported activation/weight/bias zero points")
+        if weight_edge.params.dtype != "i8" or bias_edge.params.dtype != "i8":
+            raise ValueError(f"{node.name}: weight and bias tensors must be signed int8")
+        if len(node.input) < 3 or bias_edge.input_name not in initializers:
+            raise ValueError(f"{node.name}: bias must be a static quantized initializer")
+        if weight_edge.input_name not in initializers:
+            raise ValueError(f"{node.name}: weight must be a static quantized initializer")
+        weight = np.asarray(initializers[weight_edge.input_name], dtype=np.int8)
+        bias_raw = np.asarray(initializers[bias_edge.input_name], dtype=np.int32).reshape(-1)
+        if bias_raw.size != weight.shape[0]:
+            raise ValueError(f"{node.name}: bias length does not match output channels")
+        product_scale = act_scale * weight_scale
+        accum_bias = bias_raw.astype(np.float64) * bias_scale / product_scale
+        rounded_bias = np.rint(accum_bias)
+        if not np.allclose(accum_bias, rounded_bias, rtol=1e-6, atol=1e-6):
+            raise ValueError(f"{node.name}: bias cannot be represented as an exact integer accumulator")
+        if np.any(rounded_bias < np.iinfo(np.int32).min) or np.any(rounded_bias > np.iinfo(np.int32).max):
+            raise ValueError(f"{node.name}: bias overflows int32 accumulator")
+        shifts.append(_power_of_two_shift(output_scale / product_scale, f"{node.name} requantization"))
+        weight_arrays.append(weight)
+        bias_accumulators.append(rounded_bias.astype(np.int32))
+        activation_scales.append(output_scale)
+
+    final_scale, final_zero = _single_q_params(final_quantizer, "residual output")
+    conv3_scale, conv3_zero = _single_q_params(quantizers[2], "conv3 output")
+    if final_zero != 128 or conv3_zero != 128:
+        raise ValueError("the fused residual requires uint8 output zero point 128")
+    residual_factor = conv3_scale / final_scale
+    input_factor = input_scale / final_scale
+    if not math.isclose(residual_factor, 4.0, rel_tol=1e-6) or not math.isclose(input_factor, 1.0, rel_tol=1e-6):
+        raise ValueError("residual requantization does not match the fused integer residual expression")
+    if tuple(shifts) != (5, 8, 7):
+        raise ValueError(f"compiled kernel requires requantization shifts (5, 8, 7), got {tuple(shifts)}")
+    final_dequantizer = next(
+        (
+            edge for edge in edges.values()
+            if edge.op_type == "DequantizeLinear" and edge.input_name == final_quantizer.output_name
+        ),
+        None,
+    )
+    if final_dequantizer is None:
+        raise ValueError("fused block output has no matching DequantizeLinear boundary")
+
+    # The C kernel consumes OIHW int8 weights and accumulator-domain int32 bias.
+    w1, w2, w3 = weight_arrays
+    b1, b2, b3 = bias_accumulators
+    w1_offset = 0
+    b1_offset = w1.nbytes
+    w2_offset = b1_offset + b1.nbytes
+    b2_offset = w2_offset + w2.nbytes
+    w3_offset = b2_offset + b2.nbytes
+    b3_offset = w3_offset + w3.nbytes
+    parameter_bytes = b3_offset + b3.nbytes
+    params = np.zeros(parameter_bytes, dtype=np.uint8)
+    params[w1_offset : w1_offset + w1.nbytes] = w1.view(np.uint8).reshape(-1)
+    params[b1_offset : b1_offset + b1.nbytes] = b1.view(np.uint8)
+    params[w2_offset : w2_offset + w2.nbytes] = w2.view(np.uint8).reshape(-1)
+    params[b2_offset : b2_offset + b2.nbytes] = b2.view(np.uint8)
+    params[w3_offset : w3_offset + w3.nbytes] = w3.view(np.uint8).reshape(-1)
+    params[b3_offset : b3_offset + b3.nbytes] = b3.view(np.uint8)
+
+    q_type = "u8"
+    q_nodes = [edges[edge.output_name] for edge in (*quantizers, final_quantizer)]
+    if any(edge.params.dtype != q_type for edge in q_nodes):
+        raise ValueError("all fused activation boundaries must use uint8")
+    input_raw_name = input_edge.input_name
+    output_raw_name = final_quantizer.output_name
+    covered = tuple(
+        index for index, node in enumerate(nodes)
+        if block.prefix in str(node.name) and min(conv_indices) <= index <= block.add_index + 3
+    )
+    return {
+        "block": block,
+        "params": params,
+        "shifts": tuple(shifts),
+        "input_raw_name": input_raw_name,
+        "input_zero_point": input_zero,
+        "output_raw_name": output_raw_name,
+        "output_dequant_name": final_dequantizer.output_name,
+        "output_scale": final_scale,
+        "output_zero_point": final_zero,
+        "input_shape": block.conv_plans[0].input_shape,
+        "output_shape": block.conv_plans[2].output_shape,
+        "covered_nodes": covered,
+        "quantizers": quantizers,
+        "final_quantizer": final_quantizer,
+        "offsets": (w1_offset, b1_offset, w2_offset, b2_offset, w3_offset, b3_offset),
+    }
+
+
+def _resolve_type(dtype: str) -> int:
+    from onnx import TensorProto
+    return TensorProto.UINT8 if dtype == "u8" else TensorProto.INT8
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("model", type=Path)
+    parser.add_argument("block", help="ONNX node-name prefix, e.g. /layer1/layer1.1")
+    parser.add_argument("xclbin", type=Path)
+    parser.add_argument("insts", type=Path)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--iters", type=int, default=10)
+    args = parser.parse_args()
+
+    model = onnx.load(args.model)
+    block = next((item for item in plan_bottleneck_blocks(model) if item.prefix == args.block), None)
+    if block is None:
+        parser.error(f"no ResNet bottleneck found for prefix {args.block!r}")
+    binding = bind_fused_bottleneck(model, block)
+    if not args.xclbin.is_file() or not args.insts.is_file():
+        parser.error("compiled xclbin and instruction stream must both exist")
+
+    from aie.utils import NPUKernel
+    import aie.iron as iron
+
+    input_shape = tuple(int(v) for v in binding["input_shape"])
+    output_shape = tuple(int(v) for v in binding["output_shape"])
+    input_channels = input_shape[1]
+    params = binding["params"]
+    parameters = iron.tensor(params, dtype=np.uint8, device="npu")
+    result = iron.zeros(input_shape[0] * output_shape[1] * output_shape[2] * output_shape[3], dtype=np.int8, device="npu")
+    kernel = NPUKernel(str(args.xclbin), str(args.insts))
+
+    # Add the raw quantized tensors at the block boundary to an ORT copy so
+    # both the NPU input and expected output come from the same graph input.
+    from onnx import TensorProto
+    from onnxruntime import InferenceSession
+
+    ref_model = onnx.ModelProto()
+    ref_model.CopyFrom(model)
+    for name, shape in ((binding["input_raw_name"], input_shape), (binding["output_raw_name"], output_shape)):
+        ref_model.graph.output.append(
+            helper.make_tensor_value_info(name, _resolve_type("u8"), list(shape))
+        )
+    sample_shape = [int(dim.dim_value) or 1 for dim in model.graph.input[0].type.tensor_type.shape.dim]
+    sample = np.random.default_rng(0).random(sample_shape, dtype=np.float32)
+    expected_session = InferenceSession(ref_model.SerializeToString(), providers=["CPUExecutionProvider"])
+    expected_input, expected_output = expected_session.run(
+        [binding["input_raw_name"], binding["output_raw_name"]],
+        {model.graph.input[0].name: sample},
+    )
+    edge = qdq_edge_map(model)[next(
+        str(node.input[0]) for node in model.graph.node
+        if node.op_type == "Conv" and node.name == f"{args.block}/conv1/Conv"
+    )]
+    zero = edge.params.zero_point[0]
+    x_hwc = (expected_input.astype(np.int16) - zero).astype(np.int8).transpose(0, 2, 3, 1).copy()
+    x_tensor = iron.tensor(x_hwc.reshape(-1), dtype=np.int8, device="npu")
+
+    def execute() -> np.ndarray:
+        kernel(x_tensor, parameters, result)
+        return result.numpy().view(np.uint8).reshape(output_shape[0], output_shape[2], output_shape[3], output_shape[1]).transpose(0, 3, 1, 2).copy()
+
+    actual = execute()
+    for _ in range(args.warmup):
+        actual = execute()
+    start = time.perf_counter()
+    for _ in range(args.iters):
+        actual = execute()
+    elapsed_ms = (time.perf_counter() - start) * 1000.0 / args.iters
+    delta = np.abs(actual.astype(np.int16) - expected_output.astype(np.int16))
+    report = {
+        "block": args.block,
+        "mode": "one_xdna_dispatch_three_convs_qdq_residual_relu",
+        "covered_node_indices": list(binding["covered_nodes"]),
+        "input_shape": list(input_shape),
+        "output_shape": list(output_shape),
+        "requantization_shifts": list(binding["shifts"]),
+        "latency_ms": elapsed_ms,
+        "iterations": args.iters,
+        "max_abs_quantized_error": int(delta.max(initial=0)),
+        "exact_match": bool(np.array_equal(actual, expected_output)),
+    }
+    print(json.dumps(report, indent=2))
+    return 0 if report["exact_match"] else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

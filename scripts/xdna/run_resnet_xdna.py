@@ -23,6 +23,12 @@ from onnx import helper, numpy_helper
 from conv_lowering import plan_all_convs
 from conv_reference import im2col_nchw
 from resnet_codegen import build_codegen_plan
+try:
+    from .benchmark_fused_bottleneck import bind_fused_bottleneck
+    from .resnet_bottleneck import plan_bottleneck_blocks
+except ImportError:  # executed directly as a script
+    from benchmark_fused_bottleneck import bind_fused_bottleneck
+    from resnet_bottleneck import plan_bottleneck_blocks
 
 
 def _attrs(node: Any) -> dict[str, Any]:
@@ -99,6 +105,9 @@ class XDNAResNetRunner:
         cpu_small_m: int = 0,
         cpu_backend: str = "numpy",
         cpu_threads: int = 1,
+        fused_block_prefix: str | None = None,
+        fused_block_xclbin: str | None = None,
+        fused_block_insts: str | None = None,
     ):
         self.model = model
         self.nodes = list(model.graph.node)
@@ -170,6 +179,42 @@ class XDNAResNetRunner:
         self._packed_weight_cache: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
         self._cpu_weight_cache: dict[int, np.ndarray] = {}
         self._torch_weight_cache: dict[int, Any] = {}
+        self._fused_block_binding: dict[str, Any] | None = None
+        self._fused_block_nodes: set[int] = set()
+        self._fused_block_start: int | None = None
+        self._fused_block_input = None
+        self._fused_block_parameters = None
+        self._fused_block_output = None
+        if any((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
+            if not all((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
+                raise ValueError("fused block requires its node prefix, xclbin, and instruction stream")
+            block = next(
+                (item for item in plan_bottleneck_blocks(model) if item.prefix == fused_block_prefix),
+                None,
+            )
+            if block is None:
+                raise ValueError(f"no bottleneck block found for prefix {fused_block_prefix!r}")
+            if not Path(fused_block_xclbin).is_file() or not Path(fused_block_insts).is_file():
+                raise ValueError("fused block xclbin and instruction stream must exist")
+            self._fused_block_binding = bind_fused_bottleneck(model, block)
+            self._fused_block_nodes = set(self._fused_block_binding["covered_nodes"])
+            self._fused_block_start = min(self._fused_block_nodes)
+            import aie.iron as iron
+
+            input_shape = self._fused_block_binding["input_shape"]
+            output_shape = self._fused_block_binding["output_shape"]
+            input_count = int(np.prod(input_shape))
+            output_count = int(np.prod(output_shape))
+            self._fused_block_input = iron.tensor(
+                np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu"
+            )
+            self._fused_block_parameters = iron.tensor(
+                self._fused_block_binding["params"], dtype=np.uint8, device="npu"
+            )
+            self._fused_block_output = iron.zeros(output_count, dtype=np.int8, device="npu")
+            self._fused_block_kernel = self._kernel(
+                str(fused_block_xclbin), str(fused_block_insts)
+            )
 
     def _quant_source(self, value_name: str, values: dict[str, np.ndarray]) -> tuple[np.ndarray, float, int]:
         dq = self.nodes_by_output.get(value_name)
@@ -392,14 +437,83 @@ class XDNAResNetRunner:
         })
         return output
 
+    def _run_fused_bottleneck(self, values: dict[str, np.ndarray]) -> None:
+        binding = self._fused_block_binding
+        if binding is None:
+            raise RuntimeError("fused bottleneck was dispatched without a binding")
+        total_start = time.perf_counter()
+        start = total_start
+        activation = np.asarray(values[binding["input_raw_name"]])
+        centered = _centered_int8(
+            activation,
+            int(binding["input_zero_point"]),
+            f"fused block {binding['block'].prefix} activation",
+        )
+        nchw_shape = tuple(int(value) for value in binding["input_shape"])
+        channel_last = centered.reshape(nchw_shape).transpose(0, 2, 3, 1).copy().reshape(-1)
+        with self._fused_block_input.overwrite() as host_input:
+            np.copyto(host_input, channel_last)
+        self._profile["fused_bottleneck_input_prep_ms"] = (
+            self._profile.get("fused_bottleneck_input_prep_ms", 0.0)
+            + (time.perf_counter() - start) * 1000.0
+        )
+
+        launch_start = time.perf_counter()
+        self._fused_block_kernel(
+            self._fused_block_input,
+            self._fused_block_parameters,
+            self._fused_block_output,
+        )
+        self._profile["fused_bottleneck_kernel_call_ms"] = (
+            self._profile.get("fused_bottleneck_kernel_call_ms", 0.0)
+            + (time.perf_counter() - launch_start) * 1000.0
+        )
+
+        read_start = time.perf_counter()
+        output_shape = tuple(int(value) for value in binding["output_shape"])
+        output = (
+            self._fused_block_output.numpy()
+            .view(np.uint8)
+            .reshape(output_shape[0], output_shape[2], output_shape[3], output_shape[1])
+            .transpose(0, 3, 1, 2)
+            .copy()
+        )
+        values[binding["output_raw_name"]] = output
+        values[binding["output_dequant_name"]] = _dequantize(
+            output,
+            np.asarray([binding["output_scale"]], dtype=np.float32),
+            np.asarray([binding["output_zero_point"]], dtype=np.uint8),
+            axis=1,
+        )
+        self._profile["fused_bottleneck_readback_ms"] = (
+            self._profile.get("fused_bottleneck_readback_ms", 0.0)
+            + (time.perf_counter() - read_start) * 1000.0
+        )
+        self._profile["fused_bottleneck_total_ms"] = (
+            self._profile.get("fused_bottleneck_total_ms", 0.0)
+            + (time.perf_counter() - total_start) * 1000.0
+        )
+        self._executed["fused_bottleneck"] += 1
+
     def run(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        self._executed = {"xdna_conv": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0}
+        self._executed = {
+            "xdna_conv": 0,
+            "cpu_conv": 0,
+            "host_ops": 0,
+            "skipped_conv_dq": 0,
+            "fused_relu": 0,
+            "fused_bottleneck": 0,
+        }
         self._profile = {}
         self._conv_times = []
         self._precomputed_relu_nodes: set[int] = set()
         values = dict(self.arrays)
         values.update(inputs)
         for index, node in enumerate(self.nodes):
+            if index in self._fused_block_nodes:
+                if index == self._fused_block_start:
+                    self._run_fused_bottleneck(values)
+                continue
             if index in self._precomputed_relu_nodes:
                 continue
             if index in self._dq_only_used_by_conv:
@@ -481,6 +595,9 @@ def main() -> int:
         "--cpu-threads", type=int, default=2,
         help="PyTorch intra-op CPU threads for --cpu-backend torch",
     )
+    parser.add_argument("--fused-block-prefix", help="fuse one supported identity bottleneck, e.g. /layer1/layer1.1")
+    parser.add_argument("--fused-block-xclbin", type=Path)
+    parser.add_argument("--fused-block-insts", type=Path)
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     model = onnx.load(args.model)
@@ -491,6 +608,9 @@ def main() -> int:
         cpu_small_m=args.cpu_small_m,
         cpu_backend=args.cpu_backend,
         cpu_threads=args.cpu_threads,
+        fused_block_prefix=args.fused_block_prefix,
+        fused_block_xclbin=str(args.fused_block_xclbin) if args.fused_block_xclbin else None,
+        fused_block_insts=str(args.fused_block_insts) if args.fused_block_insts else None,
     )
     input_info = model.graph.input[0]
     shape = [int(dim.dim_value) or 1 for dim in input_info.type.tensor_type.shape.dim]
@@ -508,7 +628,10 @@ def main() -> int:
     avg_ms = elapsed_ms / args.iters
     result = {
         "backend": "amd_xdna_iron_xrt_resnet_graph",
-        "execution": "full_graph_xdna_conv_host_ops" if not args.cpu_small_m else "full_graph_hybrid_conv_host_ops",
+        "execution": "full_graph_with_fused_bottleneck" if args.fused_block_prefix else (
+            "full_graph_xdna_conv_host_ops" if not args.cpu_small_m else "full_graph_hybrid_conv_host_ops"
+        ),
+        "fused_block_prefix": args.fused_block_prefix,
         "cpu_small_m_threshold": args.cpu_small_m,
         "cpu_backend": args.cpu_backend,
         "cpu_threads": args.cpu_threads if args.cpu_backend == "torch" else None,
