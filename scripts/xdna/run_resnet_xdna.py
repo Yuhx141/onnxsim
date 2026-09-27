@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Execute a static QDQ ResNet graph with Conv GEMMs on XDNA.
+"""Execute a static QDQ ResNet graph with selected kernels on XDNA.
 
-Convolutions run through compiled IRON/XRT artifacts. The remaining ONNX ops
-run in NumPy on the host, so this is full graph execution with XDNA Conv
-offload, not an all-operators-on-NPU claim.
+Convolutions and supported operator kernels run through compiled IRON/XRT
+artifacts. Unsupported ONNX ops run in NumPy on the host.
 """
 
 from __future__ import annotations
@@ -184,7 +183,12 @@ class XDNAResNetRunner:
             ):
                 self._dq_only_used_by_conv.add(index)
         self.specs = [entry for entry in manifest.get("kernels", []) if entry.get("compiled_artifact")]
-        self._executed = {"xdna_conv": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
+        self.operation_specs = {
+            int(entry["node_index"]): entry
+            for entry in manifest.get("operation_kernels", [])
+            if entry.get("op_type") == "MaxPool" and entry.get("compiled_artifact")
+        }
+        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
         self._profile: dict[str, float] = {}
         self._device_readback_cache: dict[int, np.ndarray] = {}
         self._conv_times: list[dict[str, Any]] = []
@@ -346,6 +350,40 @@ class XDNAResNetRunner:
     def _kernel(xclbin: str, insts: str) -> Any:
         from aie.utils import NPUKernel
         return NPUKernel(xclbin, insts)
+
+    def _run_maxpool_kernel(self, index: int, x: np.ndarray) -> np.ndarray:
+        """Pad an NCHW activation on the host and execute its compiled pool kernel."""
+        import aie.iron as iron
+        from aie.iron.device import from_name
+
+        iron.set_current_device(from_name("npu2", n_cols=None))
+        spec = self.operation_specs[index]
+        params = spec["parameters"]
+        artifact = spec["compiled_artifact"]
+        started = time.perf_counter()
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim != 4 or x.shape[0] != 1:
+            raise ValueError(f"compiled MaxPool node {index} requires batch-one NCHW input")
+        pads = tuple(int(value) for value in params["pads"])
+        pt, pl, pb, pr = pads
+        padded = np.pad(x, ((0, 0), (0, 0), (pt, pb), (pl, pr)), constant_values=-np.inf)
+        expected = (1, int(params["channels"]), int(params["input_height"]), int(params["input_width"]))
+        if padded.shape != expected:
+            raise ValueError(f"compiled MaxPool node {index} expects padded input {expected}, got {padded.shape}")
+        output_shape = (1, int(params["channels"]), int(params["output_height"]), int(params["output_width"]))
+        input_tensor = iron.tensor(padded.reshape(-1), dtype=np.float32, device="npu")
+        output_tensor = iron.tensor(np.empty(math.prod(output_shape), dtype=np.float32), dtype=np.float32, device="npu")
+        self._profile["maxpool_pad_upload_ms"] = self._profile.get("maxpool_pad_upload_ms", 0.0) + (time.perf_counter() - started) * 1000.0
+        launch_start = time.perf_counter()
+        self._kernel(str(artifact["xclbin"]), str(artifact["insts"]))(input_tensor, output_tensor)
+        self._profile["maxpool_kernel_ms"] = self._profile.get("maxpool_kernel_ms", 0.0) + (time.perf_counter() - launch_start) * 1000.0
+        read_start = time.perf_counter()
+        # Keep the host result independent from the temporary XRT tensor, whose
+        # mapped view becomes invalid when the allocation is released.
+        result = output_tensor.numpy().reshape(output_shape).copy()
+        self._profile["maxpool_readback_ms"] = self._profile.get("maxpool_readback_ms", 0.0) + (time.perf_counter() - read_start) * 1000.0
+        self._executed["xdna_maxpool"] += 1
+        return result
 
     def _run_conv(self, index: int, node: Any, values: dict[str, np.ndarray]) -> np.ndarray:
         total_start = time.perf_counter()
@@ -579,6 +617,7 @@ class XDNAResNetRunner:
     def run(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         self._executed = {
             "xdna_conv": 0,
+            "xdna_maxpool": 0,
             "cpu_conv": 0,
             "host_ops": 0,
             "skipped_conv_dq": 0,
@@ -614,6 +653,7 @@ class XDNAResNetRunner:
                 continue
             node_start = time.perf_counter()
             op = node.op_type
+            offloaded = False
             attrs = _attrs(node)
             args = [] if op == "Conv" else [self._host_value(values[name]) for name in node.input if name]
             if op == "Constant":
@@ -631,7 +671,11 @@ class XDNAResNetRunner:
             elif op == "Mul":
                 result = args[0] * args[1]
             elif op == "MaxPool":
-                result = _max_pool(args[0], attrs)
+                if index in self.operation_specs:
+                    result = self._run_maxpool_kernel(index, args[0])
+                    offloaded = True
+                else:
+                    result = _max_pool(args[0], attrs)
             elif op == "GlobalAveragePool":
                 result = np.mean(args[0], axis=tuple(range(2, args[0].ndim)), keepdims=True)
             elif op == "Flatten":
@@ -652,9 +696,9 @@ class XDNAResNetRunner:
                 self._fuse_conv_tail(index, result, values)
                 tail_ms = (time.perf_counter() - tail_start) * 1000.0
                 self._profile["conv_fused_relu_ms"] = self._profile.get("conv_fused_relu_ms", 0.0) + tail_ms
-            if op not in {"Conv", "Constant"}:
+            if op not in {"Conv", "Constant"} and not offloaded:
                 self._executed["host_ops"] += 1
-            if op != "Conv":
+            if op != "Conv" and not offloaded:
                 key = f"host_{op}_ms"
                 self._profile[key] = self._profile.get(key, 0.0) + (time.perf_counter() - node_start) * 1000.0
         return {value.name: self._host_value(values[value.name]) for value in self.model.graph.output}

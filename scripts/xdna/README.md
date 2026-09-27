@@ -106,7 +106,8 @@ python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
 
 The graph runner supports an all-XDNA Conv mode and a hybrid mode that runs
 small Conv layers as CPU integer GEMMs to avoid launch overhead. In both modes,
-QDQ, activation, pooling, residual, and dense nodes run on the host. Reports
+unsupported QDQ, activation, residual, dense, and uncompiled pooling nodes run on
+the host. Reports
 distinguish `full_graph_xdna_conv_host_ops` from
 `full_graph_hybrid_conv_host_ops`; neither means all graph operators execute on
 the NPU. The quicktest ResNet-50 graph has 53 Conv nodes and 91 planned
@@ -175,9 +176,10 @@ projection/downsample residuals with power-of-two QDQ scales. The four
 projection blocks bind with tile-memory-aware skip chunks. The
 `/layer2/layer2.1` identity block remains an on-device exactness checkpoint.
 Small spatial identity blocks at H=2 and H=1 also matched the reference on
-device. Full graph execution is still incomplete: the stem, pooling, and
-classifier-side operators run on the host, and the 91-dispatch graph schedule
-remains planning metadata rather than one executable XDNA program.
+device. Full graph execution is still incomplete: stem convolution and
+classifier-side operators run on the host; supported pooling dispatches to XDNA
+but stages padded input and output through host memory. The 91-dispatch graph
+schedule remains planning metadata rather than one executable XDNA program.
 
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
 hybrid Conv layers and skips their unused im2col staging. Converted constant
@@ -256,13 +258,15 @@ the 2,048-channel, 7×7 shape compiled and matched NumPy on the NPU. A 1×1
 spatial input is emitted as a zero-copy view.
 
 Batch-one NCHW float32 2D `MaxPool` with unit dilation and floor output sizing
-now lowers to a row-streamed kernel. Codegen records the original padding and
-the runtime must supply `-inf`-padded input rows; the kernel streams row slabs
-so the full activation does not need to fit in core memory. Both the ResNet
-quicktest 16×16→8×8 pool and the standard 112×112→56×56 stem pool compiled and
-matched NumPy on the NPU. General `AveragePool`, MaxPool indices, and other data
-types remain unsupported. Compiled pooling artifacts still need graph-runner
-dispatch wiring.
+lowers to a row-streamed kernel. The graph runner applies ONNX padding with
+`-inf`, uploads the padded NCHW tensor, dispatches the compiled artifact, and
+reads its result back for subsequent graph operations. The kernel streams row
+slabs so the full activation does not need to fit in core memory. Both the
+ResNet quicktest 16×16→8×8 pool and the standard 112×112→56×56 stem pool
+compiled and matched NumPy on the NPU. General `AveragePool`, MaxPool indices,
+and other data types remain unsupported. The current runner path still crosses
+the host/device boundary around pooling; adjacent operator fusion is future
+work.
 
 `Flatten` and `Reshape` are emitted as zero-copy contiguous tensor views, with
 their input/output shapes carried in the operation record. They require no AIE
