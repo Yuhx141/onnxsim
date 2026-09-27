@@ -342,6 +342,7 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         "output_scale": final_scale,
         "output_zero_point": final_zero,
         "input_shape": input_shape,
+        "input_scale": input_scale,
         "output_shape": output_shape,
         "covered_nodes": covered,
         "quantizers": quantizers,
@@ -426,12 +427,9 @@ def main() -> int:
         [binding["input_raw_name"], binding["output_raw_name"]],
         {model.graph.input[0].name: sample},
     )
-    edge = qdq_edge_map(model)[next(
-        str(node.input[0]) for node in model.graph.node
-        if node.op_type == "Conv" and node.name == f"{args.block}/conv1/Conv"
-    )]
-    zero = edge.params.zero_point[0]
-    x_hwc = (expected_input.astype(np.int16) - zero).astype(np.int8).transpose(0, 2, 3, 1).copy()
+    # The fused kernel accepts the raw uint8 edge and centers it on the AIE
+    # core, which also lets adjacent blocks pass this buffer device to device.
+    x_hwc = expected_input.transpose(0, 2, 3, 1).copy().view(np.int8)
     x_tensor = iron.tensor(x_hwc.reshape(-1), dtype=np.int8, device="npu")
 
     def execute() -> np.ndarray:

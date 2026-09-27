@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import time
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,18 @@ try:
 except ImportError:  # executed directly as a script
     from benchmark_fused_bottleneck import bind_fused_bottleneck
     from resnet_bottleneck import plan_bottleneck_blocks
+
+
+@dataclass
+class _DeviceValue:
+    """A raw quantized edge retained in an XRT allocation in HWC order."""
+
+    tensor: Any
+    shape: tuple[int, ...]
+    scale: float
+    zero_point: int
+    as_real: bool = False
+    producer: str = ""
 
 
 def _attrs(node: Any) -> dict[str, Any]:
@@ -171,8 +184,9 @@ class XDNAResNetRunner:
             ):
                 self._dq_only_used_by_conv.add(index)
         self.specs = [entry for entry in manifest.get("kernels", []) if entry.get("compiled_artifact")]
-        self._executed = {"xdna_conv": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0}
+        self._executed = {"xdna_conv": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
         self._profile: dict[str, float] = {}
+        self._device_readback_cache: dict[int, np.ndarray] = {}
         self._conv_times: list[dict[str, Any]] = []
         self._workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
         # ONNX weights are constants. Keep their padded GEMM layout so steady
@@ -187,6 +201,7 @@ class XDNAResNetRunner:
             fused_specs.append((fused_block_prefix, fused_block_xclbin, fused_block_insts))
         self._fused_blocks: dict[str, dict[str, Any]] = {}
         self._fused_nodes: dict[int, tuple[str, bool]] = {}
+        self._fused_input_handoffs: dict[int, str] = {}
         if fused_specs:
             import aie.iron as iron
 
@@ -227,6 +242,59 @@ class XDNAResNetRunner:
             }
             for index in covered:
                 self._fused_nodes[index] = (prefix, index == start_index)
+        self._plan_fused_input_handoffs()
+
+    def _plan_fused_input_handoffs(self) -> None:
+        """Find adjacent fused blocks whose raw QDQ edge can stay on device."""
+        for target_prefix, target in self._fused_blocks.items():
+            target_binding = target["binding"]
+            target_block = target_binding["block"]
+            target_conv = self.nodes[target_block.main_conv_indices[0]]
+            input_dq_name = str(target_conv.input[0])
+            input_dq = self.nodes_by_output.get(input_dq_name)
+            if input_dq is None or input_dq.op_type != "DequantizeLinear":
+                continue
+            if self.consumers_by_input.get(input_dq_name) != [(target_block.main_conv_indices[0], 0)]:
+                continue
+            dq_scale = float(np.asarray(self.arrays[str(input_dq.input[1])]).reshape(-1)[0])
+            dq_zero = int(np.asarray(self.arrays[str(input_dq.input[2])]).reshape(-1)[0])
+            dq_index = next(i for i, node in enumerate(self.nodes) if node is input_dq)
+            for source_prefix, source in self._fused_blocks.items():
+                if source_prefix == target_prefix:
+                    continue
+                source_binding = source["binding"]
+                if source_binding["output_raw_name"] != target_binding["input_raw_name"]:
+                    continue
+                if tuple(source_binding["output_shape"]) != tuple(target_binding["input_shape"]):
+                    continue
+                if (source_binding["output_zero_point"] != dq_zero
+                        or not math.isclose(float(source_binding["output_scale"]), dq_scale, rel_tol=1e-6)
+                        or dq_zero != 128):
+                    continue
+                self._fused_input_handoffs[dq_index] = source_prefix
+                break
+
+    def _host_value(self, value: Any) -> np.ndarray:
+        if not isinstance(value, _DeviceValue):
+            return np.asarray(value)
+        cache_key = id(value.tensor)
+        raw = self._device_readback_cache.get(cache_key)
+        if raw is None:
+            started = time.perf_counter()
+            n, c, h, w = value.shape
+            raw = (
+                value.tensor.numpy()
+                .view(np.uint8)
+                .reshape(n, h, w, c)
+                .transpose(0, 3, 1, 2)
+                .copy()
+            )
+            self._device_readback_cache[cache_key] = raw
+            self._executed["device_edge_readbacks"] += 1
+            self._profile["device_edge_readback_ms"] = self._profile.get("device_edge_readback_ms", 0.0) + (time.perf_counter() - started) * 1000.0
+        if value.as_real:
+            return _dequantize(raw, np.asarray([value.scale], dtype=np.float32), np.asarray([value.zero_point], dtype=np.uint8), axis=1)
+        return raw
 
     def _quant_source(self, value_name: str, values: dict[str, np.ndarray]) -> tuple[np.ndarray, float, int]:
         dq = self.nodes_by_output.get(value_name)
@@ -234,6 +302,8 @@ class XDNAResNetRunner:
             raise ValueError(f"Conv tensor {value_name!r} is not produced by DequantizeLinear")
         raw_name, scale_name, zero_name = dq.input[:3]
         raw = values[raw_name]
+        if isinstance(raw, _DeviceValue):
+            raw = self._host_value(raw)
         scale = np.asarray(self.arrays[scale_name], dtype=np.float32).reshape(-1)
         zero = np.asarray(self.arrays[zero_name]).reshape(-1)
         if scale.size != 1 or zero.size != 1:
@@ -452,48 +522,43 @@ class XDNAResNetRunner:
     def _run_fused_bottleneck(self, values: dict[str, np.ndarray], block: dict[str, Any]) -> None:
         binding = block["binding"]
         total_start = time.perf_counter()
-        start = total_start
-        activation = np.asarray(values[binding["input_raw_name"]])
-        centered = _centered_int8(
-            activation,
-            int(binding["input_zero_point"]),
-            f"fused block {binding['block'].prefix} activation",
-        )
-        nchw_shape = tuple(int(value) for value in binding["input_shape"])
-        channel_last = centered.reshape(nchw_shape).transpose(0, 2, 3, 1).copy().reshape(-1)
-        with block["input"].overwrite() as host_input:
-            np.copyto(host_input, channel_last)
-        self._profile["fused_bottleneck_input_prep_ms"] = (
-            self._profile.get("fused_bottleneck_input_prep_ms", 0.0)
-            + (time.perf_counter() - start) * 1000.0
-        )
+        activation = values[binding["input_raw_name"]]
+        if isinstance(activation, _DeviceValue):
+            if tuple(activation.shape) != tuple(binding["input_shape"]):
+                raise ValueError(f"device handoff shape mismatch for {binding['block'].prefix}")
+            block_input = activation.tensor
+            self._executed["device_resident_handoffs"] += 1
+        else:
+            start = time.perf_counter()
+            raw = np.asarray(activation).reshape(binding["input_shape"])
+            channel_last = raw.transpose(0, 2, 3, 1).copy().view(np.int8).reshape(-1)
+            with block["input"].overwrite() as host_input:
+                np.copyto(host_input, channel_last)
+            block_input = block["input"]
+            self._profile["fused_bottleneck_input_prep_ms"] = (
+                self._profile.get("fused_bottleneck_input_prep_ms", 0.0)
+                + (time.perf_counter() - start) * 1000.0
+            )
 
         launch_start = time.perf_counter()
-        block["kernel"](block["input"], block["parameters"], block["output"])
+        block["kernel"](block_input, block["parameters"], block["output"])
         self._profile["fused_bottleneck_kernel_call_ms"] = (
             self._profile.get("fused_bottleneck_kernel_call_ms", 0.0)
             + (time.perf_counter() - launch_start) * 1000.0
         )
 
-        read_start = time.perf_counter()
         output_shape = tuple(int(value) for value in binding["output_shape"])
-        output = (
-            block["output"].numpy()
-            .view(np.uint8)
-            .reshape(output_shape[0], output_shape[2], output_shape[3], output_shape[1])
-            .transpose(0, 3, 1, 2)
-            .copy()
+        device_output = _DeviceValue(
+            block["output"],
+            output_shape,
+            float(binding["output_scale"]),
+            int(binding["output_zero_point"]),
+            producer=binding["block"].prefix,
         )
-        values[binding["output_raw_name"]] = output
-        values[binding["output_dequant_name"]] = _dequantize(
-            output,
-            np.asarray([binding["output_scale"]], dtype=np.float32),
-            np.asarray([binding["output_zero_point"]], dtype=np.uint8),
-            axis=1,
-        )
-        self._profile["fused_bottleneck_readback_ms"] = (
-            self._profile.get("fused_bottleneck_readback_ms", 0.0)
-            + (time.perf_counter() - read_start) * 1000.0
+        values[binding["output_raw_name"]] = device_output
+        values[binding["output_dequant_name"]] = _DeviceValue(
+            block["output"], output_shape, device_output.scale, device_output.zero_point,
+            as_real=True, producer=device_output.producer,
         )
         self._profile["fused_bottleneck_total_ms"] = (
             self._profile.get("fused_bottleneck_total_ms", 0.0)
@@ -509,8 +574,11 @@ class XDNAResNetRunner:
             "skipped_conv_dq": 0,
             "fused_relu": 0,
             "fused_bottleneck": 0,
+            "device_resident_handoffs": 0,
+            "device_edge_readbacks": 0,
         }
         self._profile = {}
+        self._device_readback_cache = {}
         self._conv_times = []
         self._precomputed_relu_nodes: set[int] = set()
         values = dict(self.arrays)
@@ -523,13 +591,20 @@ class XDNAResNetRunner:
                 continue
             if index in self._precomputed_relu_nodes:
                 continue
+            if index in self._fused_input_handoffs:
+                raw = values.get(str(node.input[0]))
+                if (not isinstance(raw, _DeviceValue)
+                        or raw.producer != self._fused_input_handoffs[index]):
+                    raise RuntimeError("planned device handoff input is not resident on device")
+                values[str(node.output[0])] = raw
+                continue
             if index in self._dq_only_used_by_conv:
                 self._executed["skipped_conv_dq"] += 1
                 continue
             node_start = time.perf_counter()
             op = node.op_type
             attrs = _attrs(node)
-            args = [] if op == "Conv" else [values[name] for name in node.input if name]
+            args = [] if op == "Conv" else [self._host_value(values[name]) for name in node.input if name]
             if op == "Constant":
                 result = numpy_helper.to_array(attrs["value"])
             elif op == "QuantizeLinear":
@@ -571,7 +646,7 @@ class XDNAResNetRunner:
             if op != "Conv":
                 key = f"host_{op}_ms"
                 self._profile[key] = self._profile.get(key, 0.0) + (time.perf_counter() - node_start) * 1000.0
-        return {value.name: values[value.name] for value in self.model.graph.output}
+        return {value.name: self._host_value(values[value.name]) for value in self.model.graph.output}
 
     def _fuse_conv_tail(self, conv_index: int, output: np.ndarray, values: dict[str, np.ndarray]) -> None:
         """Materialize a fused Conv+Relu output once instead of repeating Relu."""

@@ -60,7 +60,7 @@ extern "C" void fused_bottleneck_conv1_chunk(const int8_t *input, const uint8_t 
   for (int p = 0; p < pixels; ++p) for (int oc = 0; oc < outputs; ++oc) {
     int32_t acc = bias[oc];
     for (int ic = 0; ic < FUSED_C; ++ic)
-      acc += (int32_t)input[p * FUSED_C + ic] * (int32_t)weights[oc * FUSED_C + ic];
+      acc += ((int32_t)((uint8_t)input[p * FUSED_C + ic] - 128)) * (int32_t)weights[oc * FUSED_C + ic];
     int32_t q = 128 + round_shift_even(acc, FUSED_SHIFT1);
     if (q < 128) q = 128; else if (q > 255) q = 255;
     bundle[p * FUSED_MID + chunk * outputs + oc] = (uint8_t)q;

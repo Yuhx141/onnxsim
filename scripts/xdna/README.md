@@ -206,30 +206,28 @@ inputs, a topologically ordered instruction stream with ONNX attributes and
 QDQ scale/zero-point references, internal tensor lifetimes, an estimated peak
 live-buffer size, and the operator lowerings still required. This gives the
 future fused runtime a graph IR plus a buffer and dependency contract. Regions are explicitly marked
-`planning_only_not_executable`; current XDNA execution still uses individual
-Conv kernels and host-side operators.
+`planning_only_not_executable`; current XDNA execution uses individual Conv
+kernels, selected fused bottlenecks, and host-side operators.
 
 ### From planned regions to device-resident execution
 
 The connected regions above describe dependencies; they do not imply that one
 XDNA kernel can execute every listed operator. A graph runner must separately
 bind each planned instruction to a supported device kernel and retain each
-internal tensor in an XRT allocation until its final consumer. The present
-runner instead copies activations through host memory between its executable
-fused-block calls, and runs the remaining operations on the host.
+internal tensor in an XRT allocation until its final consumer. Adjacent fused
+blocks can now pass their raw quantized activation buffers directly on device
+when shape and QDQ scale match. Unfused operations and incompatible boundaries
+still materialize values on the host.
 
 A practical implementation sequence is:
 
-1. Extend block lowering to projection/downsample residuals and the small
-   spatial tails, preserving the ONNX QDQ scale and zero-point at every edge.
-2. Add a device-buffer schedule for consecutive supported blocks. Allocate
+1. Extend the device-buffer schedule beyond adjacent bottlenecks. Allocate
    edge tensors once, launch each block against those allocations, and read
-   back only graph outputs. Keep host fallback boundaries explicit where an
-   operator has no device lowering.
-3. Lower the stem pooling, residual/activation cases outside blocks, global
+   back only graph outputs or explicit host fallback boundaries.
+2. Lower the stem pooling, residual/activation cases outside blocks, global
    average pool, flatten, and classifier. Then let the scheduler join the
    resulting instructions into one graph-level device schedule.
-4. Mark a region executable only when every instruction has a device binding
+3. Mark a region executable only when every instruction has a device binding
    and every internal edge has a device-resident buffer plan. Keep planned
    node coverage, executable node coverage, and measured device execution as
    separate report fields.

@@ -49,7 +49,7 @@ extern "C" void fused_bottleneck_skip_chunk(const int8_t *input,
     for (int oc = 0; oc < outputs; ++oc) {
       int32_t acc = bias[oc];
       for (int ic = 0; ic < FUSED_C; ++ic)
-        acc += (int32_t)input[ip * FUSED_C + ic] * (int32_t)weights[oc * FUSED_C + ic];
+        acc += ((int32_t)((uint8_t)input[ip * FUSED_C + ic] - 128)) * (int32_t)weights[oc * FUSED_C + ic];
       int32_t q = 128 + round_shift_even(acc, FUSED_SKIP_SHIFT);
       if (q < 0) q = 0; else if (q > 255) q = 255;
       output[p * FUSED_OUT_C + chunk * outputs + oc] = (uint8_t)q;

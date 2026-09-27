@@ -24,6 +24,6 @@ extern "C" void fused_bottleneck_identity_skip(const int8_t *input, int8_t *outp
     const int ip = (p / FUSED_OUT_W) * FUSED_SKIP_STRIDE * FUSED_W +
                    (p % FUSED_OUT_W) * FUSED_SKIP_STRIDE;
     for (int c = 0; c < FUSED_OUT_C; ++c)
-      output[p * FUSED_OUT_C + c] = input[ip * FUSED_C + c];
+      output[p * FUSED_OUT_C + c] = (int8_t)((uint8_t)input[ip * FUSED_C + c] - 128);
   }
 }
