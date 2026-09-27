@@ -131,6 +131,9 @@ cmake -S tools/onnx-remote -B build-ort-worker \
 cmake --build build-ort-worker --target onnx-remote-ort-worker
 ```
 
+Run it with `--threads 1` (the default) for bounded CPU use, or raise the
+value on a compile host with spare cores.
+
 The worker accepts `subgraph` or `onnx` requests containing serialized ONNX
 bytes in `Request::model`, executes float32 inputs on ORT CPU, and returns
 float32 outputs plus an `ort_session_run` profile event. It is optional and
