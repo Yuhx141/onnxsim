@@ -27,25 +27,64 @@ static int self_test() {
     std::cerr << "request payload round-trip failed\n";
     return 1;
   }
-  int fd = connect_tcp("127.0.0.1", 39501);
-  if (fd < 0) { std::cerr << "connect failed (start onnx-remote-worker --port 39501)\n"; return 1; }
-  Request r = payload_request;
-  if (!send_request(fd, r, error)) { std::cerr << error << '\n'; close_socket(fd); return 1; }
-  Response response;
-  if (!receive_response(fd, response, error) || !response.ok || response.outputs.size() != 1) {
-    std::cerr << (error.empty() ? response.error : error) << '\n'; close_socket(fd); return 1;
-  }
-  if (response.request_id != payload_request.request_id) {
-    std::cerr << "response request id mismatch\n";
+  struct Operation {
+    const char* name;
+    std::vector<float> lhs;
+    std::vector<float> rhs;
+    std::vector<float> expected;
+  };
+  const std::vector<Operation> operations = {
+      {"relu", {-2, -1, 0, 1, 2}, {}, {0, 0, 0, 1, 2}},
+      {"add", {1, 2, 3}, {4, 5, 6}, {5, 7, 9}},
+      {"mul", {1, 2, 3}, {4, 5, 6}, {4, 10, 18}},
+      {"sub", {1, 2, 3}, {4, 5, 6}, {-3, -3, -3}},
+      {"div", {4, 9, 12}, {2, 3, 4}, {2, 3, 3}},
+      {"max", {1, 5, 3}, {4, 2, 6}, {4, 5, 6}},
+      {"min", {1, 5, 3}, {4, 2, 6}, {1, 2, 3}},
+  };
+  size_t profile_events = 0;
+  for (const Operation& operation : operations) {
+    int fd = connect_tcp("127.0.0.1", 39501);
+    if (fd < 0) {
+      std::cerr << "connect failed (start onnx-remote-worker --port 39501)\n";
+      return 1;
+    }
+    Request request;
+    request.request_id = 7 + profile_events;
+    request.op = operation.name;
+    request.profiling = ProfilingLevel::Detailed;
+    request.inputs.push_back(Tensor{{static_cast<int64_t>(operation.lhs.size())},
+                                    operation.lhs});
+    if (!operation.rhs.empty())
+      request.inputs.push_back(Tensor{{static_cast<int64_t>(operation.rhs.size())},
+                                      operation.rhs});
+    if (!send_request(fd, request, error)) {
+      std::cerr << error << '\n'; close_socket(fd); return 1;
+    }
+    Response response;
+    if (!receive_response(fd, response, error) || !response.ok ||
+        response.outputs.size() != 1) {
+      std::cerr << (error.empty() ? response.error : error) << '\n';
+      close_socket(fd); return 1;
+    }
+    if (response.request_id != request.request_id ||
+        response.outputs[0].data.size() != operation.expected.size()) {
+      std::cerr << "response mismatch for " << operation.name << '\n';
+      close_socket(fd); return 1;
+    }
+    for (size_t i = 0; i < operation.expected.size(); ++i) {
+      if (std::fabs(response.outputs[0].data[i] - operation.expected[i]) >
+          1e-6f) {
+        std::cerr << "value mismatch for " << operation.name << '\n';
+        close_socket(fd); return 1;
+      }
+    }
+    profile_events += response.profile.size();
     close_socket(fd);
-    return 1;
   }
-  const auto& got = response.outputs[0].data; const float want[] = {0, 0, 0, 1, 2};
-  if (got.size() != 5) return 1;
-  for (size_t i = 0; i < got.size(); ++i) if (std::fabs(got[i] - want[i]) > 1e-6f) return 1;
-  if (response.profile.empty() || response.profile[0].name != "relu") return 1;
   std::cout << "remote transport self-test passed (profile events: "
-            << response.profile.size() << ")\n"; close_socket(fd); return 0;
+            << profile_events << ")\n";
+  return 0;
 }
 
 int main(int argc, char** argv) {
