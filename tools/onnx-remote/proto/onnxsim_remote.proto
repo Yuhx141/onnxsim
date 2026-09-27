@@ -59,6 +59,10 @@ message ExecuteRequest {
   // Small control values only; large model/artifact data belongs in the
   // dedicated compile/load RPCs.
   map<string, string> parameters = 6;
+  // Serialized ONNX ModelProto for `subgraph` execution. Empty for unary
+  // ops and artifact-ID-only compiled runs. Bounded by the native
+  // transport's message limit.
+  bytes model = 7;
 }
 
 message ExecuteResponse {

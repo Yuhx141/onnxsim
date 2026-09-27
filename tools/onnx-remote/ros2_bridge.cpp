@@ -192,8 +192,23 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   }
 
   bool query_capabilities(onnx_remote::Response& response,
-                          std::string& error) const {
-    return query_capabilities_at(host_, port_, response, error);
+                          std::string& error) {
+    const bool ok = query_capabilities_at(host_, port_, response, error);
+    // Keep the discovery announcement's graph hint fresh without probing on
+    // the announce tick itself.
+    if (ok) {
+      onnx_remote::CapabilitySummary summary;
+      std::string parse_error;
+      if (onnx_remote::parse_capability_manifest(
+              response.manifest, summary, parse_error)) {
+        announced_graph_execution_ = summary.graph_execution;
+      } else {
+        announced_graph_execution_.reset();
+      }
+    } else {
+      announced_graph_execution_.reset();
+    }
+    return ok;
   }
 
   static std::string json_string(const std::string& json,
@@ -297,13 +312,24 @@ class OnnxRemoteBridge final : public rclcpp::Node {
 
   void announce() {
     String message;
+    // Include the last known graph_execution hint so subscribers with
+    // require_graph_execution can skip non-graph runners without a TCP
+    // probe. The hint is advisory: verify_discovery still confirms it. It
+    // refreshes on each successful capability query and clears on query
+    // failures, so announce itself never blocks on a worker round trip.
+    std::string graph_hint;
+    if (announced_graph_execution_.has_value()) {
+      graph_hint = std::string(",\"graph_execution\":") +
+                   (*announced_graph_execution_ ? "true" : "false");
+    }
     message.data = "{\"schema_version\":1,\"runner_id\":\"" +
                    json_escape(runner_id_) + "\",\"host\":\"" +
                    json_escape(advertise_host_) +
                    "\",\"port\":" + std::to_string(port_) + ",\"target\":\"" +
                    json_escape(discovery_target_) +
-                   "\",\"transport\":\"onnx-remote-v5\",\"ready\":true,"
-                   "\"ttl_ms\":" + std::to_string(discovery_timeout_ms_) + ","
+                   "\",\"transport\":\"onnx-remote-v5\",\"ready\":true" +
+                   graph_hint +
+                   ",\"ttl_ms\":" + std::to_string(discovery_timeout_ms_) + ","
                    "\"profiling\":[\"off\",\"summary\",\"detailed\"]}";
     discovery_->publish(std::move(message));
   }
@@ -317,6 +343,26 @@ class OnnxRemoteBridge final : public rclcpp::Node {
         !json_bool(message->data, "ready")) return;
     const std::string target = json_string(message->data, "target");
     if (!discovery_target_.empty() && target != discovery_target_) return;
+    // Fast-path: a runner that explicitly announces graph_execution:false
+    // can be rejected without a TCP probe when graph execution is required.
+    // A missing hint still falls through to verification.
+    if (require_graph_execution_) {
+      const std::string marker = "\"graph_execution\":";
+      const size_t hint_at = message->data.find(marker);
+      if (hint_at != std::string::npos) {
+        const size_t value_at = hint_at + marker.size();
+        if (message->data.compare(value_at, 5, "false") == 0) {
+          const std::string host = json_string(message->data, "host");
+          const int port = json_int(message->data, "port");
+          publish_discovery_status("rejected", id, host, port,
+                                   "runner announces graph_execution:false");
+          RCLCPP_WARN(get_logger(),
+                      "ignoring discovered runner %s: announces no graph execution",
+                      id.c_str());
+          return;
+        }
+      }
+    }
     const std::string host = json_string(message->data, "host");
     const int port = json_int(message->data, "port");
     if (host.empty() || port <= 0 || port > 65535) return;
@@ -475,6 +521,9 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   int discovered_timeout_ms_ = 15000;
   std::string discovered_runner_id_;
   std::optional<bool> discovered_graph_execution_;
+  // Last known graph_execution of this bridge's own worker, refreshed by
+  // capability queries. Published as an advisory hint in announcements.
+  std::optional<bool> announced_graph_execution_;
   bool publish_profile_ = true;
   bool publish_profile_events_ = false;
   std::chrono::steady_clock::time_point last_discovery_{};

@@ -19,6 +19,25 @@ int main(int argc, char** argv) {
   std::string error;
   Response response;
   int fd = -1;
+  {
+    // Capability-gated dispatch: verify the runner is reachable and parse
+    // its manifest before uploading an artifact.
+    Request capabilities;
+    capabilities.op = "capabilities";
+    capabilities.request_id = 1;
+    fd = connect_tcp_timeout(host, port, 2000);
+    if (fd < 0 || !send_request(fd, capabilities, error)) return 1;
+    if (!receive_response(fd, response, error) || !response.ok) {
+      close_socket(fd);
+      return 1;
+    }
+    close_socket(fd);
+    if (response.manifest.find("mock-runner") == std::string::npos ||
+        response.manifest.find("run_compiled") == std::string::npos) {
+      std::cerr << "unexpected runner capability manifest\n";
+      return 1;
+    }
+  }
   if (!run_only) {
     Request load;
     load.op = "load_compiled";

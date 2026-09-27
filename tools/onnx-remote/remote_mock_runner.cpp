@@ -65,6 +65,18 @@ static bool load_persisted_artifact(const std::string& id,
 static Response execute(const Request& request) {
   Response response;
   response.request_id = request.request_id;
+  if (request.op == "capabilities") {
+    response.ok = true;
+    response.artifact_id = "mock-runner";
+    response.manifest =
+        "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
+        "\"runner_id\":\"mock-runner\",\"ready\":true,"
+        "\"graph_execution\":false,"
+        "\"supported_ops\":[\"load_compiled\",\"run_compiled\"],"
+        "\"supported_dtypes\":[\"FLOAT\"],"
+        "\"profiling\":true}";
+    return response;
+  }
   if (request.op == "load_compiled") {
     if (request.artifact_id.empty() || request.artifact.empty()) {
       response.error = "load_compiled requires artifact_id and artifact";
@@ -81,7 +93,8 @@ static Response execute(const Request& request) {
     return response;
   }
   if (request.op != "run_compiled") {
-    response.error = "mock runner only accepts load_compiled/run_compiled";
+    response.error =
+        "mock runner only accepts capabilities/load_compiled/run_compiled";
     return response;
   }
   {

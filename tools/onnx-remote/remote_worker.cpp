@@ -80,8 +80,7 @@ static Response execute(const Request& r) {
         "\"exp\",\"log\",\"tanh\"],"
         "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\","
         "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","
-        "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\","
-        "\"FLOAT16\",\"BFLOAT16\"],"
+        "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\"],"
         "\"graph_execution\":false,"
         "\"profiling\":true}";
     out.ok = true;
