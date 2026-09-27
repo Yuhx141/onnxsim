@@ -238,6 +238,11 @@ TCP connection. Direct `remote_host`/`remote_port` remains the fallback when
 discovery is disabled. Announcement selection is target-filtered but does not
 provide authentication; use DDS security or a trusted ROS2 domain on shared
 networks.
+When multiple announcements match, a bridge keeps the first runner while its
+advertised lease is alive instead of switching endpoints on DDS delivery order.
+After the lease expires, the next matching announcement is selected and the
+bridge returns to its configured `remote_host`/`remote_port` if no replacement
+appears.
 
 The bridge exposes `health` and `capabilities` for ROS2 discovery/selection;
 both services query the selected worker, while tensor and profile data remain

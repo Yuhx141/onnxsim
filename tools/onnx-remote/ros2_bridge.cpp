@@ -198,14 +198,25 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     const std::string host = json_string(message->data, "host");
     const int port = json_int(message->data, "port");
     if (host.empty() || port <= 0 || port > 65535) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (discovered_ && id != discovered_runner_id_) {
+      const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - last_discovery_);
+      if (age.count() <= discovered_timeout_ms_) {
+        // Keep a live lease stable instead of switching based on DDS delivery
+        // order when multiple matching runners announce periodically.
+        return;
+      }
+    }
     host_ = host;
     port_ = port;
-    last_discovery_ = std::chrono::steady_clock::now();
+    last_discovery_ = now;
     const int advertised_ttl = json_int(message->data, "ttl_ms");
     discovered_timeout_ms_ = advertised_ttl > 0
                                  ? std::min(discovery_timeout_ms_, advertised_ttl)
                                  : discovery_timeout_ms_;
     discovered_ = true;
+    discovered_runner_id_ = id;
     RCLCPP_INFO(get_logger(), "auto-discovered runner %s at %s:%d", id.c_str(),
                 host_.c_str(), port_);
   }
@@ -220,6 +231,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     host_ = configured_host_;
     port_ = configured_port_;
     discovered_ = false;
+    discovered_runner_id_.clear();
   }
 
   void forward(const UInt8MultiArray::SharedPtr& message) {
@@ -286,6 +298,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   int discovery_timeout_ms_ = 15000;
   bool discovered_ = false;
   int discovered_timeout_ms_ = 15000;
+  std::string discovered_runner_id_;
   bool publish_profile_ = true;
   std::chrono::steady_clock::time_point last_discovery_{};
   std::string discovery_topic_;
