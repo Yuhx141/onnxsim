@@ -138,6 +138,10 @@ message CapabilitiesResponse {
   repeated string supported_dtypes = 6;
   uint64 max_message_bytes = 7;
   bool profiling = 8;
+  // True when the runner accepts serialized ONNX subgraphs as execution
+  // requests. This is capability-based dispatch; supported_ops is retained
+  // for legacy unary smoke clients.
+  bool graph_execution = 9;
 }
 
 enum ProfilingLevel {

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "remote_profile.h"
+#include "remote_capabilities.h"
 #include "remote_transport.h"
 
 using namespace std::chrono_literals;
@@ -64,6 +65,8 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                                                       "onnx_remote/runners");
     discovery_target_ = declare_parameter<std::string>("discovery_target", "");
     verify_discovery_ = declare_parameter<bool>("verify_discovery", true);
+    require_graph_execution_ = declare_parameter<bool>(
+        "require_graph_execution", false);
     publish_discovery_status_ =
         declare_parameter<bool>("publish_discovery_status", true);
     discovery_status_topic_ = declare_parameter<std::string>(
@@ -331,6 +334,19 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                     host.c_str(), port, error.c_str());
         return;
       }
+      if (require_graph_execution_) {
+        onnx_remote::CapabilitySummary summary;
+        if (!onnx_remote::parse_capability_manifest(
+                capabilities.manifest, summary, error) ||
+            !summary.graph_execution) {
+          if (error.empty()) error = "runner does not advertise graph execution";
+          publish_discovery_status("rejected", id, host, port, error);
+          RCLCPP_WARN(get_logger(),
+                      "ignoring discovered runner %s at %s:%d: %s", id.c_str(),
+                      host.c_str(), port, error.c_str());
+          return;
+        }
+      }
     }
     host_ = host;
     port_ = port;
@@ -435,6 +451,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   int io_timeout_ms_;
   bool auto_discover_;
   bool verify_discovery_ = true;
+  bool require_graph_execution_ = false;
   bool publish_discovery_status_ = true;
   int announce_period_ms_ = 5000;
   int discovery_timeout_ms_ = 15000;

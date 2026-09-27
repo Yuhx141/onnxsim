@@ -1,5 +1,6 @@
 #include "grpc_gateway.h"
 
+#include "remote_capabilities.h"
 #include "remote_transport.h"
 
 #include <cstring>
@@ -267,6 +268,14 @@ grpc::Status Service::GetCapabilities(grpc::ServerContext*, const CapabilitiesRe
   response->set_protocol("onnx-remote-v5");
   response->set_max_message_bytes(kMaxMessageBytes);
   response->set_profiling(native_response.ok);
+  onnx_remote::CapabilitySummary capabilities;
+  std::string capability_error;
+  if (native_response.ok &&
+      onnx_remote::parse_capability_manifest(native_response.manifest,
+                                             capabilities, capability_error)) {
+    response->set_graph_execution(capabilities.graph_execution);
+    response->set_profiling(capabilities.profiling);
+  }
   for (const auto& op : options_.supported_ops) response->add_supported_ops(op);
   for (const char* dtype : {"FLOAT", "UINT8", "INT8", "UINT16", "INT16",
                             "INT32", "INT64", "BOOL", "FLOAT16", "DOUBLE",

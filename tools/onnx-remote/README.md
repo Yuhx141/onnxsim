@@ -312,6 +312,10 @@ false only when the announced endpoint is intentionally unavailable during
 startup; the first tensor request will then perform the connectivity check.
 Announcements with an unsupported `schema_version` are ignored before any
 endpoint connection is attempted.
+Set `require_graph_execution:=true` when the bridge must select a runner that
+advertises serialized subgraph execution, such as the optional ORT graph
+worker; candidates without `graph_execution:true` are rejected with a status
+diagnostic.
 
 The announcing bridge can advertise a Tailscale address or DNS name with
 `advertise_host:=100.x.y.z`. Discovery is only the ROS2 control plane; tensor

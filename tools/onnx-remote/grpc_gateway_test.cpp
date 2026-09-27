@@ -42,7 +42,10 @@ void serve_requests() {
     if (request.op == "capabilities") {
       response.ok = true;
       response.artifact_id = "smoke-runner";
-      response.manifest = "{\"ready\":true}";
+      response.manifest =
+          "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
+          "\"runner_id\":\"smoke-runner\",\"graph_execution\":true,"
+          "\"profiling\":true}";
     } else if (request.op == "identity" && request.inputs.size() == 1) {
       response.ok = true;
       response.outputs = request.inputs;
@@ -98,6 +101,8 @@ int main() {
   assert(capability_response.ready());
   assert(capability_response.protocol() == "onnx-remote-v5");
   assert(capability_response.runner_id() == "smoke-runner");
+  assert(capability_response.graph_execution());
+  assert(capability_response.profiling());
   assert(capability_response.supported_ops_size() == 14);
   assert(capability_response.supported_ops(8) == "abs");
   assert(capability_response.supported_ops(9) == "neg");
