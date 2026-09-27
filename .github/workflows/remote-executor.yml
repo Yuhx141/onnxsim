@@ -198,6 +198,7 @@ jobs:
           (exec 3<>"/dev/tcp/127.0.0.1/39501") 2>/dev/null || {
             echo "worker never became ready:"; cat "$RUNNER_TEMP/public-ep-worker.log"; exit 1
           }
+          command -v gdb >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq gdb; } >/dev/null
           gdb -batch -ex 'set pagination off' -ex run -ex 'bt 24' \
             --args build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
             "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
