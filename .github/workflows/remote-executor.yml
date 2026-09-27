@@ -202,6 +202,41 @@ jobs:
             scripts/convertmodel/test/webgpu_kernel_add.onnx \
             "$RUNNER_TEMP/public-ep-cpu-fallback-profile"
 
+  ort-graph-worker:
+    name: ORT graph worker
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download public ORT SDK
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-1.29.0.tgz \
+            --output "$RUNNER_TEMP/onnxruntime.tgz"
+          tar -xzf "$RUNNER_TEMP/onnxruntime.tgz" -C "$RUNNER_TEMP"
+      - name: Configure ORT graph worker
+        run: |
+          cmake -S tools/onnx-remote -B build/onnx-remote-ort-worker \
+            -DONNXSIM_REMOTE_ORT_WORKER=ON \
+            -DONNXSIM_ORT_WORKER_INCLUDE_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-1.29.0/include" \
+            -DONNXSIM_ORT_WORKER_LIBRARY="$RUNNER_TEMP/onnxruntime-linux-x64-1.29.0/lib/libonnxruntime.so" \
+            -DBUILD_TESTING=ON
+      - name: Build ORT graph worker
+        run: |
+          cmake --build build/onnx-remote-ort-worker --target \
+            onnx-remote-ort-worker onnx-remote-ort-worker-test \
+            onnx-remote-client -j2
+      - name: Test graph execution round trip
+        env:
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.29.0/lib
+        run: |
+          build/onnx-remote-ort-worker/onnx-remote-ort-worker --port 39503 \
+            >"$RUNNER_TEMP/ort-worker.log" 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote-ort-worker/onnx-remote-ort-worker-test \
+            scripts/convertmodel/test/webgpu_kernel_add.onnx 39503
+
   dora-compile:
     name: DORA adapter compile contract
     runs-on: ubuntu-24.04

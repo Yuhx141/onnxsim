@@ -246,6 +246,10 @@ grpc::Status Service::LoadArtifact(grpc::ServerContext*, const LoadArtifactReque
     return invalid("artifact_id exceeds transport limit");
   if (request->artifact().size() > static_cast<int64_t>(kMaxArtifactBytes))
     return invalid("artifact exceeds transport limit");
+  // The native load_compiled request carries only ID and bytes; the manifest
+  // here only keys the gateway-local already_present hint.
+  if (request->manifest().size() > kMaxManifestBytes)
+    return invalid("manifest exceeds transport limit");
   NativeRequest native;
   native.request_id = request->request_id();
   native.op = "load_compiled";
