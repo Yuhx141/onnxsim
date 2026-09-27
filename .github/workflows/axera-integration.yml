@@ -57,6 +57,7 @@ on:
       - "tests/test_axera_replay.py"
       - "tests/test_axera_emitter.py"
       - "tests/test_axera_training_legalize.py"
+      - "tests/test_axera_step_runner.py"
 
 concurrency:
   group: axera-integration-${{ github.ref }}
