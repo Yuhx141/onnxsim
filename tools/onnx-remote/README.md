@@ -151,7 +151,18 @@ another operator allow-list.
 
 `onnx-remote-ort-worker-test MODEL.onnx PORT` runs the same float32 model
 locally through ORT and compares every output with the remote subgraph result,
-including the required profile event.
+including the required profile event. For a quick manual check without the
+test harness:
+
+```sh
+onnx-remote-ort-worker --port 39503 &
+onnx-remote-client --subgraph 127.0.0.1 39503 MODEL.onnx 1,2,3 --shape 3 \
+  --input 4,5,6@3
+```
+
+The positional values are the first input; repeat `--input VALUES[@D0,D1]`
+for additional model inputs. Output shapes, values, and profile events are
+printed.
 
 ## Design constraints
 

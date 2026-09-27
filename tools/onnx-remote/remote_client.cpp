@@ -5,8 +5,149 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 
 using namespace onnx_remote;
+
+static bool parse_floats(const std::string& text, std::vector<float>& values,
+                         std::string& error) {
+  values.clear();
+  std::string item;
+  std::istringstream stream(text);
+  while (std::getline(stream, item, ',')) {
+    char* end = nullptr;
+    const float value = std::strtof(item.c_str(), &end);
+    if (end == item.c_str() || *end != '\0' || !std::isfinite(value)) {
+      error = "invalid float value: " + item;
+      return false;
+    }
+    values.push_back(value);
+  }
+  if (values.empty()) error = "input values must not be empty";
+  return !values.empty();
+}
+
+static int subgraph_request(int argc, char** argv) {
+  // onnx-remote-client --subgraph HOST PORT MODEL.onnx V0,V1,... [--shape D0,D1]
+  // Repeat [--input VALUES [--shape DIMS]] for additional model inputs.
+  std::string shape_text;
+  int positional = 0;
+  std::string host, port_text, model_path, values_text;
+  std::vector<std::pair<std::string, std::string>> extra_inputs;
+  for (int i = 2; i < argc; ++i) {
+    const std::string argument = argv[i];
+    if (argument == "--shape" && i + 1 < argc) {
+      shape_text = argv[++i];
+    } else if (argument == "--input" && i + 1 < argc) {
+      std::string spec = argv[++i];
+      std::string input_shape;
+      const size_t at = spec.find('@');
+      if (at != std::string::npos) {
+        input_shape = spec.substr(at + 1);
+        spec.resize(at);
+      }
+      extra_inputs.emplace_back(spec, input_shape);
+    } else if (positional == 0) {
+      host = argument;
+      ++positional;
+    } else if (positional == 1) {
+      port_text = argument;
+      ++positional;
+    } else if (positional == 2) {
+      model_path = argument;
+      ++positional;
+    } else if (positional == 3) {
+      values_text = argument;
+      ++positional;
+    } else {
+      std::cerr << "unexpected argument: " << argument << '\n';
+      return 2;
+    }
+  }
+  if (positional != 4) {
+    std::cerr << "usage: onnx-remote-client --subgraph HOST PORT MODEL.onnx "
+                 "V0,V1,... [--shape D0,D1] [--input VALUES[@D0,D1] ...]\n";
+    return 2;
+  }
+  std::ifstream model_file(model_path, std::ios::binary);
+  if (!model_file) {
+    std::cerr << "cannot open model\n";
+    return 1;
+  }
+  Request request;
+  request.op = kSubgraphOperation;
+  request.profiling = ProfilingLevel::Detailed;
+  request.model.assign(std::istreambuf_iterator<char>(model_file), {});
+  auto append_input = [&](const std::string& values_text,
+                          const std::string& shape_text) {
+    std::string error;
+    std::vector<float> values;
+    if (!parse_floats(values_text, values, error)) {
+      std::cerr << error << '\n';
+      return false;
+    }
+    Tensor input;
+    if (shape_text.empty()) {
+      input.shape = {static_cast<int64_t>(values.size())};
+    } else {
+      std::string item;
+      std::istringstream stream(shape_text);
+      while (std::getline(stream, item, ',')) {
+        char* end = nullptr;
+        const long dimension = std::strtol(item.c_str(), &end, 10);
+        if (end == item.c_str() || *end != '\0' || dimension <= 0) {
+          std::cerr << "invalid shape dimension: " << item << '\n';
+          return false;
+        }
+        input.shape.push_back(dimension);
+      }
+      size_t elements = 1;
+      for (int64_t dimension : input.shape) elements *= static_cast<size_t>(dimension);
+      if (elements != values.size()) {
+        std::cerr << "values count does not match shape\n";
+        return false;
+      }
+    }
+    input.data = values;
+    request.inputs.push_back(std::move(input));
+    return true;
+  };
+  if (!append_input(values_text, shape_text)) return 2;
+  for (const auto& extra : extra_inputs) {
+    if (!append_input(extra.first, extra.second)) return 2;
+  }
+  const int fd = connect_tcp(host,
+                             static_cast<uint16_t>(std::strtoul(port_text.c_str(), nullptr, 10)));
+  if (fd < 0) {
+    std::cerr << "connect failed\n";
+    return 1;
+  }
+  std::string error;
+  Response response;
+  const bool ok =
+      send_request(fd, request, error) && receive_response(fd, response, error);
+  close_socket(fd);
+  if (!ok || !response.ok) {
+    std::cerr << (error.empty() ? response.error : error) << '\n';
+    return 1;
+  }
+  for (size_t i = 0; i < response.outputs.size(); ++i) {
+    const Tensor& output = response.outputs[i];
+    std::cout << "output[" << i << "] dtype=" << static_cast<int>(output.dtype)
+              << " shape=[";
+    for (size_t j = 0; j < output.shape.size(); ++j) {
+      if (j != 0) std::cout << ',';
+      std::cout << output.shape[j];
+    }
+    std::cout << "]\n";
+    for (float value : output.data) std::cout << value << '\n';
+  }
+  for (const ProfileEvent& event : response.profile) {
+    std::cout << "profile: " << event.name << " " << event.duration_us
+              << "us " << event.detail << '\n';
+  }
+  return 0;
+}
 
 static int self_test() {
   Request payload_request;
@@ -121,6 +262,8 @@ static int self_test() {
 
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--self-test") return self_test();
+  if (argc >= 2 && std::string(argv[1]) == "--subgraph")
+    return subgraph_request(argc, argv);
   if (argc == 4 && std::string(argv[1]) == "--capabilities") {
     int fd = connect_tcp(argv[2], static_cast<uint16_t>(std::strtoul(argv[3], nullptr, 10)));
     if (fd < 0) { std::cerr << "connect failed\n"; return 1; }
@@ -159,7 +302,12 @@ int main(int argc, char** argv) {
               << response.manifest << '\n';
     return 0;
   }
-  if (argc != 4) { std::cerr << "usage: onnx-remote-client HOST PORT OP\n"; return 2; }
+  if (argc != 4) {
+    std::cerr << "usage: onnx-remote-client HOST PORT OP\n"
+                 "   or: onnx-remote-client --subgraph HOST PORT MODEL.onnx "
+                 "V0,V1,... [--shape D0,D1]\n";
+    return 2;
+  }
   int fd = connect_tcp(argv[1], static_cast<uint16_t>(std::strtoul(argv[2], nullptr, 10)));
   if (fd < 0) { std::cerr << "connect failed\n"; return 1; }
   Request r; r.op = argv[3]; r.inputs.push_back(Tensor{{5}, {-2, -1, 0, 1, 2}});
