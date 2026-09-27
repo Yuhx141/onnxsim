@@ -30,6 +30,31 @@ grpc::Status unavailable(const std::string& message) {
   return {grpc::StatusCode::UNAVAILABLE, message};
 }
 
+size_t element_bytes(uint32_t dtype) {
+  switch (dtype) {
+    case 1:  // FLOAT
+    case 6:  // INT32
+    case 12: // UINT32
+      return 4;
+    case 2:  // UINT8
+    case 3:  // INT8
+    case 9:  // BOOL
+      return 1;
+    case 4:  // UINT16
+    case 5:  // INT16
+    case 10: // FLOAT16
+      return 2;
+    case 7:  // INT64
+    case 11: // DOUBLE
+    case 13: // UINT64
+      return 8;
+    case 16: // BFLOAT16
+      return 2;
+    default:
+      return 0;
+  }
+}
+
 ProfilingLevel profiling_level(
     onnxsim::remote::v1::ProfilingLevel level) {
   switch (level) {
@@ -48,14 +73,32 @@ bool copy_input(const ProtoTensor& source, Tensor& target, std::string& error) {
     error = "tensor rank exceeds limit";
     return false;
   }
+  const size_t bytes_per_element = element_bytes(source.dtype());
+  if (bytes_per_element == 0) {
+    error = "unsupported tensor dtype";
+    return false;
+  }
+  uint64_t element_count = 1;
+  for (const int64_t dimension : source.shape()) {
+    if (dimension <= 0 ||
+        element_count > kMaxTensorBytes / static_cast<uint64_t>(dimension)) {
+      error = "invalid tensor shape";
+      return false;
+    }
+    element_count *= static_cast<uint64_t>(dimension);
+  }
+  if (element_count > kMaxTensorBytes / bytes_per_element) {
+    error = "tensor exceeds transport limit";
+    return false;
+  }
   target.dtype = static_cast<uint8_t>(source.dtype());
   target.shape.assign(source.shape().begin(), source.shape().end());
   const std::string& bytes = source.raw_data();
+  if (bytes.size() != element_count * bytes_per_element) {
+    error = "tensor payload does not match shape and dtype";
+    return false;
+  }
   if (target.dtype == 1) {
-    if (bytes.size() % sizeof(float) != 0) {
-      error = "float32 tensor payload is not aligned";
-      return false;
-    }
     target.data.resize(bytes.size() / sizeof(float));
     if (!bytes.empty()) std::memcpy(target.data.data(), bytes.data(), bytes.size());
   } else {
@@ -202,9 +245,9 @@ grpc::Status Service::GetCapabilities(grpc::ServerContext*, const CapabilitiesRe
   response->set_max_message_bytes(kMaxMessageBytes);
   response->set_profiling(native_response.ok);
   for (const auto& op : options_.supported_ops) response->add_supported_ops(op);
-  for (const char* dtype : {"FLOAT", "FLOAT16", "BFLOAT16", "INT8", "UINT8",
-                            "INT16", "UINT16", "INT32", "UINT32", "INT64",
-                            "UINT64", "DOUBLE", "BOOL"}) {
+  for (const char* dtype : {"FLOAT", "UINT8", "INT8", "UINT16", "INT16",
+                            "INT32", "INT64", "BOOL", "FLOAT16", "DOUBLE",
+                            "UINT32", "UINT64", "BFLOAT16"}) {
     response->add_supported_dtypes(dtype);
   }
   return grpc::Status::OK;

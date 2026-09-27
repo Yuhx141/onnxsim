@@ -104,6 +104,32 @@ int main() {
   status = stub->Execute(&invalid_context, invalid_request, &invalid_response);
   assert(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
 
+  ExecuteRequest invalid_shape_request;
+  invalid_shape_request.set_op("identity");
+  onnxsim::remote::v1::Tensor* invalid_shape_input =
+      invalid_shape_request.add_inputs();
+  invalid_shape_input->set_dtype(1);
+  invalid_shape_input->add_shape(2);
+  invalid_shape_input->set_raw_data("\0\0\0\0", 4);
+  ExecuteResponse invalid_shape_response;
+  grpc::ClientContext invalid_shape_context;
+  status = stub->Execute(&invalid_shape_context, invalid_shape_request,
+                         &invalid_shape_response);
+  assert(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+
+  ExecuteRequest invalid_dtype_request;
+  invalid_dtype_request.set_op("identity");
+  onnxsim::remote::v1::Tensor* invalid_dtype_input =
+      invalid_dtype_request.add_inputs();
+  invalid_dtype_input->set_dtype(99);
+  invalid_dtype_input->add_shape(1);
+  invalid_dtype_input->set_raw_data("\0", 1);
+  ExecuteResponse invalid_dtype_response;
+  grpc::ClientContext invalid_dtype_context;
+  status = stub->Execute(&invalid_dtype_context, invalid_dtype_request,
+                         &invalid_dtype_response);
+  assert(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+
   ExecuteRequest request;
   request.set_request_id(17);
   request.set_op("identity");

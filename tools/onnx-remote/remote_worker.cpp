@@ -39,7 +39,8 @@ static Response execute(const Request& r) {
         "\"supported_ops\":[\"identity\",\"relu\",\"add\",\"mul\"],"
         "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\","
         "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","
-        "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\"],"
+        "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\","
+        "\"FLOAT16\",\"BFLOAT16\"],"
         "\"profiling\":true}";
     out.ok = true;
     return out;
