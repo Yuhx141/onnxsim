@@ -132,7 +132,11 @@ class OnnxRemoteBridge final : public rclcpp::Node {
       error = "remote worker capability connection failed";
       return false;
     }
-    onnx_remote::set_socket_io_timeout(fd, io_timeout_ms_);
+    if (!onnx_remote::set_socket_io_timeout(fd, io_timeout_ms_)) {
+      onnx_remote::close_socket(fd);
+      error = "ROS2 bridge: cannot set capability socket timeout";
+      return false;
+    }
     onnx_remote::Request request;
     request.op = "capabilities";
     const bool sent = onnx_remote::send_request(fd, request, error);
@@ -329,7 +333,12 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                     request.request_id);
       return;
     }
-    onnx_remote::set_socket_io_timeout(fd, io_timeout_ms_);
+    if (!onnx_remote::set_socket_io_timeout(fd, io_timeout_ms_)) {
+      onnx_remote::close_socket(fd);
+      publish_error("ROS2 bridge: cannot set socket timeout",
+                    request.request_id);
+      return;
+    }
     onnx_remote::Response response;
     const bool sent = onnx_remote::send_request(fd, request, error);
     const bool received =

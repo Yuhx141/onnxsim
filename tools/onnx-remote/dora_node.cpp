@@ -50,7 +50,11 @@ bool query_capabilities(Response& response, std::string& error) {
     error = "DORA adapter: capability connection failed";
     return false;
   }
-  set_socket_io_timeout(fd, env_timeout("ONNXSIM_DORA_IO_TIMEOUT_MS", 0));
+  if (!set_socket_io_timeout(fd, env_timeout("ONNXSIM_DORA_IO_TIMEOUT_MS", 0))) {
+    close_socket(fd);
+    error = "DORA adapter: cannot set capability socket timeout";
+    return false;
+  }
   Request request;
   request.op = "capabilities";
   const bool sent = send_request(fd, request, error);
@@ -78,7 +82,11 @@ bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
     error = "DORA adapter: remote worker connection failed";
     return false;
   }
-  set_socket_io_timeout(fd, env_timeout("ONNXSIM_DORA_IO_TIMEOUT_MS", 0));
+  if (!set_socket_io_timeout(fd, env_timeout("ONNXSIM_DORA_IO_TIMEOUT_MS", 0))) {
+    close_socket(fd);
+    error = "DORA adapter: cannot set socket timeout";
+    return false;
+  }
   const bool sent = send_request(fd, request, error);
   const bool received = sent && receive_response(fd, response_out, error);
   close_socket(fd);
