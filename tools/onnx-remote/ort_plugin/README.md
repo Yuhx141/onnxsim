@@ -26,6 +26,11 @@ creating the ORT session. ORT session/run profiling receives the remote events
 through the public `OrtEpProfilerImpl` bridge; the profile-file option also
 keeps a transport-native JSON copy for ROS2, DORA, or browser tooling.
 
+Set `ONNXSIM_REMOTE_EP_SUPPORTED_OPS` to a comma-separated ONNX operator list
+to constrain partitioning for a runner with a smaller capability set, for
+example `Identity,Relu,Add`. An unset or empty value enables the complete
+reference operation set.
+
 When a public ORT SDK library is supplied, the CMake target also builds
 `onnxsim_remote_ep_load_test` and `onnxsim_remote_ep_run_test` for plugin
 discovery and real remote execution coverage.

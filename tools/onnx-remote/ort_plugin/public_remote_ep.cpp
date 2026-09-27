@@ -31,8 +31,23 @@ constexpr const char* kVendor = "onnxsim";
 constexpr const char* kVersion = "1.0.0";
 
 bool SupportedOp(const std::string& op) {
-  return op == "Identity" || op == "Relu" || op == "Add" || op == "Mul" ||
-         op == "Sub" || op == "Div" || op == "Max" || op == "Min";
+  if (op != "Identity" && op != "Relu" && op != "Add" && op != "Mul" &&
+      op != "Sub" && op != "Div" && op != "Max" && op != "Min") {
+    return false;
+  }
+  const char* configured = std::getenv("ONNXSIM_REMOTE_EP_SUPPORTED_OPS");
+  if (configured == nullptr || *configured == '\0') return true;
+  const std::string list(configured);
+  size_t start = 0;
+  while (start <= list.size()) {
+    const size_t end = list.find(',', start);
+    const std::string token = list.substr(
+        start, end == std::string::npos ? std::string::npos : end - start);
+    if (token == op) return true;
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return false;
 }
 
 bool IsFloatTensor(const Ort::ConstValueInfo& value_info) {

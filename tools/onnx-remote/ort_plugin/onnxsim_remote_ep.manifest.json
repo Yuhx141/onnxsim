@@ -7,6 +7,7 @@
   "registration": "internal_cpp",
   "public_plugin_entrypoints": ["CreateEpFactories", "ReleaseEpFactory"],
   "supported_ops": ["Identity", "Relu", "Add", "Mul", "Sub", "Div", "Max", "Min"],
+  "supported_ops_env": "ONNXSIM_REMOTE_EP_SUPPORTED_OPS",
   "tensor_types": ["float32"],
   "profiling": {
     "levels": ["off", "summary", "detailed"],
@@ -21,7 +22,7 @@
   "public_plugin": {
     "library": "onnxsim_remote_ep",
     "api": "onnxruntime_ep_c_api.h",
-    "configuration": "ONNXSIM_REMOTE_EP_HOST,ONNXSIM_REMOTE_EP_PORT,ONNXSIM_REMOTE_EP_PROFILING",
+    "configuration": "ONNXSIM_REMOTE_EP_HOST,ONNXSIM_REMOTE_EP_PORT,ONNXSIM_REMOTE_EP_PROFILING,ONNXSIM_REMOTE_EP_SUPPORTED_OPS",
     "runtime_test": "onnxsim_remote_ep_run_test"
   }
 }
