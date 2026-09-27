@@ -80,3 +80,17 @@ The board image also exposes only `/dev/rknpu` (driver v0.9.2); no NPU
 devfreq, clock, or voltage control nodes were available through sysfs. The
 235 GOPS stress result is consequently the ceiling of the current image and
 clock configuration, not a frequency-tuned silicon peak.
+
+The alternative `onnxsim.quantize_weight_only_int4` route was probed with a
+64x64 MatMul. It generated a standard block-wise INT4 QDQ graph and ONNX
+Runtime executed it, but RKNN-Toolkit2 2.3.2 treated it as QAT: loading
+succeeded, `do_quantization=False` was rejected for RV1106, and calibrated
+builds are ordinary INT8 models. Manually changing the opset to 19 only
+caused the expected checker warning for the opset-21 `block_size` attribute;
+it did not provide an INT4 kernel. `com.microsoft::MatMulNBits` is not a
+portable RV1106 fallback either.
+
+The public host SDK is already 2.3.2, the latest published version. Its
+W4A16 support is target-specific (documented for RK3576), so an SDK update
+cannot enable W4A16 on this RV1106 image without a vendor compiler/runtime
+release.

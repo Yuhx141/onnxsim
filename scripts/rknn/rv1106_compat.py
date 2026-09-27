@@ -39,6 +39,13 @@ UNSUPPORTED_OPS = frozenset({
 })
 
 
+# RKNN has no RV1106 implementation for ONNX Runtime's packed weight-only
+# operator. Keep this explicit instead of reporting it as an unknown custom op.
+UNSUPPORTED_CUSTOM_OPS = frozenset({
+    ("com.microsoft", "MatMulNBits"),
+})
+
+
 # Operators with a public entry but restrictions that matter on RV1106.
 PARTIAL_OPS = frozenset({
     "Div", "EyeLike", "GRU", "If", "LSTM", "LogSoftmax", "Resize", "RoiAlign",
@@ -111,6 +118,12 @@ def check_rv1106(model: onnx.ModelProto) -> List[Finding]:
     for index, node in enumerate(model.graph.node):
         name = _node_name(node, index)
         op = node.op_type
+        if (node.domain, op) in UNSUPPORTED_CUSTOM_OPS:
+            findings.append(Finding(
+                "error", name, op,
+                "packed weight-only INT4 is not implemented by the RV1106 RKNN target",
+            ))
+            continue
         if op in UNSUPPORTED_OPS:
             findings.append(Finding("error", name, op, "listed as unsupported by RKNN Toolkit2"))
             continue
@@ -133,6 +146,13 @@ def check_rv1106(model: onnx.ModelProto) -> List[Finding]:
             if mode not in {"nearest", "linear"}:
                 findings.append(Finding("error", name, op,
                                         f"RV1106 supports nearest/bilinear Resize, got {mode!r}"))
+        elif op == "DequantizeLinear" and _attr(node, "block_size") is not None:
+            findings.append(Finding(
+                "error", name, op,
+                "block-wise INT4 QDQ is not deployable on RV1106: the public RKNN "
+                "toolkit accepts the graph only as QAT, while RV1106 requires its "
+                "own INT8 quantization build path",
+            ))
         elif op in {"GRU", "LogSoftmax", "RoiAlign", "Slice", "Softmax"}:
             findings.append(Finding("warning", name, op,
                                     "supported only with target-specific restrictions; verify with RKNN"))

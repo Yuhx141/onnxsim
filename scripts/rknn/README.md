@@ -100,6 +100,21 @@ INT4 is not currently an available RV1106 deployment path. The connected
 image also does not expose NPU clock controls; see the benchmark report for
 the negative checks.
 
+The other onnxsim INT4 route was also probed. `quantize_weight_only_int4`
+produces standard ONNX block-wise `DequantizeLinear` + `MatMul` QDQ, which is
+valid for ONNX Runtime and other weight-only backends. RKNN-Toolkit2 2.3.2
+loads that graph as QAT, but RV1106 rejects the required
+`do_quantization=False` build; enabling calibration instead returns to the
+ordinary INT8 path. `com.microsoft::MatMulNBits` is likewise not an RV1106
+operator. The RV1106 compatibility checker now reports both forms before
+conversion.
+
+The host SDK is already the latest public `rknn-toolkit2` 2.3.2. Its public
+changelog documents W4A16 for RK3576, not RV1106, so updating the host SDK
+does not unlock INT4 on this board. The board's runtime library/driver is a
+separate vendor image component; no compatible public RV1106 runtime upgrade
+was available to install remotely during this check.
+
 Verifies that `onnxsim`'s output still converts and runs through
 [`rknn-toolkit2`](https://pypi.org/project/rknn-toolkit2/), Rockchip's real
 ONNX -> RKNN converter for the RK35xx/RV1106 NPU line -- the same toolchain
