@@ -845,7 +845,10 @@ def test_onnx_constant_first_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
         output = tmp_path / "constant_first_mul.axmodel"
         onnx.save(model, source)
         graph_generator.generate(
-            str(source), str(output), schedule_path=str(schedule), calibration=calibration
+            str(source),
+            str(output),
+            schedule_path=str(schedule),
+            calibration=calibration,
         )
         axmodel = output.read_bytes()
 
