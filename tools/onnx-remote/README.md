@@ -118,6 +118,29 @@ an ORT plugin EP instead.
 This is a software/reference EP and does not require Snapdragon, AX8850, QNN,
 or TensorRT hardware.
 
+### Optional ORT-backed graph worker
+
+For software-only graph transport tests, build the optional worker against a
+matching public ONNX Runtime SDK:
+
+```sh
+cmake -S tools/onnx-remote -B build-ort-worker \
+  -DONNXSIM_REMOTE_ORT_WORKER=ON \
+  -DONNXSIM_ORT_WORKER_INCLUDE_DIR=/path/to/onnxruntime/include \
+  -DONNXSIM_ORT_WORKER_LIBRARY=/path/to/onnxruntime/lib/libonnxruntime.so
+cmake --build build-ort-worker --target onnx-remote-ort-worker
+```
+
+The worker accepts `subgraph` or `onnx` requests containing serialized ONNX
+bytes in `Request::model`, executes float32 inputs on ORT CPU, and returns
+float32 outputs plus an `ort_session_run` profile event. It is optional and
+separate from the dependency-free worker, so embedded targets do not inherit
+an ORT or C++ runtime dependency.
+
+`onnx-remote-ort-worker-test MODEL.onnx PORT` runs the same float32 model
+locally through ORT and compares every output with the remote subgraph result,
+including the required profile event.
+
 ## Design constraints
 
 * bounded message size and tensor count;

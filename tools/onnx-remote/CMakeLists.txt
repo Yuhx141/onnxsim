@@ -12,6 +12,12 @@ option(ONNXSIM_REMOTE_GRPC "Generate the optional host-side gRPC bindings" OFF)
 option(ONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN
        "Build the public OrtEp remote execution-provider plugin"
        OFF)
+option(ONNXSIM_REMOTE_ORT_WORKER
+       "Build the optional ORT-backed serialized subgraph worker" OFF)
+set(ONNXSIM_ORT_WORKER_INCLUDE_DIR "" CACHE PATH
+    "ONNX Runtime public include directory for the ORT worker")
+set(ONNXSIM_ORT_WORKER_LIBRARY "" CACHE FILEPATH
+    "ONNX Runtime library for the ORT worker")
 set(ONNXSIM_ORT_PUBLIC_INCLUDE_DIR "" CACHE PATH
     "ONNX Runtime public include directory for the OrtEp plugin")
 set(ONNXSIM_ORT_PUBLIC_LIBRARY "" CACHE FILEPATH
@@ -91,6 +97,27 @@ endif()
 
 add_executable(onnx-remote-worker remote_worker.cpp)
 target_link_libraries(onnx-remote-worker PRIVATE onnx_remote_transport)
+
+if (ONNXSIM_REMOTE_ORT_WORKER)
+  if (NOT ONNXSIM_ORT_WORKER_INCLUDE_DIR OR
+      NOT EXISTS "${ONNXSIM_ORT_WORKER_INCLUDE_DIR}/onnxruntime_cxx_api.h" OR
+      NOT ONNXSIM_ORT_WORKER_LIBRARY)
+    message(FATAL_ERROR
+      "ONNXSIM_REMOTE_ORT_WORKER requires the ORT public headers and library")
+  endif()
+  add_executable(onnx-remote-ort-worker remote_ort_worker.cpp)
+  add_executable(onnx-remote-ort-worker-test remote_ort_worker_test.cpp)
+  target_include_directories(onnx-remote-ort-worker PRIVATE
+                             ${ONNXSIM_ORT_WORKER_INCLUDE_DIR})
+  target_link_libraries(onnx-remote-ort-worker PRIVATE
+                        onnx_remote_transport ${ONNXSIM_ORT_WORKER_LIBRARY})
+  target_include_directories(onnx-remote-ort-worker-test PRIVATE
+                             ${ONNXSIM_ORT_WORKER_INCLUDE_DIR})
+  target_link_libraries(onnx-remote-ort-worker-test PRIVATE
+                        onnx_remote_transport ${ONNXSIM_ORT_WORKER_LIBRARY})
+  install(TARGETS onnx-remote-ort-worker RUNTIME DESTINATION bin)
+  install(TARGETS onnx-remote-ort-worker-test RUNTIME DESTINATION bin)
+endif()
 
 add_executable(onnx-remote-client remote_client.cpp)
 target_link_libraries(onnx-remote-client PRIVATE onnx_remote_transport)
