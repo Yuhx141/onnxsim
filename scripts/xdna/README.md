@@ -216,6 +216,16 @@ future fused runtime a graph IR plus a buffer and dependency contract. Regions a
 `planning_only_not_executable`; current XDNA execution uses individual Conv
 kernels, selected fused bottlenecks, and host-side operators.
 
+The build manifest also emits `operation_kernels` records for the non-Conv
+operators and every Q/DQ edge. Each record carries the node inputs, outputs,
+attributes, available shapes, and a proposed lowering family (for example,
+NCHW pooling, broadcast arithmetic, dense GEMM, or Q/DQ conversion). These are
+codegen descriptors only: they identify work and parameters for a native IRON
+kernel builder, but are not executable XDNA artifacts yet. Their
+`descriptor_only_native_kernel_required` status must not be counted as device
+coverage. The actual full-graph run still executes those operations on the
+host.
+
 ### From planned regions to device-resident execution
 
 The connected regions above describe dependencies; they do not imply that one

@@ -20,8 +20,10 @@ from .resnet_coverage import (
 from .resnet_emitter import (
     BottleneckArtifactSpec,
     KernelArtifactSpec,
+    OperationArtifactSpec,
     emit_bottleneck_specs,
     emit_kernel_specs,
+    emit_operation_specs,
     render_build_manifest,
     write_build_manifest,
 )
@@ -78,9 +80,11 @@ __all__ = [
     "build_codegen_plan",
     "codegen_plan_to_dict",
     "KernelArtifactSpec",
+    "OperationArtifactSpec",
     "BottleneckArtifactSpec",
     "emit_bottleneck_specs",
     "emit_kernel_specs",
+    "emit_operation_specs",
     "render_build_manifest",
     "write_build_manifest",
     "QDQEdge",

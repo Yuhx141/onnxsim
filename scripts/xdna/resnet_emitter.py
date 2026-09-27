@@ -21,6 +21,10 @@ try:
     from .resnet_bottleneck import BottleneckBlockPlan, plan_bottleneck_blocks
 except ImportError:  # direct script-directory imports
     from resnet_bottleneck import BottleneckBlockPlan, plan_bottleneck_blocks
+try:
+    from .graph_fusion import _attributes
+except ImportError:  # direct script-directory imports
+    from graph_fusion import _attributes
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,111 @@ class BottleneckArtifactSpec:
             "source": self.source,
             "entrypoint": self.entrypoint,
         }
+
+
+@dataclass(frozen=True)
+class OperationArtifactSpec:
+    """Serializable lowering record for non-Conv/Gemm graph operations.
+
+    These records are emitted into the graph program so a later IRON kernel
+    builder can consume them. They are deliberately marked as descriptors:
+    this repository does not yet ship executable kernels for these ops.
+    """
+
+    node_index: int
+    node_name: str
+    op_type: str
+    lowering: str
+    inputs: Tuple[str, ...]
+    outputs: Tuple[str, ...]
+    attributes: Mapping[str, Any]
+    input_shapes: Tuple[Optional[Tuple[int, ...]], ...]
+    output_shapes: Tuple[Optional[Tuple[int, ...]], ...]
+    status: str = "descriptor_only_native_kernel_required"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_index": self.node_index,
+            "node_name": self.node_name,
+            "op_type": self.op_type,
+            "lowering": self.lowering,
+            "inputs": list(self.inputs),
+            "outputs": list(self.outputs),
+            "attributes": dict(self.attributes),
+            "input_shapes": [list(shape) if shape is not None else None for shape in self.input_shapes],
+            "output_shapes": [list(shape) if shape is not None else None for shape in self.output_shapes],
+            "status": self.status,
+        }
+
+
+_OP_LOWERINGS = {
+    "Gemm": "dense_gemm_int8",
+    "Add": "broadcast_binary_int8",
+    "Mul": "broadcast_binary_quantized",
+    "Relu": "elementwise_relu_int8",
+    "MaxPool": "nchw_max_pool",
+    "AveragePool": "nchw_average_pool",
+    "GlobalAveragePool": "nchw_global_average_pool",
+    "Flatten": "view_or_reorder",
+    "Reshape": "view_or_reorder",
+    "Transpose": "tensor_permutation",
+    "Concat": "tensor_concatenation",
+    "QuantizeLinear": "quantize_linear_edge",
+    "DequantizeLinear": "dequantize_linear_edge",
+}
+
+
+def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[OperationArtifactSpec, ...]:
+    """Emit operation-level lowering descriptors for graph ops outside Conv kernels."""
+    graph = model.graph
+    nodes = list(graph.node)
+    shapes: dict[str, Tuple[int, ...]] = {}
+    for value in (*getattr(graph, "input", ()), *getattr(graph, "value_info", ()), *getattr(graph, "output", ())):
+        dims = getattr(getattr(getattr(value, "type", None), "tensor_type", None), "shape", None)
+        if dims is not None:
+            shape = tuple(int(dim.dim_value) for dim in dims.dim)
+            if all(shape):
+                shapes[str(value.name)] = shape
+    for value in getattr(graph, "initializer", ()):
+        shapes[str(value.name)] = tuple(int(dim) for dim in value.dims)
+    result = []
+    for dispatch in plan.dispatches:
+        node_index = dispatch.node_indices[0]
+        node = nodes[node_index]
+        op = str(node.op_type)
+        if op == "Conv":
+            continue
+        result.append(OperationArtifactSpec(
+            node_index=node_index,
+            node_name=dispatch.node_names[0],
+            op_type=op,
+            lowering=_OP_LOWERINGS.get(op, "unsupported_native_lowering"),
+            inputs=tuple(str(value) for value in node.input if value),
+            outputs=tuple(str(value) for value in node.output if value),
+            attributes=_attributes(node),
+            input_shapes=tuple(shapes.get(str(value)) for value in node.input if value),
+            output_shapes=tuple(shapes.get(str(value)) for value in node.output if value),
+            status=("descriptor_only_native_kernel_required" if op in _OP_LOWERINGS else "unsupported"),
+        ))
+    # Q/DQ nodes are graph-edge semantics rather than dispatches. Emit them
+    # too, including graph-boundary conversions that are outside a region.
+    for node_index, node in enumerate(nodes):
+        op = str(node.op_type)
+        if op not in {"QuantizeLinear", "DequantizeLinear"}:
+            continue
+        result.append(OperationArtifactSpec(
+            node_index=node_index,
+            node_name=str(getattr(node, "name", "") or f"{op}_{node_index}"),
+            op_type=op,
+            lowering=_OP_LOWERINGS[op],
+            inputs=tuple(str(value) for value in node.input if value),
+            outputs=tuple(str(value) for value in node.output if value),
+            attributes=_attributes(node),
+            input_shapes=tuple(shapes.get(str(value)) for value in node.input if value),
+            output_shapes=tuple(shapes.get(str(value)) for value in node.output if value),
+        ))
+    result.sort(key=lambda spec: spec.node_index)
+    return tuple(result)
 
 
 def emit_bottleneck_specs(
@@ -198,6 +307,7 @@ def render_build_manifest(
     """Render a stable JSON-ready offline build manifest."""
     specs = emit_kernel_specs(plan, columns=columns, source=source, entrypoint=entrypoint)
     bottleneck_specs = emit_bottleneck_specs(model, source=bottleneck_source, columns=columns) if model is not None else ()
+    operation_specs = emit_operation_specs(plan, model) if model is not None else ()
     schedule = codegen_plan_to_dict(plan)
     return {
         "format": "xdna-resnet-build-v1",
@@ -210,6 +320,7 @@ def render_build_manifest(
         "schedule": schedule,
         "graph_programs": schedule["graph_regions"],
         "kernels": [spec.to_dict() for spec in specs],
+        "operation_kernels": [spec.to_dict() for spec in operation_specs],
         "bottlenecks": [spec.to_dict() for spec in bottleneck_specs],
     }
 
