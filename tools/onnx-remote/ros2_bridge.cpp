@@ -75,9 +75,17 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     runner_id_ = declare_parameter<std::string>("runner_id", get_name());
     publish_profile_ = declare_parameter<bool>("publish_profile", true);
     profile_topic_ = declare_parameter<std::string>("profile_topic", "profile");
+    publish_profile_events_ = declare_parameter<bool>(
+        "publish_profile_events", false);
+    profile_event_topic_ = declare_parameter<std::string>(
+        "profile_event_topic", "profile_events");
     result_ = create_publisher<UInt8MultiArray>("result", rclcpp::QoS(10));
     if (publish_profile_) {
       profile_ = create_publisher<String>(profile_topic_, rclcpp::QoS(10));
+    }
+    if (publish_profile_events_) {
+      profile_events_ = create_publisher<String>(profile_event_topic_,
+                                                 rclcpp::QoS(10));
     }
     discovery_ = create_publisher<String>(
         discovery_topic_, rclcpp::QoS(1).transient_local().reliable());
@@ -245,10 +253,20 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   }
 
   void publish_profile(const onnx_remote::Response& response) {
-    if (!publish_profile_ || profile_ == nullptr || response.profile.empty()) return;
-    String message;
-    message.data = onnx_remote::profile_json(response);
-    profile_->publish(std::move(message));
+    if (response.profile.empty()) return;
+    if (publish_profile_ && profile_ != nullptr) {
+      String message;
+      message.data = onnx_remote::profile_json(response);
+      profile_->publish(std::move(message));
+    }
+    if (publish_profile_events_ && profile_events_ != nullptr) {
+      onnx_remote::receive_profile(response, [&](const auto& event) {
+        String event_message;
+        event_message.data = onnx_remote::profile_event_json(
+            response.request_id, event);
+        profile_events_->publish(std::move(event_message));
+      });
+    }
   }
 
   void publish_discovery_status(const std::string& state,
@@ -424,6 +442,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   int discovered_timeout_ms_ = 15000;
   std::string discovered_runner_id_;
   bool publish_profile_ = true;
+  bool publish_profile_events_ = false;
   std::chrono::steady_clock::time_point last_discovery_{};
   std::string discovery_topic_;
   std::string discovery_status_topic_;
@@ -431,8 +450,10 @@ class OnnxRemoteBridge final : public rclcpp::Node {
   std::string advertise_host_;
   std::string runner_id_;
   std::string profile_topic_;
+  std::string profile_event_topic_;
   rclcpp::Publisher<UInt8MultiArray>::SharedPtr result_;
   rclcpp::Publisher<String>::SharedPtr profile_;
+  rclcpp::Publisher<String>::SharedPtr profile_events_;
   rclcpp::Publisher<String>::SharedPtr discovery_;
   rclcpp::Publisher<String>::SharedPtr discovery_status_;
   rclcpp::Subscription<UInt8MultiArray>::SharedPtr run_;

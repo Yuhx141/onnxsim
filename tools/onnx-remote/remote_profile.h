@@ -17,6 +17,9 @@ void receive_profile(const Response& response, const ProfileReceiver& receiver);
 // consumers. The binary response remains the lossless transport format.
 std::string profile_json(const Response& response);
 
+// Serialize one event for incremental control-plane publication.
+std::string profile_event_json(uint64_t request_id, const ProfileEvent& event);
+
 // Serialize the same worker-relative events as Chrome Trace Event Format.
 // `ts` and `dur` are microseconds, matching the native response fields, so
 // the result can be loaded directly by Perfetto or chrome://tracing.

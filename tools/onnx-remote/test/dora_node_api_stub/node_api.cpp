@@ -42,6 +42,7 @@ void* dora_next_event(void* value) {
   onnx_remote::Request request;
   request.request_id = 41;
   request.op = "relu";
+  request.profiling = onnx_remote::ProfilingLevel::Detailed;
   request.inputs.push_back(onnx_remote::Tensor{{4}, {-1.0f, 0.0f, 2.0f, 4.0f}});
   std::string error;
   auto* event = new StubEvent;
@@ -84,7 +85,15 @@ int read_dora_input_data(void* value, char** data, size_t* length) {
 int dora_send_output(void* value, const char* id, size_t id_length,
                      const char* data, size_t data_length) {
   auto* ctx = context(value);
-  if (!ctx->runtime || id_length != 6 || std::memcmp(id, "result", 6) != 0)
+  if (!ctx->runtime) return 0;
+  if (id_length == 13 && std::memcmp(id, "profile_event", 13) == 0) {
+    const std::string profile(data, data_length);
+    if (profile.find("\"request_id\":41") == std::string::npos ||
+        profile.find("\"event\"") == std::string::npos)
+      ctx->failed = true;
+    return ctx->failed ? -1 : 0;
+  }
+  if (id_length != 6 || std::memcmp(id, "result", 6) != 0)
     return 0;
   onnx_remote::Response response;
   std::string error;

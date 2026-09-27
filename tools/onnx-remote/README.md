@@ -198,7 +198,7 @@ cmake -S tools/onnx-remote -B build/onnx-remote-dora \
 cmake --build build/onnx-remote-dora --target onnx-remote-dora-node
 ```
 
-The same stub can exercise the forwarding path against the reference worker,
+The same stub can exercise the forwarding and incremental profile path against the reference worker,
 without installing DORA. Set `ONNXSIM_DORA_STUB_RUNTIME=1`; it injects a
 synthetic `relu` input into the node and validates the binary response,
 including request correlation and output values. For example:
@@ -206,7 +206,7 @@ including request correlation and output values. For example:
 ```sh
 ONNXSIM_DORA_STUB_RUNTIME=1 \
   build/onnx-remote-dora/onnx-remote-worker --port 39501 &
-ONNXSIM_DORA_STUB_RUNTIME=1 \
+ONNXSIM_DORA_STUB_RUNTIME=1 ONNXSIM_DORA_PUBLISH_PROFILE_EVENTS=1 \
   build/onnx-remote-dora/onnx-remote-dora-node
 ```
 
@@ -343,6 +343,10 @@ Set `publish_profile:=true` (the default) to additionally publish a compact
 JSON profile summary on the `profile_topic` (default: `profile`). The `result`
 topic remains the lossless binary response, including the same profile events;
 the JSON topic is intended for ROS tools and lightweight profiling UIs.
+Set `publish_profile_events:=true` to additionally publish one JSON message per
+event on `profile_event_topic` (default: `profile_events`). DORA provides the
+equivalent `profile_event` output when `ONNXSIM_DORA_PUBLISH_PROFILE_EVENTS=1`.
+These incremental surfaces are optional; the binary result remains lossless.
 Native consumers can call `profile_chrome_trace_json()` on a response to emit
 Chrome Trace Event Format for Perfetto or `chrome://tracing`; timestamps remain
 worker-relative microseconds and therefore do not require clock synchronization.

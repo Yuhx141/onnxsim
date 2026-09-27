@@ -189,6 +189,14 @@ int main() {
           const std::string profile = profile_json(response);
           dora_send_output(context, "profile", 7, profile.data(), profile.size());
         }
+        if (std::getenv("ONNXSIM_DORA_PUBLISH_PROFILE_EVENTS") != nullptr) {
+          receive_profile(response, [&](const ProfileEvent& event) {
+            const std::string profile = profile_event_json(response.request_id,
+                                                            event);
+            dora_send_output(context, "profile_event", 13, profile.data(),
+                             profile.size());
+          });
+        }
       } else {
         report_error(context,
                      error.empty() ? "DORA adapter: request failed" : error,

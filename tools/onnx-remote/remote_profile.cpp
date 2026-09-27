@@ -40,6 +40,19 @@ void receive_profile(const Response& response,
   for (const auto& event : response.profile) receiver(event);
 }
 
+std::string profile_event_json(uint64_t request_id,
+                               const ProfileEvent& event) {
+  std::ostringstream json;
+  json << "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
+       << "\"request_id\":" << request_id << ",\"event\":{"
+       << "\"name\":\"" << json_escape(event.name)
+       << "\",\"category\":\"" << json_escape(event.category)
+       << "\",\"start_us\":" << event.start_us
+       << ",\"duration_us\":" << event.duration_us
+       << ",\"detail\":\"" << json_escape(event.detail) << "\"}}";
+  return json.str();
+}
+
 std::string profile_json(const Response& response) {
   std::ostringstream json;
   json << "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\",\"request_id\":"
