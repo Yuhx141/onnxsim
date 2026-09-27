@@ -812,6 +812,60 @@ def test_onnx_constant_broadcast_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm
 
 @needs_device
 @pytest.mark.parametrize("route", ["compile_onnx", "graph_generator"])
+def test_onnx_constant_first_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
+    tmp_path, route
+):
+    """Validate the optimizer-style ``Mul(constant, live)`` normalization."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import binary_op_scale_emit as bse
+    import tinygrad_ax_backend as axb
+
+    shape = (1, 64)
+    z = np.array(0.2, dtype=np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Mul", ["z", "x"], ["y"])],
+            "onnx_constant_first_mul_to_uop_vm",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+            [onnx.numpy_helper.from_array(z, "z")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template("Mul", shape, {"x": 0, "y": 0, "z": 0})
+    calibration = {"scales": meta["scales"], "zero_points": meta["zero_points"]}
+    schedule = tmp_path / f"constant_first_mul_{route}.schedule.json"
+    if route == "compile_onnx":
+        axmodel = axb.compile_onnx(model, str(schedule), calibration)
+    else:
+        import graph_generator
+
+        source = tmp_path / "constant_first_mul.onnx"
+        output = tmp_path / "constant_first_mul.axmodel"
+        onnx.save(model, source)
+        graph_generator.generate(
+            str(source), str(output), schedule_path=str(schedule), calibration=calibration
+        )
+        axmodel = output.read_bytes()
+
+    rng = np.random.default_rng(1965)
+    x = rng.uniform(0.1, 0.3, shape).astype(np.float32)
+    with axcl_session.AXSession(
+        subdir=f"uop_constant_first_mul_{route}_{tmp_path.name}"
+    ) as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x, np.full(shape, z, dtype=np.float32)])
+        finally:
+            session.unload(loaded)
+    np.testing.assert_allclose(
+        got, x * z, atol=float(meta["scales"]["y"]) * 1.5, rtol=0
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("route", ["compile_onnx", "graph_generator"])
 def test_frozen_conv_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, route):
     """Run the frozen-weight Conv UOp route without a Pulsar2 build."""
     pytest.importorskip("tinygrad")
