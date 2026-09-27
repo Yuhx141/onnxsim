@@ -50,7 +50,7 @@ struct RemoteExecutorOptions {
   // static artifact per observed shape; the default keeps model-only caching.
   bool compile_per_static_shape = false;
   bool cache_compiled_models = true;
-  // Optional FIFO bound for compiled artifacts retained by this process.
+  // Optional LRU bound for compiled artifacts retained by this process.
   // Zero preserves the existing unlimited cache behavior.
   size_t max_cached_models = 0;
   std::string compile_operation = "compile";

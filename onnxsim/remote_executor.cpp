@@ -317,7 +317,16 @@ class RemoteModelExecutor final : public ModelExecutor {
       // external compiler invocation or race a runner-side load.
       cache_lock.lock();
       const auto it = compiled_cache_.find(cache_key);
-      if (it != compiled_cache_.end()) return it->second;
+      if (it != compiled_cache_.end()) {
+        // Keep recently reused dynamic-shape specializations hot. The cache
+        // order is only a small bounded bookkeeping list, so a linear move
+        // avoids imposing another container/allocation on the common path.
+        const auto order_it =
+            std::find(cache_order_.begin(), cache_order_.end(), cache_key);
+        if (order_it != cache_order_.end()) cache_order_.erase(order_it);
+        cache_order_.push_back(cache_key);
+        return it->second;
+      }
     }
 
     onnx_remote::Request request;

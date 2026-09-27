@@ -364,8 +364,9 @@ rewrites outside the transport library.
 The native executor caches compiled artifacts in memory, keyed by the exact
 serialized fold-group model. This prevents repeated compilation within one
 onnxsim process. Set `max_cached_models` to a positive value when dynamic
-shape specialization could produce many variants; eviction is FIFO and is
-local to that executor instance. The compiler/runner should own the persistent device cache:
+shape specialization could produce many variants; eviction is LRU and is
+local to that executor instance, so reusing a specialization promotes it.
+The compiler/runner should own the persistent device cache:
 it can validate the artifact ID against compiler version, SDK, driver, chip,
 and ABI, then reuse or reject it. `send_compiled_artifact=true` is the safe
 stateless default; a later load/attach handshake can send only `artifact_id`
