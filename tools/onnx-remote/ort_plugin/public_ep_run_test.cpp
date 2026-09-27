@@ -31,6 +31,12 @@ static size_t ElementBytes(ONNXTensorElementDataType type) {
   }
 }
 
+static void Step(const char* stage) {
+  // Unbuffered stderr: survives segfaults that block-buffered stdout loses,
+  // pinpointing the failing call in CI runs that die mid-session-creation.
+  std::cerr << "[step] " << stage << std::endl;
+}
+
 int main(int argc, char** argv) {
   if (argc != 3 && argc != 4) {
     std::cerr << "usage: onnxsim_remote_ep_run_test PLUGIN MODEL.onnx [ORT_PROFILE_PREFIX]\n";
@@ -42,7 +48,9 @@ int main(int argc, char** argv) {
                      ? ORT_LOGGING_LEVEL_VERBOSE
                      : ORT_LOGGING_LEVEL_WARNING,
                 "onnxsim-remote-ep-run-test"};
+    Step("env");
     env.RegisterExecutionProviderLibrary("onnxsim_remote", argv[1]);
+    Step("register");
     // ORT's device discovery runs asynchronously after registration. On
     // low-core CI runners the refresh thread races session creation and
     // ORT frees EpDevice-related objects underneath CreateSession (an
@@ -65,6 +73,7 @@ int main(int argc, char** argv) {
       previous_snapshot = std::move(snapshot);
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    Step("devices");
     if (verbose != nullptr && std::string(verbose) != "0") {
       for (const auto& value : devices)
         std::cerr << "[devices] ep=" << value.EpName() << '\n';
@@ -83,12 +92,14 @@ int main(int argc, char** argv) {
     Ort::SessionOptions options;
     if (argc == 4) options.EnableProfiling(argv[3]);
     options.AppendExecutionProvider_V2(env, {*device}, Ort::KeyValuePairs{});
+    Step("append");
     // The session and everything referencing it must be released before
     // UnregisterExecutionProviderLibrary dlcloses the plugin: ORT releases
     // EP kernels during session teardown, and those vtables live in the
     // library being closed.
     {
     Ort::Session session{env, argv[2], options};
+    Step("session");
     Ort::MemoryInfo memory = Ort::MemoryInfo::CreateCpu(
         OrtAllocatorType::OrtArenaAllocator, OrtMemTypeDefault);
     Ort::AllocatorWithDefaultOptions allocator;
@@ -143,9 +154,11 @@ int main(int argc, char** argv) {
       output_name_storage.emplace_back(name.get());
       output_names.push_back(output_name_storage.back().c_str());
     }
+    Step("run");
     auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names.data(),
                                inputs.data(), inputs.size(), output_names.data(),
                                output_names.size());
+    Step("ran");
     if (outputs.empty()) {
       std::cerr << "model returned no outputs\n";
       return 1;
@@ -175,6 +188,7 @@ int main(int argc, char** argv) {
       }
     }
     }
+    Step("session-released");
     env.UnregisterExecutionProviderLibrary("onnxsim_remote");
     std::cout << "public OrtEp remote execution passed\n";
     return 0;
