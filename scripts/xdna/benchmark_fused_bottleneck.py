@@ -212,19 +212,24 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         chunks.append((w3[sl], b3[sl]))
     chunk_sizes = []
     offsets = []
-    payloads = []
-    cursor = 0
+    packed_chunks = []
     for weight, bias in chunks:
         raw_weight = np.ascontiguousarray(weight).view(np.uint8).reshape(-1)
         bias_offset = _align4(raw_weight.size)
         packed = np.zeros(bias_offset + bias.nbytes, dtype=np.uint8)
         packed[:raw_weight.size] = raw_weight
         packed[bias_offset:] = bias.view(np.uint8)
-        offsets.append(cursor)
         chunk_sizes.append(packed.size)
-        payloads.append(packed)
-        cursor += packed.size
-    params = np.concatenate(payloads)
+        packed_chunks.append(packed)
+    slot_bytes = max(chunk_sizes)
+    # ObjectFifo fills transfer a complete object. Pad every packed chunk to
+    # the common slot size while keeping its bias at the unpadded weight end.
+    params = np.zeros(len(packed_chunks) * slot_bytes, dtype=np.uint8)
+    offsets = []
+    for index, packed in enumerate(packed_chunks):
+        offset = index * slot_bytes
+        offsets.append(offset)
+        params[offset : offset + packed.size] = packed
 
     q_type = "u8"
     q_nodes = [edges[edge.output_name] for edge in (*quantizers, final_quantizer)]
@@ -254,6 +259,7 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         "chunk_counts": (c1_chunks, c2_chunks, c3_chunks),
         "chunk_sizes": tuple(chunk_sizes),
         "chunk_offsets": tuple(offsets),
+        "chunk_slot_bytes": slot_bytes,
         "chunk_output_counts": (c1_rows, c2_rows, c3_rows),
         "residual_shift": residual_shift,
         "input_shift": input_shift,

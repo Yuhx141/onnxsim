@@ -11,6 +11,7 @@ from aie.iron import CompileTime, ExternalFunction, In, ObjectFifo, Out, Program
 from aie.iron.controlflow import range_
 from aie.iron.dataflow import ObjectFifoLink
 from aie.iron.device import Tile
+from aie.iron.runtime import TaskGroup
 from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
 from aie.utils.hostruntime.cli import run_design_cli
 
@@ -49,8 +50,9 @@ def fused_identity_bottleneck(
     bytes3 = _align4(outputs3 * mid_channels) + outputs3 * 4
 
     activation_ty = np.ndarray[(pixels * channels,), np.dtype[np.int8]]
-    params_ty = np.ndarray[(chunks1 * bytes1 + 2 * chunks2 * bytes2 + chunks3 * bytes3,), np.dtype[np.uint8]]
     max_weight_bytes = max(bytes1, bytes2, bytes3)
+    parameter_chunks = chunks1 + 2 * chunks2 + chunks3
+    params_ty = np.ndarray[(parameter_chunks * max_weight_bytes,), np.dtype[np.uint8]]
     weight_ty = np.ndarray[(max_weight_bytes,), np.dtype[np.uint8]]
     stage1_ty = np.ndarray[(pixels * (mid_channels + channels),), np.dtype[np.int8]]
     stage2a_ty = np.ndarray[(pixels * (mid_channels // 2 + channels),), np.dtype[np.int8]]
@@ -110,12 +112,14 @@ def fused_identity_bottleneck(
             w = weights.acquire(1)
             kernel(bundle, w, output, i, channel_offset)
             weights.release(1)
-        discard(weights, (chunks2 if is_a else 0) + chunks3)
         if is_a:
             for i in range_(pixels * channels):
                 output[pixels * (mid_channels // 2) + i] = bundle[pixels * mid_channels + i]
         out.release(1)
         inp.release(1)
+        # Release the stage2 bundle before discarding later chunks: conv3
+        # needs this bundle before it can consume its own weight chunks.
+        discard(weights, (chunks2 if is_a else 0) + chunks3)
 
     def conv3_worker(inp, weights, out, kernel):
         discard(weights, chunks1 + 2 * chunks2)
@@ -137,13 +141,19 @@ def fused_identity_bottleneck(
     ObjectFifoLink([stage2a_fifo.cons(), stage2b_fifo.cons()], stage2_fifo.prod(), src_offsets=[0, pixels * (mid_channels // 2 + channels)])
 
     def sequence(x, w, y, xprod, weights_prod, ycons):
-        xprod.fill(x)
-        sizes = [bytes1] * chunks1 + [bytes2] * (2 * chunks2) + [bytes3] * chunks3
+        group = TaskGroup()
+        xprod.fill(x, wait=True, group=group)
+        group.finish()
         offset = 0
-        for size in sizes:
-            weights_prod.fill(w, wait=True, sizes=[size], strides=[1], offset=offset, transfer_len=size)
-            offset += size
-        ycons.drain(y, wait=True)
+        for _ in range(parameter_chunks):
+            # Complete and free each transfer before configuring the next BD.
+            group = TaskGroup()
+            weights_prod.fill(w, wait=True, sizes=[max_weight_bytes], strides=[1], offset=offset, transfer_len=max_weight_bytes, group=group)
+            group.finish()
+            offset += max_weight_bytes
+        group = TaskGroup()
+        ycons.drain(y, wait=True, group=group)
+        group.finish()
 
     runtime = Runtime(sequence, [activation_ty, params_ty, output_ty, activation_fifo.prod(), weights_fifo.prod(), output_fifo.cons()])
     return Program(iron.get_current_device(), runtime, workers=workers).resolve_program()
