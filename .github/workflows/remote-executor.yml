@@ -195,6 +195,12 @@ jobs:
           test -s "$RUNNER_TEMP/public-ep-profile.json"
           grep -q '"name":"add"' "$RUNNER_TEMP/public-ep-profile.json"
           ls "$RUNNER_TEMP"/public-ep-ort-profile*.json
+          ONNXSIM_REMOTE_EP_SUPPORTED_OPS=Relu \
+          ONNXSIM_REMOTE_EP_EXPECT_REMOTE=0 \
+          build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
+            build/onnx-remote-public-ep/libonnxsim_remote_ep.so \
+            scripts/convertmodel/test/webgpu_kernel_add.onnx \
+            "$RUNNER_TEMP/public-ep-cpu-fallback-profile"
 
   dora-compile:
     name: DORA adapter compile contract

@@ -57,8 +57,15 @@ int main(int argc, char** argv) {
       std::ifstream profile(profile_path);
       const std::string contents((std::istreambuf_iterator<char>(profile)),
                                  std::istreambuf_iterator<char>());
-      if (contents.find("onnxsim_remote") == std::string::npos) {
-        std::cerr << "ORT profile did not contain the remote EP event\n";
+      const char* expect_remote = std::getenv("ONNXSIM_REMOTE_EP_EXPECT_REMOTE");
+      const bool remote_expected = expect_remote == nullptr ||
+                                    std::string(expect_remote) != "0";
+      const bool remote_present = contents.find("onnxsim_remote") !=
+                                   std::string::npos;
+      if (remote_present != remote_expected) {
+        std::cerr << (remote_expected
+                          ? "ORT profile did not contain the remote EP event\n"
+                          : "ORT profile unexpectedly contained the remote EP event\n");
         return 1;
       }
     }
