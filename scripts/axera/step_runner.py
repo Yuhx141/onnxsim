@@ -173,6 +173,7 @@ class Segment:
     split: list[bool] = dataclasses.field(default_factory=list)
     input_shapes: list[tuple[int, ...]] = dataclasses.field(default_factory=list)
     output_shape: tuple[int, ...] = ()
+    constant_inputs: list[str] = dataclasses.field(default_factory=list)
 
 
 _RETARGET_KEY = re.compile(r"retarget of (\S+) \(")
@@ -332,12 +333,29 @@ def _segment_for(
     if detail.startswith("ElementwiseScaleEdit"):
         cls = _CLASS.search(detail).group(1)
         key = axb.key_for_record(rec, cls)
+        constant_inputs = []
         if op in ew.OPS:
             sc, _ = _scale_dict(calib, {"x": ins[0], "y": outs[0]})
             live = ins[:1]
         else:
-            sc, _ = _scale_dict(calib, {"x": ins[0], "z": ins[1], "y": outs[0]})
-            live = ins[:2]
+            const_index = rec.get("attrs", {}).get("constant_input")
+            if (
+                rec.get("attrs", {}).get("form") == "const"
+                and const_index is not None
+                and ins[const_index] in inits
+            ):
+                const_name = ins[const_index]
+                live_index = 1 - int(const_index)
+                z = int(re.search(r",z(\d+)\)?", detail).group(1))
+                value = np.asarray(inits[const_name], dtype=np.float32)
+                bound = max(float(np.max(np.abs(value))), np.finfo(np.float32).tiny)
+                sc, _ = _scale_dict(calib, {"x": ins[live_index], "y": outs[0]})
+                sc["z"] = bound / (255.0 if z == 0 else 127.0)
+                live = [ins[live_index]]
+                constant_inputs = [const_name]
+            else:
+                sc, _ = _scale_dict(calib, {"x": ins[0], "z": ins[1], "y": outs[0]})
+                live = ins[:2]
 
         def emit_ew():
             return axb.EditSet([axb.ElementwiseScaleEdit(sc)]).build(key)
@@ -361,6 +379,7 @@ def _segment_for(
             q(outs),
             input_shapes=input_shapes,
             output_shape=output_shape,
+            constant_inputs=constant_inputs,
         )
 
     if op in ("Reshape", "Squeeze") and detail.startswith("reshape_record_emit"):
@@ -441,14 +460,32 @@ def build_plan(
     """NPU segments (only of ``kinds`` if given) and a per-node reason for
     every node left on the host."""
     cache = axb.TemplateCache()
+    inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+    planned_records = []
+    for original in records:
+        rec = dict(original)
+        attrs = dict(rec.get("attrs", {}))
+        if attrs.get("form") == "const":
+            const = next((t for t in rec["inputs"][1:] if t in inits), None)
+            const_index = next(
+                (i for i, t in enumerate(rec["inputs"]) if t in inits), None
+            )
+            if const is None and const_index is not None:
+                const = rec["inputs"][const_index]
+            if const is not None:
+                value = np.asarray(inits[const], dtype=np.float32)
+                attrs["constant_zero_point"] = 0 if float(value.min()) >= 0 else 128
+                attrs["constant_input"] = const_index
+                rec["attrs"] = attrs
+        planned_records.append(rec)
     # Live MatMul/Conv validation scans the compiled MCode.  The same scan is
     # required by the segment emitter below, so defer it to
     # ``drop_unemittable`` instead of doing it once during planning and again
     # while materializing the models.
     plans = [
-        axb.plan_at_calibration(r, calib, cache, validate_live=False) for r in records
+        axb.plan_at_calibration(r, calib, cache, validate_live=False)
+        for r in planned_records
     ]
-    inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
     consumers: dict[str, list[onnx.NodeProto]] = {}
     for n in model.graph.node:
         for t in n.input:
@@ -461,7 +498,7 @@ def build_plan(
         v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
         for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
     }
-    for rec, (status, detail) in zip(records, plans):
+    for rec, (status, detail) in zip(planned_records, plans):
         if (
             status in ("refused", "covered")
             and rec["op"] in axb.bse.OPS
@@ -726,6 +763,8 @@ class StepRunner:
 
     def _sim(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
         local = dict(env)
+        for tensor in seg.constant_inputs:
+            local[tensor] = np.asarray(self.host.inits[tensor], dtype=np.float32)
         values = []
         for j, (t, qq) in enumerate(zip(seg.inputs, seg.in_q)):
             value = fake_quant(local[t], *qq)

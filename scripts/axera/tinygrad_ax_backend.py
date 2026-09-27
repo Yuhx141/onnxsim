@@ -1143,11 +1143,11 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
             )
         if op in bse.OPS:
             form = attrs.get("form")
-            if form != "same_shape":
+            if form not in ("same_shape", "const", "broadcast"):
                 return (
                     "refused",
                     f"{op} with a {form} operand compiles to a different program; "
-                    "templates exist for two live same-shape inputs only",
+                    "templates exist for live, broadcast, and constant operands",
                 )
             hits = []
             for zp in _BINARY_ZP_CLASSES[op]:
@@ -1395,11 +1395,37 @@ def plan_at_calibration(
                 )
             return "covered", f"ElementwiseScaleEdit ({cls})"
         if op in bse.OPS:
-            zx = _u8_zp(calib, rec["inputs"][0])
-            zz = _u8_zp(calib, rec["inputs"][1])
+            const_index = attrs.get("constant_input")
+            if attrs.get("form") == "const" and const_index is None:
+                # Coverage reports use the compact checked-in records, which
+                # do not carry the source initializer table.  Calibration
+                # membership still identifies which side is live.
+                const_index = 0 if rec["inputs"][0] not in calib.get("tensors", {}) else 1
+            if attrs.get("form") == "const" and const_index is not None:
+                if op not in ("Add", "Mul") and int(const_index) != 1:
+                    raise _NotAtCalibration(
+                        f"constant-first {op} is not a native commutative binary form"
+                    )
+                live_index = 1 - int(const_index)
+            else:
+                live_index = 0
+            zx = _u8_zp(calib, rec["inputs"][live_index])
             zy = _u8_zp(calib, rec["outputs"][0])
+            # Initializers are not activation calibration tensors.  The
+            # runner annotates their measured unsigned class when it has the
+            # source model; standalone coverage keeps the conservative z0
+            # default, which is also the only valid Div denominator class.
+            zz = int(attrs.get("constant_zero_point", 0))
+            if attrs.get("form") != "const":
+                zz = _u8_zp(calib, rec["inputs"][1])
             cls = f"x{zx},y{zy},z{zz}"
             hits = _class_hits(rec, _BINARY_ZP_CLASSES[op], cache)
+            if attrs.get("form") == "const" and cls not in hits:
+                for candidate in (128, 0):
+                    alternate = f"x{zx},y{zy},z{candidate}"
+                    if alternate in hits:
+                        cls, zz = alternate, candidate
+                        break
             if cls not in hits:
                 raise _NotAtCalibration(
                     f"zero points {cls} are not a template class {hits}"
