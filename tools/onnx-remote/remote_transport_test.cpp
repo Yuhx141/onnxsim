@@ -117,5 +117,16 @@ int main() {
   std::vector<uint8_t> status_only = {1};
   assert(!decode_response_payload(status_only.data(), status_only.size(),
                                   malformed_response, error));
+
+  Request truncated_request;
+  assert(encode_request_payload(request, payload, error));
+  payload.pop_back();
+  assert(!decode_request_payload(payload.data(), payload.size(),
+                                 truncated_request, error));
+  Response truncated_response;
+  assert(encode_response_payload(response, payload, error));
+  payload.pop_back();
+  assert(!decode_response_payload(payload.data(), payload.size(),
+                                  truncated_response, error));
   return 0;
 }
