@@ -1443,9 +1443,10 @@ def plan_at_calibration(
                 and cls == "x0,y0,z0"
                 and cls in hits
             ):
+                tile_side = int(attrs.get("tile_side", 7))
                 return "covered", (
-                    "ElementwiseScaleEdit (x0,y0,z0) tiled-7x7 constant from "
-                    f"({cls})"
+                    f"ElementwiseScaleEdit (x0,y0,z0) tiled-{tile_side}x{tile_side} "
+                    f"constant from ({cls})"
                 )
             if cls not in hits:
                 # Constant positive Mul operands can use the measured

@@ -420,7 +420,9 @@ def _segment_for(
         output_transform = None
         batch_split = 1
         split = []
-        if "tiled-7x7" in detail:
+        tile_match = re.search(r"tiled-(\d+)x\1", detail)
+        if tile_match:
+            tile_side = int(tile_match.group(1))
             original_shape = tuple(
                 int(d.dim_value)
                 for d in next(
@@ -431,20 +433,22 @@ def _segment_for(
             )
             b, _, channels, pixels = original_shape
             side = math.isqrt(pixels)
-            tiles = side // 7
+            tiles = side // tile_side
             batch_split = tiles * tiles
 
             def tile_input(value, shape=original_shape):
                 expanded = np.broadcast_to(np.asarray(value), shape)
                 x = expanded[:, 0].reshape(b, channels, side, side)
                 return (
-                    x.reshape(b, channels, tiles, 7, tiles, 7)
+                    x.reshape(b, channels, tiles, tile_side, tiles, tile_side)
                     .transpose(0, 2, 4, 1, 3, 5)
-                    .reshape(b * tiles * tiles, channels, 7, 7)
+                    .reshape(b * tiles * tiles, channels, tile_side, tile_side)
                 )
 
             def untile_output(value):
-                x = np.asarray(value).reshape(b, tiles, tiles, channels, 7, 7)
+                x = np.asarray(value).reshape(
+                    b, tiles, tiles, channels, tile_side, tile_side
+                )
                 return (
                     x.transpose(0, 3, 1, 4, 2, 5)
                     .reshape(b, 1, channels, pixels)
@@ -592,19 +596,41 @@ def build_plan(
                     attrs["output_shape"] = list(out_shape)
                 live_name = rec["inputs"][1 - int(const_index)]
                 live_shape = value_shapes.get(live_name, ())
+                tile_side = None
                 if (
                     rec["op"] == "Mul"
                     and len(live_shape) == 4
                     and live_shape[1] == 1
                     and live_shape[3] > 0
                     and int(math.isqrt(live_shape[3])) ** 2 == live_shape[3]
-                    and math.isqrt(live_shape[3]) % 7 == 0
                 ):
                     side = math.isqrt(live_shape[3])
+                    # Prefer the largest validated spatial tile already in
+                    # the fixture corpus. A tiled mask keeps the same
+                    # contiguous channel/spatial layout, so a template can
+                    # serve any larger side divisible by its tile.
+                    for candidate in (56, 28, 14, 7):
+                        if side % candidate:
+                            continue
+                        trial = dict(rec)
+                        trial_attrs = dict(attrs)
+                        trial_attrs["template_shape"] = [
+                            live_shape[0], live_shape[2], candidate, candidate
+                        ]
+                        trial["attrs"] = trial_attrs
+                        trial["shapes"] = [list(trial_attrs["template_shape"])]
+                        try:
+                            cache.lookup(axb.key_for_record(trial, "x0,y0,z0"))
+                        except ValueError:
+                            continue
+                        tile_side = candidate
+                        break
+                if tile_side is not None:
                     attrs["template_shape"] = [
-                        live_shape[0], live_shape[2], 7, 7
+                        live_shape[0], live_shape[2], tile_side, tile_side
                     ]
-                    attrs["tile_blocks"] = (side // 7) ** 2
+                    attrs["tile_blocks"] = (side // tile_side) ** 2
+                    attrs["tile_side"] = tile_side
                     rec["shapes"] = [list(attrs["template_shape"])]
                 rec["attrs"] = attrs
         planned_records.append(rec)

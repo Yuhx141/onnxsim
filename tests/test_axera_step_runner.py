@@ -129,7 +129,7 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     # planner nodes from the record-level total.
     nonemittable = sum("no runner segment" in reason for reason in host.values())
     synthetic = sum(
-        "tiled-7x7" in s.detail
+        "tiled-" in s.detail
         or ("constant from" in s.detail and bool(s.output_shape))
         for s in everything
     )
@@ -308,21 +308,25 @@ def test_constant_mul_broadcast_output_shape_runs_on_axcl_vm():
 
 @needs_device
 @needs_step
-def test_mask_mul_tiled_7x7_runs_on_axcl_vm():
-    """Mask multiplies can be tiled into the native 7x7 binary template."""
+def test_mask_mul_tiled_native_shapes_runs_on_axcl_vm():
+    """Mask multiplies can use each validated native spatial tile."""
     import axcl_session
 
     model = sr.load_step()
     calib = sr.axb.load_calibration(sr.STEP_CALIB)
     segments, _ = sr.build_plan(model, sr.load_records(), calib)
-    selected = [s for s in segments if s.name in {"Mul_58", "Mul_80", "Mul_103"}]
-    assert len(selected) == 3
+    selected = [
+        s
+        for s in segments
+        if s.name in {"Mul_58", "Mul_160", "Mul_262", "Mul_364"}
+    ]
+    assert len(selected) == 4
     reference = sr.load_reference()
-    with axcl_session.AXSession(subdir="mask_mul_tiled_7x7") as session:
+    with axcl_session.AXSession(subdir="mask_mul_tiled_native_shapes") as session:
         _, stats = sr.StepRunner(model, selected, session, health_every=0).run(
             reference["feeds"], "npu"
         )
-    assert len(stats) == 3
+    assert len(stats) == 4
     for stat in stats:
         assert not stat.error, stat
         assert stat.max_lsb <= 2.01, stat
