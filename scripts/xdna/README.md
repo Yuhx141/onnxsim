@@ -244,6 +244,12 @@ was compiled and matched the NumPy quantization reference on the NPU. Other
 scale ratios and per-channel quantization stay descriptor-only; runtime graph
 dispatch is still pending.
 
+Scalar float32 `Mul` nodes now lower to a shape-specialized AIE kernel when one
+operand is a static scalar and the tensor shape is preserved. The quicktest
+ResNet's scalar is exactly `1.0`, so codegen removes it as a zero-copy view.
+A non-identity `Mul` kernel was compiled and verified on the NPU against NumPy
+for 2,048 elements. Broadcasts by non-scalar tensors remain unsupported.
+
 `Flatten` and `Reshape` are emitted as zero-copy contiguous tensor views, with
 their input/output shapes carried in the operation record. They require no AIE
 instruction artifact; the future runner can preserve the same device buffer

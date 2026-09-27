@@ -120,6 +120,7 @@ class OperationArtifactSpec:
     output_shapes: Tuple[Optional[Tuple[int, ...]], ...]
     status: str = "descriptor_only_native_kernel_required"
     quantization: Optional[Mapping[str, Any]] = None
+    parameters: Optional[Mapping[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +135,7 @@ class OperationArtifactSpec:
             "output_shapes": [list(shape) if shape is not None else None for shape in self.output_shapes],
             "status": self.status,
             "quantization": dict(self.quantization) if self.quantization is not None else None,
+            "parameters": dict(self.parameters) if self.parameters is not None else None,
         }
 
 
@@ -160,6 +162,51 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
     nodes = list(graph.node)
     shapes, _ = _value_metadata(model)
     graph_outputs = {str(value.name) for value in graph.output}
+    scalar_constants: dict[str, float] = {}
+    float32_values: set[str] = set()
+    try:
+        from onnx import numpy_helper
+        for initializer in graph.initializer:
+            arr = numpy_helper.to_array(initializer)
+            if arr.size == 1:
+                scalar_constants[str(initializer.name)] = float(arr.reshape(-1)[0])
+            if int(initializer.data_type) == 1:
+                float32_values.add(str(initializer.name))
+        for value in (*graph.input, *graph.value_info, *graph.output):
+            tensor = getattr(getattr(value.type, "tensor_type", None), "elem_type", 0)
+            if int(tensor) == 1:
+                float32_values.add(str(value.name))
+        for constant in nodes:
+            if str(constant.op_type) != "Constant" or not constant.output:
+                continue
+            value_attr = next((attr for attr in constant.attribute if str(attr.name) == "value"), None)
+            if value_attr is not None:
+                arr = numpy_helper.to_array(value_attr.t)
+                if arr.size == 1:
+                    scalar_constants[str(constant.output[0])] = float(arr.reshape(-1)[0])
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
+    float_propagating_ops = {
+        "Conv", "Gemm", "Relu", "Add", "Mul", "MaxPool", "AveragePool",
+        "GlobalAveragePool", "Flatten", "Reshape", "Transpose", "Concat",
+    }
+    for _ in range(len(nodes) + 1):
+        changed = False
+        for candidate in nodes:
+            if str(candidate.op_type) == "DequantizeLinear":
+                for output in candidate.output:
+                    if str(output) not in float32_values:
+                        float32_values.add(str(output))
+                        changed = True
+            elif str(candidate.op_type) in float_propagating_ops and any(
+                str(value) in float32_values for value in candidate.input
+            ):
+                for output in candidate.output:
+                    if str(output) not in float32_values:
+                        float32_values.add(str(output))
+                        changed = True
+        if not changed:
+            break
     consumers: dict[str, list[int]] = {}
     for consumer_index, consumer in enumerate(nodes):
         for value in consumer.input:
@@ -180,6 +227,8 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
         if op == "Conv":
             continue
         qadd = None
+        mul_scalar = None
+        mul_identity = False
         qadd_inputs = tuple(str(value) for value in node.input if value)
         qadd_outputs = tuple(str(value) for value in node.output if value)
         qadd_node_indices: Tuple[int, ...] = (node_index,)
@@ -235,12 +284,31 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
                     qadd_inputs = tuple(qadd["raw_inputs"])
                     qadd_outputs = (str(qadd["raw_output"]),)
                     qadd_node_indices = (node_index, relu_index, output_quant.node_index)
+        if op == "Mul" and len(node.input) == 2 and node.output:
+            scalar_slot = next((slot for slot, value in enumerate(node.input) if str(value) in scalar_constants), None)
+            if scalar_slot is not None:
+                data_slot = 1 - scalar_slot
+                data_name = str(node.input[data_slot])
+                out_name = str(node.output[0])
+                scalar = scalar_constants[str(node.input[scalar_slot])]
+                if (
+                    math.isfinite(scalar)
+                    and data_name in float32_values
+                    and shapes.get(data_name) is not None
+                    and shapes.get(data_name) == shapes.get(out_name)
+                ):
+                    mul_scalar = {"scalar": scalar, "dtype": "float32", "input_name": data_name}
+                    mul_identity = scalar == 1.0
+                    qadd_inputs = (data_name,)
+                    qadd_outputs = (out_name,)
         result.append(OperationArtifactSpec(
             node_index=node_index,
             node_name=dispatch.node_names[0],
             op_type=op,
             lowering=(
                 "quantized_add_relu_u8" if qadd is not None
+                else "identity_device_view" if mul_identity
+                else "mul_scalar_f32" if mul_scalar is not None
                 else _OP_LOWERINGS.get(op, "unsupported_native_lowering")
             ),
             inputs=qadd_inputs,
@@ -250,6 +318,8 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             output_shapes=tuple(shapes.get(str(value)) for value in qadd_outputs),
             status=(
                 "compilable_quantized_add_relu" if qadd is not None
+                else "zero_copy_device_view" if mul_identity
+                else "compilable_mul_scalar_f32" if mul_scalar is not None
                 else "compilable_iron_kernel" if op == "Relu"
                 else "zero_copy_device_view" if op in {"Flatten", "Reshape"}
                 else "descriptor_only_native_kernel_required" if op in _OP_LOWERINGS
@@ -258,6 +328,7 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             quantization=(
                 {**qadd, "fused_node_indices": list(qadd_node_indices)} if qadd is not None else None
             ),
+            parameters=mul_scalar,
         ))
     # Q/DQ nodes are graph-edge semantics rather than dispatches. Emit them
     # too, including graph-boundary conversions that are outside a region.

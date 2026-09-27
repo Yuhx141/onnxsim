@@ -110,6 +110,27 @@ def _compile_quantized_add_relu(
     return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
 
 
+def _compile_mul_scalar(elements: int, scalar: float, device: str, output_dir: Path) -> dict[str, str]:
+    tile = _relu_tile_width(elements)
+    scalar_key = float(scalar).hex().replace("+", "").replace("-", "m").replace(".", "p")
+    key = f"mul_scalar_f32_e{elements}_t{tile}_s{scalar_key}"
+    xclbin = output_dir / f"{key}.xclbin"
+    insts = output_dir / f"{key}.insts.bin"
+    design = Path(__file__).with_name("mul_scalar_design.py")
+    command = [
+        sys.executable, str(design), "--dev", device,
+        "--elements", str(elements), "--tile-width", str(tile), "--scalar", str(scalar),
+        "--xclbin-path", str(xclbin), "--insts-path", str(insts),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.returncode:
+        raise RuntimeError(f"IRON scalar Mul compile failed for {key}:\n{completed.stdout}\n{completed.stderr}")
+    missing = [str(path) for path in (xclbin, insts) if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"compiler reported success but did not create: {', '.join(missing)}")
+    return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
@@ -151,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
 
     compiled_relu: dict[int, dict[str, str]] = {}
     compiled_qadd: dict[tuple[Any, ...], dict[str, str]] = {}
+    compiled_mul: dict[tuple[int, float], dict[str, str]] = {}
     report = dict(render_build_manifest(plan, model=model, columns=args.columns, source=str(args.example)))
     fused_relu_indices = {
         int(index)
@@ -174,6 +196,22 @@ def main(argv: list[str] | None = None) -> int:
         if artifact is None:
             artifact = _compile_relu(elements, args.device, args.artifact_dir)
             compiled_relu[elements] = artifact
+        item["compiled_artifact"] = artifact
+        item["compile_status"] = "compiled"
+    for item in report["operation_kernels"]:
+        if item["status"] != "compilable_mul_scalar_f32":
+            continue
+        output_shape = next((shape for shape in item["output_shapes"] if shape), None)
+        if not output_shape:
+            item["compile_status"] = "shape_required"
+            continue
+        elements = math.prod(output_shape)
+        scalar = float(item["parameters"]["scalar"])
+        cache_key = (elements, scalar)
+        artifact = compiled_mul.get(cache_key)
+        if artifact is None:
+            artifact = _compile_mul_scalar(elements, scalar, args.device, args.artifact_dir)
+            compiled_mul[cache_key] = artifact
         item["compiled_artifact"] = artifact
         item["compile_status"] = "compiled"
     for item in report["operation_kernels"]:
@@ -211,8 +249,8 @@ def main(argv: list[str] | None = None) -> int:
     report["compile_all_specs"] = args.compile_all
     report["optimize_small_m"] = args.optimize_small_m
     report["compile_device"] = args.device
-    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu) + len(compiled_qadd)
-    report["compiled_operator_kernel_count"] = len(compiled_relu) + len(compiled_qadd)
+    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu) + len(compiled_qadd) + len(compiled_mul)
+    report["compiled_operator_kernel_count"] = len(compiled_relu) + len(compiled_qadd) + len(compiled_mul)
     report["graph_runtime_blockers"] = [
         "NCHW im2col packing and logical-to-padded GEMM staging",
         "QDQ scale/zero-point conversion and Conv bias/requantization",
