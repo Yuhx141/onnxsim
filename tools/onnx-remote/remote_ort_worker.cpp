@@ -17,6 +17,30 @@ uint64_t elapsed_us(const std::chrono::steady_clock::time_point& start) {
       std::chrono::steady_clock::now() - start).count());
 }
 
+size_t element_bytes(ONNXTensorElementDataType type) {
+  switch (type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+      return 4;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+      return 1;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      return 2;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      return 8;
+    default:
+      return 0;
+  }
+}
+
 Response execute(const Request& request, Ort::Env& env, int threads) {
   Response response;
   response.request_id = request.request_id;
@@ -27,7 +51,10 @@ Response execute(const Request& request, Ort::Env& env, int threads) {
         "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
         "\"runner_id\":\"ort-cpu-worker\",\"ready\":true,"
         "\"supported_ops\":[\"subgraph\",\"onnx\"],"
-        "\"supported_dtypes\":[\"FLOAT\"],\"profiling\":true}";
+        "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\","
+        "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","
+        "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\"],"
+        "\"profiling\":true}";
     return response;
   }
   if (request.op != "subgraph" && request.op != "onnx") {
@@ -57,17 +84,41 @@ Response execute(const Request& request, Ort::Env& env, int threads) {
     input_name_ptrs.reserve(request.inputs.size());
     inputs.reserve(request.inputs.size());
     for (size_t i = 0; i < request.inputs.size(); ++i) {
-      if (request.inputs[i].dtype != 1) {
-        response.error = "ORT worker currently supports float32 subgraph inputs only";
+      const auto input_type = static_cast<ONNXTensorElementDataType>(
+          request.inputs[i].dtype);
+      const size_t input_bytes = element_bytes(input_type);
+      if (input_bytes == 0) {
+        response.error = "ORT worker received an unsupported input dtype";
         return response;
       }
       auto name = session.GetInputNameAllocated(i, allocator);
       input_names.emplace_back(name.get());
       input_name_ptrs.push_back(input_names.back().c_str());
-      inputs.push_back(Ort::Value::CreateTensor<float>(
-          memory, const_cast<float*>(request.inputs[i].data.data()),
-          request.inputs[i].data.size(), request.inputs[i].shape.data(),
-          request.inputs[i].shape.size()));
+      const size_t input_elements = request.inputs[i].dtype == 1
+                                        ? request.inputs[i].data.size()
+                                        : request.inputs[i].raw_data.size() /
+                                              input_bytes;
+      const size_t input_size = input_elements * input_bytes;
+      if (input_size == 0 && input_elements != 0) {
+        response.error = "ORT worker input tensor size overflow";
+        return response;
+      }
+      if (request.inputs[i].dtype == 1) {
+        inputs.push_back(Ort::Value::CreateTensor<float>(
+            memory, const_cast<float*>(request.inputs[i].data.data()),
+            input_elements, request.inputs[i].shape.data(),
+            request.inputs[i].shape.size()));
+      } else {
+        if (request.inputs[i].raw_data.size() != input_size) {
+          response.error = "ORT worker input payload does not match dtype";
+          return response;
+        }
+        inputs.push_back(Ort::Value::CreateTensor(
+            memory.GetConst(),
+            const_cast<uint8_t*>(request.inputs[i].raw_data.data()),
+            input_size, request.inputs[i].shape.data(),
+            request.inputs[i].shape.size(), input_type));
+      }
     }
     std::vector<std::string> output_names;
     std::vector<const char*> output_name_ptrs;
@@ -90,16 +141,24 @@ Response execute(const Request& request, Ort::Env& env, int threads) {
     response.outputs.reserve(outputs.size());
     for (auto& output : outputs) {
       auto info = output.GetTensorTypeAndShapeInfo();
-      if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-        response.error = "ORT worker currently supports float32 outputs only";
+      const auto output_type = info.GetElementType();
+      const size_t output_bytes = element_bytes(output_type);
+      if (output_bytes == 0) {
+        response.error = "ORT worker returned an unsupported output dtype";
         response.profile.clear();
         return response;
       }
       Tensor tensor;
       tensor.shape = info.GetShape();
       const size_t count = info.GetElementCount();
-      const float* data = output.GetTensorData<float>();
-      tensor.data.assign(data, data + count);
+      if (output_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        const float* data = output.GetTensorData<float>();
+        tensor.data.assign(data, data + count);
+      } else {
+        tensor.dtype = static_cast<uint8_t>(output_type);
+        const auto* data = static_cast<const uint8_t*>(output.GetTensorRawData());
+        tensor.raw_data.assign(data, data + count * output_bytes);
+      }
       response.outputs.push_back(std::move(tensor));
     }
     response.ok = true;
