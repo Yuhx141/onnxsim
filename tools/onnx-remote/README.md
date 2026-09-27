@@ -237,6 +237,9 @@ document. If the worker is unavailable, `status` reports `unavailable` and the
 capabilities output contains a short error object. The adapter also accepts
 `ONNXSIM_DORA_CONNECT_TIMEOUT_MS` and
 `ONNXSIM_DORA_IO_TIMEOUT_MS` for unreliable links.
+Set `ONNXSIM_DORA_REQUIRE_GRAPH_EXECUTION=1` to make startup fail unless the
+queried worker advertises `graph_execution:true`; this performs the capability
+query even when `ONNXSIM_DORA_ANNOUNCE` is disabled.
 
 The status output uses `schema_version: 1` and includes the selected host and
 port. When the capability probe fails, its escaped error is included in both

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "dora_status.h"
+#include "remote_capabilities.h"
 #include "remote_profile.h"
 #include "remote_transport.h"
 
@@ -40,6 +41,12 @@ int env_timeout(const char* name, int fallback) {
   const long timeout = std::strtol(value, nullptr, 10);
   return timeout > 0 && timeout <= 3600000 ? static_cast<int>(timeout)
                                            : fallback;
+}
+
+bool env_flag(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && (*value == '1' || *value == 'y' || *value == 'Y' ||
+                              *value == 't' || *value == 'T');
 }
 
 bool query_capabilities(Response& response, std::string& error) {
@@ -129,24 +136,46 @@ int main() {
     return 1;
   }
 
-  if (std::getenv("ONNXSIM_DORA_ANNOUNCE") != nullptr) {
+  const bool require_graph_execution =
+      env_flag("ONNXSIM_DORA_REQUIRE_GRAPH_EXECUTION");
+  if (std::getenv("ONNXSIM_DORA_ANNOUNCE") != nullptr ||
+      require_graph_execution) {
     Response worker_capabilities;
     std::string capability_error;
-    const bool ready = query_capabilities(worker_capabilities, capability_error);
+    bool ready = query_capabilities(worker_capabilities, capability_error);
+    if (ready && require_graph_execution) {
+      CapabilitySummary summary;
+      if (!parse_capability_manifest(worker_capabilities.manifest, summary,
+                                     capability_error) ||
+          !summary.graph_execution) {
+        if (capability_error.empty())
+          capability_error = "worker does not advertise graph execution";
+        ready = false;
+      }
+    }
     const std::string host =
         env_string("ONNXSIM_DORA_REMOTE_HOST", "127.0.0.1");
     const uint16_t port = env_port();
-    const std::string status = onnx_remote::dora::readiness_status(
-        ready, host, port, capability_error);
-    dora_send_output(context, "status", 6, status.data(), status.size());
-    if (ready && !worker_capabilities.manifest.empty()) {
-      dora_send_output(context, "capabilities", 12,
-                       worker_capabilities.manifest.data(),
-                       worker_capabilities.manifest.size());
-    } else {
-      const std::string error =
-          onnx_remote::dora::unavailable_capabilities(capability_error);
-      dora_send_output(context, "capabilities", 12, error.data(), error.size());
+    if (std::getenv("ONNXSIM_DORA_ANNOUNCE") != nullptr) {
+      const std::string status = onnx_remote::dora::readiness_status(
+          ready, host, port, capability_error);
+      dora_send_output(context, "status", 6, status.data(), status.size());
+      if (ready && !worker_capabilities.manifest.empty()) {
+        dora_send_output(context, "capabilities", 12,
+                         worker_capabilities.manifest.data(),
+                         worker_capabilities.manifest.size());
+      } else {
+        const std::string error =
+            onnx_remote::dora::unavailable_capabilities(capability_error);
+        dora_send_output(context, "capabilities", 12, error.data(), error.size());
+      }
+    }
+    if (require_graph_execution && !ready) {
+      std::cerr << (capability_error.empty()
+                        ? "DORA adapter: graph-capable worker unavailable\n"
+                        : "DORA adapter: " + capability_error + "\n");
+      free_dora_context(context);
+      return 2;
     }
   }
 
