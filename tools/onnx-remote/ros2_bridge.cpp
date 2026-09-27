@@ -311,6 +311,11 @@ class OnnxRemoteBridge final : public rclcpp::Node {
                     request.request_id);
       return;
     }
+    if (response.request_id != request.request_id) {
+      publish_error("ROS2 bridge: remote worker response request id mismatch",
+                    request.request_id);
+      return;
+    }
     publish_profile(response);
     std::vector<uint8_t> payload;
     if (!onnx_remote::encode_response_payload(response, payload, error)) {

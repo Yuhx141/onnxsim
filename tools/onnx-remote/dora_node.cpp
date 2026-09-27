@@ -109,6 +109,10 @@ bool forward(const uint8_t* data, size_t size, std::vector<uint8_t>& result,
   const bool received = sent && receive_response(fd, response_out, error);
   close_socket(fd);
   if (!received) return false;
+  if (response_out.request_id != request.request_id) {
+    error = "DORA adapter: remote worker response request id mismatch";
+    return false;
+  }
   return encode_response_payload(response_out, result, error);
 }
 
