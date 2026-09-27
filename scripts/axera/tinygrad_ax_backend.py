@@ -1056,7 +1056,9 @@ def key_for_record(
 ) -> TemplateKey:
     attrs = rec.get("attrs", {})
     shapes = rec["shapes"]
-    if rec["op"] in bse.OPS and attrs.get("output_shape"):
+    if rec["op"] in bse.OPS and attrs.get("template_shape"):
+        shapes = [attrs["template_shape"]]
+    elif rec["op"] in bse.OPS and attrs.get("output_shape"):
         shapes = [attrs["output_shape"]]
     keep: dict[str, Any] = {}
     if rec["op"] == "Transpose":
@@ -1410,7 +1412,15 @@ def plan_at_calibration(
             else:
                 live_index = 0
             zx = _u8_zp(calib, rec["inputs"][live_index])
-            zy = _u8_zp(calib, rec["outputs"][0])
+            out_q = _tensor_q(calib, rec["outputs"][0])
+            if attrs.get("tile_blocks") and out_q.get("signed"):
+                if int(out_q["zero_point"]) != 0:
+                    raise _NotAtCalibration(
+                        "tiled binary output must use symmetric zero point 0"
+                    )
+                zy = 0
+            else:
+                zy = _u8_zp(calib, rec["outputs"][0])
             # Initializers are not activation calibration tensors.  The
             # runner annotates their measured unsigned class when it has the
             # source model; standalone coverage keeps the conservative z0
@@ -1426,6 +1436,17 @@ def plan_at_calibration(
                     if alternate in hits:
                         cls, zz = alternate, candidate
                         break
+            if (
+                op == "Mul"
+                and attrs.get("form") == "const"
+                and attrs.get("tile_blocks")
+                and cls == "x0,y0,z0"
+                and cls in hits
+            ):
+                return "covered", (
+                    "ElementwiseScaleEdit (x0,y0,z0) tiled-7x7 constant from "
+                    f"({cls})"
+                )
             if cls not in hits:
                 # Constant positive Mul operands can use the measured
                 # x128/y128/z128 frame when the result remains unsigned.

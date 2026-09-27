@@ -177,6 +177,12 @@ class Segment:
     # Shape decompositions may run a replicated lane template and retain only
     # the prefix corresponding to the graph output.
     output_take: int | None = None
+    input_transforms: dict[str, Callable[[np.ndarray], np.ndarray]] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
+    output_transform: Callable[[np.ndarray], np.ndarray] | None = dataclasses.field(
+        default=None, repr=False
+    )
 
 
 _RETARGET_KEY = re.compile(r"retarget of (\S+) \(")
@@ -410,6 +416,48 @@ def _segment_for(
         def emit_ew():
             return axb.EditSet([axb.ElementwiseScaleEdit(sc)]).build(key)
 
+        input_transforms = {}
+        output_transform = None
+        batch_split = 1
+        split = []
+        if "tiled-7x7" in detail:
+            original_shape = tuple(
+                int(d.dim_value)
+                for d in next(
+                    v
+                    for v in (*model.graph.value_info, *model.graph.output)
+                    if v.name == outs[0]
+                ).type.tensor_type.shape.dim
+            )
+            b, _, channels, pixels = original_shape
+            side = math.isqrt(pixels)
+            tiles = side // 7
+            batch_split = tiles * tiles
+
+            def tile_input(value, shape=original_shape):
+                expanded = np.broadcast_to(np.asarray(value), shape)
+                x = expanded[:, 0].reshape(b, channels, side, side)
+                return (
+                    x.reshape(b, channels, tiles, 7, tiles, 7)
+                    .transpose(0, 2, 4, 1, 3, 5)
+                    .reshape(b * tiles * tiles, channels, 7, 7)
+                )
+
+            def untile_output(value):
+                x = np.asarray(value).reshape(b, tiles, tiles, channels, 7, 7)
+                return (
+                    x.transpose(0, 3, 1, 4, 2, 5)
+                    .reshape(b, 1, channels, pixels)
+                )
+
+            for tensor in live:
+                input_transforms[tensor] = tile_input
+            for tensor in constant_inputs:
+                input_transforms[tensor] = tile_input
+            output_transform = untile_output
+            output_shape = ()
+            split = [True] * (len(live) + len(constant_inputs))
+
         input_shapes = [
             tuple(int(d) for d in s)
             for s in rec.get("attrs", {}).get("input_shapes", [])
@@ -431,6 +479,10 @@ def _segment_for(
             output_shape=output_shape,
             constant_inputs=constant_inputs,
             output_take=output_take,
+            batch_split=batch_split,
+            split=split,
+            input_transforms=input_transforms,
+            output_transform=output_transform,
         )
 
     if op in ("Reshape", "Squeeze") and detail.startswith("reshape_record_emit"):
@@ -538,6 +590,22 @@ def build_plan(
                 out_shape = value_shapes.get(rec["outputs"][0], ())
                 if out_shape and tuple(rec["shapes"][0]) != out_shape:
                     attrs["output_shape"] = list(out_shape)
+                live_name = rec["inputs"][1 - int(const_index)]
+                live_shape = value_shapes.get(live_name, ())
+                if (
+                    rec["op"] == "Mul"
+                    and len(live_shape) == 4
+                    and live_shape[1] == 1
+                    and live_shape[3] > 0
+                    and int(math.isqrt(live_shape[3])) ** 2 == live_shape[3]
+                    and math.isqrt(live_shape[3]) % 7 == 0
+                ):
+                    side = math.isqrt(live_shape[3])
+                    attrs["template_shape"] = [
+                        live_shape[0], live_shape[2], 7, 7
+                    ]
+                    attrs["tile_blocks"] = (side // 7) ** 2
+                    rec["shapes"] = [list(attrs["template_shape"])]
                 rec["attrs"] = attrs
         planned_records.append(rec)
     # Live MatMul/Conv validation scans the compiled MCode.  The same scan is
@@ -851,7 +919,12 @@ class StepRunner:
     def _device(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
         m = self.session.load(self.emitted(seg))
         try:
-            ins = [np.asarray(env[t], dtype=np.float32) for t in seg.inputs]
+            ins = [
+                seg.input_transforms.get(t, lambda x: x)(
+                    np.asarray(env[t], dtype=np.float32)
+                )
+                for t in seg.inputs
+            ]
             model_inputs = getattr(m, "inputs", None)
             if model_inputs is not None and len(model_inputs) > len(ins):
                 initializer = {
@@ -861,7 +934,8 @@ class StepRunner:
                 for node_name in seg.nodes:
                     for tensor in self.by_name[node_name].input:
                         if tensor not in seg.inputs and tensor in initializer:
-                            ins.append(np.asarray(initializer[tensor], dtype=np.float32))
+                            value = np.asarray(initializer[tensor], dtype=np.float32)
+                            ins.append(seg.input_transforms.get(tensor, lambda x: x)(value))
             if model_inputs is not None and len(ins) != len(model_inputs):
                 raise ValueError(
                     f"segment {seg.name} emitted {len(m.inputs)} inputs, "
@@ -912,6 +986,8 @@ class StepRunner:
         want = {o.name: o for o in self.model.graph.value_info}
         out = []
         for t, y in zip(seg.outputs, ys):
+            if seg.output_transform is not None:
+                y = seg.output_transform(y)
             vi = want.get(t)
             shape = [d.dim_value for d in vi.type.tensor_type.shape.dim] if vi else None
             y = y.astype(np.float32)

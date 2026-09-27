@@ -124,11 +124,16 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     report_covered = sr.axb.coverage_report(records, calibration=calib)["totals"][
         "covered"
     ]
-    # Three binary scale-collision cases are recognized by the graph planner
-    # but intentionally stay host-side until their separate native template
-    # family is available.
+    # A tiled constant-broadcast segment uses a full-shape template that the
+    # compact coverage records cannot represent, so subtract those synthetic
+    # planner nodes from the record-level total.
     nonemittable = sum("no runner segment" in reason for reason in host.values())
-    assert covered + nonemittable == report_covered
+    synthetic = sum(
+        "tiled-7x7" in s.detail
+        or ("constant from" in s.detail and bool(s.output_shape))
+        for s in everything
+    )
+    assert covered + nonemittable - synthetic == report_covered
     unsafe = [s for s in everything if s.unsafe]
     # signed Reshapes take the Reshape -> Identity templates, so none is unsafe
     assert not any(s.kind == "reshape" for s in unsafe)
@@ -145,6 +150,7 @@ def test_plan_materializes_live_broadcast_binary_operands():
     broadcast = [s for s in segs if s.output_shape]
     # Two decomposed residual/update broadcasts now use the fixed x128 binary
     # template for their dequantized float boundary as well.
+    broadcast = [s for s in broadcast if "constant from" not in s.detail]
     assert len(broadcast) == 44
     assert all(s.input_shapes[-1] == (1,) for s in broadcast)
     assert all(s.output_shape == s.input_shapes[0] for s in broadcast)
@@ -298,6 +304,28 @@ def test_constant_mul_broadcast_output_shape_runs_on_axcl_vm():
     # native path only within its measured device error budget.
     assert stats[0].max_lsb <= 40.0, stats[0]
     assert stats[0].float_rel <= 0.03, stats[0]
+
+
+@needs_device
+@needs_step
+def test_mask_mul_tiled_7x7_runs_on_axcl_vm():
+    """Mask multiplies can be tiled into the native 7x7 binary template."""
+    import axcl_session
+
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, _ = sr.build_plan(model, sr.load_records(), calib)
+    selected = [s for s in segments if s.name in {"Mul_58", "Mul_80", "Mul_103"}]
+    assert len(selected) == 3
+    reference = sr.load_reference()
+    with axcl_session.AXSession(subdir="mask_mul_tiled_7x7") as session:
+        _, stats = sr.StepRunner(model, selected, session, health_every=0).run(
+            reference["feeds"], "npu"
+        )
+    assert len(stats) == 3
+    for stat in stats:
+        assert not stat.error, stat
+        assert stat.max_lsb <= 2.01, stat
 
 
 @needs_device
