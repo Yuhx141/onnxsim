@@ -139,7 +139,9 @@ def test_plan_materializes_live_broadcast_binary_operands():
     calib = sr.axb.load_calibration(sr.STEP_CALIB)
     segs, _ = sr.build_plan(model, sr.load_records(), calib)
     broadcast = [s for s in segs if s.output_shape]
-    assert len(broadcast) == 42
+    # Two decomposed residual/update broadcasts now use the fixed x128 binary
+    # template for their dequantized float boundary as well.
+    assert len(broadcast) == 44
     assert all(s.input_shapes[-1] == (1,) for s in broadcast)
     assert all(s.output_shape == s.input_shapes[0] for s in broadcast)
 
@@ -204,6 +206,30 @@ def test_one_segment_of_each_kind_matches_its_simulation_on_device():
     assert {st.kind for st in stats} == set(first)
     for st in stats:
         assert sr.segment_passed(vars(st)), st
+
+
+@needs_device
+@needs_step
+def test_recentered_add_sub_segment_matches_simulation_on_axcl_vm():
+    """Arbitrary residual zero points can use the native x128 binary frame."""
+    import axcl_session
+
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, _ = sr.build_plan(model, sr.load_records(), calib)
+    seg = next(s for s in segments if "recentered from" in s.detail)
+    reference = sr.load_reference()
+    with axcl_session.AXSession(subdir="recentered_binary") as session:
+        _, stats = sr.StepRunner(model, [seg], session, health_every=0).run(
+            reference["feeds"], "npu"
+        )
+    assert len(stats) == 1
+    # Reusing a fixed zero-point binary frame for arbitrary calibrated
+    # residual zero-points is a bounded quantized approximation; it must
+    # execute natively and remain close to the float operation.
+    assert not stats[0].error, stats[0]
+    assert stats[0].max_lsb <= 16.0, stats[0]
+    assert stats[0].float_rel <= 0.03, stats[0]
 
 
 @needs_device

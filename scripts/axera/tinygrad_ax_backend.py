@@ -1427,6 +1427,23 @@ def plan_at_calibration(
                         cls, zz = alternate, candidate
                         break
             if cls not in hits:
+                # Add/Sub have a useful fixed-frame decomposition.  When the
+                # measured graph class is not one of the directly compiled
+                # classes, an x128/y128/z128 template can still execute the
+                # dequantized float boundary natively, with bounded extra
+                # quantization error.  This is especially useful for
+                # decomposed training graphs, where residual and optimizer
+                # arithmetic naturally gets distinct zero points at every
+                # edge.
+                if (
+                    op in ("Add", "Sub")
+                    and attrs.get("form") in ("same_shape", "broadcast")
+                    and "x128,y128,z128" in hits
+                ):
+                    return "covered", (
+                        "ElementwiseScaleEdit (x128,y128,z128) recentered from "
+                        f"({cls})"
+                    )
                 raise _NotAtCalibration(
                     f"zero points {cls} are not a template class {hits}"
                 )
