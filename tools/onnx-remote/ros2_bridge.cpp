@@ -159,10 +159,39 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     const size_t start = json.find(marker);
     if (start == std::string::npos) return {};
     const size_t value_start = start + marker.size();
-    const size_t end = json.find('"', value_start);
-    return end == std::string::npos
-               ? std::string{}
-               : json.substr(value_start, end - value_start);
+    std::string value;
+    value.reserve(json.size() - value_start);
+    bool escaped = false;
+    for (size_t i = value_start; i < json.size(); ++i) {
+      const char c = json[i];
+      if (!escaped) {
+        if (c == '"') return value;
+        if (c == '\\') {
+          escaped = true;
+          continue;
+        }
+        value += c;
+        continue;
+      }
+      escaped = false;
+      switch (c) {
+        case '"': value += '"'; break;
+        case '\\': value += '\\'; break;
+        case '/': value += '/'; break;
+        case 'b': value += '\b'; break;
+        case 'f': value += '\f'; break;
+        case 'n': value += '\n'; break;
+        case 'r': value += '\r'; break;
+        case 't': value += '\t'; break;
+        default:
+          // Discovery fields are normally hostnames/IPs. Preserve unknown
+          // escapes rather than accepting a truncated or ambiguous value.
+          value += '\\';
+          value += c;
+          break;
+      }
+    }
+    return {};
   }
 
   static int json_int(const std::string& json, const std::string& key) {
