@@ -23,6 +23,26 @@ int main(int argc, char** argv) {
     Ort::AllocatorWithDefaultOptions allocator;
     Ort::MemoryInfo memory = Ort::MemoryInfo::CreateCpu(
         OrtAllocatorType::OrtArenaAllocator, OrtMemTypeDefault);
+    {
+      Request capabilities;
+      capabilities.request_id = 7000;
+      capabilities.op = "capabilities";
+      const int capability_fd = connect_tcp_timeout(
+          "127.0.0.1", static_cast<uint16_t>(std::stoul(argv[2])), 2000);
+      if (capability_fd < 0) throw std::runtime_error("cannot connect to ORT worker");
+      std::string capability_error;
+      if (!send_request(capability_fd, capabilities, capability_error))
+        throw std::runtime_error(capability_error);
+      Response capability_response;
+      if (!receive_response(capability_fd, capability_response,
+                             capability_error))
+        throw std::runtime_error(capability_error);
+      close_socket(capability_fd);
+      if (!capability_response.ok ||
+          capability_response.manifest.find("ort-cpu-worker") ==
+              std::string::npos)
+        throw std::runtime_error("ORT worker capability response mismatch");
+    }
     std::vector<std::string> input_names;
     std::vector<const char*> input_name_ptrs;
     std::vector<std::vector<float>> input_storage;

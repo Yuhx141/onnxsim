@@ -20,6 +20,16 @@ uint64_t elapsed_us(const std::chrono::steady_clock::time_point& start) {
 Response execute(const Request& request, Ort::Env& env) {
   Response response;
   response.request_id = request.request_id;
+  if (request.op == "capabilities") {
+    response.ok = true;
+    response.artifact_id = "ort-cpu-worker";
+    response.manifest =
+        "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
+        "\"runner_id\":\"ort-cpu-worker\",\"ready\":true,"
+        "\"supported_ops\":[\"subgraph\",\"onnx\"],"
+        "\"supported_dtypes\":[\"FLOAT\"],\"profiling\":true}";
+    return response;
+  }
   if (request.op != "subgraph" && request.op != "onnx") {
     response.error = "ORT worker expects subgraph or onnx operation";
     return response;

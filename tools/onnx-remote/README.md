@@ -137,6 +137,10 @@ float32 outputs plus an `ort_session_run` profile event. It is optional and
 separate from the dependency-free worker, so embedded targets do not inherit
 an ORT or C++ runtime dependency.
 
+It also answers the native `capabilities` request with an ORT CPU runner
+manifest, so ROS2/DORA discovery can verify and select it like the reference
+worker.
+
 `onnx-remote-ort-worker-test MODEL.onnx PORT` runs the same float32 model
 locally through ORT and compares every output with the remote subgraph result,
 including the required profile event.
