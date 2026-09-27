@@ -174,6 +174,9 @@ class Segment:
     input_shapes: list[tuple[int, ...]] = dataclasses.field(default_factory=list)
     output_shape: tuple[int, ...] = ()
     constant_inputs: list[str] = dataclasses.field(default_factory=list)
+    # Shape decompositions may run a replicated lane template and retain only
+    # the prefix corresponding to the graph output.
+    output_take: int | None = None
 
 
 _RETARGET_KEY = re.compile(r"retarget of (\S+) \(")
@@ -332,7 +335,13 @@ def _segment_for(
 
     if detail.startswith("ElementwiseScaleEdit"):
         cls = _CLASS.search(detail).group(1)
-        key = axb.key_for_record(rec, cls)
+        template_rec = rec
+        output_take = None
+        if "shape-expanded" in detail:
+            template_rec = dict(rec)
+            template_rec["shapes"] = [[1, 128]]
+            output_take = 1
+        key = axb.key_for_record(template_rec, cls)
         constant_inputs = []
         if op in ew.OPS:
             sc, _ = _scale_dict(calib, {"x": ins[0], "y": outs[0]})
@@ -392,6 +401,7 @@ def _segment_for(
             input_shapes=input_shapes,
             output_shape=output_shape,
             constant_inputs=constant_inputs,
+            output_take=output_take,
         )
 
     if op in ("Reshape", "Squeeze") and detail.startswith("reshape_record_emit"):
@@ -865,6 +875,8 @@ class StepRunner:
             vi = want.get(t)
             shape = [d.dim_value for d in vi.type.tensor_type.shape.dim] if vi else None
             y = y.astype(np.float32)
+            if seg.output_take is not None:
+                y = y.reshape(-1)[: seg.output_take]
             out.append(
                 y.reshape(shape) if shape and int(np.prod(shape)) == y.size else y
             )

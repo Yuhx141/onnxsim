@@ -238,6 +238,26 @@ def test_recentered_add_sub_segment_matches_simulation_on_axcl_vm():
 
 @needs_device
 @needs_step
+def test_shape_expanded_add_segment_runs_on_axcl_vm():
+    """The scalar decomposed Add uses a replicated native lane template."""
+    import axcl_session
+
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, _ = sr.build_plan(model, sr.load_records(), calib)
+    seg = next(s for s in segments if "shape-expanded" in s.detail)
+    reference = sr.load_reference()
+    with axcl_session.AXSession(subdir="shape_expanded_binary") as session:
+        _, stats = sr.StepRunner(model, [seg], session, health_every=0).run(
+            reference["feeds"], "npu"
+        )
+    assert len(stats) == 1
+    assert not stats[0].error, stats[0]
+    assert stats[0].max_lsb <= 2.01, stats[0]
+
+
+@needs_device
+@needs_step
 def test_resnet18_training_graph_runs_pulsar_free_on_axcl_vm(tmp_path):
     """Run the complete calibrated ResNet18 training graph on the AX8850."""
     import axcl_session

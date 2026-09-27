@@ -1427,6 +1427,27 @@ def plan_at_calibration(
                         cls, zz = alternate, candidate
                         break
             if cls not in hits:
+                # The scalar Add in the decomposed loss path has no native
+                # (1,1) x0 template, but the validated (1,128) x0 program
+                # is lane-independent.  Replicate the scalar inputs across
+                # its lanes and keep lane zero at the segment boundary.
+                if (
+                    op in ("Add", "Sub")
+                    and attrs.get("form") == "same_shape"
+                    and cls == "x0,y0,z0"
+                    and int(np.prod(rec.get("shapes", [[0]])[0] or [0])) == 1
+                ):
+                    expanded = dict(rec)
+                    expanded["shapes"] = [[1, 128]]
+                    try:
+                        cache.lookup(key_for_record(expanded, cls))
+                    except ValueError:
+                        pass
+                    else:
+                        return "covered", (
+                            "ElementwiseScaleEdit (x0,y0,z0) shape-expanded "
+                            "from (1,1) to (1,128)"
+                        )
                 # Add/Sub have a useful fixed-frame decomposition.  When the
                 # measured graph class is not one of the directly compiled
                 # classes, an x128/y128/z128 template can still execute the
