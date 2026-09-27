@@ -29,6 +29,7 @@ class GraphRegion:
     constant_values: tuple[str, ...]
     output_values: tuple[str, ...]
     internal_qdq_nodes: tuple[int, ...]
+    instructions: tuple[Mapping[str, Any], ...]
     internal_tensors: tuple[Mapping[str, Any], ...]
     peak_live_bytes: int | None
     device_lowering_gaps: tuple[str, ...]
@@ -65,6 +66,66 @@ def _qdq_root(value: str, producer: Mapping[str, int], nodes: Sequence[Any]) -> 
             return value
         value = str(nodes[index].input[0])
     return value
+
+
+def _qdq_path_to_root(value: str, producer: Mapping[str, int], nodes: Sequence[Any]) -> tuple[int, ...]:
+    path: list[int] = []
+    seen: set[str] = set()
+    while value and value not in seen:
+        seen.add(value)
+        index = producer.get(value)
+        if index is None or str(nodes[index].op_type) not in QDQ_OPS:
+            break
+        path.append(index)
+        value = str(nodes[index].input[0])
+    return tuple(path)
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    # TensorProto-valued Constant attributes are serialized with a small,
+    # dependency-light descriptor; initializer contents remain named inputs.
+    if hasattr(value, "dims") and hasattr(value, "data_type"):
+        return {"tensor_dims": [int(dim) for dim in value.dims], "tensor_data_type": int(value.data_type)}
+    return str(value)
+
+
+def _attributes(node: Any) -> dict[str, Any]:
+    try:
+        from onnx import helper, numpy_helper
+    except ImportError:
+        helper = numpy_helper = None
+    result: dict[str, Any] = {}
+    for attr in getattr(node, "attribute", ()):
+        try:
+            value = helper.get_attribute_value(attr) if helper is not None else None
+        except Exception:
+            value = None
+        if value is None:
+            if getattr(attr, "ints", ()):
+                value = tuple(attr.ints)
+            elif getattr(attr, "floats", ()):
+                value = tuple(attr.floats)
+            elif getattr(attr, "s", b""):
+                value = attr.s
+            elif hasattr(attr, "i"):
+                value = attr.i
+            elif hasattr(attr, "f"):
+                value = attr.f
+        if numpy_helper is not None and hasattr(value, "dims") and hasattr(value, "data_type"):
+            try:
+                value = numpy_helper.to_array(value)
+            except Exception:
+                pass
+        result[str(attr.name)] = _json_value(value)
+    return result
 
 
 def _semantic_edges(nodes: Sequence[Any], consumers: Mapping[str, Sequence[tuple[int, int]]]):
@@ -225,6 +286,7 @@ def plan_graph_regions(model: Any) -> tuple[GraphRegion, ...]:
             for value in getattr(node, "input", ()):
                 if not value:
                     continue
+                qdq_nodes.update(_qdq_path_to_root(str(value), producer, nodes))
                 source = _semantic_source(str(value), producer, nodes)
                 if source not in members:
                     root = _qdq_root(str(value), producer, nodes)
@@ -271,6 +333,54 @@ def plan_graph_regions(model: Any) -> tuple[GraphRegion, ...]:
             if elem_bytes is not None and shape is not None:
                 item["nbytes"] = prod(shape) * elem_bytes
             internal_tensors.append(item)
+        constant_node_indices = {
+            producer[value]
+            for index in group
+            for value in getattr(nodes[index], "input", ())
+            if value and value in producer and str(nodes[producer[value]].op_type) in STATIC_OPS
+        }
+        program_indices = sorted(members | qdq_nodes | constant_node_indices)
+        instructions = tuple(
+            {
+                "node_index": index,
+                "op_type": str(nodes[index].op_type),
+                "inputs": [str(value) for value in getattr(nodes[index], "input", ()) if value],
+                "outputs": [str(value) for value in getattr(nodes[index], "output", ()) if value],
+                "attributes": _attributes(nodes[index]),
+                "quantization_edge": str(nodes[index].op_type) in QDQ_OPS,
+            }
+            for index in program_indices
+        )
+        program_outputs = {
+            value for instruction in instructions for value in instruction["outputs"]
+        }
+        graph_input_names = {str(value.name) for value in getattr(model.graph, "input", ())}
+        for instruction in instructions:
+            for value in instruction["inputs"]:
+                if value in program_outputs:
+                    continue
+                root = _qdq_root(value, producer, nodes)
+                if root in initializer_names or root in constant_outputs:
+                    constant_values.add(root)
+                elif root in graph_input_names:
+                    input_values.add(root)
+                else:
+                    input_values.add(value)
+        program_outputs = {
+            value for instruction in instructions for value in instruction["outputs"]
+        }
+        graph_input_names = {str(value.name) for value in getattr(model.graph, "input", ())}
+        for instruction in instructions:
+            for value in instruction["inputs"]:
+                if value in program_outputs:
+                    continue
+                root = _qdq_root(value, producer, nodes)
+                if root in initializer_names or root in constant_outputs:
+                    constant_values.add(root)
+                elif root in graph_input_names:
+                    input_values.add(root)
+                else:
+                    input_values.add(value)
         tensor_lifetimes: dict[str, dict[str, Any]] = {}
         for tensor in internal_tensors:
             value = str(tensor["value"])
@@ -303,6 +413,7 @@ def plan_graph_regions(model: Any) -> tuple[GraphRegion, ...]:
             constant_values=tuple(sorted(constant_values)),
             output_values=tuple(sorted(output_values)),
             internal_qdq_nodes=tuple(sorted(qdq_nodes)),
+            instructions=instructions,
             internal_tensors=tuple(internal_tensors),
             peak_live_bytes=peak if events else None,
             device_lowering_gaps=tuple(sorted(gaps)),
@@ -321,6 +432,7 @@ def graph_regions_to_dict(regions: Sequence[GraphRegion]) -> list[dict[str, Any]
             "constant_values": list(region.constant_values),
             "output_values": list(region.output_values),
             "internal_qdq_nodes": list(region.internal_qdq_nodes),
+            "instructions": [dict(instruction) for instruction in region.instructions],
             "internal_tensors": [dict(tensor) for tensor in region.internal_tensors],
             "peak_live_bytes_known": region.peak_live_bytes,
             "device_lowering_gaps": list(region.device_lowering_gaps),

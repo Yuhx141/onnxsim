@@ -1,11 +1,8 @@
-"""Dependency-light AMD XDNA backend helpers.
-
-The Phase 1 backend is deliberately an offline graph planner.  Runtime
-execution is added once precompiled IRON/MLIR-AIE artifacts are available.
-"""
+"""AMD XDNA backend planning, codegen, and experimental runtime helpers."""
 
 from .bottleneck_runtime import BottleneckBinding, bind_bottleneck_block
 from .conv_reference import execute_conv_reference, im2col_nchw
+from .graph_fusion import GraphRegion, graph_regions_to_dict, plan_graph_regions
 from .qdq_runtime import QDQEdge, QuantParams, extract_qdq_edges, qdq_edge_map
 from .resnet_bottleneck import BottleneckBlockPlan, plan_bottleneck_blocks
 from .resnet_codegen import (
@@ -96,6 +93,9 @@ __all__ = [
     "coverage_to_dict",
     "execute_conv_reference",
     "im2col_nchw",
+    "GraphRegion",
+    "plan_graph_regions",
+    "graph_regions_to_dict",
     "BottleneckBlockPlan",
     "plan_bottleneck_blocks",
     "BottleneckBinding",

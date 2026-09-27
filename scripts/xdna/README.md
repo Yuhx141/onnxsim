@@ -148,9 +148,10 @@ so use a separate unprofiled run for the headline latency.
 
 The same manifest now includes `graph_programs`: maximal connected semantic
 regions across QDQ edges, graph input/output boundaries, static constant
-inputs, internal tensor lifetimes, an estimated peak live-buffer size, and
-the operator lowerings still required. This gives the future fused runtime a
-buffer and dependency contract. Regions are explicitly marked
+inputs, a topologically ordered instruction stream with ONNX attributes and
+QDQ scale/zero-point references, internal tensor lifetimes, an estimated peak
+live-buffer size, and the operator lowerings still required. This gives the
+future fused runtime a graph IR plus a buffer and dependency contract. Regions are explicitly marked
 `planning_only_not_executable`; current XDNA execution still uses individual
 Conv kernels and host-side operators.
 
