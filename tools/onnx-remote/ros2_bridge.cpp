@@ -105,11 +105,15 @@ class OnnxRemoteBridge final : public rclcpp::Node {
           onnx_remote::Response capabilities;
           std::string error;
           if (!query_capabilities(capabilities, error)) {
+            publish_discovery_status("unavailable", discovered_runner_id_,
+                                     host_, port_, error);
             response->success = false;
             response->message = error.empty() ? "remote worker is unreachable"
                                                : error;
             return;
           }
+          publish_discovery_status("ready", discovered_runner_id_, host_,
+                                   port_);
           response->success = true;
           response->message = "remote worker is ready";
         });
@@ -120,6 +124,10 @@ class OnnxRemoteBridge final : public rclcpp::Node {
       onnx_remote::Response capabilities;
       std::string error;
       response->success = query_capabilities(capabilities, error);
+      if (!response->success) {
+        publish_discovery_status("unavailable", discovered_runner_id_, host_,
+                                 port_, error);
+      }
       response->message = response->success
                               ? capabilities.manifest
                               : (error.empty() ? "capability query failed"

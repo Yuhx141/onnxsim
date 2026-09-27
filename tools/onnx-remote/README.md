@@ -265,8 +265,9 @@ Discovery transitions are published as JSON diagnostics on
 `state` of `selected`, `rejected`, or `expired`, together with the runner ID,
 host, and port; rejected messages also include an `error` string. This topic is
 transient-local and reliable, so late-joining monitors receive the most recent
-transition. It is only a control/status surface: tensor and profile payloads
-remain binary.
+transition. Health/capability probes additionally publish `ready` or
+`unavailable`. It is only a control/status surface: tensor and profile
+payloads remain binary.
 
 The bridge exposes `health` and `capabilities` for ROS2 discovery/selection;
 both services query the selected worker, while tensor and profile data remain
