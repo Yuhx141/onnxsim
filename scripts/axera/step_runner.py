@@ -215,6 +215,7 @@ def _segment_for(
 ) -> Segment | None:
     op, name = rec["op"], rec["name"]
     ins, outs = list(rec["inputs"]), list(rec["outputs"])
+    attrs = rec.get("attrs", {})
 
     def q(ts):
         return [qparams_of(calib, t) for t in ts]
@@ -406,21 +407,40 @@ def _segment_for(
         # advertising a segment that only fails when the VM loads it: a
         # collision is a distinct Pulsar2 program family, not a retargetable
         # instance of the selected template.
+        template_only = False
         if op in axb.bse.OPS:
             try:
                 values = axb.bse.op_values(op, sc)
                 axb.bse._check_distinct(values, "target")
             except ValueError:
-                return None
+                # A binary 0/1 mask can have the same input and output
+                # scale. That is a compiler collision for scale retargeting,
+                # but it is safe to use the native template unchanged when
+                # the flat frame was built at exactly that calibration.
+                if not (
+                    attrs.get("flat_blocks")
+                    and op == "Mul"
+                    and cls == "x0,y0,z0"
+                    and float(sc["x"]) == float(sc["y"])
+                    and abs(float(sc["z"]) - 1.0 / 255.0) < 1e-7
+                ):
+                    return None
+                template_only = True
 
         def emit_ew():
-            return axb.EditSet([axb.ElementwiseScaleEdit(sc)]).build(key)
+            edit = (
+                axb.BinaryTemplateOnly()
+                if template_only
+                else axb.ElementwiseScaleEdit(sc)
+            )
+            return axb.EditSet([edit]).build(key)
 
         input_transforms = {}
         output_transform = None
         batch_split = 1
         split = []
         tile_match = re.search(r"tiled-(\d+)x\1", detail)
+        flat_match = re.search(r"flat-(\d+)x(\d+)", detail)
         if tile_match:
             tile_side = int(tile_match.group(1))
             original_shape = tuple(
@@ -459,6 +479,37 @@ def _segment_for(
             for tensor in constant_inputs:
                 input_transforms[tensor] = tile_input
             output_transform = untile_output
+            output_shape = ()
+            split = [True] * (len(live) + len(constant_inputs))
+        elif flat_match:
+            rows, cols = (int(x) for x in flat_match.groups())
+            original_shape = tuple(
+                int(d.dim_value)
+                for d in next(
+                    v
+                    for v in (*model.graph.value_info, *model.graph.output)
+                    if v.name == outs[0]
+                ).type.tensor_type.shape.dim
+            )
+            elements = int(np.prod(original_shape))
+            chunk = rows * cols
+            blocks = (elements + chunk - 1) // chunk
+            batch_split = blocks
+
+            def pack_input(value, shape=original_shape):
+                flat = np.broadcast_to(np.asarray(value), shape).reshape(-1)
+                padded = np.zeros(blocks * chunk, dtype=np.float32)
+                padded[: flat.size] = flat
+                return padded.reshape(blocks * rows, cols)
+
+            def unpack_output(value):
+                return np.asarray(value).reshape(-1)[:elements].reshape(original_shape)
+
+            for tensor in live:
+                input_transforms[tensor] = pack_input
+            for tensor in constant_inputs:
+                input_transforms[tensor] = pack_input
+            output_transform = unpack_output
             output_shape = ()
             split = [True] * (len(live) + len(constant_inputs))
 
@@ -632,6 +683,33 @@ def build_plan(
                     attrs["tile_blocks"] = (side // tile_side) ** 2
                     attrs["tile_side"] = tile_side
                     rec["shapes"] = [list(attrs["template_shape"])]
+                elif (
+                    rec["op"] == "Mul"
+                    and np.all((value == 0) | (value == 1))
+                    and out_shape
+                    and int(np.prod(out_shape)) > 1024 * 512
+                ):
+                    # Binary masks are contiguous regardless of their ONNX
+                    # rank. Pack them into the validated 1000x512 frame and
+                    # run one native invocation per frame; padding is dropped
+                    # by the inverse transform at the segment boundary.
+                    flat_template = [1024, 512]
+                    trial = dict(rec)
+                    trial_attrs = dict(attrs)
+                    trial_attrs["template_shape"] = flat_template
+                    trial["attrs"] = trial_attrs
+                    trial["shapes"] = [flat_template]
+                    try:
+                        cache.lookup(axb.key_for_record(trial, "x0,y0,z0"))
+                    except ValueError:
+                        pass
+                    else:
+                        attrs["template_shape"] = flat_template
+                        attrs["flat_blocks"] = (
+                            int(np.prod(out_shape)) + 1024 * 512 - 1
+                        ) // (1024 * 512)
+                        attrs["tile_blocks"] = attrs["flat_blocks"]
+                        rec["shapes"] = [flat_template]
                 rec["attrs"] = attrs
         planned_records.append(rec)
     # Live MatMul/Conv validation scans the compiled MCode.  The same scan is

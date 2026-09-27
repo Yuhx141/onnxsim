@@ -695,6 +695,26 @@ class TemplateOnly:
 
 
 @dataclasses.dataclass
+class BinaryTemplateOnly:
+    """Keep an exact binary template for a collision class.
+
+    Binary scale retargeting rejects coincident scale formulas because that is
+    a different Pulsar2 program family. A shape probe can nevertheless match
+    the target calibration exactly, in which case no MCode edit is needed.
+    """
+
+    def validate(self, key, entry):
+        if entry.kind != "binary":
+            raise ValueError(f"{key.op} template is not a binary template")
+
+    def apply(self, key, entry, model):
+        return model
+
+    def to_json(self):
+        return {"type": "binary_template_only"}
+
+
+@dataclasses.dataclass
 class GatherIndexEdit:
     """Retarget a last-axis Gather's constant indices (``memory_emit.py``)."""
 
@@ -838,6 +858,8 @@ def edit_from_json(d: Mapping) -> Edit:
     kind = d.get("type")
     if kind == "template_only":
         return TemplateOnly()
+    if kind == "binary_template_only":
+        return BinaryTemplateOnly()
     if kind == "gather_indices":
         return GatherIndexEdit(list(d["indices"]))
     if kind == "elementwise_scales":
@@ -1443,6 +1465,11 @@ def plan_at_calibration(
                 and cls == "x0,y0,z0"
                 and cls in hits
             ):
+                if attrs.get("flat_blocks"):
+                    return "covered", (
+                        "ElementwiseScaleEdit (x0,y0,z0) flat-1024x512 "
+                        f"constant from ({cls})"
+                    )
                 tile_side = int(attrs.get("tile_side", 7))
                 return "covered", (
                     f"ElementwiseScaleEdit (x0,y0,z0) tiled-{tile_side}x{tile_side} "

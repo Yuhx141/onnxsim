@@ -130,6 +130,7 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     nonemittable = sum("no runner segment" in reason for reason in host.values())
     synthetic = sum(
         "tiled-" in s.detail
+        or "flat-" in s.detail
         or ("constant from" in s.detail and bool(s.output_shape))
         for s in everything
     )
@@ -318,15 +319,25 @@ def test_mask_mul_tiled_native_shapes_runs_on_axcl_vm():
     selected = [
         s
         for s in segments
-        if s.name in {"Mul_58", "Mul_160", "Mul_262", "Mul_364"}
+        if s.name
+        in {
+            "Mul_58",
+            "Mul_125",
+            "Mul_160",
+            "Mul_227",
+            "Mul_262",
+            "Mul_329",
+            "Mul_364",
+            "Mul_451",
+        }
     ]
-    assert len(selected) == 4
+    assert len(selected) == 8
     reference = sr.load_reference()
     with axcl_session.AXSession(subdir="mask_mul_tiled_native_shapes") as session:
         _, stats = sr.StepRunner(model, selected, session, health_every=0).run(
             reference["feeds"], "npu"
         )
-    assert len(stats) == 4
+    assert len(stats) == 8
     for stat in stats:
         assert not stat.error, stat
         assert stat.max_lsb <= 2.01, stat
