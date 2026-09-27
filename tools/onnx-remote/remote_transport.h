@@ -52,6 +52,25 @@ struct Request {
   ProfilingLevel profiling = ProfilingLevel::Off;
 };
 
+// Canonical operation name for a serialized ONNX subgraph. The graph bytes
+// use Request::model and remain opaque to the v5 transport, allowing a
+// compiler/runner to choose ONNX ModelProto or a backend-specific envelope
+// without changing the tensor wire format.
+constexpr const char* kSubgraphOperation = "subgraph";
+
+inline Request MakeSubgraphRequest(
+    uint64_t request_id, const std::vector<uint8_t>& serialized_graph,
+    const std::vector<Tensor>& inputs,
+    ProfilingLevel profiling = ProfilingLevel::Off) {
+  Request request;
+  request.request_id = request_id;
+  request.op = kSubgraphOperation;
+  request.model = serialized_graph;
+  request.inputs = inputs;
+  request.profiling = profiling;
+  return request;
+}
+
 struct Response {
   // Echoes Request::request_id, including on error responses.
   uint64_t request_id = 0;

@@ -1,10 +1,17 @@
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "remote_transport.h"
 
 namespace onnx_remote {
+
+using ProfileReceiver = std::function<void(const ProfileEvent&)>;
+
+// Deliver lossless binary profile events to an application-owned sink. This
+// avoids requiring JSON or another parser on constrained hosts.
+void receive_profile(const Response& response, const ProfileReceiver& receiver);
 
 // Serialize worker-relative profile events for lightweight ROS2/DORA/UI
 // consumers. The binary response remains the lossless transport format.

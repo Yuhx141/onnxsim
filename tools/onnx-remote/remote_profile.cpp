@@ -34,6 +34,12 @@ std::string json_escape(const std::string& value) {
 
 }  // namespace
 
+void receive_profile(const Response& response,
+                     const ProfileReceiver& receiver) {
+  if (!receiver) return;
+  for (const auto& event : response.profile) receiver(event);
+}
+
 std::string profile_json(const Response& response) {
   std::ostringstream json;
   json << "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\",\"request_id\":"

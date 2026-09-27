@@ -34,6 +34,21 @@ int main() {
   assert(decoded_request.inputs[0].shape == request.inputs[0].shape);
   assert(decoded_request.inputs[0].data == request.inputs[0].data);
 
+  const Request subgraph = MakeSubgraphRequest(
+      77, {0x08, 0x4f, 0x4e, 0x4e, 0x58}, request.inputs,
+      ProfilingLevel::Summary);
+  assert(subgraph.op == kSubgraphOperation);
+  assert(subgraph.model.size() == 5);
+  assert(subgraph.inputs.size() == request.inputs.size());
+  assert(subgraph.profiling == ProfilingLevel::Summary);
+  assert(encode_request_payload(subgraph, payload, error));
+  Request decoded_subgraph;
+  assert(decode_request_payload(payload.data(), payload.size(), decoded_subgraph,
+                                error));
+  assert(decoded_subgraph.op == kSubgraphOperation);
+  assert(decoded_subgraph.model == subgraph.model);
+  assert(decoded_subgraph.inputs[0].data == subgraph.inputs[0].data);
+
   Request typed_request;
   typed_request.op = "run_compiled";
   Tensor fp16;
@@ -67,6 +82,14 @@ int main() {
   assert(decoded_response.outputs[0].data == response.outputs[0].data);
   assert(decoded_response.profile.size() == 1);
   assert(decoded_response.profile[0].duration_us == 34);
+  size_t received_events = 0;
+  uint64_t received_duration = 0;
+  receive_profile(response, [&](const ProfileEvent& event) {
+    ++received_events;
+    received_duration += event.duration_us;
+  });
+  assert(received_events == 1);
+  assert(received_duration == 34);
   assert(decoded_response.artifact_id == response.artifact_id);
   assert(decoded_response.artifact == response.artifact);
   assert(decoded_response.manifest == response.manifest);

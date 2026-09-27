@@ -21,6 +21,11 @@ forwarding the same binary tensor and profile payloads. Large tensors and
 traces should stay binary; use the control plane for metadata, request IDs,
 health, and progress.
 
+Graph-aware native clients should use the `subgraph` operation with serialized
+graph bytes in the request model field. Profile events can be consumed through
+the C++ `receive_profile` callback, while the response retains the complete
+bounded event list for lossless forwarding.
+
 For DORA specifically, `tools/onnx-remote/onnx-remote-dora-node` is an optional
 C node adapter. Its `run` input and `result` output carry the transport's
 payload-only format as raw UInt8 messages, so DORA does not need to understand

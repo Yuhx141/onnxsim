@@ -335,6 +335,17 @@ send each constant-folding submodel to a worker without Python. The worker may
 run that model with native ONNX Runtime, an accelerator compiler, or translate
 it to a device-specific model handle.
 
+Graph-aware callers can use `MakeSubgraphRequest()` to set the canonical
+`subgraph` operation and place serialized graph bytes in the existing
+`Request::model` field. This preserves v5 compatibility while allowing a
+compiler or runner to interpret the payload as ONNX `ModelProto` or a
+backend-specific graph envelope.
+
+Native consumers can use `receive_profile(response, callback)` to consume the
+lossless profile events directly. The callback is independent of JSON and can
+forward each event to an ORT profiler, ROS2/DORA stream, browser transport, or
+an embedded aggregate without allocating a complete trace string.
+
 ## Optional gRPC schema
 
 For hosts that need generated RPC clients, `proto/onnxsim_remote.proto` defines
