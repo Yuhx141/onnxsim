@@ -19,6 +19,8 @@ using LoadArtifactRequest = onnxsim::remote::v1::LoadArtifactRequest;
 using LoadArtifactResponse = onnxsim::remote::v1::LoadArtifactResponse;
 using CapabilitiesRequest = onnxsim::remote::v1::CapabilitiesRequest;
 using CapabilitiesResponse = onnxsim::remote::v1::CapabilitiesResponse;
+using ModelInferRequest = onnxsim::remote::v1::ModelInferRequest;
+using ModelInferResponse = onnxsim::remote::v1::ModelInferResponse;
 using NativeRequest = onnx_remote::Request;
 using NativeResponse = onnx_remote::Response;
 
@@ -271,6 +273,43 @@ grpc::Status Service::GetCapabilities(grpc::ServerContext*, const CapabilitiesRe
                             "UINT32", "UINT64", "BFLOAT16"}) {
     response->add_supported_dtypes(dtype);
   }
+  return grpc::Status::OK;
+}
+
+grpc::Status Service::ModelInfer(grpc::ServerContext*,
+                                 const ModelInferRequest* request,
+                                 ModelInferResponse* response) {
+  if (request->model_name().empty() ||
+      request->model_name().size() > kMaxOpBytes)
+    return invalid("model_name is required or exceeds transport limit");
+  if (request->inputs_size() > static_cast<int>(kMaxTensors))
+    return invalid("too many input tensors");
+  NativeRequest native;
+  native.request_id = std::hash<std::string>{}(request->id());
+  native.op = request->model_name();
+  const auto operation = request->parameters().find("op");
+  if (operation != request->parameters().end() && !operation->second.empty())
+    native.op = operation->second;
+  native.profiling = profiling_level(request->profiling());
+  native.inputs.reserve(request->inputs_size());
+  for (const auto& input : request->inputs()) {
+    Tensor tensor;
+    std::string error;
+    if (!copy_input(input, tensor, error)) return invalid(error);
+    native.inputs.push_back(std::move(tensor));
+  }
+  NativeResponse native_response;
+  grpc::Status status = roundtrip(options_, std::move(native), native_response);
+  if (!status.ok()) return status;
+  response->set_id(request->id());
+  response->set_model_name(request->model_name());
+  response->set_model_version(request->model_version());
+  response->set_ok(native_response.ok);
+  if (!native_response.ok) response->set_error(native_response.error);
+  for (const auto& output : native_response.outputs)
+    copy_output(output, response->add_outputs());
+  for (const auto& event : native_response.profile)
+    copy_profile(event, response->add_profile());
   return grpc::Status::OK;
 }
 

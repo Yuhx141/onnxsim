@@ -46,6 +46,10 @@ class Service final : public onnxsim::remote::v1::OnnxSimExecutor::Service {
       grpc::ServerContext* context,
       const onnxsim::remote::v1::CapabilitiesRequest* request,
       onnxsim::remote::v1::CapabilitiesResponse* response) override;
+  grpc::Status ModelInfer(
+      grpc::ServerContext* context,
+      const onnxsim::remote::v1::ModelInferRequest* request,
+      onnxsim::remote::v1::ModelInferResponse* response) override;
 
   const Options& options() const { return options_; }
 

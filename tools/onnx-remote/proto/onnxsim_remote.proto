@@ -24,6 +24,12 @@ service OnnxSimExecutor {
 
   // Lightweight capability and liveness query for ROS2/DORA gateways.
   rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+
+  // Lightweight KServe-style inference mapping. This keeps model identity
+  // and named tensors at the gateway boundary without importing KServe's
+  // protobuf package into constrained workers. It is intentionally not a
+  // wire-compatible replacement for inference.GRPCInferenceService.
+  rpc ModelInfer(ModelInferRequest) returns (ModelInferResponse);
 }
 
 message Tensor {
@@ -61,6 +67,25 @@ message ExecuteResponse {
   string error = 3;
   repeated Tensor outputs = 4;
   repeated ProfileEvent profile = 5;
+}
+
+message ModelInferRequest {
+  string id = 1;
+  string model_name = 2;
+  string model_version = 3;
+  repeated Tensor inputs = 4;
+  ProfilingLevel profiling = 5;
+  map<string, string> parameters = 6;
+}
+
+message ModelInferResponse {
+  string id = 1;
+  string model_name = 2;
+  string model_version = 3;
+  bool ok = 4;
+  string error = 5;
+  repeated Tensor outputs = 6;
+  repeated ProfileEvent profile = 7;
 }
 
 message CompileRequest {

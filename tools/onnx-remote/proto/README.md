@@ -79,6 +79,9 @@ not expose that mode beyond a trusted ROS2/DORA or Tailscale network.
 
 An actual gRPC service should translate `Execute` to
 `onnx_remote::Request`/`Response` and retain the native transport as the
-canonical embedded path. A KServe V2 adapter can map `ModelInfer` to
-`Execute`; KServe's model metadata and readiness methods remain gateway
-features rather than requirements for the worker.
+canonical embedded path. The optional `ModelInfer` RPC in this schema provides
+that small mapping for host-side clients: `model_name` selects the operation
+by default, or the small `op` parameter overrides it. It is deliberately not
+wire-compatible with KServe's `inference.GRPCInferenceService`; a full KServe
+gateway can still translate its `ModelInfer` request into this RPC or directly
+into `Execute`.

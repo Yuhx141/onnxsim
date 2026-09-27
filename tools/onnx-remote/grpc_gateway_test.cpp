@@ -18,6 +18,8 @@ using onnxsim::remote::v1::ExecuteRequest;
 using onnxsim::remote::v1::ExecuteResponse;
 using onnxsim::remote::v1::LoadArtifactRequest;
 using onnxsim::remote::v1::LoadArtifactResponse;
+using onnxsim::remote::v1::ModelInferRequest;
+using onnxsim::remote::v1::ModelInferResponse;
 using onnxsim::remote::v1::OnnxSimExecutor;
 using onnxsim::remote::v1::PROFILING_DETAILED;
 
@@ -28,7 +30,7 @@ constexpr uint16_t kWorkerPort = 39671;
 void serve_requests() {
   const int listener = listen_tcp(kWorkerPort, 1);
   assert(listener >= 0);
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < 6; ++i) {
     const int fd = accept_tcp(listener);
     assert(fd >= 0);
 
@@ -156,6 +158,26 @@ int main() {
                      sizeof(values)) == 0);
   assert(response.profile_size() == 1);
   assert(response.profile(0).name() == "worker_identity");
+
+  ModelInferRequest infer_request;
+  infer_request.set_id("infer-1");
+  infer_request.set_model_name("identity");
+  infer_request.set_model_version("smoke");
+  onnxsim::remote::v1::Tensor* infer_input = infer_request.add_inputs();
+  infer_input->set_dtype(1);
+  infer_input->add_shape(2);
+  infer_input->set_raw_data(reinterpret_cast<const char*>(values),
+                            sizeof(values));
+  ModelInferResponse infer_response;
+  grpc::ClientContext infer_context;
+  status = stub->ModelInfer(&infer_context, infer_request, &infer_response);
+  assert(status.ok());
+  assert(infer_response.ok());
+  assert(infer_response.id() == "infer-1");
+  assert(infer_response.model_name() == "identity");
+  assert(infer_response.outputs_size() == 1);
+  assert(std::memcmp(infer_response.outputs(0).raw_data().data(), values,
+                     sizeof(values)) == 0);
 
   CompileRequest compile_request;
   compile_request.set_request_id(18);
