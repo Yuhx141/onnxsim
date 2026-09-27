@@ -248,6 +248,12 @@ announcing `runner-a` and a second bridge configured with
 bridge selects the announced runner through the transient-local discovery
 topic.
 
+`onnx-remote-ros2-failover-smoke` observes the same bridge's lease-expiry
+transition. Start it while the discovery smoke topology is running, then stop
+the announcing `runner-a` bridge; the observer requires both `selected` and
+`expired` status events. The auto-discovering bridge then restores its
+configured fallback endpoint.
+
 The flake currently pins the ROS2 Humble package set from nixpkgs. It does not
 replace the project toolchain; it only supplies CMake, `ament_cmake`, `rclcpp`,
 `std_msgs`, `std_srvs`, and the ROS2 CLI.
