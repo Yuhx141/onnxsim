@@ -19,6 +19,14 @@ int main() {
   assert(capabilities.graph_execution);
   assert(capabilities.profiling);
   assert(capabilities.runner_id == "ort-cpu-worker");
+  assert(parse_capability_manifest(
+      "{\n  \"schema_version\" : 1,\n"
+      "  \"protocol\" : \"onnx-remote-v5\",\n"
+      "  \"runner_id\" : \"pretty-worker\",\n"
+      "  \"graph_execution\" : true\n}",
+      capabilities, capability_error));
+  assert(capabilities.runner_id == "pretty-worker");
+  assert(capabilities.graph_execution);
   assert(!parse_capability_manifest(
       "{\"schema_version\":2,\"protocol\":\"onnx-remote-v5\","
       "\"runner_id\":\"old-worker\"}", capabilities, capability_error));
