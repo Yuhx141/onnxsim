@@ -226,6 +226,20 @@ kernel builder, but are not executable XDNA artifacts yet. Their
 coverage. The actual full-graph run still executes those operations on the
 host.
 
+Standalone INT8 ReLU now has a native AIE tile kernel and IRON design in
+`kernels/relu_int8.cc` and `relu_design.py`. The compiler emits shape-specialized
+XCLBIN/instruction artifacts for ReLU nodes with known output shapes and
+attaches those artifact paths to their operation records. Hardware verification
+passed for 1,024- and 16,384-element tensors. The graph runner does not yet bind
+these artifacts; full-model ReLU execution remains covered by the existing
+fused bottleneck or host path.
+
+`Flatten` is emitted as a zero-copy contiguous tensor view, with its axis and
+input/output shapes carried in the operation record. It requires no AIE
+instruction artifact; the future runner can preserve the same device buffer
+and update only the logical shape. Other reshape/permutation operations remain
+kernel-required until their layout constraints are checked.
+
 ### From planned regions to device-resident execution
 
 The connected regions above describe dependencies; they do not imply that one

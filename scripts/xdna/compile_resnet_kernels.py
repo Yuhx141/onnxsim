@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +49,33 @@ def _compile(example: Path, spec: Any, device: str, output_dir: Path) -> dict[st
     if missing:
         raise RuntimeError(f"compiler reported success but did not create: {', '.join(missing)}")
     return {"xclbin": str(xclbin), "insts": str(insts)}
+
+
+def _relu_tile_width(elements: int) -> int:
+    """Pick the largest supported transform tile dividing this tensor."""
+    for tile in (128, 64, 32, 16, 8, 4, 2, 1):
+        if elements % tile == 0:
+            return tile
+    return 1
+
+
+def _compile_relu(elements: int, device: str, output_dir: Path) -> dict[str, str]:
+    key = f"relu_int8_e{elements}_t{_relu_tile_width(elements)}"
+    xclbin = output_dir / f"{key}.xclbin"
+    insts = output_dir / f"{key}.insts.bin"
+    design = Path(__file__).with_name("relu_design.py")
+    command = [
+        sys.executable, str(design), "--dev", device,
+        "--elements", str(elements), "--tile-width", str(_relu_tile_width(elements)),
+        "--xclbin-path", str(xclbin), "--insts-path", str(insts),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.returncode:
+        raise RuntimeError(f"IRON ReLU compile failed for {key}:\n{completed.stdout}\n{completed.stderr}")
+    missing = [str(path) for path in (xclbin, insts) if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"compiler reported success but did not create: {', '.join(missing)}")
+    return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,7 +117,23 @@ def main(argv: list[str] | None = None) -> int:
         if spec.buildable_with_whole_array or args.compile_all:
             compiled[spec.key] = _compile(args.example, spec, args.device, args.artifact_dir)
 
+    compiled_relu: dict[int, dict[str, str]] = {}
     report = dict(render_build_manifest(plan, model=model, columns=args.columns, source=str(args.example)))
+    for item in report["operation_kernels"]:
+        if item["op_type"] != "Relu" or item["status"] != "compilable_iron_kernel":
+            continue
+        output_shape = next((shape for shape in item["output_shapes"] if shape), None)
+        if not output_shape:
+            item["compile_status"] = "shape_required"
+            continue
+        elements = math.prod(output_shape)
+        artifact = compiled_relu.get(elements)
+        if artifact is None:
+            artifact = _compile_relu(elements, args.device, args.artifact_dir)
+            compiled_relu[elements] = artifact
+        item["compiled_artifact"] = artifact
+        item["compile_status"] = "compiled"
+
     for item in report["kernels"]:
         artifact = compiled.get(item["key"])
         item["compiled_artifact"] = artifact
@@ -102,11 +146,13 @@ def main(argv: list[str] | None = None) -> int:
     report["compile_all_specs"] = args.compile_all
     report["optimize_small_m"] = args.optimize_small_m
     report["compile_device"] = args.device
-    report["compiled_kernel_count"] = len(compiled)
+    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu)
+    report["compiled_operator_kernel_count"] = len(compiled_relu)
     report["graph_runtime_blockers"] = [
         "NCHW im2col packing and logical-to-padded GEMM staging",
         "QDQ scale/zero-point conversion and Conv bias/requantization",
-        "non-Conv dispatches, residual paths, and unsupported operators",
+        "runtime dispatch wiring for compiled standalone Relu operators",
+        "QDQ conversion, pooling, residual arithmetic, and tensor-layout kernels",
     ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

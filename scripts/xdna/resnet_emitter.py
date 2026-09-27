@@ -22,9 +22,9 @@ try:
 except ImportError:  # direct script-directory imports
     from resnet_bottleneck import BottleneckBlockPlan, plan_bottleneck_blocks
 try:
-    from .graph_fusion import _attributes
+    from .graph_fusion import _attributes, _value_metadata
 except ImportError:  # direct script-directory imports
-    from graph_fusion import _attributes
+    from graph_fusion import _attributes, _value_metadata
 
 
 @dataclass(frozen=True)
@@ -139,7 +139,7 @@ _OP_LOWERINGS = {
     "MaxPool": "nchw_max_pool",
     "AveragePool": "nchw_average_pool",
     "GlobalAveragePool": "nchw_global_average_pool",
-    "Flatten": "view_or_reorder",
+    "Flatten": "contiguous_tensor_view",
     "Reshape": "view_or_reorder",
     "Transpose": "tensor_permutation",
     "Concat": "tensor_concatenation",
@@ -152,15 +152,7 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
     """Emit operation-level lowering descriptors for graph ops outside Conv kernels."""
     graph = model.graph
     nodes = list(graph.node)
-    shapes: dict[str, Tuple[int, ...]] = {}
-    for value in (*getattr(graph, "input", ()), *getattr(graph, "value_info", ()), *getattr(graph, "output", ())):
-        dims = getattr(getattr(getattr(value, "type", None), "tensor_type", None), "shape", None)
-        if dims is not None:
-            shape = tuple(int(dim.dim_value) for dim in dims.dim)
-            if all(shape):
-                shapes[str(value.name)] = shape
-    for value in getattr(graph, "initializer", ()):
-        shapes[str(value.name)] = tuple(int(dim) for dim in value.dims)
+    shapes, _ = _value_metadata(model)
     result = []
     for dispatch in plan.dispatches:
         node_index = dispatch.node_indices[0]
@@ -178,7 +170,12 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             attributes=_attributes(node),
             input_shapes=tuple(shapes.get(str(value)) for value in node.input if value),
             output_shapes=tuple(shapes.get(str(value)) for value in node.output if value),
-            status=("descriptor_only_native_kernel_required" if op in _OP_LOWERINGS else "unsupported"),
+            status=(
+                "compilable_iron_kernel" if op == "Relu"
+                else "zero_copy_device_view" if op == "Flatten"
+                else "descriptor_only_native_kernel_required" if op in _OP_LOWERINGS
+                else "unsupported"
+            ),
         ))
     # Q/DQ nodes are graph-edge semantics rather than dispatches. Emit them
     # too, including graph-boundary conversions that are outside a region.
