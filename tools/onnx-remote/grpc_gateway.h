@@ -18,7 +18,9 @@ struct Options {
   int connect_timeout_ms = 5000;
   int io_timeout_ms = 30000;
   std::string runner_id = "onnxsim-grpc-gateway";
-  std::vector<std::string> supported_ops = {"identity", "relu", "add", "mul"};
+  std::vector<std::string> supported_ops = {"identity", "relu", "add", "mul",
+                                            "sub", "div", "max", "min",
+                                            "abs", "neg", "sqrt"};
   std::string tls_certificate;
   std::string tls_private_key;
   std::string tls_client_ca;

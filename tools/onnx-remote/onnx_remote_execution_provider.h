@@ -22,7 +22,7 @@ struct Options {
   onnx_remote::ProfilingLevel profiling = onnx_remote::ProfilingLevel::Off;
   std::unordered_set<std::string> supported_ops{"Identity", "Relu", "Add",
                                                 "Mul", "Sub", "Div", "Max",
-                                                "Min"};
+                                                "Min", "Abs", "Neg", "Sqrt"};
 };
 
 // The caller owns the returned provider and registers it with its

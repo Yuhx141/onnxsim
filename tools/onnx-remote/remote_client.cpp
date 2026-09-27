@@ -41,6 +41,9 @@ static int self_test() {
       {"div", {4, 9, 12}, {2, 3, 4}, {2, 3, 3}},
       {"max", {1, 5, 3}, {4, 2, 6}, {4, 5, 6}},
       {"min", {1, 5, 3}, {4, 2, 6}, {1, 2, 3}},
+      {"abs", {-2, 0, 3}, {}, {2, 0, 3}},
+      {"neg", {-2, 0, 3}, {}, {2, 0, -3}},
+      {"sqrt", {0, 1, 4}, {}, {0, 1, 2}},
   };
   size_t profile_events = 0;
   for (const Operation& operation : operations) {

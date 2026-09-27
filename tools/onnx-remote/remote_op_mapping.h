@@ -25,6 +25,12 @@ inline std::string remote_operation_name(const std::string &onnx_op) {
     return "max";
   if (onnx_op == "Min")
     return "min";
+  if (onnx_op == "Abs")
+    return "abs";
+  if (onnx_op == "Neg")
+    return "neg";
+  if (onnx_op == "Sqrt")
+    return "sqrt";
   return {};
 }
 

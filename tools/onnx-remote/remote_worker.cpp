@@ -1,6 +1,7 @@
 #include "remote_transport.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -38,7 +39,7 @@ static Response execute(const Request& r) {
         "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
         "\"runner_id\":\"reference-worker\",\"ready\":true,"
         "\"supported_ops\":[\"identity\",\"relu\",\"add\",\"mul\","
-        "\"sub\",\"div\",\"max\",\"min\"],"
+        "\"sub\",\"div\",\"max\",\"min\",\"abs\",\"neg\",\"sqrt\"],"
         "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\","
         "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","
         "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\","
@@ -59,6 +60,24 @@ static Response execute(const Request& r) {
     }
     Tensor y;
     execute_op([&] { y = r.inputs[0]; for (float& x : y.data) if (x < 0.0f) x = 0.0f; });
+    out.outputs.push_back(std::move(y)); out.ok = true; return out;
+  }
+  if (r.op == "abs" || r.op == "neg" || r.op == "sqrt") {
+    if (r.inputs.size() != 1) {
+      out.error = r.op + " expects one input"; return out;
+    }
+    if (r.inputs[0].dtype != 1) {
+      out.error = r.op + " reference implementation supports float32 tensors only";
+      return out;
+    }
+    Tensor y = r.inputs[0];
+    execute_op([&] {
+      for (float& x : y.data) {
+        if (r.op == "abs") x = std::fabs(x);
+        else if (r.op == "neg") x = -x;
+        else x = std::sqrt(x);
+      }
+    });
     out.outputs.push_back(std::move(y)); out.ok = true; return out;
   }
   if (r.op == "add" || r.op == "mul" || r.op == "sub" ||
