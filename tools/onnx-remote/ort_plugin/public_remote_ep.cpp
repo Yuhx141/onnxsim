@@ -159,6 +159,7 @@ struct RemoteProfiler final : OrtEpProfilerImpl {
   struct Event {
     std::string name;
     Clock::time_point start;
+    uint64_t remote_start_us;
     int64_t duration_us;
   };
 
@@ -172,7 +173,7 @@ struct RemoteProfiler final : OrtEpProfilerImpl {
               Clock::time_point local_start) {
     std::lock_guard<std::mutex> lock(mutex);
     for (const auto& event : remote_events) {
-      events.push_back({event.name, local_start,
+      events.push_back({event.name, local_start, event.start_us,
                         static_cast<int64_t>(std::min<uint64_t>(
                             event.duration_us,
                             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())))});
@@ -219,7 +220,10 @@ struct RemoteProfiler final : OrtEpProfilerImpl {
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             event.start - profiler->start_time).count();
         const int64_t timestamp_us =
-            (profiler->start_offset_ns + elapsed) / 1000;
+            (profiler->start_offset_ns + elapsed) / 1000 +
+            static_cast<int64_t>(std::min<uint64_t>(
+                event.remote_start_us,
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
         OrtProfilingEvent* ort_event = nullptr;
         const char* key = "remote_profile";
         const char* value_text = "onnx-remote-v5";
