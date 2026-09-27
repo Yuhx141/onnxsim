@@ -6,21 +6,29 @@
 using namespace onnx_remote;
 
 int main(int argc, char** argv) {
+  const bool run_only = argc == 4 && std::string(argv[3]) == "--run-only";
+  if (argc != 1 && argc != 3 && !run_only) {
+    std::cerr << "usage: onnx-remote-attach-test [HOST PORT [--run-only]]\n";
+    return 2;
+  }
   const std::string host = argc > 1 ? argv[1] : "127.0.0.1";
   const uint16_t port = argc > 2
                             ? static_cast<uint16_t>(std::strtoul(argv[2], nullptr, 10))
                             : 39510;
   const std::string id = "mock-artifact-1";
   std::string error;
-  Request load;
-  load.op = "load_compiled";
-  load.artifact_id = id;
-  load.artifact = {1, 2, 3, 4};
-  int fd = connect_tcp_timeout(host, port, 2000);
-  if (fd < 0 || !send_request(fd, load, error)) return 1;
   Response response;
-  if (!receive_response(fd, response, error) || !response.ok) return 1;
-  close_socket(fd);
+  int fd = -1;
+  if (!run_only) {
+    Request load;
+    load.op = "load_compiled";
+    load.artifact_id = id;
+    load.artifact = {1, 2, 3, 4};
+    fd = connect_tcp_timeout(host, port, 2000);
+    if (fd < 0 || !send_request(fd, load, error)) return 1;
+    if (!receive_response(fd, response, error) || !response.ok) return 1;
+    close_socket(fd);
+  }
 
   Request run;
   run.op = "run_compiled";

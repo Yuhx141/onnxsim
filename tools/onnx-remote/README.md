@@ -262,7 +262,10 @@ build/onnx-remote/onnx-remote-profile-dump \
 `onnx-remote-mock-runner` and `onnx-remote-attach-test` provide a vendor-free
 test of the compiled-artifact handshake. The mock stores opaque artifact bytes
 on `load_compiled`, accepts ID-only `run_compiled`, and returns identity output
-with a profile event; it is for CI protocol coverage, not model execution.
+with a profile event; it is for CI protocol coverage, not model execution. Use
+`--cache-dir DIR` on the mock runner to persist artifacts across runner
+restarts; `onnx-remote-attach-test HOST PORT --run-only` verifies that
+restart/reload path without uploading the artifact again.
 
 The transport also carries an optional serialized `ModelProto`. This is the
 native `onnxsim::ModelExecutor` integration point: a host-side executor can
