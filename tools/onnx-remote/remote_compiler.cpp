@@ -113,7 +113,26 @@ std::string cache_key(const Request& request, const Options& options) {
     add(options.compiler_id.data(), options.compiler_id.size());
     add(options.command.data(), options.command.size());
     add(request.model.data(), request.model.size());
+    for (const auto& input : request.inputs) {
+      add(&input.dtype, sizeof(input.dtype));
+      add(input.shape.data(), input.shape.size() * sizeof(input.shape[0]));
+    }
   });
+}
+
+std::string shape_spec(const Request& request) {
+  std::string result = "[";
+  for (size_t i = 0; i < request.inputs.size(); ++i) {
+    if (i != 0) result += ',';
+    result += "{\"dtype\":" + std::to_string(request.inputs[i].dtype) +
+              ",\"shape\":[";
+    for (size_t j = 0; j < request.inputs[i].shape.size(); ++j) {
+      if (j != 0) result += ',';
+      result += std::to_string(request.inputs[i].shape[j]);
+    }
+    result += "]}";
+  }
+  return result + "]";
 }
 
 std::string cache_content_digest(const std::vector<uint8_t>& artifact,
@@ -395,6 +414,8 @@ Response compile(const Request& request, const Options& options) {
     command = replace_all(command, "{target}", shell_quote(options.target));
     command = replace_all(command, "{compiler_id}",
                           shell_quote(options.compiler_id));
+    command = replace_all(command, "{shapes}",
+                          shell_quote(shape_spec(request)));
     const int status = std::system(command.c_str());
     if (status != 0) {
       response.error = "compiler command failed with status " + std::to_string(status);
@@ -448,7 +469,7 @@ bool parse_options(int argc, char** argv, Options& options) {
                    " [--target TARGET] [--compiler-id ID]"
                    " [--max-cache-bytes BYTES] [--command COMMAND]\n"
                    "COMMAND placeholders: {input} {output} {manifest} {target}"
-                   " {compiler_id}\n"
+                   " {compiler_id} {shapes}\n"
                    "Without COMMAND, copies the model as a transport smoke-test artifact.\n";
       return false;
     } else {

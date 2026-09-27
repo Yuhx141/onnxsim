@@ -116,23 +116,6 @@ class RemoteModelExecutor final : public ModelExecutor {
     request.request_id =
         next_request_id.fetch_add(1, std::memory_order_relaxed);
     request.profiling = options_.profiling;
-    if (options_.compile_model) {
-      if (!options_.send_compiled_artifact &&
-          !options_.attach_compiled_artifact) {
-        throw std::runtime_error(
-            "remote executor compiled mode requires either "
-            "send_compiled_artifact or attach_compiled_artifact");
-      }
-      const auto artifact = GetOrCompile(serialized);
-      request.op = options_.compiled_operation;
-      request.artifact_id = artifact->id;
-      if (options_.send_compiled_artifact) {
-        request.artifact = artifact->bytes;
-      }
-    } else {
-      request.op = options_.operation;
-      request.model.assign(serialized.begin(), serialized.end());
-    }
     request.inputs.reserve(inputs.size());
     for (const DLManagedTensor* input : inputs) {
       if (input == nullptr || input->dl_tensor.ndim < 0 ||
@@ -162,7 +145,8 @@ class RemoteModelExecutor final : public ModelExecutor {
         element_count *= static_cast<size_t>(tensor.shape[i]);
       }
       const size_t element_bytes = onnxsim::dlpack::SizeOf(tensor.dtype);
-      if (element_count > std::numeric_limits<size_t>::max() / element_bytes) {
+      if (element_bytes == 0 ||
+          element_count > std::numeric_limits<size_t>::max() / element_bytes) {
         throw std::runtime_error("remote executor received oversized input tensor");
       }
       const size_t nbytes = element_count * element_bytes;
@@ -179,7 +163,23 @@ class RemoteModelExecutor final : public ModelExecutor {
       }
       request.inputs.emplace_back(std::move(wire));
     }
-
+    if (options_.compile_model) {
+      if (!options_.send_compiled_artifact &&
+          !options_.attach_compiled_artifact) {
+        throw std::runtime_error(
+            "remote executor compiled mode requires either "
+            "send_compiled_artifact or attach_compiled_artifact");
+      }
+      const auto artifact = GetOrCompile(serialized, request.inputs);
+      request.op = options_.compiled_operation;
+      request.artifact_id = artifact->id;
+      if (options_.send_compiled_artifact) {
+        request.artifact = artifact->bytes;
+      }
+    } else {
+      request.op = options_.operation;
+      request.model.assign(serialized.begin(), serialized.end());
+    }
     const onnx_remote::Response response =
         Exchange(request, options_.host, options_.port, "execute");
     std::vector<DLManagedTensorPtr> outputs;
@@ -295,7 +295,19 @@ class RemoteModelExecutor final : public ModelExecutor {
   }
 
   std::shared_ptr<const CompiledArtifact> GetOrCompile(
-      const std::string& serialized) const {
+      const std::string& serialized,
+      const std::vector<onnx_remote::Tensor>& specialization_inputs) const {
+    std::string cache_key = serialized;
+    if (options_.compile_per_static_shape) {
+      cache_key += "\nonnxsim-static-shape-v1\n";
+      for (const auto& input : specialization_inputs) {
+        cache_key += std::to_string(input.dtype) + ":" +
+                     std::to_string(input.shape.size()) + ":";
+        for (const int64_t dimension : input.shape)
+          cache_key += std::to_string(dimension) + ",";
+        cache_key += ";";
+      }
+    }
     std::unique_lock<std::mutex> cache_lock(cache_mu_, std::defer_lock);
     if (options_.cache_compiled_models) {
       // Keep the per-executor cache lock through compilation and optional
@@ -303,13 +315,15 @@ class RemoteModelExecutor final : public ModelExecutor {
       // concurrent folds for the same model cannot duplicate an expensive
       // external compiler invocation or race a runner-side load.
       cache_lock.lock();
-      const auto it = compiled_cache_.find(serialized);
+      const auto it = compiled_cache_.find(cache_key);
       if (it != compiled_cache_.end()) return it->second;
     }
 
     onnx_remote::Request request;
     request.op = options_.compile_operation;
     request.model.assign(serialized.begin(), serialized.end());
+    if (options_.compile_per_static_shape)
+      request.inputs = specialization_inputs;
     request.profiling = options_.profiling;
     const std::string compile_host =
         options_.compile_host.empty() ? options_.host : options_.compile_host;
@@ -370,7 +384,7 @@ class RemoteModelExecutor final : public ModelExecutor {
     // the artifact, a later retry must compile/attach again rather than
     // reusing an artifact that onnxsim believes is resident remotely.
     if (options_.cache_compiled_models) {
-      compiled_cache_[serialized] = artifact;
+      compiled_cache_[cache_key] = artifact;
     }
     return artifact;
   }

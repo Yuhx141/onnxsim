@@ -45,6 +45,10 @@ struct RemoteExecutorOptions {
   // then execute the returned artifact. The default preserves the simple
   // model-per-run protocol.
   bool compile_model = false;
+  // Treat runtime input dtype/shape signatures as compile specialization
+  // keys. This is useful when a dynamic ONNX model is compiled into one
+  // static artifact per observed shape; the default keeps model-only caching.
+  bool compile_per_static_shape = false;
   bool cache_compiled_models = true;
   std::string compile_operation = "compile";
   std::string compiled_operation = "run_compiled";

@@ -308,6 +308,14 @@ The manifest is opaque to the transport and should describe the compiler,
 target device, runtime/driver requirements, I/O ABI, shape constraints, and
 legalization profile. The existing transport only bounds and carries it.
 
+For a dynamic ONNX model whose backend requires static artifacts, enable
+`compile_per_static_shape`. The native executor then keys its in-process cache
+by the serialized model plus each input's ONNX dtype and concrete dimensions,
+and sends those input descriptors to the compiler. External compiler commands
+can consume the descriptors through the `{shapes}` JSON placeholder. The
+runner still receives the concrete tensors at execution time; omit this option
+when the compiler produces one genuinely dynamic artifact.
+
 Native callers can add a legalization preflight through
 `RemoteExecutorOptions::legalizer`. It receives a mutable fold-group
 `ModelProto` and the configured `target`, and can rewrite it or return a short
@@ -354,8 +362,9 @@ build/onnx-remote/onnx-remote-compiler \
 The command is trusted local configuration, not request data. It must write the
 compiled artifact to `{output}` and a bounded UTF-8 manifest to `{manifest}`;
 `{input}` is the received ONNX ModelProto. `{target}` and `{compiler_id}` are
-the configured backend identity values, shell-quoted like the file paths. A
-no-command service copies the
+the configured backend identity values, shell-quoted like the file paths.
+`{shapes}` is a JSON array of input dtype/shape descriptors for static-shape
+specialization. A no-command service copies the
 model into an artifact and is useful for validating networking and cache
 plumbing before installing QAIRT. A QNN wrapper can run the converter,
 backend-specific graph preparation, and context-binary generation as one
