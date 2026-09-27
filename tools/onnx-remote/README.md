@@ -242,6 +242,12 @@ C++ client for validating the bridge's `health` and `capabilities` services
 when a ROS installation does not include the optional `ros2 service` CLI
 extension.
 
+It also produces `onnx-remote-ros2-discovery-smoke`. Run it with one bridge
+announcing `runner-a` and a second bridge configured with
+`auto_discover:=true` and `discovery_target:=target` to verify that the second
+bridge selects the announced runner through the transient-local discovery
+topic.
+
 The flake currently pins the ROS2 Humble package set from nixpkgs. It does not
 replace the project toolchain; it only supplies CMake, `ament_cmake`, `rclcpp`,
 `std_msgs`, `std_srvs`, and the ROS2 CLI.
