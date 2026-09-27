@@ -21,8 +21,11 @@ advertises CPU-backed remote execution for `Identity`, `Relu`, `Add`, `Mul`,
 `Sub`, `Div`, `Max`, and `Min`, marshaling each fused node through
 `onnx-remote-v5`. Set
 `ONNXSIM_REMOTE_EP_HOST`, `ONNXSIM_REMOTE_EP_PORT`, and optionally
-`ONNXSIM_REMOTE_EP_PROFILING` or `ONNXSIM_REMOTE_EP_PROFILE_FILE` before
-creating the ORT session. ORT session/run profiling receives the remote events
+`ONNXSIM_REMOTE_EP_CONNECT_TIMEOUT_MS`,
+`ONNXSIM_REMOTE_EP_IO_TIMEOUT_MS`, `ONNXSIM_REMOTE_EP_PROFILING`, or
+`ONNXSIM_REMOTE_EP_PROFILE_FILE` before creating the ORT session. A zero I/O
+timeout preserves the platform default; a positive value bounds each socket
+send/receive operation. ORT session/run profiling receives the remote events
 through the public `OrtEpProfilerImpl` bridge; the profile-file option also
 keeps a transport-native JSON copy for ROS2, DORA, or browser tooling.
 

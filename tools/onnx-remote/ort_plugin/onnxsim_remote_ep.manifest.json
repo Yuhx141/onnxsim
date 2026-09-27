@@ -22,7 +22,7 @@
   "public_plugin": {
     "library": "onnxsim_remote_ep",
     "api": "onnxruntime_ep_c_api.h",
-    "configuration": "ONNXSIM_REMOTE_EP_HOST,ONNXSIM_REMOTE_EP_PORT,ONNXSIM_REMOTE_EP_PROFILING,ONNXSIM_REMOTE_EP_SUPPORTED_OPS",
+    "configuration": "ONNXSIM_REMOTE_EP_HOST,ONNXSIM_REMOTE_EP_PORT,ONNXSIM_REMOTE_EP_CONNECT_TIMEOUT_MS,ONNXSIM_REMOTE_EP_IO_TIMEOUT_MS,ONNXSIM_REMOTE_EP_PROFILING,ONNXSIM_REMOTE_EP_PROFILE_FILE,ONNXSIM_REMOTE_EP_SUPPORTED_OPS",
     "runtime_test": "onnxsim_remote_ep_run_test"
   }
 }
