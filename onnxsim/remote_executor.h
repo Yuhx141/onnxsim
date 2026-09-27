@@ -78,6 +78,11 @@ struct RemoteExecutorOptions {
   // If non-empty, every remaining node after legalization must use one of
   // these operator types. This is a cheap preflight for constrained runners.
   std::vector<std::string> supported_ops;
+  // Probe the runner's capability manifest once before the first model run
+  // and fail fast when it does not advertise graph_execution:true. This is
+  // opt-in because the default model-per-run path targets legacy unary
+  // workers that predate the graph capability field.
+  bool require_graph_execution = false;
 };
 
 std::shared_ptr<const ModelExecutor> GetRemoteModelExecutor(

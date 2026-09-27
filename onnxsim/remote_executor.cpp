@@ -14,6 +14,7 @@
 
 #include "dlpack_bridge.h"
 #include "profiler.h"
+#include "remote_capabilities.h"
 #include "remote_transport.h"
 
 namespace {
@@ -111,6 +112,9 @@ class RemoteModelExecutor final : public ModelExecutor {
               node.op_type());
         }
       }
+    }
+    if (options_.require_graph_execution) {
+      EnsureGraphExecution();
     }
     const std::string serialized = prepared.SerializeAsString();
     onnx_remote::Request request;
@@ -239,6 +243,32 @@ class RemoteModelExecutor final : public ModelExecutor {
     std::vector<uint8_t> bytes;
     std::string manifest;
   };
+
+  // Probe the runner's capability manifest once per executor and fail fast
+  // unless it advertises serialized subgraph execution. The result is
+  // cached: assignment races only repeat the probe, never corrupt dispatch.
+  void EnsureGraphExecution() const {
+    if (graph_execution_checked_.load(std::memory_order_acquire)) return;
+    onnx_remote::Request probe;
+    probe.op = "capabilities";
+    probe.request_id =
+        next_request_id.fetch_add(1, std::memory_order_relaxed);
+    const onnx_remote::Response response =
+        Exchange(probe, options_.host, options_.port, "capabilities");
+    onnx_remote::CapabilitySummary summary;
+    std::string error;
+    if (!onnx_remote::parse_capability_manifest(response.manifest, summary,
+                                                error)) {
+      throw std::runtime_error("remote executor capability probe: " + error);
+    }
+    if (!summary.graph_execution) {
+      throw std::runtime_error(
+          "remote executor requires a graph-capable runner, but " +
+          (summary.runner_id.empty() ? options_.host : summary.runner_id) +
+          " does not advertise graph_execution");
+    }
+    graph_execution_checked_.store(true, std::memory_order_release);
+  }
 
   onnx_remote::Response Exchange(const onnx_remote::Request& request,
                                  const std::string& host, uint16_t port,
@@ -413,6 +443,7 @@ class RemoteModelExecutor final : public ModelExecutor {
                              std::shared_ptr<const CompiledArtifact>>
       compiled_cache_;
   mutable std::deque<std::string> cache_order_;
+  mutable std::atomic<bool> graph_execution_checked_{false};
 };
 
 }  // namespace

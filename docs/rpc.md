@@ -59,6 +59,12 @@ conversion, legalization, and context-binary generation on the compile host,
 while the execution host only receives the final artifact. The service has a
 passthrough mode for transport tests; it is not itself a QNN compiler.
 
+Set `RemoteExecutorOptions.require_graph_execution=true` to probe the
+runner's capability manifest before the first model run and fail fast unless
+it advertises `graph_execution:true`. The probe result is cached per
+executor; legacy manifests without the field are rejected under this flag,
+so leave it off for pre-graph unary workers.
+
 Compiled execution can optionally use a load/attach handshake: the host sends
 `load_compiled(artifact_id, artifact)` once to the runner, then sends
 `run_compiled(artifact_id, tensors)` without repeating the artifact bytes. The

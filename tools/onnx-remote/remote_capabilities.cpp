@@ -102,7 +102,9 @@ bool parse_capability_manifest(const std::string& manifest,
   }
   // Optional for legacy reference workers; graph-capable workers must publish
   // this explicitly as true.
-  json_bool(manifest, "graph_execution", summary.graph_execution);
+  summary.graph_execution = false;
+  summary.has_graph_execution =
+      json_bool(manifest, "graph_execution", summary.graph_execution);
   json_bool(manifest, "profiling", summary.profiling);
   summary.supported_ops.clear();
   json_string_array(manifest, "supported_ops", summary.supported_ops, 64);

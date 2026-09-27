@@ -318,7 +318,9 @@ endpoint connection is attempted.
 Set `require_graph_execution:=true` when the bridge must select a runner that
 advertises serialized subgraph execution, such as the optional ORT graph
 worker; candidates without `graph_execution:true` are rejected with a status
-diagnostic.
+diagnostic. Announcements also carry an advisory `graph_execution` hint, so a
+runner that explicitly reports `false` is rejected without a TCP probe
+(the hint is still confirmed by verification when present).
 Verified `selected` and `expired` status events include the optional
 `graph_execution` boolean, allowing a UI to display the selected runner's
 capability without issuing another worker request.
@@ -374,7 +376,9 @@ build/onnx-remote/onnx-remote-profile-dump \
 `onnx-remote-mock-runner` and `onnx-remote-attach-test` provide a vendor-free
 test of the compiled-artifact handshake. The mock stores opaque artifact bytes
 on `load_compiled`, accepts ID-only `run_compiled`, and returns identity output
-with a profile event; it is for CI protocol coverage, not model execution. Use
+with a profile event; it is for CI protocol coverage, not model execution. The
+mock answers `capabilities` as a non-graph runner, and the attach test verifies
+that manifest before uploading. Use
 `--cache-dir DIR` on the mock runner to persist artifacts across runner
 restarts; `onnx-remote-attach-test HOST PORT --run-only` verifies that
 restart/reload path without uploading the artifact again.

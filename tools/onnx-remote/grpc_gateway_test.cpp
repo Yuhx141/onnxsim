@@ -31,10 +31,11 @@ constexpr uint16_t kCompilerPort = 39672;
 void serve_requests() {
   const int listener = listen_tcp(kWorkerPort, 1);
   assert(listener >= 0);
-  // Five requests: capabilities, identity execute, identity ModelInfer, one
-  // load, and one repeated load. Compile is served by the compiler fake so
-  // the test proves gateway routing to a separate compiler endpoint.
-  for (int i = 0; i < 5; ++i) {
+  // Six requests: capabilities, identity execute, subgraph execute with
+  // model bytes, identity ModelInfer, one load, and one repeated load.
+  // Compile is served by the compiler fake so the test proves gateway
+  // routing to a separate compiler endpoint.
+  for (int i = 0; i < 6; ++i) {
     const int fd = accept_tcp(listener);
     assert(fd >= 0);
 
@@ -56,6 +57,14 @@ void serve_requests() {
       response.outputs = request.inputs;
       response.profile.push_back(
           ProfileEvent{"worker_identity", "remote", 4, 9, "smoke"});
+    } else if (request.op == "subgraph" && request.inputs.size() == 1 &&
+               request.model == std::vector<uint8_t>{'g', 'r', 'a', 'p',
+                                                     'h'}) {
+      // Proves Execute forwards model bytes for graph execution requests.
+      response.ok = true;
+      response.outputs = request.inputs;
+      response.profile.push_back(
+          ProfileEvent{"worker_subgraph", "remote", 1, 2, "smoke"});
     } else if (request.op == "load_compiled" &&
                request.artifact_id == "smoke-artifact" &&
                request.artifact == std::vector<uint8_t>({9, 8, 7})) {
@@ -191,6 +200,30 @@ int main() {
                      sizeof(values)) == 0);
   assert(response.profile_size() == 1);
   assert(response.profile(0).name() == "worker_identity");
+
+  ExecuteRequest subgraph_request;
+  subgraph_request.set_request_id(23);
+  subgraph_request.set_op("subgraph");
+  subgraph_request.set_model("graph");
+  subgraph_request.set_profiling(PROFILING_DETAILED);
+  onnxsim::remote::v1::Tensor* subgraph_input =
+      subgraph_request.add_inputs();
+  subgraph_input->set_dtype(1);
+  subgraph_input->add_shape(2);
+  subgraph_input->set_raw_data(reinterpret_cast<const char*>(values),
+                               sizeof(values));
+  grpc::ClientContext subgraph_context;
+  ExecuteResponse subgraph_response;
+  status = stub->Execute(&subgraph_context, subgraph_request,
+                         &subgraph_response);
+  assert(status.ok());
+  assert(subgraph_response.ok());
+  assert(subgraph_response.request_id() == subgraph_request.request_id());
+  assert(subgraph_response.outputs_size() == 1);
+  assert(std::memcmp(subgraph_response.outputs(0).raw_data().data(), values,
+                     sizeof(values)) == 0);
+  assert(subgraph_response.profile_size() == 1);
+  assert(subgraph_response.profile(0).name() == "worker_subgraph");
 
   ModelInferRequest infer_request;
   infer_request.set_id("infer-1");
