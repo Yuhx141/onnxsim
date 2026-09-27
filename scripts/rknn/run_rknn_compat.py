@@ -91,8 +91,16 @@ def main() -> int:
         action="store_true",
         help="fail if rknn-toolkit2 is unavailable instead of skipping",
     )
+    ap.add_argument(
+        "--target-platform",
+        default=None,
+        help="rknn-toolkit2 target (for example rv1106 or rk3588); "
+        "defaults to RKNN_TARGET_PLATFORM or rk3588",
+    )
     ap.add_argument("--output", default="rknn-compat.csv")
     args = ap.parse_args()
+    if args.target_platform:
+        os.environ["RKNN_TARGET_PLATFORM"] = args.target_platform
 
     selected = args.models or models.names()
     print(f"RKNN compatibility check | {len(selected)} models", flush=True)
