@@ -3,11 +3,31 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
+
+static size_t ElementBytes(ONNXTensorElementDataType type) {
+  switch (type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32: return 4;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: return 1;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16: return 2;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE: return 8;
+    default: return 0;
+  }
+}
 
 int main(int argc, char** argv) {
   if (argc != 3 && argc != 4) {
@@ -35,6 +55,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> input_name_storage;
     std::vector<const char*> input_names;
     std::vector<std::vector<float>> input_storage;
+    std::vector<std::vector<uint8_t>> raw_input_storage;
     std::vector<Ort::Value> inputs;
     for (size_t i = 0; i < session.GetInputCount(); ++i) {
       auto name = session.GetInputNameAllocated(i, allocator);
@@ -42,8 +63,10 @@ int main(int argc, char** argv) {
       input_names.push_back(input_name_storage.back().c_str());
       auto type_info = session.GetInputTypeInfo(i);
       auto shape_info = type_info.GetTensorTypeAndShapeInfo();
-      if (shape_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-        std::cerr << "runtime test requires float32 inputs\n";
+      const auto type = shape_info.GetElementType();
+      const size_t element_bytes = ElementBytes(type);
+      if (element_bytes == 0) {
+        std::cerr << "runtime test encountered an unsupported input type\n";
         return 1;
       }
       auto shape = shape_info.GetShape();
@@ -52,10 +75,18 @@ int main(int argc, char** argv) {
         if (dimension <= 0) dimension = 2;
         elements *= static_cast<size_t>(dimension);
       }
-      input_storage.emplace_back(elements, static_cast<float>(i + 1));
-      inputs.push_back(Ort::Value::CreateTensor<float>(
-          memory, input_storage.back().data(), elements, shape.data(),
-          shape.size()));
+      if (type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        input_storage.emplace_back(elements, static_cast<float>(i + 1));
+        inputs.push_back(Ort::Value::CreateTensor<float>(
+            memory, input_storage.back().data(), elements, shape.data(),
+            shape.size()));
+      } else {
+        raw_input_storage.emplace_back(elements * element_bytes,
+                                       static_cast<uint8_t>(i + 1));
+        inputs.push_back(Ort::Value::CreateTensor(
+            memory.GetConst(), raw_input_storage.back().data(),
+            raw_input_storage.back().size(), shape.data(), shape.size(), type));
+      }
     }
     std::vector<std::string> output_name_storage;
     std::vector<const char*> output_names;
@@ -71,7 +102,7 @@ int main(int argc, char** argv) {
       std::cerr << "model returned no outputs\n";
       return 1;
     }
-    const float* result = outputs[0].GetTensorData<float>();
+    const void* result = outputs[0].GetTensorRawData();
     if (result == nullptr) {
       std::cerr << "remote EP returned no output data\n";
       return 1;
