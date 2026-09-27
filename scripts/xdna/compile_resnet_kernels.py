@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile buildable ResNet Conv GEMM specs with the installed IRON example.
+"""Compile ResNet Conv GEMM and selected native operator kernels.
 
 This prepares kernel artifacts only. The generated kernels do not by
 themselves execute the ONNX graph: runtime im2col, QDQ, bias/requantization,
@@ -78,6 +78,38 @@ def _compile_relu(elements: int, device: str, output_dir: Path) -> dict[str, str
     return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
 
 
+def _compile_quantized_add_relu(
+    elements: int, quantization: dict[str, Any], device: str, output_dir: Path
+) -> dict[str, str]:
+    tile = _relu_tile_width(elements)
+    scales = quantization["input_scales"]
+    zeros = quantization["input_zero_points"]
+    scale_out = float(quantization["output_scale"])
+    zero_out = int(quantization["output_zero_point"])
+    multipliers = quantization["multipliers_q30"]
+    key = f"qadd_relu_u8_e{elements}_t{tile}_m{multipliers[0]}_{multipliers[1]}_z{zeros[0]}_{zeros[1]}_{zero_out}"
+    xclbin = output_dir / f"{key}.xclbin"
+    insts = output_dir / f"{key}.insts.bin"
+    design = Path(__file__).with_name("quantized_add_relu_design.py")
+    command = [
+        sys.executable, str(design), "--dev", device,
+        "--elements", str(elements), "--tile-width", str(tile),
+        "--scale-a", str(scales[0]), "--scale-b", str(scales[1]),
+        "--scale-out", str(scale_out), "--zero-a", str(zeros[0]),
+        "--zero-b", str(zeros[1]), "--zero-out", str(zero_out),
+        "--xclbin-path", str(xclbin), "--insts-path", str(insts),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.returncode:
+        raise RuntimeError(
+            f"IRON quantized Add+ReLU compile failed for {key}:\n{completed.stdout}\n{completed.stderr}"
+        )
+    missing = [str(path) for path in (xclbin, insts) if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"compiler reported success but did not create: {', '.join(missing)}")
+    return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
@@ -118,8 +150,19 @@ def main(argv: list[str] | None = None) -> int:
             compiled[spec.key] = _compile(args.example, spec, args.device, args.artifact_dir)
 
     compiled_relu: dict[int, dict[str, str]] = {}
+    compiled_qadd: dict[tuple[Any, ...], dict[str, str]] = {}
     report = dict(render_build_manifest(plan, model=model, columns=args.columns, source=str(args.example)))
+    fused_relu_indices = {
+        int(index)
+        for item in report["operation_kernels"]
+        if item["status"] == "compilable_quantized_add_relu" and item.get("quantization")
+        for index in item["quantization"]["fused_node_indices"][1:2]
+    }
     for item in report["operation_kernels"]:
+        if item["op_type"] == "Relu" and int(item["node_index"]) in fused_relu_indices:
+            item["status"] = "fused_into_quantized_add_relu"
+            item["compile_status"] = "covered_by_quantized_add_relu"
+            continue
         if item["op_type"] != "Relu" or item["status"] != "compilable_iron_kernel":
             continue
         output_shape = next((shape for shape in item["output_shapes"] if shape), None)
@@ -131,6 +174,28 @@ def main(argv: list[str] | None = None) -> int:
         if artifact is None:
             artifact = _compile_relu(elements, args.device, args.artifact_dir)
             compiled_relu[elements] = artifact
+        item["compiled_artifact"] = artifact
+        item["compile_status"] = "compiled"
+    for item in report["operation_kernels"]:
+        if item["status"] != "compilable_quantized_add_relu":
+            continue
+        output_shape = next((shape for shape in item["output_shapes"] if shape), None)
+        if not output_shape:
+            item["compile_status"] = "shape_required"
+            continue
+        elements = math.prod(output_shape)
+        quantization = item["quantization"]
+        cache_key = (
+            elements, tuple(quantization["multipliers_q30"]),
+            tuple(quantization["input_zero_points"]), quantization["output_scale"],
+            quantization["output_zero_point"],
+        )
+        artifact = compiled_qadd.get(cache_key)
+        if artifact is None:
+            artifact = _compile_quantized_add_relu(
+                elements, quantization, args.device, args.artifact_dir
+            )
+            compiled_qadd[cache_key] = artifact
         item["compiled_artifact"] = artifact
         item["compile_status"] = "compiled"
 
@@ -146,13 +211,13 @@ def main(argv: list[str] | None = None) -> int:
     report["compile_all_specs"] = args.compile_all
     report["optimize_small_m"] = args.optimize_small_m
     report["compile_device"] = args.device
-    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu)
-    report["compiled_operator_kernel_count"] = len(compiled_relu)
+    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu) + len(compiled_qadd)
+    report["compiled_operator_kernel_count"] = len(compiled_relu) + len(compiled_qadd)
     report["graph_runtime_blockers"] = [
         "NCHW im2col packing and logical-to-padded GEMM staging",
         "QDQ scale/zero-point conversion and Conv bias/requantization",
-        "runtime dispatch wiring for compiled standalone Relu operators",
-        "QDQ conversion, pooling, residual arithmetic, and tensor-layout kernels",
+        "runtime dispatch wiring for compiled standalone operators",
+        "pooling, generic QDQ conversion, and tensor-layout kernels",
     ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

@@ -9,6 +9,7 @@ dependency is introduced here.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
@@ -25,6 +26,10 @@ try:
     from .graph_fusion import _attributes, _value_metadata
 except ImportError:  # direct script-directory imports
     from graph_fusion import _attributes, _value_metadata
+try:
+    from .qdq_runtime import extract_qdq_edges
+except ImportError:  # direct script-directory imports
+    from qdq_runtime import extract_qdq_edges
 
 
 @dataclass(frozen=True)
@@ -100,9 +105,8 @@ class BottleneckArtifactSpec:
 class OperationArtifactSpec:
     """Serializable lowering record for non-Conv/Gemm graph operations.
 
-    These records are emitted into the graph program so a later IRON kernel
-    builder can consume them. They are deliberately marked as descriptors:
-    this repository does not yet ship executable kernels for these ops.
+    These records describe each op lowering or reference a shape-specialized
+    native artifact when the compiler has an executable kernel for it.
     """
 
     node_index: int
@@ -115,6 +119,7 @@ class OperationArtifactSpec:
     input_shapes: Tuple[Optional[Tuple[int, ...]], ...]
     output_shapes: Tuple[Optional[Tuple[int, ...]], ...]
     status: str = "descriptor_only_native_kernel_required"
+    quantization: Optional[Mapping[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,6 +133,7 @@ class OperationArtifactSpec:
             "input_shapes": [list(shape) if shape is not None else None for shape in self.input_shapes],
             "output_shapes": [list(shape) if shape is not None else None for shape in self.output_shapes],
             "status": self.status,
+            "quantization": dict(self.quantization) if self.quantization is not None else None,
         }
 
 
@@ -153,6 +159,19 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
     graph = model.graph
     nodes = list(graph.node)
     shapes, _ = _value_metadata(model)
+    graph_outputs = {str(value.name) for value in graph.output}
+    consumers: dict[str, list[int]] = {}
+    for consumer_index, consumer in enumerate(nodes):
+        for value in consumer.input:
+            consumers.setdefault(str(value), []).append(consumer_index)
+    try:
+        qdq = extract_qdq_edges(model)
+    except ValueError:
+        # Lightweight planner fixtures may intentionally omit QDQ constants;
+        # in that case they remain descriptors without a compiled fusion.
+        qdq = ()
+    dequantized = {edge.output_name: edge for edge in qdq if edge.op_type == "DequantizeLinear"}
+    quantized_by_input = {edge.input_name: edge for edge in qdq if edge.op_type == "QuantizeLinear"}
     result = []
     for dispatch in plan.dispatches:
         node_index = dispatch.node_indices[0]
@@ -160,21 +179,84 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
         op = str(node.op_type)
         if op == "Conv":
             continue
+        qadd = None
+        qadd_inputs = tuple(str(value) for value in node.input if value)
+        qadd_outputs = tuple(str(value) for value in node.output if value)
+        qadd_node_indices: Tuple[int, ...] = (node_index,)
+        if op == "Add" and len(node.input) == 2 and node.output:
+            input_edges = [dequantized.get(str(value)) for value in node.input]
+            post_ops = consumers.get(str(node.output[0]), ())
+            relu_index = (
+                post_ops[0]
+                if len(post_ops) == 1
+                and str(nodes[post_ops[0]].op_type) == "Relu"
+                and str(node.output[0]) not in graph_outputs
+                else None
+            )
+            output_quant = None
+            if relu_index is not None:
+                relu = nodes[relu_index]
+                relu_consumers = consumers.get(str(relu.output[0]), ()) if len(relu.output) == 1 else ()
+                if (
+                    len(relu.output) == 1
+                    and len(relu_consumers) == 1
+                    and str(relu.output[0]) not in graph_outputs
+                ):
+                    output_quant = quantized_by_input.get(str(relu.output[0]))
+            if all(input_edges) and output_quant is not None:
+                params = [edge.params for edge in input_edges] + [output_quant.params]
+                output_shape = shapes.get(str(output_quant.output_name))
+                ratios = (params[0].scale[0] / params[2].scale[0], params[1].scale[0] / params[2].scale[0])
+                power_of_two_ratios = all(
+                    math.frexp(value)[0] == 0.5 and -30 <= math.frexp(value)[1] - 1 <= 24
+                    for value in ratios
+                )
+                compatible_shape = (
+                    output_shape is not None
+                    and all(shapes.get(edge.input_name) == output_shape for edge in input_edges)
+                )
+                if (
+                    all(param.scalar and param.dtype == "u8" for param in params)
+                    and compatible_shape
+                    and power_of_two_ratios
+                ):
+                    multipliers = [round(value * (1 << 30)) for value in ratios]
+                    qadd = {
+                        "input_scales": [param.scale[0] for param in params[:2]],
+                        "input_zero_points": [param.zero_point[0] for param in params[:2]],
+                        "output_scale": params[2].scale[0],
+                        "output_zero_point": params[2].zero_point[0],
+                        "multipliers_q30": multipliers,
+                        "dtype": "u8",
+                        "relu": True,
+                        "raw_inputs": [edge.input_name for edge in input_edges],
+                        "raw_output": output_quant.output_name,
+                    }
+                    qadd_inputs = tuple(qadd["raw_inputs"])
+                    qadd_outputs = (str(qadd["raw_output"]),)
+                    qadd_node_indices = (node_index, relu_index, output_quant.node_index)
         result.append(OperationArtifactSpec(
             node_index=node_index,
             node_name=dispatch.node_names[0],
             op_type=op,
-            lowering=_OP_LOWERINGS.get(op, "unsupported_native_lowering"),
-            inputs=tuple(str(value) for value in node.input if value),
-            outputs=tuple(str(value) for value in node.output if value),
+            lowering=(
+                "quantized_add_relu_u8" if qadd is not None
+                else _OP_LOWERINGS.get(op, "unsupported_native_lowering")
+            ),
+            inputs=qadd_inputs,
+            outputs=qadd_outputs,
             attributes=_attributes(node),
-            input_shapes=tuple(shapes.get(str(value)) for value in node.input if value),
-            output_shapes=tuple(shapes.get(str(value)) for value in node.output if value),
+            input_shapes=tuple(shapes.get(str(value)) for value in qadd_inputs),
+            output_shapes=tuple(shapes.get(str(value)) for value in qadd_outputs),
             status=(
-                "compilable_iron_kernel" if op == "Relu"
+                "compilable_quantized_add_relu" if qadd is not None
+                else "compilable_iron_kernel" if op == "Relu"
                 else "zero_copy_device_view" if op in {"Flatten", "Reshape"}
                 else "descriptor_only_native_kernel_required" if op in _OP_LOWERINGS
                 else "unsupported"
+            ),
+            quantization=(
+                {**qadd, "fused_node_indices": list(qadd_node_indices)} if qadd is not None else None
             ),
         ))
     # Q/DQ nodes are graph-edge semantics rather than dispatches. Emit them

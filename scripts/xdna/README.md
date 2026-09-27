@@ -234,6 +234,16 @@ passed for 1,024- and 16,384-element tensors. The graph runner does not yet bind
 these artifacts; full-model ReLU execution remains covered by the existing
 fused bottleneck or host path.
 
+Residual `Add -> Relu -> QuantizeLinear` patterns with scalar uint8 Q/DQ
+parameters and power-of-two input/output scale ratios now lower to one native
+fixed-point kernel. It consumes the two raw quantized activation edges, applies
+the two scale ratios and zero points, clamps ReLU values, rounds ties to even,
+and emits the quantized output edge. The manifest compiler specializes these
+artifacts by tensor size and quantization parameters. A 16,384-element kernel
+was compiled and matched the NumPy quantization reference on the NPU. Other
+scale ratios and per-channel quantization stay descriptor-only; runtime graph
+dispatch is still pending.
+
 `Flatten` and `Reshape` are emitted as zero-copy contiguous tensor views, with
 their input/output shapes carried in the operation record. They require no AIE
 instruction artifact; the future runner can preserve the same device buffer
