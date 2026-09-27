@@ -10,6 +10,7 @@
 #include "remote_transport.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -41,8 +42,16 @@ bool SupportedOp(const std::string& op) {
   size_t start = 0;
   while (start <= list.size()) {
     const size_t end = list.find(',', start);
-    const std::string token = list.substr(
+    std::string token = list.substr(
         start, end == std::string::npos ? std::string::npos : end - start);
+    token.erase(token.begin(), std::find_if(token.begin(), token.end(),
+                                            [](unsigned char c) {
+                                              return !std::isspace(c);
+                                            }));
+    token.erase(std::find_if(token.rbegin(), token.rend(),
+                             [](unsigned char c) { return !std::isspace(c); })
+                    .base(),
+                token.end());
     if (token == op) return true;
     if (end == std::string::npos) break;
     start = end + 1;

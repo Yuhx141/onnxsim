@@ -97,5 +97,25 @@ int main() {
   Response oversized = response;
   oversized.manifest.assign(kMaxManifestBytes + 1, 'x');
   assert(!encode_response_payload(oversized, payload, error));
+
+  Request bad_shape = request;
+  bad_shape.inputs[0].shape = {2, 2};
+  bad_shape.inputs[0].data.resize(3);
+  assert(!encode_request_payload(bad_shape, payload, error));
+
+  Request bad_dtype = request;
+  bad_dtype.inputs[0].dtype = 8;  // STRING is not a supported raw dtype.
+  bad_dtype.inputs[0].data.clear();
+  bad_dtype.inputs[0].raw_data = {0, 0, 0, 0};
+  assert(!encode_request_payload(bad_dtype, payload, error));
+
+  Request malformed_request;
+  assert(!decode_request_payload(nullptr, 0, malformed_request, error));
+  assert(!decode_request_payload(payload.data(), 0, malformed_request, error));
+  Response malformed_response;
+  assert(!decode_response_payload(nullptr, 0, malformed_response, error));
+  std::vector<uint8_t> status_only = {1};
+  assert(!decode_response_payload(status_only.data(), status_only.size(),
+                                  malformed_response, error));
   return 0;
 }
