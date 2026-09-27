@@ -710,7 +710,46 @@ def build_plan(
                         ) // (1024 * 512)
                         attrs["tile_blocks"] = attrs["flat_blocks"]
                         rec["shapes"] = [flat_template]
-                rec["attrs"] = attrs
+        if (
+            rec["op"] == "Mul"
+            and attrs.get("form") in ("same_shape", "broadcast")
+            and not attrs.get("flat_blocks")
+        ):
+            out_shape = value_shapes.get(rec["outputs"][0], ())
+            if out_shape and int(np.prod(out_shape)) > 1024 * 512:
+                qnames = (*rec["inputs"][:2], rec["outputs"][0])
+                zps = [
+                    int(calib["tensors"][t]["zero_point"])
+                    for t in qnames
+                    if t in calib.get("tensors", {})
+                ]
+                if len(zps) == 3 and zps == [0, 0, 0]:
+                    scales = [
+                        float(calib["tensors"][t]["scale"])
+                        for t in qnames
+                    ]
+                    if not all(abs(s - 1.0 / 255.0) < 1e-7 for s in scales):
+                        rec["attrs"] = attrs
+                        planned_records.append(rec)
+                        continue
+                    flat_template = [1024, 512]
+                    trial = dict(rec)
+                    trial_attrs = dict(attrs)
+                    trial_attrs["template_shape"] = flat_template
+                    trial["attrs"] = trial_attrs
+                    trial["shapes"] = [flat_template]
+                    try:
+                        cache.lookup(axb.key_for_record(trial, "x0,y0,z0"))
+                    except ValueError:
+                        pass
+                    else:
+                        attrs["template_shape"] = flat_template
+                        attrs["flat_blocks"] = (
+                            int(np.prod(out_shape)) + 1024 * 512 - 1
+                        ) // (1024 * 512)
+                        attrs["tile_blocks"] = attrs["flat_blocks"]
+                        rec["shapes"] = [flat_template]
+        rec["attrs"] = attrs
         planned_records.append(rec)
     # Live MatMul/Conv validation scans the compiled MCode.  The same scan is
     # required by the segment emitter below, so defer it to

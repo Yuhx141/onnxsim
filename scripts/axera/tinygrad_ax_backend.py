@@ -1460,7 +1460,10 @@ def plan_at_calibration(
                         break
             if (
                 op == "Mul"
-                and attrs.get("form") == "const"
+                and (
+                    attrs.get("form") == "const"
+                    or attrs.get("flat_blocks")
+                )
                 and attrs.get("tile_blocks")
                 and cls == "x0,y0,z0"
                 and cls in hits
