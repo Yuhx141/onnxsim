@@ -233,12 +233,16 @@ if (ONNXSIM_REMOTE_ROS2)
   find_package(std_msgs REQUIRED)
   find_package(std_srvs REQUIRED)
   add_executable(onnx-remote-ros2-bridge ros2_bridge.cpp)
+  add_executable(onnx-remote-ros2-service-smoke ros2_service_smoke.cpp)
   # ament_target_dependencies uses CMake's plain target_link_libraries
   # signature, so keep this target on the same signature for compatibility
   # with ament-cmake releases used by the Nix ROS2 overlay.
   target_link_libraries(onnx-remote-ros2-bridge onnx_remote_transport)
   ament_target_dependencies(onnx-remote-ros2-bridge rclcpp std_msgs std_srvs)
+  ament_target_dependencies(onnx-remote-ros2-service-smoke rclcpp std_srvs)
   install(TARGETS onnx-remote-ros2-bridge
+          DESTINATION lib/${PROJECT_NAME})
+  install(TARGETS onnx-remote-ros2-service-smoke
           DESTINATION lib/${PROJECT_NAME})
   ament_package()
 endif()

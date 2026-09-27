@@ -222,6 +222,11 @@ cmake --build build --target onnx-remote-ros2-bridge
 cmake --install build --prefix /tmp/onnx-remote-install
 ```
 
+The same build produces `onnx-remote-ros2-service-smoke`, a dependency-light
+C++ client for validating the bridge's `health` and `capabilities` services
+when a ROS installation does not include the optional `ros2 service` CLI
+extension.
+
 The flake currently pins the ROS2 Humble package set from nixpkgs. It does not
 replace the project toolchain; it only supplies CMake, `ament_cmake`, `rclcpp`,
 `std_msgs`, `std_srvs`, and the ROS2 CLI.
