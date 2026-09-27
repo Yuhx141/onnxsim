@@ -278,6 +278,30 @@ def test_constant_mul_fixed_frame_runs_on_axcl_vm():
 
 @needs_device
 @needs_step
+def test_constant_mul_broadcast_output_shape_runs_on_axcl_vm():
+    """A constant broadcast uses the validated full output-shape template."""
+    import axcl_session
+
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, _ = sr.build_plan(model, sr.load_records(), calib)
+    seg = next(s for s in segments if s.name == "Mul_43")
+    assert seg.output_shape == (16, 512, 7, 7)
+    reference = sr.load_reference()
+    with axcl_session.AXSession(subdir="constant_mul_broadcast_output") as session:
+        _, stats = sr.StepRunner(model, [seg], session, health_every=0).run(
+            reference["feeds"], "npu"
+        )
+    assert len(stats) == 1
+    assert not stats[0].error, stats[0]
+    # This calibrated boundary is a fixed-frame approximation; retain the
+    # native path only within its measured device error budget.
+    assert stats[0].max_lsb <= 40.0, stats[0]
+    assert stats[0].float_rel <= 0.03, stats[0]
+
+
+@needs_device
+@needs_step
 def test_resnet18_training_graph_runs_pulsar_free_on_axcl_vm(tmp_path):
     """Run the complete calibrated ResNet18 training graph on the AX8850."""
     import axcl_session

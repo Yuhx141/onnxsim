@@ -512,6 +512,10 @@ def build_plan(
     every node left on the host."""
     cache = axb.TemplateCache()
     inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+    value_shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
     planned_records = []
     for original in records:
         rec = dict(original)
@@ -527,6 +531,13 @@ def build_plan(
                 value = np.asarray(inits[const], dtype=np.float32)
                 attrs["constant_zero_point"] = 0 if float(value.min()) >= 0 else 128
                 attrs["constant_input"] = const_index
+                # Constant broadcasts are compiled as the full output shape.
+                # The compact records historically kept the live input shape,
+                # which hid validated full-shape binary templates from the
+                # planner (for example the 16x512x1x1 * 1x1x7x7 path).
+                out_shape = value_shapes.get(rec["outputs"][0], ())
+                if out_shape and tuple(rec["shapes"][0]) != out_shape:
+                    attrs["output_shape"] = list(out_shape)
                 rec["attrs"] = attrs
         planned_records.append(rec)
     # Live MatMul/Conv validation scans the compiled MCode.  The same scan is
