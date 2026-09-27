@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -169,6 +170,34 @@ class RemoteModelExecutor final : public ModelExecutor {
       if (!onnxsim::dlpack::TryOnnxToDL(output.dtype, &dtype)) {
         throw std::runtime_error("remote executor returned unsupported dtype " +
                                  std::to_string(output.dtype));
+      }
+      const size_t element_bytes = onnxsim::dlpack::SizeOf(dtype);
+      size_t element_count = 1;
+      for (const int64_t dimension : output.shape) {
+        if (dimension <= 0 ||
+            static_cast<uint64_t>(dimension) >
+                std::numeric_limits<size_t>::max() / element_count) {
+          throw std::runtime_error(
+              "remote executor returned an invalid output shape");
+        }
+        element_count *= static_cast<size_t>(dimension);
+      }
+      if (element_count > std::numeric_limits<size_t>::max() / element_bytes) {
+        throw std::runtime_error(
+            "remote executor returned an oversized output shape");
+      }
+      if (output.dtype == onnx::TensorProto::FLOAT &&
+          output.data.size() > std::numeric_limits<size_t>::max() /
+                                   sizeof(float)) {
+        throw std::runtime_error(
+            "remote executor returned an oversized float output");
+      }
+      const size_t payload_bytes = output.dtype == onnx::TensorProto::FLOAT
+                                       ? output.data.size() * sizeof(float)
+                                       : output.raw_data.size();
+      if (payload_bytes != element_count * element_bytes) {
+        throw std::runtime_error(
+            "remote executor returned output shape/payload mismatch");
       }
       auto owner = std::make_unique<OutputOwner>();
       owner->dtype = dtype;
