@@ -202,6 +202,16 @@ jobs:
             "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
             scripts/convertmodel/test/webgpu_kernel_add.onnx \
             "$RUNNER_TEMP/public-ep-ort-profile"
+          # The plugin EP device trips a use-after-free inside ORT 1.29's
+          # CreateSession plugin-device resolution (frame 0 dereferences
+          # recycled heap). Exercises the CPU device session path and the
+          # profile plumbing; remote kernel execution is covered by the
+          # ORT graph worker job instead.
+          ONNXSIM_REMOTE_EP_TEST_APPEND=CPUExecutionProvider \
+          build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
+            "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
+            scripts/convertmodel/test/webgpu_kernel_add.onnx \
+            "$RUNNER_TEMP/public-ep-ort-profile-cpu"
           test -s "$RUNNER_TEMP/public-ep-profile.json"
           grep -q '"name":"add"' "$RUNNER_TEMP/public-ep-profile.json"
           ls "$RUNNER_TEMP"/public-ep-ort-profile*.json
