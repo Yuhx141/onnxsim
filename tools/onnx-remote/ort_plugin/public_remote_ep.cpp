@@ -6,10 +6,12 @@
 
 #include <onnxruntime_cxx_api.h>
 
+#include "remote_op_mapping.h"
 #include "remote_profile.h"
 #include "remote_transport.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -30,6 +32,7 @@ using Clock = std::chrono::high_resolution_clock;
 constexpr const char* kName = "onnxsim_remote";
 constexpr const char* kVendor = "onnxsim";
 constexpr const char* kVersion = "1.0.0";
+std::atomic<uint64_t> next_request_id{1};
 
 bool SupportedOp(const std::string& op) {
   if (op != "Identity" && op != "Relu" && op != "Add" && op != "Mul" &&
@@ -79,18 +82,6 @@ bool SupportedNode(const Ort::ConstNode& node) {
     if (!IsFloatTensor(value)) return false;
   }
   return true;
-}
-
-const char* RemoteOperation(const std::string& op) {
-  if (op == "Identity") return "identity";
-  if (op == "Relu") return "relu";
-  if (op == "Add") return "add";
-  if (op == "Mul") return "mul";
-  if (op == "Sub") return "sub";
-  if (op == "Div") return "div";
-  if (op == "Max") return "max";
-  if (op == "Min") return "min";
-  return nullptr;
 }
 
 size_t ElementBytes(ONNXTensorElementDataType type) {
@@ -430,7 +421,12 @@ OrtStatus* ORT_API_CALL RemoteNodeComputeInfo::ComputeImpl(
       return Error(api, ORT_INVALID_ARGUMENT, "onnxsim_remote expects one output");
     }
     onnx_remote::Request request;
-    request.op = RemoteOperation(info->op);
+    request.request_id = next_request_id.fetch_add(1, std::memory_order_relaxed);
+    request.op = onnx_remote::remote_operation_name(info->op);
+    if (request.op.empty()) {
+      return Error(api, ORT_INVALID_ARGUMENT,
+                   "onnxsim_remote received an unsupported operation");
+    }
     request.profiling = info->ep.options().profiling;
     request.inputs.reserve(input_count);
     for (size_t i = 0; i < input_count; ++i) {
@@ -463,6 +459,10 @@ OrtStatus* ORT_API_CALL RemoteNodeComputeInfo::ComputeImpl(
     if (!ok || !response.ok) {
       return Error(api, ORT_FAIL,
                    transport_error.empty() ? response.error : transport_error);
+    }
+    if (response.request_id != request.request_id) {
+      return Error(api, ORT_FAIL,
+                   "onnxsim_remote response request id mismatch");
     }
     if (auto* profiler = RemoteProfiler::active) {
       profiler->Record(response.profile, local_start);
@@ -498,6 +498,25 @@ OrtStatus* ORT_API_CALL RemoteNodeComputeInfo::ComputeImpl(
             context, 0, result.shape.data(), result.shape.size(), &output)) {
       api->ReleaseStatus(status);
       return Error(api, ORT_FAIL, "cannot allocate onnxsim_remote output");
+    }
+    OrtTensorTypeAndShapeInfo* output_info = nullptr;
+    if (OrtStatus* status = api->GetTensorTypeAndShape(output, &output_info)) {
+      api->ReleaseStatus(status);
+      return Error(api, ORT_FAIL,
+                   "cannot inspect onnxsim_remote output type");
+    }
+    ONNXTensorElementDataType output_type;
+    OrtStatus* type_status =
+        api->GetTensorElementType(output_info, &output_type);
+    api->ReleaseTensorTypeAndShapeInfo(output_info);
+    if (type_status != nullptr) {
+      api->ReleaseStatus(type_status);
+      return Error(api, ORT_FAIL,
+                   "cannot read onnxsim_remote output type");
+    }
+    if (output_type != static_cast<ONNXTensorElementDataType>(result.dtype)) {
+      return Error(api, ORT_FAIL,
+                   "onnxsim_remote returned a dtype different from the ORT graph");
     }
     void* destination = nullptr;
     if (OrtStatus* status = api->GetTensorMutableData(output, &destination)) {
