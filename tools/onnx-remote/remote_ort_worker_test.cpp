@@ -113,8 +113,20 @@ int main(int argc, char** argv) {
           throw std::runtime_error("remote output value mismatch");
       }
     }
+    request.request_id = 7002;
+    const int cached_fd = connect_tcp_timeout(
+        "127.0.0.1", static_cast<uint16_t>(std::stoul(argv[2])), 2000);
+    if (cached_fd < 0) throw std::runtime_error("cannot reconnect to ORT worker");
+    if (!send_request(cached_fd, request, error)) throw std::runtime_error(error);
+    Response cached_response;
+    if (!receive_response(cached_fd, cached_response, error))
+      throw std::runtime_error(error);
+    close_socket(cached_fd);
+    if (!cached_response.ok || cached_response.profile.size() < 2 ||
+        cached_response.profile.front().name != "ort_session_cache_hit")
+      throw std::runtime_error("ORT worker session cache was not reused");
     std::cout << "ORT graph worker integration passed (profile events: "
-              << response.profile.size() << ")\n";
+              << cached_response.profile.size() << ")\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

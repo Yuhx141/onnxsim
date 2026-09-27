@@ -132,7 +132,9 @@ cmake --build build-ort-worker --target onnx-remote-ort-worker
 ```
 
 Run it with `--threads 1` (the default) for bounded CPU use, or raise the
-value on a compile host with spare cores.
+value on a compile host with spare cores. `--max-models 2` bounds the LRU
+serialized-graph session cache; set it to `0` to disable caching. Detailed
+profiling reports `ort_session_cache_hit` when a graph session is reused.
 
 The worker accepts `subgraph` or `onnx` requests containing serialized ONNX
 bytes in `Request::model`, executes float32 inputs on ORT CPU, and returns
