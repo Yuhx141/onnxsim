@@ -17,6 +17,14 @@ inline std::string remote_operation_name(const std::string &onnx_op) {
     return "add";
   if (onnx_op == "Mul")
     return "mul";
+  if (onnx_op == "Sub")
+    return "sub";
+  if (onnx_op == "Div")
+    return "div";
+  if (onnx_op == "Max")
+    return "max";
+  if (onnx_op == "Min")
+    return "min";
   return {};
 }
 

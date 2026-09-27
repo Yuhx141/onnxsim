@@ -8,6 +8,10 @@ int main() {
   assert(remote_operation_name("Relu") == "relu");
   assert(remote_operation_name("Add") == "add");
   assert(remote_operation_name("Mul") == "mul");
+  assert(remote_operation_name("Sub") == "sub");
+  assert(remote_operation_name("Div") == "div");
+  assert(remote_operation_name("Max") == "max");
+  assert(remote_operation_name("Min") == "min");
   assert(remote_operation_name("Conv").empty());
   assert(remote_operation_name("ai.onnx::Relu").empty());
   return 0;

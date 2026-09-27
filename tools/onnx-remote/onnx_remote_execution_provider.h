@@ -21,7 +21,8 @@ struct Options {
   int io_timeout_ms = 0;
   onnx_remote::ProfilingLevel profiling = onnx_remote::ProfilingLevel::Off;
   std::unordered_set<std::string> supported_ops{"Identity", "Relu", "Add",
-                                                "Mul"};
+                                                "Mul", "Sub", "Div", "Max",
+                                                "Min"};
 };
 
 // The caller owns the returned provider and registers it with its

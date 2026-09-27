@@ -1,5 +1,6 @@
 #include "remote_transport.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -36,7 +37,8 @@ static Response execute(const Request& r) {
     out.manifest =
         "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
         "\"runner_id\":\"reference-worker\",\"ready\":true,"
-        "\"supported_ops\":[\"identity\",\"relu\",\"add\",\"mul\"],"
+        "\"supported_ops\":[\"identity\",\"relu\",\"add\",\"mul\","
+        "\"sub\",\"div\",\"max\",\"min\"],"
         "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\","
         "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","
         "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\","
@@ -59,7 +61,8 @@ static Response execute(const Request& r) {
     execute_op([&] { y = r.inputs[0]; for (float& x : y.data) if (x < 0.0f) x = 0.0f; });
     out.outputs.push_back(std::move(y)); out.ok = true; return out;
   }
-  if (r.op == "add" || r.op == "mul") {
+  if (r.op == "add" || r.op == "mul" || r.op == "sub" ||
+      r.op == "div" || r.op == "max" || r.op == "min") {
     if (r.inputs.size() != 2 || !same_shape(r.inputs[0], r.inputs[1])) {
       out.error = r.op + " expects two tensors with the same shape"; return out;
     }
@@ -69,9 +72,16 @@ static Response execute(const Request& r) {
     }
     Tensor y = r.inputs[0];
     execute_op([&] {
-      for (size_t i = 0; i < y.data.size(); ++i)
-        y.data[i] = r.op == "add" ? r.inputs[0].data[i] + r.inputs[1].data[i]
-                                   : r.inputs[0].data[i] * r.inputs[1].data[i];
+      for (size_t i = 0; i < y.data.size(); ++i) {
+        const float lhs = r.inputs[0].data[i];
+        const float rhs = r.inputs[1].data[i];
+        if (r.op == "add") y.data[i] = lhs + rhs;
+        else if (r.op == "mul") y.data[i] = lhs * rhs;
+        else if (r.op == "sub") y.data[i] = lhs - rhs;
+        else if (r.op == "div") y.data[i] = lhs / rhs;
+        else if (r.op == "max") y.data[i] = std::max(lhs, rhs);
+        else y.data[i] = std::min(lhs, rhs);
+      }
     });
     out.outputs.push_back(std::move(y)); out.ok = true; return out;
   }

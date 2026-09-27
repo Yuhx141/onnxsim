@@ -6,7 +6,7 @@
   "entrypoint": "onnxsim::ort_remote::CreateRemoteExecutionProviderFromOptions",
   "registration": "internal_cpp",
   "public_plugin_entrypoints": ["CreateEpFactories", "ReleaseEpFactory"],
-  "supported_ops": ["Identity", "Relu", "Add", "Mul"],
+  "supported_ops": ["Identity", "Relu", "Add", "Mul", "Sub", "Div", "Max", "Min"],
   "tensor_types": ["float32"],
   "profiling": {
     "levels": ["off", "summary", "detailed"],

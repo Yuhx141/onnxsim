@@ -92,7 +92,8 @@ enabled, the plugin also reports the returned remote kernel events through
 `OrtEpProfilerImpl`; `ONNXSIM_REMOTE_EP_PROFILE_FILE` remains available for a
 transport-native JSON copy.
 
-The provider partitions `Identity`, `Relu`, `Add`, and `Mul` by default and
+The provider partitions `Identity`, `Relu`, `Add`, `Mul`, `Sub`, `Div`, `Max`,
+and `Min` by default and
 executes float32 tensors through the dependency-free worker. Unsupported ops
 remain on the normal CPU EP. `Options::profiling` forwards worker events into
 onnxsim's profiler. Applications using ORT's internal provider registration

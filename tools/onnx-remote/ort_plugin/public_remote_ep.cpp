@@ -31,7 +31,8 @@ constexpr const char* kVendor = "onnxsim";
 constexpr const char* kVersion = "1.0.0";
 
 bool SupportedOp(const std::string& op) {
-  return op == "Identity" || op == "Relu" || op == "Add" || op == "Mul";
+  return op == "Identity" || op == "Relu" || op == "Add" || op == "Mul" ||
+         op == "Sub" || op == "Div" || op == "Max" || op == "Min";
 }
 
 bool IsFloatTensor(const Ort::ConstValueInfo& value_info) {
@@ -61,6 +62,10 @@ const char* RemoteOperation(const std::string& op) {
   if (op == "Relu") return "relu";
   if (op == "Add") return "add";
   if (op == "Mul") return "mul";
+  if (op == "Sub") return "sub";
+  if (op == "Div") return "div";
+  if (op == "Max") return "max";
+  if (op == "Min") return "min";
   return nullptr;
 }
 

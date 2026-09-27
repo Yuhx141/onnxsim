@@ -17,8 +17,9 @@ versions before loading the onnxsim library. Provider options are documented in
 
 The standalone public plugin exports `CreateEpFactories` and
 `ReleaseEpFactory` and implements the public `OrtEpFactory`/`OrtEp` C API. It
-advertises CPU-backed remote execution for `Identity`, `Relu`, `Add`, and
-`Mul`, marshaling each fused node through `onnx-remote-v5`. Set
+advertises CPU-backed remote execution for `Identity`, `Relu`, `Add`, `Mul`,
+`Sub`, `Div`, `Max`, and `Min`, marshaling each fused node through
+`onnx-remote-v5`. Set
 `ONNXSIM_REMOTE_EP_HOST`, `ONNXSIM_REMOTE_EP_PORT`, and optionally
 `ONNXSIM_REMOTE_EP_PROFILING` or `ONNXSIM_REMOTE_EP_PROFILE_FILE` before
 creating the ORT session. ORT session/run profiling receives the remote events
