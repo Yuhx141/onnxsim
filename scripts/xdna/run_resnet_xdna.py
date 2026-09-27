@@ -57,6 +57,16 @@ def _dequantize(x: np.ndarray, scale: np.ndarray, zero: np.ndarray, axis: int) -
     return (np.asarray(x).astype(np.float32) - zero.astype(np.float32)) * scale
 
 
+def _centered_int8(raw: np.ndarray, zero: int, label: str) -> np.ndarray:
+    raw = np.asarray(raw)
+    if raw.dtype == np.int8 and zero == 0:
+        return raw
+    centered = raw.astype(np.int16) - zero
+    if np.any((centered < -128) | (centered > 127)):
+        raise ValueError(f"{label} cannot be represented as signed int8")
+    return centered.astype(np.int8)
+
+
 def _max_pool(x: np.ndarray, attrs: dict[str, Any]) -> np.ndarray:
     kernel = tuple(attrs["kernel_shape"])
     strides = tuple(attrs.get("strides", (1,) * len(kernel)))
@@ -96,6 +106,35 @@ class XDNAResNetRunner:
             for plan in plan_all_convs(model, optimize_small_m=self.optimize_small_m)
         }
         self.nodes_by_output = {name: node for node in self.nodes for name in node.output}
+        self.consumers_by_input: dict[str, list[int]] = {}
+        for index, node in enumerate(self.nodes):
+            for name in node.input:
+                if name:
+                    self.consumers_by_input.setdefault(name, []).append(index)
+        self._fused_relu_for_conv: dict[int, tuple[int, str]] = {}
+        graph_outputs = {str(value.name) for value in getattr(model.graph, "output", ())}
+        for conv_index, plan in self.conv_plans.items():
+            if not plan.fused_relu:
+                continue
+            conv_output = self.nodes[conv_index].output[0]
+            if conv_output in graph_outputs:
+                continue
+            frontier = [conv_output]
+            seen: set[str] = set()
+            relu_candidates: list[tuple[int, str]] = []
+            while frontier:
+                value = frontier.pop()
+                if value in seen:
+                    continue
+                seen.add(value)
+                for consumer_index in self.consumers_by_input.get(value, ()):
+                    consumer = self.nodes[consumer_index]
+                    if consumer.op_type in {"QuantizeLinear", "DequantizeLinear"}:
+                        frontier.extend(consumer.output)
+                    elif consumer.op_type == "Relu":
+                        relu_candidates.append((consumer_index, consumer.output[0]))
+            if len(relu_candidates) == 1:
+                self._fused_relu_for_conv[conv_index] = relu_candidates[0]
         self._dq_only_used_by_conv: set[int] = set()
         for index, node in enumerate(self.nodes):
             if node.op_type != "DequantizeLinear" or not node.output:
@@ -112,7 +151,7 @@ class XDNAResNetRunner:
             ):
                 self._dq_only_used_by_conv.add(index)
         self.specs = [entry for entry in manifest.get("kernels", []) if entry.get("compiled_artifact")]
-        self._executed = {"xdna_conv": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0}
+        self._executed = {"xdna_conv": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0}
         self._profile: dict[str, float] = {}
         self._conv_times: list[dict[str, Any]] = []
         self._workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
@@ -176,10 +215,7 @@ class XDNAResNetRunner:
         stage_start = time.perf_counter()
         in_raw, in_scale, in_zero = self._quant_source(node.input[0], values)
         wt_raw, wt_scale, wt_zero = self._quant_source(node.input[1], values)
-        x = in_raw.astype(np.int16) - in_zero
-        if np.any((x < -128) | (x > 127)):
-            raise ValueError(f"Conv {plan.node_name} activation cannot be represented as signed int8")
-        x = x.astype(np.int8)
+        x = _centered_int8(in_raw, in_zero, f"Conv {plan.node_name} activation")
         panels = im2col_nchw(x, plan)
         pack_ms = (time.perf_counter() - stage_start) * 1000.0
         output = np.empty(plan.output_shape, dtype=np.float32)
@@ -192,10 +228,7 @@ class XDNAResNetRunner:
         packed_weights = self._packed_weight_cache.get(packed_key)
         if packed_weights is None:
             weight_start = time.perf_counter()
-            weights = wt_raw.astype(np.int16) - wt_zero
-            if np.any((weights < -128) | (weights > 127)):
-                raise ValueError(f"Conv {plan.node_name} weights cannot be represented as signed int8")
-            weights = weights.astype(np.int8)
+            weights = _centered_int8(wt_raw, wt_zero, f"Conv {plan.node_name} weights")
             packed_groups = []
             for group in range(plan.groups):
                 w = weights[group * n_out_group : (group + 1) * n_out_group].reshape(n_out_group, khkwc).T
@@ -273,16 +306,10 @@ class XDNAResNetRunner:
         stage_start = time.perf_counter()
         in_raw, in_scale, in_zero = self._quant_source(node.input[0], values)
         wt_raw, wt_scale, wt_zero = self._quant_source(node.input[1], values)
-        x = in_raw.astype(np.int16) - in_zero
-        if np.any((x < -128) | (x > 127)):
-            raise ValueError(f"Conv {plan.node_name} activation cannot be represented as signed int8")
-        x = x.astype(np.int8)
+        x = _centered_int8(in_raw, in_zero, f"Conv {plan.node_name} activation")
         weights = self._cpu_weight_cache.get(index)
         if weights is None:
-            weights = wt_raw.astype(np.int16) - wt_zero
-            if np.any((weights < -128) | (weights > 127)):
-                raise ValueError(f"Conv {plan.node_name} weights cannot be represented as signed int8")
-            weights = weights.astype(np.int8)
+            weights = _centered_int8(wt_raw, wt_zero, f"Conv {plan.node_name} weights")
             self._cpu_weight_cache[index] = weights
         panels = im2col_nchw(x, plan)
         bias = values[node.input[2]].astype(np.float32).reshape(-1) if len(node.input) > 2 else None
@@ -319,12 +346,15 @@ class XDNAResNetRunner:
         return output
 
     def run(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        self._executed = {"xdna_conv": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0}
+        self._executed = {"xdna_conv": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0}
         self._profile = {}
         self._conv_times = []
+        self._precomputed_relu_nodes: set[int] = set()
         values = dict(self.arrays)
         values.update(inputs)
         for index, node in enumerate(self.nodes):
+            if index in self._precomputed_relu_nodes:
+                continue
             if index in self._dq_only_used_by_conv:
                 self._executed["skipped_conv_dq"] += 1
                 continue
@@ -363,12 +393,26 @@ class XDNAResNetRunner:
                 raise NotImplementedError(f"node {index} {op} has no XDNA graph-runner implementation")
             for output_name in node.output:
                 values[output_name] = np.asarray(result)
+            if op == "Conv":
+                tail_start = time.perf_counter()
+                self._fuse_conv_tail(index, result, values)
+                tail_ms = (time.perf_counter() - tail_start) * 1000.0
+                self._profile["conv_fused_relu_ms"] = self._profile.get("conv_fused_relu_ms", 0.0) + tail_ms
             if op not in {"Conv", "Constant"}:
                 self._executed["host_ops"] += 1
             if op != "Conv":
                 key = f"host_{op}_ms"
                 self._profile[key] = self._profile.get(key, 0.0) + (time.perf_counter() - node_start) * 1000.0
         return {value.name: values[value.name] for value in self.model.graph.output}
+
+    def _fuse_conv_tail(self, conv_index: int, output: np.ndarray, values: dict[str, np.ndarray]) -> None:
+        """Materialize a fused Conv+Relu output once instead of repeating Relu."""
+        relu = self._fused_relu_for_conv.get(conv_index)
+        if relu is not None:
+            relu_index, relu_output = relu
+            values[relu_output] = np.asarray(output)
+            self._precomputed_relu_nodes.add(relu_index)
+            self._executed["fused_relu"] += 1
 
 
 def main() -> int:

@@ -123,13 +123,15 @@ model, reusing prepacked constant weights brought the all-XDNA Conv path to
 seen in Vitis skips 90 dequantizations that are only consumed by Conv, lowering
 the all-XDNA Conv path to 89.6 ms with exact CPU-reference output. Finally,
 `--cpu-small-m 64` runs 52 small-spatial Conv nodes as CPU integer GEMMs and
-keeps the 256-pixel stem Conv on XDNA. This hybrid run averaged 59.2 ms
-(16.9 FPS), a further 34% reduction, also with exact output. Vitis averaged
-1.60 ms on the same input: the all-XDNA Conv path is about 56x slower, and the
-hybrid path about 37x slower. The hybrid result is faster because it avoids
-most NPU launches; its CPU fallback still costs about 59 ms. Closing the gap
-requires graph-level XDNA fusion and moving the intermediate QDQ/residual
-operations into the device program, like Vitis does.
+keeps the 256-pixel stem Conv on XDNA. The runner also skips 33 duplicate host
+Relu nodes and avoids copying/scanning already signed-int8, zero-point-zero
+activations. The latest all-XDNA run averaged 79.0 ms (12.7 FPS), and the
+hybrid run averaged 54.1 ms (18.5 FPS); both match the CPU output exactly.
+Vitis averaged 1.60 ms on the same input, so these runs are about 49x and 34x
+slower, respectively. The hybrid result is faster because it avoids most NPU
+launches; CPU Conv execution remains its largest cost. Closing the gap
+requires graph-level XDNA fusion and moving the
+intermediate QDQ/residual operations into the device program, like Vitis does.
 
 ```bash
 python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \

@@ -221,7 +221,13 @@ def plan_conv_gemm(
         for value in getattr(candidate, "input", ()):
             consumers.setdefault(str(value), []).append(i)
     following = _next_semantic(node_index, nodes, consumers)
-    fused_relu = len(following) == 1 and str(nodes[following[0]].op_type) == "Relu"
+    graph_outputs = {str(value.name) for value in getattr(model.graph, "output", ())}
+    conv_output_is_public = any(str(value) in graph_outputs for value in getattr(node, "output", ()))
+    fused_relu = (
+        not conv_output_is_public
+        and len(following) == 1
+        and str(nodes[following[0]].op_type) == "Relu"
+    )
     if fused_relu:
         kernel += "_relu"
     return ConvGemmPlan(
