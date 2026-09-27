@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -384,7 +385,15 @@ class RemoteModelExecutor final : public ModelExecutor {
     // the artifact, a later retry must compile/attach again rather than
     // reusing an artifact that onnxsim believes is resident remotely.
     if (options_.cache_compiled_models) {
+      if (options_.max_cached_models != 0) {
+        while (compiled_cache_.size() >= options_.max_cached_models &&
+               !cache_order_.empty()) {
+          compiled_cache_.erase(cache_order_.front());
+          cache_order_.pop_front();
+        }
+      }
       compiled_cache_[cache_key] = artifact;
+      cache_order_.push_back(cache_key);
     }
     return artifact;
   }
@@ -394,6 +403,7 @@ class RemoteModelExecutor final : public ModelExecutor {
   mutable std::unordered_map<std::string,
                              std::shared_ptr<const CompiledArtifact>>
       compiled_cache_;
+  mutable std::deque<std::string> cache_order_;
 };
 
 }  // namespace
