@@ -187,6 +187,10 @@ capabilities output contains a short error object. The adapter also accepts
 `ONNXSIM_DORA_CONNECT_TIMEOUT_MS` and
 `ONNXSIM_DORA_IO_TIMEOUT_MS` for unreliable links.
 
+The status output uses `schema_version: 1` and includes the selected host and
+port. When the capability probe fails, its escaped error is included in both
+the status object and the `ready: false` capabilities object.
+
 ## ROS2 bridge
 
 The optional `onnx-remote-ros2-bridge` uses ROS2 only for discovery and control:
