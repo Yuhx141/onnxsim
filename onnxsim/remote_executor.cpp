@@ -135,6 +135,10 @@ class RemoteModelExecutor final : public ModelExecutor {
     }
     request.inputs.reserve(inputs.size());
     for (const DLManagedTensor* input : inputs) {
+      if (input == nullptr || input->dl_tensor.ndim < 0 ||
+          (input->dl_tensor.ndim > 0 && input->dl_tensor.shape == nullptr)) {
+        throw std::runtime_error("remote executor received invalid input tensor");
+      }
       const DLTensor& tensor = input->dl_tensor;
       int32_t onnx_dtype = 0;
       if (tensor.device.device_type != kDLCPU || tensor.dtype.lanes != 1 ||
@@ -146,10 +150,25 @@ class RemoteModelExecutor final : public ModelExecutor {
       }
       onnx_remote::Tensor wire;
       wire.dtype = static_cast<uint8_t>(onnx_dtype);
-      wire.shape.assign(tensor.shape, tensor.shape + tensor.ndim);
-      const size_t nbytes = static_cast<size_t>(onnxsim::dlpack::NumElements(
-                                tensor.shape, tensor.ndim)) *
-                            onnxsim::dlpack::SizeOf(tensor.dtype);
+      if (tensor.ndim > 0)
+        wire.shape.assign(tensor.shape, tensor.shape + tensor.ndim);
+      size_t element_count = 1;
+      for (int32_t i = 0; i < tensor.ndim; ++i) {
+        if (tensor.shape[i] <= 0 ||
+            static_cast<uint64_t>(tensor.shape[i]) >
+                std::numeric_limits<size_t>::max() / element_count) {
+          throw std::runtime_error("remote executor received invalid input shape");
+        }
+        element_count *= static_cast<size_t>(tensor.shape[i]);
+      }
+      const size_t element_bytes = onnxsim::dlpack::SizeOf(tensor.dtype);
+      if (element_count > std::numeric_limits<size_t>::max() / element_bytes) {
+        throw std::runtime_error("remote executor received oversized input tensor");
+      }
+      const size_t nbytes = element_count * element_bytes;
+      if (nbytes != 0 && tensor.data == nullptr) {
+        throw std::runtime_error("remote executor received null input data");
+      }
       const auto* begin =
           static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset;
       if (onnx_dtype == onnx::TensorProto::FLOAT) {
