@@ -9,6 +9,7 @@ test here, and hold ``/tmp/axcl-device.lock`` while they do.
 
 from __future__ import annotations
 
+import gzip
 import os
 import sys
 
@@ -865,6 +866,50 @@ def test_onnx_constant_first_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
     np.testing.assert_allclose(
         got, x * z, atol=float(meta["scales"]["y"]) * 1.5, rtol=0
     )
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "op,x,z,want",
+    [
+        ("add", -0.5, 0.25, -0.25),
+        ("mul", 0.5, 0.25, 0.125),
+        ("div", -0.5, 0.5, -1.0),
+    ],
+)
+def test_native_binary_shape_templates_run_on_axcl_vm(op, x, z, want, tmp_path):
+    """Run the checked-in native shape templates on the AXCL VM.
+
+    These fixtures cover the small/broadcast shapes that are not represented
+    by the original 1xN Pulsar2 templates.  The offline test proves their
+    MCode can be retargeted; this closes the loop by loading the actual native
+    binaries on AXCL as well.
+    """
+    import axcl_session
+
+    path = os.path.join(
+        HERE,
+        "..",
+        "scripts",
+        "axera",
+        "fixtures",
+        "binary_op_scale_emit",
+        f"{op}_1x1_x{'128_y128_z128' if op == 'add' else '0_y0_z0' if op == 'mul' else '128_y128_z0'}.axmodel.gz",
+    )
+    with gzip.open(path, "rb") as stream:
+        axmodel = stream.read()
+    with axcl_session.AXSession(
+        subdir=f"native_binary_shape_{op}_{tmp_path.name}"
+    ) as session:
+        loaded = session.load(axmodel)
+        try:
+            (got,) = session.run(
+                loaded,
+                [np.array([[x]], dtype=np.float32), np.array([[z]], dtype=np.float32)],
+            )
+        finally:
+            session.unload(loaded)
+    np.testing.assert_allclose(got, [[want]], atol=0.02, rtol=0)
 
 
 @needs_device
