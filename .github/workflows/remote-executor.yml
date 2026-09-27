@@ -198,15 +198,10 @@ jobs:
           (exec 3<>"/dev/tcp/127.0.0.1/39501") 2>/dev/null || {
             echo "worker never became ready:"; cat "$RUNNER_TEMP/public-ep-worker.log"; exit 1
           }
-          command -v gdb >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq gdb; } >/dev/null
-          gdb -batch -ex 'set pagination off' -ex run \
-            -ex 'bt 24' -ex 'info threads' -ex 'thread apply all bt 4' \
-            -ex 'frame 0' -ex 'info registers' -ex 'x/6i $pc' \
-            -ex 'info sharedlibrary' \
-            --args build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
+          build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
             "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
             scripts/convertmodel/test/webgpu_kernel_add.onnx \
-            "$RUNNER_TEMP/public-ep-ort-profile" || true
+            "$RUNNER_TEMP/public-ep-ort-profile"
           test -s "$RUNNER_TEMP/public-ep-profile.json"
           grep -q '"name":"add"' "$RUNNER_TEMP/public-ep-profile.json"
           ls "$RUNNER_TEMP"/public-ep-ort-profile*.json

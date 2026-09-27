@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 static size_t ElementBytes(ONNXTensorElementDataType type) {
@@ -41,7 +43,28 @@ int main(int argc, char** argv) {
                      : ORT_LOGGING_LEVEL_WARNING,
                 "onnxsim-remote-ep-run-test"};
     env.RegisterExecutionProviderLibrary("onnxsim_remote", argv[1]);
-    const auto devices = env.GetEpDevices();
+    // ORT's device discovery runs asynchronously after registration. On
+    // low-core CI runners the refresh thread races session creation and
+    // ORT frees EpDevice-related objects underneath CreateSession (an
+    // indirect call through recycled memory inside libonnxruntime). Poll
+    // the device list until two consecutive snapshots match and our EP
+    // is present, so discovery has demonstrably quiesced before the
+    // session is created; then read the authoritative list.
+    std::string previous_snapshot;
+    std::vector<Ort::ConstEpDevice> devices;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      devices = env.GetEpDevices();
+      std::string snapshot;
+      for (const auto& value : devices) {
+        snapshot += value.EpName();
+        snapshot += ';';
+      }
+      if (snapshot == previous_snapshot &&
+          snapshot.find("onnxsim_remote;") != std::string::npos)
+        break;
+      previous_snapshot = std::move(snapshot);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     if (verbose != nullptr && std::string(verbose) != "0") {
       for (const auto& value : devices)
         std::cerr << "[devices] ep=" << value.EpName() << '\n';
