@@ -870,14 +870,18 @@ def test_onnx_constant_first_mul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
 
 @needs_device
 @pytest.mark.parametrize(
-    "op,x,z,want",
+    "op,filename,shape,x,z,want",
     [
-        ("add", -0.5, 0.25, -0.25),
-        ("mul", 0.5, 0.25, 0.125),
-        ("div", -0.5, 0.5, -1.0),
+        ("add", "add_1x1_x128_y128_z128", (1, 1), -0.5, 0.25, -0.25),
+        ("mul", "mul_1x1_x0_y0_z0", (1, 1), 0.5, 0.25, 0.125),
+        ("div", "div_1x1_x128_y128_z0", (1, 1), -0.5, 0.5, -1.0),
+        ("mul", "mul_1x1_x255_y255_z0", (1, 1), -0.5, 0.25, -0.125),
+        ("mul", "mul_16x1000_x255_y255_z0", (16, 1000), -0.5, 0.25, -0.125),
     ],
 )
-def test_native_binary_shape_templates_run_on_axcl_vm(op, x, z, want, tmp_path):
+def test_native_binary_shape_templates_run_on_axcl_vm(
+    op, filename, shape, x, z, want, tmp_path
+):
     """Run the checked-in native shape templates on the AXCL VM.
 
     These fixtures cover the small/broadcast shapes that are not represented
@@ -894,7 +898,7 @@ def test_native_binary_shape_templates_run_on_axcl_vm(op, x, z, want, tmp_path):
         "axera",
         "fixtures",
         "binary_op_scale_emit",
-        f"{op}_1x1_x{'128_y128_z128' if op == 'add' else '0_y0_z0' if op == 'mul' else '128_y128_z0'}.axmodel.gz",
+        f"{filename}.axmodel.gz",
     )
     with gzip.open(path, "rb") as stream:
         axmodel = stream.read()
@@ -905,11 +909,16 @@ def test_native_binary_shape_templates_run_on_axcl_vm(op, x, z, want, tmp_path):
         try:
             (got,) = session.run(
                 loaded,
-                [np.array([[x]], dtype=np.float32), np.array([[z]], dtype=np.float32)],
+                [
+                    np.full(shape, x, dtype=np.float32),
+                    np.full(shape, z, dtype=np.float32),
+                ],
             )
         finally:
             session.unload(loaded)
-    np.testing.assert_allclose(got, [[want]], atol=0.02, rtol=0)
+    np.testing.assert_allclose(
+        got, np.full(shape, want, dtype=np.float32), atol=0.02, rtol=0
+    )
 
 
 @needs_device

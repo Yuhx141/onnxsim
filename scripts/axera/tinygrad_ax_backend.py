@@ -897,7 +897,7 @@ _ELEMENTWISE_ZP_CLASSES = ("x0,y0", "x128,y128")
 _BINARY_ZP_CLASSES = {
     "Add": ("x0,y0,z0", "x128,y128,z128"),
     "Sub": ("x0,y0,z0", "x128,y128,z128"),
-    "Mul": ("x0,y0,z0", "x128,y128,z128"),
+    "Mul": ("x0,y0,z0", "x128,y128,z128", "x255,y255,z0"),
     "Div": ("x0,y0,z0", "x128,y128,z0"),
 }
 

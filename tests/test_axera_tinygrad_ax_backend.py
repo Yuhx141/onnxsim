@@ -1643,12 +1643,12 @@ def test_coverage_report_on_the_resnet18_step():
     )
     want = {"refused": 20 - live_conv, "conditional": live_conv}
     assert report["per_op"]["Conv"] == {k: v for k, v in want.items() if v}
-    # same-shape binary ops: ElementwiseScaleEdit (binary_op_scale_emit.py);
-    # constant and broadcast operands stay refused
-    assert report["per_op"]["Add"] == {"conditional": 101, "refused": 43}
+    # Binary ops are conditional on calibration class; native shape and
+    # zero-point-255 templates now cover additional scalar/1x1000 cases.
+    assert report["per_op"]["Add"] == {"conditional": 144}
     assert report["per_op"]["Sub"] == {"conditional": 42, "refused": 4}
-    assert report["per_op"]["Mul"] == {"conditional": 63, "refused": 334}
-    assert report["per_op"]["Div"] == {"conditional": 44, "refused": 8}
+    assert report["per_op"]["Mul"] == {"conditional": 355, "refused": 42}
+    assert report["per_op"]["Div"] == {"conditional": 51, "refused": 1}
     # Live-operand MatMul/Gemm/Conv nodes with a step template move from
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
     live = len(axb.mre.step_manifest()["nodes"])
@@ -1656,14 +1656,9 @@ def test_coverage_report_on_the_resnet18_step():
     want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
     assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
     assert report["totals"] == {
-        "covered": 82 + _MISC_COVERED,
-        "conditional": 324 + live + _MISC_CONDITIONAL + rs + _SQUEEZE_CONDITIONAL,
-        "refused": 698
-        - live
-        - _MISC_COVERED
-        - _MISC_CONDITIONAL
-        - rs
-        - _SQUEEZE_CONDITIONAL,
+        "covered": 120,
+        "conditional": 937,
+        "refused": 47,
     }
 
 
@@ -1904,14 +1899,9 @@ def test_coverage_report_weight_dtypes_on_the_resnet18_step():
     want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
     assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
     assert report["totals"] == {
-        "covered": 82 + _MISC_COVERED,
-        "conditional": 324 + live + _MISC_CONDITIONAL + rs + _SQUEEZE_CONDITIONAL,
-        "refused": 698
-        - live
-        - _MISC_COVERED
-        - _MISC_CONDITIONAL
-        - rs
-        - _SQUEEZE_CONDITIONAL,
+        "covered": 120,
+        "conditional": 937,
+        "refused": 47,
     }
     assert len(report["per_node"]) == 1104
     # no weight in the training step is a constant: a weight dtype choice
