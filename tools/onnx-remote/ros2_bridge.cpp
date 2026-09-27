@@ -277,6 +277,7 @@ class OnnxRemoteBridge final : public rclcpp::Node {
     if (!auto_discover_) return;
     const std::string id = json_string(message->data, "runner_id");
     if (id.empty() || id == runner_id_) return;
+    if (json_int(message->data, "schema_version") != 1) return;
     if (json_string(message->data, "transport") != "onnx-remote-v5" ||
         !json_bool(message->data, "ready")) return;
     const std::string target = json_string(message->data, "target");

@@ -239,6 +239,8 @@ Discovery verifies each candidate by querying its native `capabilities`
 operation before selecting it (`verify_discovery:=true` by default). Set it to
 false only when the announced endpoint is intentionally unavailable during
 startup; the first tensor request will then perform the connectivity check.
+Announcements with an unsupported `schema_version` are ignored before any
+endpoint connection is attempted.
 
 The announcing bridge can advertise a Tailscale address or DNS name with
 `advertise_host:=100.x.y.z`. Discovery is only the ROS2 control plane; tensor
