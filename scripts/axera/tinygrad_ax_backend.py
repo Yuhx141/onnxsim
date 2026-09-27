@@ -919,7 +919,12 @@ _ELEMENTWISE_ZP_CLASSES = ("x0,y0", "x128,y128")
 _BINARY_ZP_CLASSES = {
     "Add": ("x0,y0,z0", "x128,y128,z128"),
     "Sub": ("x0,y0,z0", "x128,y128,z128"),
-    "Mul": ("x0,y0,z0", "x128,y128,z128", "x255,y255,z0"),
+    "Mul": (
+        "x0,y0,z0",
+        "x128,y128,z128",
+        "x255,y255,z0",
+        "x115,y115,z0",
+    ),
     "Div": ("x0,y0,z0", "x128,y128,z0", "x255,y255,z0"),
 }
 
@@ -1460,24 +1465,31 @@ def plan_at_calibration(
                         break
             if (
                 op == "Mul"
+                and attrs.get("tile_blocks")
+                and cls in hits
                 and (
                     attrs.get("form") == "const"
                     or attrs.get("flat_blocks")
+                    or attrs.get("tile_layout") == "nchw"
                 )
-                and attrs.get("tile_blocks")
-                and cls == "x0,y0,z0"
-                and cls in hits
             ):
-                if attrs.get("flat_blocks"):
+                if attrs.get("flat_blocks") and cls == "x0,y0,z0":
                     return "covered", (
                         "ElementwiseScaleEdit (x0,y0,z0) flat-1024x512 "
                         f"constant from ({cls})"
                     )
-                tile_side = int(attrs.get("tile_side", 7))
-                return "covered", (
-                    f"ElementwiseScaleEdit (x0,y0,z0) tiled-{tile_side}x{tile_side} "
-                    f"constant from ({cls})"
-                )
+                if attrs.get("tile_layout") == "nchw":
+                    tile_side = int(attrs.get("tile_side", 56))
+                    return "covered", (
+                        f"ElementwiseScaleEdit ({cls}) tiled-{tile_side}x{tile_side} "
+                        "NCHW mask"
+                    )
+                if cls == "x0,y0,z0":
+                    tile_side = int(attrs.get("tile_side", 7))
+                    return "covered", (
+                        f"ElementwiseScaleEdit (x0,y0,z0) tiled-{tile_side}x{tile_side} "
+                        f"constant from ({cls})"
+                    )
             if cls not in hits:
                 # Constant positive Mul operands can use the measured
                 # x128/y128/z128 frame when the result remains unsigned.

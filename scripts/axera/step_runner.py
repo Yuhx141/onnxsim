@@ -417,13 +417,22 @@ def _segment_for(
                 # scale. That is a compiler collision for scale retargeting,
                 # but it is safe to use the native template unchanged when
                 # the flat frame was built at exactly that calibration.
-                if not (
+                exact_template = False
+                if attrs.get("tile_blocks") and op == "Mul":
+                    entry = axb.TemplateCache().lookup(key)
+                    exact_template = all(
+                        abs(float(sc[name]) - float(entry.meta["scales"][name]))
+                        < 1e-7
+                        for name in ("x", "z", "y")
+                    )
+                flat_mask = (
                     attrs.get("flat_blocks")
                     and op == "Mul"
                     and cls == "x0,y0,z0"
                     and float(sc["x"]) == float(sc["y"])
                     and abs(float(sc["z"]) - 1.0 / 255.0) < 1e-7
-                ):
+                )
+                if not (flat_mask or exact_template):
                     return None
                 template_only = True
 
@@ -451,28 +460,52 @@ def _segment_for(
                     if v.name == outs[0]
                 ).type.tensor_type.shape.dim
             )
-            b, _, channels, pixels = original_shape
-            side = math.isqrt(pixels)
-            tiles = side // tile_side
-            batch_split = tiles * tiles
+            if attrs.get("tile_layout") == "nchw":
+                b, channels, height, width = original_shape
+                tiles_y = height // tile_side
+                tiles_x = width // tile_side
+                batch_split = tiles_y * tiles_x
 
-            def tile_input(value, shape=original_shape):
-                expanded = np.broadcast_to(np.asarray(value), shape)
-                x = expanded[:, 0].reshape(b, channels, side, side)
-                return (
-                    x.reshape(b, channels, tiles, tile_side, tiles, tile_side)
-                    .transpose(0, 2, 4, 1, 3, 5)
-                    .reshape(b * tiles * tiles, channels, tile_side, tile_side)
-                )
+                def tile_input(value, shape=original_shape):
+                    expanded = np.broadcast_to(np.asarray(value), shape)
+                    x = expanded.reshape(b, channels, height, width)
+                    return (
+                        x.reshape(
+                            b, channels, tiles_y, tile_side, tiles_x, tile_side
+                        )
+                        .transpose(0, 2, 4, 1, 3, 5)
+                        .reshape(
+                            b * tiles_y * tiles_x, channels, tile_side, tile_side
+                        )
+                    )
 
-            def untile_output(value):
-                x = np.asarray(value).reshape(
-                    b, tiles, tiles, channels, tile_side, tile_side
-                )
-                return (
-                    x.transpose(0, 3, 1, 4, 2, 5)
-                    .reshape(b, 1, channels, pixels)
-                )
+                def untile_output(value):
+                    x = np.asarray(value).reshape(
+                        b, tiles_y, tiles_x, channels, tile_side, tile_side
+                    )
+                    return x.transpose(0, 3, 1, 4, 2, 5).reshape(original_shape)
+            else:
+                b, _, channels, pixels = original_shape
+                side = math.isqrt(pixels)
+                tiles = side // tile_side
+                batch_split = tiles * tiles
+
+                def tile_input(value, shape=original_shape):
+                    expanded = np.broadcast_to(np.asarray(value), shape)
+                    x = expanded[:, 0].reshape(b, channels, side, side)
+                    return (
+                        x.reshape(b, channels, tiles, tile_side, tiles, tile_side)
+                        .transpose(0, 2, 4, 1, 3, 5)
+                        .reshape(b * tiles * tiles, channels, tile_side, tile_side)
+                    )
+
+                def untile_output(value):
+                    x = np.asarray(value).reshape(
+                        b, tiles, tiles, channels, tile_side, tile_side
+                    )
+                    return x.transpose(0, 3, 1, 4, 2, 5).reshape(
+                        b, 1, channels, pixels
+                    )
 
             for tensor in live:
                 input_transforms[tensor] = tile_input
@@ -717,7 +750,9 @@ def build_plan(
         ):
             out_shape = value_shapes.get(rec["outputs"][0], ())
             if out_shape and int(np.prod(out_shape)) > 1024 * 512:
-                qnames = (*rec["inputs"][:2], rec["outputs"][0])
+                # Binary classes are ordered x, y, z while graph inputs are
+                # ordered x, z. Keep the output in the middle here.
+                qnames = (rec["inputs"][0], rec["outputs"][0], rec["inputs"][1])
                 zps = [
                     int(calib["tensors"][t]["zero_point"])
                     for t in qnames
@@ -749,6 +784,34 @@ def build_plan(
                         ) // (1024 * 512)
                         attrs["tile_blocks"] = attrs["flat_blocks"]
                         rec["shapes"] = [flat_template]
+        if (
+            rec["op"] == "Mul"
+            and attrs.get("form") == "same_shape"
+            and len(value_shapes.get(rec["outputs"][0], ())) == 4
+        ):
+            out_shape = value_shapes[rec["outputs"][0]]
+            height, width = out_shape[2:]
+            if height == width and height % 56 == 0:
+                qnames = (rec["inputs"][0], rec["outputs"][0], rec["inputs"][1])
+                if all(t in calib.get("tensors", {}) for t in qnames):
+                    cls = "x{},y{},z{}".format(
+                        *(int(calib["tensors"][t]["zero_point"]) for t in qnames)
+                    )
+                    trial = dict(rec)
+                    trial_attrs = dict(attrs)
+                    trial_attrs["template_shape"] = [out_shape[0], out_shape[1], 56, 56]
+                    trial["attrs"] = trial_attrs
+                    trial["shapes"] = [list(trial_attrs["template_shape"])]
+                    try:
+                        cache.lookup(axb.key_for_record(trial, cls))
+                    except ValueError:
+                        pass
+                    else:
+                        attrs["template_shape"] = [out_shape[0], out_shape[1], 56, 56]
+                        attrs["tile_blocks"] = (height // 56) * (width // 56)
+                        attrs["tile_side"] = 56
+                        attrs["tile_layout"] = "nchw"
+                        rec["shapes"] = [list(attrs["template_shape"])]
         rec["attrs"] = attrs
         planned_records.append(rec)
     # Live MatMul/Conv validation scans the compiled MCode.  The same scan is

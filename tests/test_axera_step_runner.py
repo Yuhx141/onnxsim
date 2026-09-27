@@ -330,15 +330,16 @@ def test_mask_mul_tiled_native_shapes_runs_on_axcl_vm():
             "Mul_364",
             "Mul_450",
             "Mul_451",
+            "Mul_464",
         }
     ]
-    assert len(selected) == 9
+    assert len(selected) == 10
     reference = sr.load_reference()
     with axcl_session.AXSession(subdir="mask_mul_tiled_native_shapes") as session:
         _, stats = sr.StepRunner(model, selected, session, health_every=0).run(
             reference["feeds"], "npu"
         )
-    assert len(stats) == 9
+    assert len(stats) == 10
     for stat in stats:
         assert not stat.error, stat
         assert stat.max_lsb <= 2.01, stat

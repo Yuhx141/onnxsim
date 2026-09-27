@@ -2020,6 +2020,18 @@
   },
   "source": "mul_16x64x56x56_zp0_t"
  },
+ "Mul:16x64x56x56:x115,y115,z0": {
+  "file": "mul_16x64x56x56_x115_y115_z0.axmodel.gz",
+  "op": "Mul",
+  "shape": [16, 64, 56, 56],
+  "scales": {
+   "x": 5.129870987730101e-05,
+   "z": 0.003921568859368563,
+   "y": 5.129870987730101e-05
+  },
+  "zero_points": {"x": 115, "z": 0, "y": 115},
+  "source": "native_shape_probe_correlated_mask_mul_16x64x56x56"
+ },
  "Mul:16x64x56x56:x128,y128,z128": {
   "file": "mul_16x64x56x56_x128_y128_z128.axmodel.gz",
   "op": "Mul",
