@@ -92,12 +92,19 @@ def _max_pool(x: np.ndarray, attrs: dict[str, Any]) -> np.ndarray:
 
 
 class XDNAResNetRunner:
-    def __init__(self, model: Any, manifest: dict[str, Any], cpu_small_m: int = 0):
+    def __init__(
+        self,
+        model: Any,
+        manifest: dict[str, Any],
+        cpu_small_m: int = 0,
+        cpu_backend: str = "numpy",
+    ):
         self.model = model
         self.nodes = list(model.graph.node)
         self.arrays = _values(model)
         self.optimize_small_m = bool(manifest.get("optimize_small_m", False))
         self.cpu_small_m = max(0, int(cpu_small_m))
+        self.cpu_backend = cpu_backend
         self.codegen = build_codegen_plan(
             model, strict=True, optimize_small_m=self.optimize_small_m
         )
@@ -311,21 +318,52 @@ class XDNAResNetRunner:
         if weights is None:
             weights = _centered_int8(wt_raw, wt_zero, f"Conv {plan.node_name} weights")
             self._cpu_weight_cache[index] = weights
-        panels = im2col_nchw(x, plan)
+        panels = im2col_nchw(x, plan) if self.cpu_backend == "numpy" else None
         bias = values[node.input[2]].astype(np.float32).reshape(-1) if len(node.input) > 2 else None
         self._profile["cpu_conv_prepare_ms"] = self._profile.get("cpu_conv_prepare_ms", 0.0) + (time.perf_counter() - stage_start) * 1000.0
         # The configured threshold is intended for batch-1 tiny feature maps,
         # where NumPy's integer GEMM avoids a device launch per Conv.
         batch, out_channels, out_h, out_w = plan.output_shape
         out_per_group = out_channels // plan.groups
-        raw = np.empty(plan.output_shape, dtype=np.float32)
-        for group in range(plan.groups):
-            w = weights[group * out_per_group : (group + 1) * out_per_group]
-            matrix = w.reshape(out_per_group, -1).T.astype(np.int32)
-            acc = panels[group].astype(np.int32) @ matrix
-            raw[:, group * out_per_group : (group + 1) * out_per_group] = acc.reshape(
-                batch, out_h, out_w, out_per_group
-            ).transpose(0, 3, 1, 2)
+        if self.cpu_backend == "torch":
+            # oneDNN's CPU convolution avoids materializing and multiplying a
+            # large int32 im2col matrix. Each centered int8 value is exactly
+            # representable in float32; keep this experimental backend
+            # opt-in because long reductions can round the integer accumulator.
+            import torch
+            import torch.nn.functional as torch_f
+
+            if torch.get_num_threads() > 1:
+                # Small batch-1 feature maps lose more to thread-pool
+                # coordination than they gain from CPU parallelism.
+                torch.set_num_threads(1)
+
+            attrs = _attrs(node)
+            pads = tuple(int(v) for v in attrs.get("pads", (0, 0, 0, 0)))
+            strides = tuple(int(v) for v in attrs.get("strides", (1, 1)))
+            dilations = tuple(int(v) for v in attrs.get("dilations", (1, 1)))
+            tx = torch.from_numpy(np.array(x, copy=True, order="C")).to(torch.float32)
+            tw = torch.from_numpy(np.array(weights, copy=True, order="C")).to(torch.float32)
+            if any(pads):
+                tx = torch_f.pad(tx, (pads[1], pads[3], pads[0], pads[2]))
+            raw = torch_f.conv2d(
+                tx,
+                tw,
+                bias=None,
+                stride=strides,
+                padding=0,
+                dilation=dilations,
+                groups=plan.groups,
+            ).numpy()
+        else:
+            raw = np.empty(plan.output_shape, dtype=np.float32)
+            for group in range(plan.groups):
+                w = weights[group * out_per_group : (group + 1) * out_per_group]
+                matrix = w.reshape(out_per_group, -1).T.astype(np.int32)
+                acc = panels[group].astype(np.int32) @ matrix
+                raw[:, group * out_per_group : (group + 1) * out_per_group] = acc.reshape(
+                    batch, out_h, out_w, out_per_group
+                ).transpose(0, 3, 1, 2)
         raw = raw.astype(np.float32)
         raw *= in_scale * wt_scale
         if bias is not None:
@@ -426,11 +464,20 @@ def main() -> int:
         "--cpu-small-m", type=int, default=0,
         help="run batch-1 Conv layers with at most this many output pixels on CPU",
     )
+    parser.add_argument(
+        "--cpu-backend", choices=("numpy", "torch"), default="numpy",
+        help="CPU implementation for --cpu-small-m (torch uses optimized float32 Conv2d)",
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     model = onnx.load(args.model)
     manifest = json.loads(args.manifest.read_text())
-    runner = XDNAResNetRunner(model, manifest, cpu_small_m=args.cpu_small_m)
+    runner = XDNAResNetRunner(
+        model,
+        manifest,
+        cpu_small_m=args.cpu_small_m,
+        cpu_backend=args.cpu_backend,
+    )
     input_info = model.graph.input[0]
     shape = [int(dim.dim_value) or 1 for dim in input_info.type.tensor_type.shape.dim]
     sample = np.random.default_rng(args.seed).random(shape, dtype=np.float32)
@@ -449,6 +496,7 @@ def main() -> int:
         "backend": "amd_xdna_iron_xrt_resnet_graph",
         "execution": "full_graph_xdna_conv_host_ops" if not args.cpu_small_m else "full_graph_hybrid_conv_host_ops",
         "cpu_small_m_threshold": args.cpu_small_m,
+        "cpu_backend": args.cpu_backend,
         "model": str(args.model),
         "graph_dispatches": runner.codegen.estimated_dispatches,
         "execution_counts": runner._executed,
