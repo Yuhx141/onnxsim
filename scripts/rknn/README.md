@@ -84,6 +84,17 @@ The measured stress results are included in the benchmark report. They are
 intended to expose sustained throughput and memory/clock ceilings, not to
 represent an application model.
 
+Standard ImageNet models can be compiled with:
+
+```bash
+python scripts/rknn/build_rv1106_imagenet.py resnet18.onnx \
+  --output-dir /tmp/luckfox-rv1106-imagenet
+```
+
+The runner supports `--output-format native` for models whose output uses
+RV1106's packed native layout. ResNet-18 and MobileNetV2 measurements are
+recorded in the benchmark report.
+
 Verifies that `onnxsim`'s output still converts and runs through
 [`rknn-toolkit2`](https://pypi.org/project/rknn-toolkit2/), Rockchip's real
 ONNX -> RKNN converter for the RK35xx/RV1106 NPU line -- the same toolchain

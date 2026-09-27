@@ -28,6 +28,7 @@ RKNN_TENSOR_FLOAT32 = 0
 RKNN_TENSOR_INT8 = 2
 RKNN_TENSOR_NCHW = 0
 RKNN_TENSOR_NHWC = 1
+RKNN_TENSOR_NC1HWC2 = 3
 
 
 class RknnInput(ctypes.Structure):
@@ -105,6 +106,7 @@ def main() -> int:
     ap.add_argument("--input-shape", default="1,3,224,224")
     ap.add_argument("--input-type", choices=("int8", "float32"), default="int8")
     ap.add_argument("--input-format", choices=("nchw", "nhwc"), default="nhwc")
+    ap.add_argument("--output-format", choices=("native", "nchw", "nhwc"), default="nhwc")
     ap.add_argument("--inputs", type=int, default=1)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iterations", type=int, default=100)
@@ -171,7 +173,10 @@ def main() -> int:
         if not output_mem:
             raise RuntimeError("rknn_create_mem returned null for output")
         output_attr.type = RKNN_TENSOR_INT8
-        output_attr.fmt = RKNN_TENSOR_NHWC
+        if args.output_format == "native":
+            pass
+        else:
+            output_attr.fmt = RKNN_TENSOR_NHWC if args.output_format == "nhwc" else RKNN_TENSOR_NCHW
         _fail("rknn_set_io_mem(output)", lib.rknn_set_io_mem(
             ctx, output_mem, ctypes.byref(output_attr)))
         for _ in range(args.warmup):

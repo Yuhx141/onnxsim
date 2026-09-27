@@ -54,3 +54,19 @@ the silicon's theoretical peak. The board reports RV1106G3 compatibility and
 the public product specification advertises up to 1 TOPS INT8 for G3; reaching
 that figure will require confirming NPU clock/voltage state and the exact
 Rockchip benchmark methodology.
+## ImageNet reference models
+
+ResNet-18 and MobileNetV2 were downloaded from the ONNX Model Zoo, simplified,
+INT8-calibrated with RKNN-Toolkit2 2.3.2, and executed with zero-copy INT8/NHWC
+input. Output memory used the model's native layout because the ResNet output
+is packed as NC1HWC2 by the RV1106 runtime.
+
+| Model | Approx. operations | Mean ms | Effective throughput | RKNN size |
+| --- | ---: | ---: | ---: | ---: |
+| ResNet-18, 224x224 | 3.63 GOP | 18.73 | 193.8 GOPS | 11.3 MiB |
+| MobileNetV2, 224x224 | 0.86 GOP | 12.94 | 66.3 GOPS | 3.75 MiB |
+
+The dense stress graphs reach about 235 GOPS, so these realistic models leave
+substantial utilization on the table. MobileNetV2 is especially limited by its
+depthwise and pointwise workload mix plus small feature maps, rather than by
+the peak dense-convolution rate.

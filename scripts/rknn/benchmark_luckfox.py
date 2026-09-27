@@ -30,6 +30,7 @@ def main() -> int:
     ap.add_argument("--input-shape", default="1,3,224,224")
     ap.add_argument("--input-type", choices=("int8", "float32"), default="int8")
     ap.add_argument("--input-format", choices=("nchw", "nhwc"), default="nhwc")
+    ap.add_argument("--output-format", choices=("native", "nchw", "nhwc"), default="nhwc")
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iterations", type=int, default=100)
     ap.add_argument("--ssh-option", action="append", default=[])
@@ -49,6 +50,7 @@ def main() -> int:
         "--input-shape", shlex.quote(args.input_shape),
         "--input-type", args.input_type,
         "--input-format", args.input_format,
+        "--output-format", args.output_format,
         "--warmup", str(args.warmup), "--iterations", str(args.iterations),
     ])
     proc = subprocess.run(["ssh", *opts, target, command], check=True,
