@@ -37,7 +37,8 @@ std::atomic<uint64_t> next_request_id{1};
 bool SupportedOp(const std::string& op) {
   if (op != "Identity" && op != "Relu" && op != "Add" && op != "Mul" &&
       op != "Sub" && op != "Div" && op != "Max" && op != "Min" &&
-      op != "Abs" && op != "Neg" && op != "Sqrt") {
+      op != "Abs" && op != "Neg" && op != "Sqrt" && op != "Exp" &&
+      op != "Log" && op != "Tanh") {
     return false;
   }
   const char* configured = std::getenv("ONNXSIM_REMOTE_EP_SUPPORTED_OPS");

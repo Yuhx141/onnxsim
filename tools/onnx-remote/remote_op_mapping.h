@@ -31,6 +31,12 @@ inline std::string remote_operation_name(const std::string &onnx_op) {
     return "neg";
   if (onnx_op == "Sqrt")
     return "sqrt";
+  if (onnx_op == "Exp")
+    return "exp";
+  if (onnx_op == "Log")
+    return "log";
+  if (onnx_op == "Tanh")
+    return "tanh";
   return {};
 }
 

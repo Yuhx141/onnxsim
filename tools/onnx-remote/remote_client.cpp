@@ -44,6 +44,9 @@ static int self_test() {
       {"abs", {-2, 0, 3}, {}, {2, 0, 3}},
       {"neg", {-2, 0, 3}, {}, {2, 0, -3}},
       {"sqrt", {0, 1, 4}, {}, {0, 1, 2}},
+      {"exp", {0, 1, 2}, {}, {1, std::exp(1.0f), std::exp(2.0f)}},
+      {"log", {1, std::exp(1.0f), std::exp(2.0f)}, {}, {0, 1, 2}},
+      {"tanh", {-1, 0, 1}, {}, {-0.76159414f, 0, 0.76159414f}},
   };
   size_t profile_events = 0;
   for (const Operation& operation : operations) {

@@ -20,7 +20,8 @@ struct Options {
   std::string runner_id = "onnxsim-grpc-gateway";
   std::vector<std::string> supported_ops = {"identity", "relu", "add", "mul",
                                             "sub", "div", "max", "min",
-                                            "abs", "neg", "sqrt"};
+                                            "abs", "neg", "sqrt", "exp", "log",
+                                            "tanh"};
   std::string tls_certificate;
   std::string tls_private_key;
   std::string tls_client_ca;

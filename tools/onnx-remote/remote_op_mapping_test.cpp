@@ -15,6 +15,9 @@ int main() {
   assert(remote_operation_name("Abs") == "abs");
   assert(remote_operation_name("Neg") == "neg");
   assert(remote_operation_name("Sqrt") == "sqrt");
+  assert(remote_operation_name("Exp") == "exp");
+  assert(remote_operation_name("Log") == "log");
+  assert(remote_operation_name("Tanh") == "tanh");
   assert(remote_operation_name("Conv").empty());
   assert(remote_operation_name("ai.onnx::Relu").empty());
   return 0;

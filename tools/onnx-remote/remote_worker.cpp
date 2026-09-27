@@ -76,7 +76,8 @@ static Response execute(const Request& r) {
         "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
         "\"runner_id\":\"reference-worker\",\"ready\":true,"
         "\"supported_ops\":[\"identity\",\"relu\",\"add\",\"mul\","
-        "\"sub\",\"div\",\"max\",\"min\",\"abs\",\"neg\",\"sqrt\"],"
+        "\"sub\",\"div\",\"max\",\"min\",\"abs\",\"neg\",\"sqrt\","
+        "\"exp\",\"log\",\"tanh\"],"
         "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\","
         "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\","
         "\"UINT32\",\"INT64\",\"UINT64\",\"DOUBLE\",\"BOOL\","
@@ -99,7 +100,8 @@ static Response execute(const Request& r) {
     execute_op([&] { y = r.inputs[0]; for (float& x : y.data) if (x < 0.0f) x = 0.0f; });
     out.outputs.push_back(std::move(y)); out.ok = true; return out;
   }
-  if (r.op == "abs" || r.op == "neg" || r.op == "sqrt") {
+  if (r.op == "abs" || r.op == "neg" || r.op == "sqrt" ||
+      r.op == "exp" || r.op == "log" || r.op == "tanh") {
     if (r.inputs.size() != 1) {
       out.error = r.op + " expects one input"; return out;
     }
@@ -112,7 +114,10 @@ static Response execute(const Request& r) {
       for (float& x : y.data) {
         if (r.op == "abs") x = std::fabs(x);
         else if (r.op == "neg") x = -x;
-        else x = std::sqrt(x);
+        else if (r.op == "sqrt") x = std::sqrt(x);
+        else if (r.op == "exp") x = std::exp(x);
+        else if (r.op == "log") x = std::log(x);
+        else x = std::tanh(x);
       }
     });
     out.outputs.push_back(std::move(y)); out.ok = true; return out;
