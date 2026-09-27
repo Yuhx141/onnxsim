@@ -4,7 +4,13 @@ import json
 from pathlib import Path
 
 
-MANIFEST = Path(__file__).parents[1] / "tools" / "onnx-remote" / "ort_plugin" / "onnxsim_remote_ep.manifest.json"
+MANIFEST = (
+    Path(__file__).parents[1]
+    / "tools"
+    / "onnx-remote"
+    / "ort_plugin"
+    / "onnxsim_remote_ep.manifest.json"
+)
 
 
 def test_remote_ep_manifest_is_explicit_about_legacy_abi():

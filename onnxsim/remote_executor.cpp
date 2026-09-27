@@ -125,7 +125,8 @@ class RemoteModelExecutor final : public ModelExecutor {
     for (const DLManagedTensor* input : inputs) {
       if (input == nullptr || input->dl_tensor.ndim < 0 ||
           (input->dl_tensor.ndim > 0 && input->dl_tensor.shape == nullptr)) {
-        throw std::runtime_error("remote executor received invalid input tensor");
+        throw std::runtime_error(
+            "remote executor received invalid input tensor");
       }
       const DLTensor& tensor = input->dl_tensor;
       int32_t onnx_dtype = 0;
@@ -145,14 +146,16 @@ class RemoteModelExecutor final : public ModelExecutor {
         if (tensor.shape[i] <= 0 ||
             static_cast<uint64_t>(tensor.shape[i]) >
                 std::numeric_limits<size_t>::max() / element_count) {
-          throw std::runtime_error("remote executor received invalid input shape");
+          throw std::runtime_error(
+              "remote executor received invalid input shape");
         }
         element_count *= static_cast<size_t>(tensor.shape[i]);
       }
       const size_t element_bytes = onnxsim::dlpack::SizeOf(tensor.dtype);
       if (element_bytes == 0 ||
           element_count > std::numeric_limits<size_t>::max() / element_bytes) {
-        throw std::runtime_error("remote executor received oversized input tensor");
+        throw std::runtime_error(
+            "remote executor received oversized input tensor");
       }
       const size_t nbytes = element_count * element_bytes;
       if (nbytes != 0 && tensor.data == nullptr) {
@@ -211,8 +214,8 @@ class RemoteModelExecutor final : public ModelExecutor {
             "remote executor returned an oversized output shape");
       }
       if (output.dtype == onnx::TensorProto::FLOAT &&
-          output.data.size() > std::numeric_limits<size_t>::max() /
-                                   sizeof(float)) {
+          output.data.size() >
+              std::numeric_limits<size_t>::max() / sizeof(float)) {
         throw std::runtime_error(
             "remote executor returned an oversized float output");
       }
@@ -251,8 +254,7 @@ class RemoteModelExecutor final : public ModelExecutor {
     if (graph_execution_checked_.load(std::memory_order_acquire)) return;
     onnx_remote::Request probe;
     probe.op = "capabilities";
-    probe.request_id =
-        next_request_id.fetch_add(1, std::memory_order_relaxed);
+    probe.request_id = next_request_id.fetch_add(1, std::memory_order_relaxed);
     const onnx_remote::Response response =
         Exchange(probe, options_.host, options_.port, "capabilities");
     onnx_remote::CapabilitySummary summary;
