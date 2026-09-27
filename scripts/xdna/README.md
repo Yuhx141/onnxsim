@@ -133,14 +133,14 @@ launches; CPU Conv execution remains its largest cost. Closing the gap
 requires graph-level XDNA fusion and moving the
 intermediate QDQ/residual operations into the device program, like Vitis does.
 
-An experimental IRON program now fuses one supported identity bottleneck on
-device: three 3×3/1×1 Conv stages, their QDQ/requantization, residual Add, and
-ReLU. It is currently specialized for the quicktest model's
-`/layer1/layer1.1` block (NPU2, 8×8×256 input, 64 inner channels, fixed
-quantization). Compile it and pass its artifacts to the graph runner:
+An experimental IRON program now fuses supported identity bottlenecks on
+device: three Conv stages (1×1, 3×3, 1×1), their QDQ/requantization, residual Add, and
+ReLU. The compiler can derive dimensions and requantization shifts from an ONNX
+block and can also accept explicit dimensions for a new specialization:
 
 ```bash
 python3 scripts/xdna/fused_bottleneck_design.py --dev npu2 \
+  --model resnet.onnx --block /layer1/layer1.1 \
   --xclbin-path layer1_1-fused.xclbin --insts-path layer1_1-fused.insts.bin
 python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
   --cpu-small-m 64 --cpu-backend torch --cpu-threads 2 \
@@ -149,19 +149,24 @@ python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
   --fused-block-insts layer1_1-fused.insts.bin --warmup 2 --iters 10
 ```
 
-The fused block matched the ONNX Runtime quantized boundary exactly in an
-isolated check. In a full quicktest graph run it also preserved exact final
-output agreement; the graph reported one fused block, 49 CPU Conv calls, one
-XDNA Conv call, and 201 host operators. Three warmed runs averaged 24.1 ms,
-with 4.6 ms attributed to the fused block including its call and readback.
-This is an executable correctness milestone, not a graph-wide speedup: the
-kernel is a scalar integer implementation and only one identity block is
-lowered this way. Remaining fusion work includes optimizing this kernel,
-supporting downsample/stride-changing residual blocks and other shapes or
-quantization layouts, and replacing per-node CPU/host execution with a generic
-graph-region compiler and scheduler. The existing 91-dispatch graph schedule
-is still planning metadata; the runner does not yet turn those regions into
-one executable XDNA program.
+It matched both `/layer1/layer1.1` and `/layer1/layer1.2` exactly at their
+quantized boundaries, including their different requantization shifts and
+residual scale ratios. Explicit 4×4 spatial specialization also compiles.
+The generalized binder accepts batch-one identity blocks with height at least
+3, 1×1/3×3/1×1 kernels, symmetric padding, even inner channels, uint8 activations with zero
+point 128, int8 weights, and power-of-two requantization ratios. The graph
+runner can compose multiple non-overlapping blocks in one run by repeating
+`--fused-block PREFIX XCLBIN INSTS`. The quicktest graph ran with both layer1
+identity blocks fused and retained exact ONNX Runtime output; the execution
+counts dropped to 46 CPU Conv calls, one XDNA Conv call, and 194 host ops.
+
+The current NPU2 data mover limits each stage's static weight descriptor to
+65,532 bytes; larger channel configurations such as `/layer2/layer2.1` are
+rejected during binding. Split weight streaming is needed to go beyond that
+limit. Downsample/stride-changing residual blocks and non-power-of-two scales
+are also unsupported. This is not yet a graph-wide speedup: the scalar
+integer kernel is a correctness baseline, and the existing 91-dispatch graph
+schedule remains planning metadata rather than one executable XDNA program.
 
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
 hybrid Conv layers and skips their unused im2col staging. Converted constant

@@ -16,6 +16,12 @@
 #ifndef FUSED_MID
 #error "FUSED_MID must be defined"
 #endif
+#ifndef FUSED_RESIDUAL_SHIFT
+#error "FUSED_RESIDUAL_SHIFT must be defined"
+#endif
+#ifndef FUSED_INPUT_SHIFT
+#error "FUSED_INPUT_SHIFT must be defined"
+#endif
 
 static int32_t round_shift_even(int32_t value, int shift) {
   if (shift <= 0)
@@ -28,6 +34,22 @@ static int32_t round_shift_even(int32_t value, int shift) {
   if (remainder > halfway || (remainder == halfway && (quotient & 1)))
     ++quotient;
   return wide < 0 ? -(int32_t)quotient : (int32_t)quotient;
+}
+
+static int64_t round_shift_even64(int64_t value, int shift) {
+  if (shift <= 0)
+    return value;
+  uint64_t magnitude = value < 0 ? (uint64_t)(-value) : (uint64_t)value;
+  uint64_t quotient = magnitude >> shift;
+  uint64_t remainder = magnitude & ((((uint64_t)1) << shift) - 1);
+  uint64_t halfway = ((uint64_t)1) << (shift - 1);
+  if (remainder > halfway || (remainder == halfway && (quotient & 1)))
+    ++quotient;
+  return value < 0 ? -(int64_t)quotient : (int64_t)quotient;
+}
+
+static int64_t scale_pow2(int32_t value, int exponent, int common_shift) {
+  return ((int64_t)value) * (((int64_t)1) << (exponent + common_shift));
 }
 
 extern "C" void fused_bottleneck_conv1_row(const int8_t *input,
@@ -102,7 +124,12 @@ extern "C" void fused_bottleneck_conv3_residual_row(const uint8_t *main_input0,
         q3 = 0;
       else if (q3 > 255)
         q3 = 255;
-      int32_t value = 4 * (q3 - 128) + residual[x * FUSED_C + oc];
+      const int common_shift = FUSED_RESIDUAL_SHIFT < FUSED_INPUT_SHIFT
+                                   ? (FUSED_RESIDUAL_SHIFT < 0 ? -FUSED_RESIDUAL_SHIFT : 0)
+                                   : (FUSED_INPUT_SHIFT < 0 ? -FUSED_INPUT_SHIFT : 0);
+      int64_t sum = scale_pow2(q3 - 128, FUSED_RESIDUAL_SHIFT, common_shift) +
+                    scale_pow2(residual[x * FUSED_C + oc], FUSED_INPUT_SHIFT, common_shift);
+      int64_t value = round_shift_even64(sum, common_shift);
       if (value < 0)
         value = 0;
       else if (value > 127)

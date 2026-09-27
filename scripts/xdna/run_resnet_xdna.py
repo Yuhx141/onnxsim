@@ -108,6 +108,7 @@ class XDNAResNetRunner:
         fused_block_prefix: str | None = None,
         fused_block_xclbin: str | None = None,
         fused_block_insts: str | None = None,
+        fused_blocks: list[tuple[str, str, str]] | None = None,
     ):
         self.model = model
         self.nodes = list(model.graph.node)
@@ -179,42 +180,53 @@ class XDNAResNetRunner:
         self._packed_weight_cache: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
         self._cpu_weight_cache: dict[int, np.ndarray] = {}
         self._torch_weight_cache: dict[int, Any] = {}
-        self._fused_block_binding: dict[str, Any] | None = None
-        self._fused_block_nodes: set[int] = set()
-        self._fused_block_start: int | None = None
-        self._fused_block_input = None
-        self._fused_block_parameters = None
-        self._fused_block_output = None
+        fused_specs = list(fused_blocks or ())
         if any((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
             if not all((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
                 raise ValueError("fused block requires its node prefix, xclbin, and instruction stream")
+            fused_specs.append((fused_block_prefix, fused_block_xclbin, fused_block_insts))
+        self._fused_blocks: dict[str, dict[str, Any]] = {}
+        self._fused_nodes: dict[int, tuple[str, bool]] = {}
+        if fused_specs:
+            import aie.iron as iron
+
+        for prefix, xclbin, insts in fused_specs:
+            if prefix in self._fused_blocks:
+                raise ValueError(f"fused block {prefix!r} was specified more than once")
             block = next(
-                (item for item in plan_bottleneck_blocks(model) if item.prefix == fused_block_prefix),
+                (item for item in plan_bottleneck_blocks(model) if item.prefix == prefix),
                 None,
             )
             if block is None:
-                raise ValueError(f"no bottleneck block found for prefix {fused_block_prefix!r}")
-            if not Path(fused_block_xclbin).is_file() or not Path(fused_block_insts).is_file():
+                raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
+            if not Path(xclbin).is_file() or not Path(insts).is_file():
                 raise ValueError("fused block xclbin and instruction stream must exist")
-            self._fused_block_binding = bind_fused_bottleneck(model, block)
-            self._fused_block_nodes = set(self._fused_block_binding["covered_nodes"])
-            self._fused_block_start = min(self._fused_block_nodes)
-            import aie.iron as iron
-
-            input_shape = self._fused_block_binding["input_shape"]
-            output_shape = self._fused_block_binding["output_shape"]
+            binding = bind_fused_bottleneck(model, block)
+            covered = set(binding["covered_nodes"])
+            start_index = min(covered)
+            if any(index in self._fused_nodes for index in covered):
+                raise ValueError(f"fused block {prefix!r} overlaps another fused block")
+            input_shape = binding["input_shape"]
+            output_shape = binding["output_shape"]
             input_count = int(np.prod(input_shape))
             output_count = int(np.prod(output_shape))
-            self._fused_block_input = iron.tensor(
+            block_input = iron.tensor(
                 np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu"
             )
-            self._fused_block_parameters = iron.tensor(
-                self._fused_block_binding["params"], dtype=np.uint8, device="npu"
+            block_parameters = iron.tensor(
+                binding["params"], dtype=np.uint8, device="npu"
             )
-            self._fused_block_output = iron.zeros(output_count, dtype=np.int8, device="npu")
-            self._fused_block_kernel = self._kernel(
-                str(fused_block_xclbin), str(fused_block_insts)
-            )
+            block_output = iron.zeros(output_count, dtype=np.int8, device="npu")
+            self._fused_blocks[prefix] = {
+                "binding": binding,
+                "start": start_index,
+                "input": block_input,
+                "parameters": block_parameters,
+                "output": block_output,
+                "kernel": self._kernel(str(xclbin), str(insts)),
+            }
+            for index in covered:
+                self._fused_nodes[index] = (prefix, index == start_index)
 
     def _quant_source(self, value_name: str, values: dict[str, np.ndarray]) -> tuple[np.ndarray, float, int]:
         dq = self.nodes_by_output.get(value_name)
@@ -437,10 +449,8 @@ class XDNAResNetRunner:
         })
         return output
 
-    def _run_fused_bottleneck(self, values: dict[str, np.ndarray]) -> None:
-        binding = self._fused_block_binding
-        if binding is None:
-            raise RuntimeError("fused bottleneck was dispatched without a binding")
+    def _run_fused_bottleneck(self, values: dict[str, np.ndarray], block: dict[str, Any]) -> None:
+        binding = block["binding"]
         total_start = time.perf_counter()
         start = total_start
         activation = np.asarray(values[binding["input_raw_name"]])
@@ -451,7 +461,7 @@ class XDNAResNetRunner:
         )
         nchw_shape = tuple(int(value) for value in binding["input_shape"])
         channel_last = centered.reshape(nchw_shape).transpose(0, 2, 3, 1).copy().reshape(-1)
-        with self._fused_block_input.overwrite() as host_input:
+        with block["input"].overwrite() as host_input:
             np.copyto(host_input, channel_last)
         self._profile["fused_bottleneck_input_prep_ms"] = (
             self._profile.get("fused_bottleneck_input_prep_ms", 0.0)
@@ -459,11 +469,7 @@ class XDNAResNetRunner:
         )
 
         launch_start = time.perf_counter()
-        self._fused_block_kernel(
-            self._fused_block_input,
-            self._fused_block_parameters,
-            self._fused_block_output,
-        )
+        block["kernel"](block["input"], block["parameters"], block["output"])
         self._profile["fused_bottleneck_kernel_call_ms"] = (
             self._profile.get("fused_bottleneck_kernel_call_ms", 0.0)
             + (time.perf_counter() - launch_start) * 1000.0
@@ -472,7 +478,7 @@ class XDNAResNetRunner:
         read_start = time.perf_counter()
         output_shape = tuple(int(value) for value in binding["output_shape"])
         output = (
-            self._fused_block_output.numpy()
+            block["output"].numpy()
             .view(np.uint8)
             .reshape(output_shape[0], output_shape[2], output_shape[3], output_shape[1])
             .transpose(0, 3, 1, 2)
@@ -510,9 +516,10 @@ class XDNAResNetRunner:
         values = dict(self.arrays)
         values.update(inputs)
         for index, node in enumerate(self.nodes):
-            if index in self._fused_block_nodes:
-                if index == self._fused_block_start:
-                    self._run_fused_bottleneck(values)
+            if index in self._fused_nodes:
+                prefix, is_start = self._fused_nodes[index]
+                if is_start:
+                    self._run_fused_bottleneck(values, self._fused_blocks[prefix])
                 continue
             if index in self._precomputed_relu_nodes:
                 continue
@@ -598,6 +605,10 @@ def main() -> int:
     parser.add_argument("--fused-block-prefix", help="fuse one supported identity bottleneck, e.g. /layer1/layer1.1")
     parser.add_argument("--fused-block-xclbin", type=Path)
     parser.add_argument("--fused-block-insts", type=Path)
+    parser.add_argument(
+        "--fused-block", nargs=3, action="append", metavar=("PREFIX", "XCLBIN", "INSTS"),
+        help="add a fused bottleneck specialization; repeat to fuse multiple blocks",
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     model = onnx.load(args.model)
@@ -611,6 +622,7 @@ def main() -> int:
         fused_block_prefix=args.fused_block_prefix,
         fused_block_xclbin=str(args.fused_block_xclbin) if args.fused_block_xclbin else None,
         fused_block_insts=str(args.fused_block_insts) if args.fused_block_insts else None,
+        fused_blocks=[(prefix, xclbin, insts) for prefix, xclbin, insts in (args.fused_block or [])],
     )
     input_info = model.graph.input[0]
     shape = [int(dim.dim_value) or 1 for dim in input_info.type.tensor_type.shape.dim]
@@ -628,10 +640,12 @@ def main() -> int:
     avg_ms = elapsed_ms / args.iters
     result = {
         "backend": "amd_xdna_iron_xrt_resnet_graph",
-        "execution": "full_graph_with_fused_bottleneck" if args.fused_block_prefix else (
+        "execution": "full_graph_with_fused_bottleneck" if (args.fused_block_prefix or args.fused_block) else (
             "full_graph_xdna_conv_host_ops" if not args.cpu_small_m else "full_graph_hybrid_conv_host_ops"
         ),
         "fused_block_prefix": args.fused_block_prefix,
+        "fused_blocks": [prefix for prefix, _xclbin, _insts in (args.fused_block or [])]
+        + ([args.fused_block_prefix] if args.fused_block_prefix else []),
         "cpu_small_m_threshold": args.cpu_small_m,
         "cpu_backend": args.cpu_backend,
         "cpu_threads": args.cpu_threads if args.cpu_backend == "torch" else None,

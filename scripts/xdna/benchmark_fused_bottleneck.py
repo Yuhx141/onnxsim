@@ -33,6 +33,17 @@ def _power_of_two_shift(ratio: float, label: str) -> int:
     return shift
 
 
+def _power_of_two_exponent(ratio: float, label: str) -> int:
+    exponent = round(math.log2(ratio))
+    if not math.isclose(ratio, 2.0**exponent, rel_tol=1e-6) or not -30 <= exponent <= 30:
+        raise ValueError(f"{label}: ratio {ratio} is not a supported power of two")
+    return exponent
+
+
+def _align4(value: int) -> int:
+    return (value + 3) & ~3
+
+
 def _quantizer_after(value: str, nodes: list[Any], consumers: dict[str, list[int]], edges: dict[str, QDQEdge]) -> QDQEdge:
     pending = [value]
     visited: set[str] = set()
@@ -58,12 +69,25 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     conv_nodes = [nodes[index] for index in conv_indices]
     if block.skip_conv_index is not None:
         raise ValueError("the first fused implementation only supports identity residual blocks")
-    if tuple(int(v) for v in block.conv_plans[0].input_shape[2:]) != (8, 8):
-        raise ValueError("the first fused implementation is specialized for 8x8 identity blocks")
-    channels = block.conv_plans[0].input_shape[1]
-    mid_channels = block.conv_plans[1].weight_shape[0]
-    if channels != 256 or mid_channels != 64:
-        raise ValueError(f"unsupported block channels {channels}->{mid_channels}->{channels}")
+    input_shape = tuple(int(v) for v in block.conv_plans[0].input_shape)
+    output_shape = tuple(int(v) for v in block.conv_plans[2].output_shape)
+    batch, channels, height, width = input_shape
+    mid_channels = int(block.conv_plans[1].weight_shape[0])
+    if batch != 1 or output_shape != input_shape:
+        raise ValueError("fused identity blocks require batch one and equal input/output shapes")
+    if height < 3 or width < 1 or mid_channels < 2 or mid_channels % 2:
+        raise ValueError("fused block dimensions require H>=3, W>=1, and an even inner channel count")
+    if (block.conv_plans[0].weight_shape[2:] != (1, 1)
+            or block.conv_plans[1].weight_shape[2:] != (3, 3)
+            or block.conv_plans[2].weight_shape[2:] != (1, 1)):
+        raise ValueError("supported bottleneck kernels are 1x1, 3x3, 1x1")
+    if any(tuple(plan.stride) != (1, 1) or tuple(plan.dilation) != (1, 1) or plan.groups != 1
+           for plan in block.conv_plans[:3]):
+        raise ValueError("identity bottleneck convolutions require stride/dilation one and group one")
+    if tuple(block.conv_plans[1].pads) != (1, 1, 1, 1):
+        raise ValueError("the 3x3 bottleneck convolution requires symmetric one-pixel padding")
+    if any(tuple(plan.pads) != (0, 0, 0, 0) for plan in (block.conv_plans[0], block.conv_plans[2])):
+        raise ValueError("the 1x1 bottleneck convolutions must not use padding")
 
     consumers: dict[str, list[int]] = {}
     for index, node in enumerate(nodes):
@@ -80,6 +104,18 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     input_edge = edges.get(str(conv_nodes[0].input[0]))
     if input_edge is None or input_edge.op_type != "DequantizeLinear":
         raise ValueError("block activation must have a static DequantizeLinear input")
+    add_inputs = [edges.get(str(name)) for name in add_node.input]
+    if not any(
+        edge is not None and edge.op_type == "DequantizeLinear" and edge.input_name == input_edge.input_name
+        for edge in add_inputs
+    ):
+        raise ValueError("identity residual Add must consume the original block activation")
+    if not any(
+        edge is not None and edge.op_type == "DequantizeLinear"
+        and edge.input_name == quantizers[2].output_name
+        for edge in add_inputs
+    ):
+        raise ValueError("residual Add must consume the third Conv's quantized output")
     input_scale, input_zero = _single_q_params(input_edge, "block input")
     if input_zero != 128 or input_edge.params.dtype != "u8":
         raise ValueError("the fused block currently requires uint8 activations with zero point 128")
@@ -126,12 +162,10 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     conv3_scale, conv3_zero = _single_q_params(quantizers[2], "conv3 output")
     if final_zero != 128 or conv3_zero != 128:
         raise ValueError("the fused residual requires uint8 output zero point 128")
-    residual_factor = conv3_scale / final_scale
-    input_factor = input_scale / final_scale
-    if not math.isclose(residual_factor, 4.0, rel_tol=1e-6) or not math.isclose(input_factor, 1.0, rel_tol=1e-6):
-        raise ValueError("residual requantization does not match the fused integer residual expression")
-    if tuple(shifts) != (5, 8, 7):
-        raise ValueError(f"compiled kernel requires requantization shifts (5, 8, 7), got {tuple(shifts)}")
+    residual_shift = _power_of_two_exponent(conv3_scale / final_scale, "residual branch scale ratio")
+    input_shift = _power_of_two_exponent(input_scale / final_scale, "identity branch scale ratio")
+    if max(abs(residual_shift), abs(input_shift)) > 8:
+        raise ValueError("residual scale exponents outside [-8, 8] are not supported")
     final_dequantizer = next(
         (
             edge for edge in edges.values()
@@ -145,12 +179,22 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     # The C kernel consumes OIHW int8 weights and accumulator-domain int32 bias.
     w1, w2, w3 = weight_arrays
     b1, b2, b3 = bias_accumulators
+    stage_sizes = (
+        _align4(w1.nbytes) + b1.nbytes,
+        _align4(w2.nbytes) + b2.nbytes,
+        _align4(w3.nbytes) + b3.nbytes,
+    )
+    if any(size > 65532 for size in stage_sizes):
+        raise ValueError(
+            "a fused weight stage exceeds the NPU2 65532-byte DMA descriptor limit; "
+            f"stage sizes are {stage_sizes}"
+        )
     w1_offset = 0
-    b1_offset = w1.nbytes
+    b1_offset = w1_offset + _align4(w1.nbytes)
     w2_offset = b1_offset + b1.nbytes
-    b2_offset = w2_offset + w2.nbytes
+    b2_offset = w2_offset + _align4(w2.nbytes)
     w3_offset = b2_offset + b2.nbytes
-    b3_offset = w3_offset + w3.nbytes
+    b3_offset = w3_offset + _align4(w3.nbytes)
     parameter_bytes = b3_offset + b3.nbytes
     params = np.zeros(parameter_bytes, dtype=np.uint8)
     params[w1_offset : w1_offset + w1.nbytes] = w1.view(np.uint8).reshape(-1)
@@ -180,12 +224,14 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         "output_dequant_name": final_dequantizer.output_name,
         "output_scale": final_scale,
         "output_zero_point": final_zero,
-        "input_shape": block.conv_plans[0].input_shape,
-        "output_shape": block.conv_plans[2].output_shape,
+        "input_shape": input_shape,
+        "output_shape": output_shape,
         "covered_nodes": covered,
         "quantizers": quantizers,
         "final_quantizer": final_quantizer,
         "offsets": (w1_offset, b1_offset, w2_offset, b2_offset, w3_offset, b3_offset),
+        "residual_shift": residual_shift,
+        "input_shift": input_shift,
     }
 
 

@@ -17,6 +17,10 @@ from aie.utils.hostruntime.cli import run_design_cli
 _KERNEL = Path(__file__).with_name("kernels") / "fused_identity_bottleneck.cc"
 
 
+def _align4(value: int) -> int:
+    return (value + 3) & ~3
+
+
 @iron.jit
 def fused_identity_bottleneck(
     activation: In,
@@ -30,6 +34,8 @@ def fused_identity_bottleneck(
     shift1: CompileTime[int] = 5,
     shift2: CompileTime[int] = 8,
     shift3: CompileTime[int] = 7,
+    residual_shift: CompileTime[int] = 2,
+    input_shift: CompileTime[int] = 0,
 ):
     pixels = width * height
     weight1_bytes = channels * mid_channels
@@ -38,9 +44,12 @@ def fused_identity_bottleneck(
     bias2_bytes = mid_channels * 4
     weight3_bytes = mid_channels * channels
     bias3_bytes = channels * 4
-    parameter1_bytes = weight1_bytes + bias1_bytes
-    parameter2_bytes = weight2_bytes + bias2_bytes
-    parameter3_bytes = weight3_bytes + bias3_bytes
+    bias1_offset = _align4(weight1_bytes)
+    bias2_offset = _align4(weight2_bytes)
+    bias3_offset = _align4(weight3_bytes)
+    parameter1_bytes = bias1_offset + bias1_bytes
+    parameter2_bytes = bias2_offset + bias2_bytes
+    parameter3_bytes = bias3_offset + bias3_bytes
     total_parameter_bytes = parameter1_bytes + parameter2_bytes + parameter3_bytes
 
     activation_full_ty = np.ndarray[(pixels * channels,), np.dtype[np.int8]]
@@ -62,9 +71,11 @@ def fused_identity_bottleneck(
         f"-DFUSED_SHIFT1={shift1}",
         f"-DFUSED_SHIFT2={shift2}",
         f"-DFUSED_SHIFT3={shift3}",
-        f"-DFUSED_BIAS1_OFFSET={weight1_bytes}",
-        f"-DFUSED_BIAS2_OFFSET={weight2_bytes}",
-        f"-DFUSED_BIAS3_OFFSET={weight3_bytes}",
+        f"-DFUSED_RESIDUAL_SHIFT={residual_shift}",
+        f"-DFUSED_INPUT_SHIFT={input_shift}",
+        f"-DFUSED_BIAS1_OFFSET={bias1_offset}",
+        f"-DFUSED_BIAS2_OFFSET={bias2_offset}",
+        f"-DFUSED_BIAS3_OFFSET={bias3_offset}",
     ]
     conv1_kernel = ExternalFunction(
         "fused_bottleneck_conv1_row",
@@ -208,11 +219,62 @@ def fused_identity_bottleneck(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     add_compile_args(parser)
+    parser.add_argument("--width", type=int, default=8)
+    parser.add_argument("--height", type=int, default=8)
+    parser.add_argument("--channels", type=int, default=256)
+    parser.add_argument("--mid-channels", type=int, default=64)
+    parser.add_argument("--shift1", type=int, default=5)
+    parser.add_argument("--shift2", type=int, default=8)
+    parser.add_argument("--shift3", type=int, default=7)
+    parser.add_argument("--residual-shift", type=int, default=2)
+    parser.add_argument("--input-shift", type=int, default=0)
+    parser.add_argument("--model", type=Path, help="derive compile parameters from an ONNX model and block")
+    parser.add_argument("--block", help="bottleneck node-name prefix to compile from --model")
     return parser
 
 
-def _compile_kwargs(_opts):
-    return {}
+def _compile_kwargs(opts):
+    if opts.model is not None or opts.block is not None:
+        if opts.model is None or opts.block is None:
+            raise ValueError("--model and --block must be used together")
+        import onnx
+
+        try:
+            from .benchmark_fused_bottleneck import bind_fused_bottleneck
+            from .resnet_bottleneck import plan_bottleneck_blocks
+        except ImportError:
+            from benchmark_fused_bottleneck import bind_fused_bottleneck
+            from resnet_bottleneck import plan_bottleneck_blocks
+        model = onnx.load(opts.model)
+        block = next((item for item in plan_bottleneck_blocks(model) if item.prefix == opts.block), None)
+        if block is None:
+            raise ValueError(f"no bottleneck block found for {opts.block!r}")
+        binding = bind_fused_bottleneck(model, block)
+        height, width = binding["input_shape"][2:]
+        channels = binding["input_shape"][1]
+        mid_channels = binding["block"].conv_plans[1].weight_shape[0]
+        return {
+            "width": width,
+            "height": height,
+            "channels": channels,
+            "mid_channels": mid_channels,
+            "shift1": binding["shifts"][0],
+            "shift2": binding["shifts"][1],
+            "shift3": binding["shifts"][2],
+            "residual_shift": binding["residual_shift"],
+            "input_shift": binding["input_shift"],
+        }
+    return {
+        "width": opts.width,
+        "height": opts.height,
+        "channels": opts.channels,
+        "mid_channels": opts.mid_channels,
+        "shift1": opts.shift1,
+        "shift2": opts.shift2,
+        "shift3": opts.shift3,
+        "residual_shift": opts.residual_shift,
+        "input_shift": opts.input_shift,
+    }
 
 
 def main() -> None:
