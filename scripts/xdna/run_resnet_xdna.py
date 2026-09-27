@@ -33,7 +33,7 @@ except ImportError:  # executed directly as a script
 
 @dataclass
 class _DeviceValue:
-    """A raw quantized edge retained in an XRT allocation in HWC order."""
+    """A graph edge retained in an XRT allocation with a known memory layout."""
 
     tensor: Any
     shape: tuple[int, ...]
@@ -41,6 +41,7 @@ class _DeviceValue:
     zero_point: int
     as_real: bool = False
     producer: str = ""
+    layout: str = "nhwc"
 
 
 def _attrs(node: Any) -> dict[str, Any]:
@@ -188,12 +189,13 @@ class XDNAResNetRunner:
             for entry in manifest.get("operation_kernels", [])
             if entry.get("op_type") == "MaxPool" and entry.get("compiled_artifact")
         }
-        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
+        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "device_resident_pool_outputs": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
         self._profile: dict[str, float] = {}
         self._device_readback_cache: dict[int, np.ndarray] = {}
         self._conv_times: list[dict[str, Any]] = []
         self._fused_times: list[dict[str, Any]] = []
         self._workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
+        self._maxpool_workspace_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
         # ONNX weights are constants. Keep their padded GEMM layout so steady
         # state inference only packs the changing activation matrix.
         self._packed_weight_cache: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
@@ -288,13 +290,13 @@ class XDNAResNetRunner:
         if raw is None:
             started = time.perf_counter()
             n, c, h, w = value.shape
-            raw = (
-                value.tensor.numpy()
-                .view(np.uint8)
-                .reshape(n, h, w, c)
-                .transpose(0, 3, 1, 2)
-                .copy()
-            )
+            device_data = value.tensor.numpy()
+            if value.layout == "nhwc":
+                raw = device_data.view(np.uint8).reshape(n, h, w, c).transpose(0, 3, 1, 2).copy()
+            elif value.layout == "nchw":
+                raw = device_data.reshape(value.shape).copy()
+            else:
+                raise ValueError(f"unsupported device tensor layout {value.layout!r}")
             self._device_readback_cache[cache_key] = raw
             self._executed["device_edge_readbacks"] += 1
             self._profile["device_edge_readback_ms"] = self._profile.get("device_edge_readback_ms", 0.0) + (time.perf_counter() - started) * 1000.0
@@ -351,8 +353,8 @@ class XDNAResNetRunner:
         from aie.utils import NPUKernel
         return NPUKernel(xclbin, insts)
 
-    def _run_maxpool_kernel(self, index: int, x: np.ndarray) -> np.ndarray:
-        """Pad an NCHW activation on the host and execute its compiled pool kernel."""
+    def _run_maxpool_kernel(self, index: int, x: np.ndarray) -> _DeviceValue:
+        """Upload padded NCHW input and retain the pooling result in XRT memory."""
         import aie.iron as iron
         from aie.iron.device import from_name
 
@@ -371,19 +373,24 @@ class XDNAResNetRunner:
         if padded.shape != expected:
             raise ValueError(f"compiled MaxPool node {index} expects padded input {expected}, got {padded.shape}")
         output_shape = (1, int(params["channels"]), int(params["output_height"]), int(params["output_width"]))
-        input_tensor = iron.tensor(padded.reshape(-1), dtype=np.float32, device="npu")
-        output_tensor = iron.tensor(np.empty(math.prod(output_shape), dtype=np.float32), dtype=np.float32, device="npu")
+        workspace_key = (str(artifact["xclbin"]), str(artifact["insts"]), expected, output_shape)
+        workspaces = self._maxpool_workspace_cache.get(workspace_key)
+        if workspaces is None:
+            workspaces = (
+                iron.tensor((math.prod(expected),), dtype=np.float32, device="npu"),
+                iron.tensor(np.zeros(math.prod(output_shape), dtype=np.float32), dtype=np.float32, device="npu"),
+            )
+            self._maxpool_workspace_cache[workspace_key] = workspaces
+        input_tensor, output_tensor = workspaces
+        with input_tensor.overwrite() as host_input:
+            np.copyto(host_input, padded.reshape(-1))
         self._profile["maxpool_pad_upload_ms"] = self._profile.get("maxpool_pad_upload_ms", 0.0) + (time.perf_counter() - started) * 1000.0
         launch_start = time.perf_counter()
         self._kernel(str(artifact["xclbin"]), str(artifact["insts"]))(input_tensor, output_tensor)
         self._profile["maxpool_kernel_ms"] = self._profile.get("maxpool_kernel_ms", 0.0) + (time.perf_counter() - launch_start) * 1000.0
-        read_start = time.perf_counter()
-        # Keep the host result independent from the temporary XRT tensor, whose
-        # mapped view becomes invalid when the allocation is released.
-        result = output_tensor.numpy().reshape(output_shape).copy()
-        self._profile["maxpool_readback_ms"] = self._profile.get("maxpool_readback_ms", 0.0) + (time.perf_counter() - read_start) * 1000.0
         self._executed["xdna_maxpool"] += 1
-        return result
+        self._executed["device_resident_pool_outputs"] += 1
+        return _DeviceValue(output_tensor, output_shape, 1.0, 0, producer=f"maxpool:{index}", layout="nchw")
 
     def _run_conv(self, index: int, node: Any, values: dict[str, np.ndarray]) -> np.ndarray:
         total_start = time.perf_counter()
@@ -618,6 +625,7 @@ class XDNAResNetRunner:
         self._executed = {
             "xdna_conv": 0,
             "xdna_maxpool": 0,
+            "device_resident_pool_outputs": 0,
             "cpu_conv": 0,
             "host_ops": 0,
             "skipped_conv_dq": 0,
@@ -690,7 +698,7 @@ class XDNAResNetRunner:
             else:
                 raise NotImplementedError(f"node {index} {op} has no XDNA graph-runner implementation")
             for output_name in node.output:
-                values[output_name] = np.asarray(result)
+                values[output_name] = result if isinstance(result, _DeviceValue) else np.asarray(result)
             if op == "Conv":
                 tail_start = time.perf_counter()
                 self._fuse_conv_tail(index, result, values)

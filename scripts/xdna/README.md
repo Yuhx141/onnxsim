@@ -259,14 +259,15 @@ spatial input is emitted as a zero-copy view.
 
 Batch-one NCHW float32 2D `MaxPool` with unit dilation and floor output sizing
 lowers to a row-streamed kernel. The graph runner applies ONNX padding with
-`-inf`, uploads the padded NCHW tensor, dispatches the compiled artifact, and
-reads its result back for subsequent graph operations. The kernel streams row
+`-inf`, uploads the padded NCHW tensor into a reusable XRT allocation, and
+dispatches the compiled artifact into a reusable device output allocation. The
+result stays device-resident until a host-only consumer or graph output asks
+for it; that boundary uses the runner's cached readback. The kernel streams row
 slabs so the full activation does not need to fit in core memory. Both the
 ResNet quicktest 16×16→8×8 pool and the standard 112×112→56×56 stem pool
 compiled and matched NumPy on the NPU. General `AveragePool`, MaxPool indices,
-and other data types remain unsupported. The current runner path still crosses
-the host/device boundary around pooling; adjacent operator fusion is future
-work.
+and other data types remain unsupported. Padding is currently prepared on the
+host before upload, and adjacent operator fusion is future work.
 
 `Flatten` and `Reshape` are emitted as zero-copy contiguous tensor views, with
 their input/output shapes carried in the operation record. They require no AIE
