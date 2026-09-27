@@ -176,33 +176,55 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     if final_dequantizer is None:
         raise ValueError("fused block output has no matching DequantizeLinear boundary")
 
-    # The C kernel consumes OIHW int8 weights and accumulator-domain int32 bias.
+    # Pack output-channel chunks independently so each transfer fits an NPU2
+    # DMA descriptor. Each worker reuses one weight FIFO for its whole stage.
     w1, w2, w3 = weight_arrays
     b1, b2, b3 = bias_accumulators
-    stage_sizes = (
-        _align4(w1.nbytes) + b1.nbytes,
-        _align4(w2.nbytes) + b2.nbytes,
-        _align4(w3.nbytes) + b3.nbytes,
-    )
-    if any(size > 65532 for size in stage_sizes):
-        raise ValueError(
-            "a fused weight stage exceeds the NPU2 65532-byte DMA descriptor limit; "
-            f"stage sizes are {stage_sizes}"
-        )
-    w1_offset = 0
-    b1_offset = w1_offset + _align4(w1.nbytes)
-    w2_offset = b1_offset + b1.nbytes
-    b2_offset = w2_offset + _align4(w2.nbytes)
-    w3_offset = b2_offset + b2.nbytes
-    b3_offset = w3_offset + _align4(w3.nbytes)
-    parameter_bytes = b3_offset + b3.nbytes
-    params = np.zeros(parameter_bytes, dtype=np.uint8)
-    params[w1_offset : w1_offset + w1.nbytes] = w1.view(np.uint8).reshape(-1)
-    params[b1_offset : b1_offset + b1.nbytes] = b1.view(np.uint8)
-    params[w2_offset : w2_offset + w2.nbytes] = w2.view(np.uint8).reshape(-1)
-    params[b2_offset : b2_offset + b2.nbytes] = b2.view(np.uint8)
-    params[w3_offset : w3_offset + w3.nbytes] = w3.view(np.uint8).reshape(-1)
-    params[b3_offset : b3_offset + b3.nbytes] = b3.view(np.uint8)
+    # Keep per-core working sets below the 64 KiB AIE tile memory while
+    # leaving enough room under the shim's 16 simultaneously live BDs.
+    max_chunk_bytes = 36864
+
+    def choose_chunks(outputs: int, weight_bytes_per_output: int) -> int:
+        for count in range(1, outputs + 1):
+            if outputs % count == 0:
+                rows = outputs // count
+                if _align4(rows * weight_bytes_per_output) + rows * 4 <= max_chunk_bytes:
+                    return count
+        raise ValueError("could not divide weight stage into DMA-sized output-channel chunks")
+
+    c1_chunks = choose_chunks(w1.shape[0], w1.shape[1])
+    c2_worker_outputs = mid_channels // 2
+    c2_chunks = choose_chunks(c2_worker_outputs, w2.shape[1] * w2.shape[2] * w2.shape[3])
+    c3_chunks = choose_chunks(w3.shape[0], w3.shape[1])
+    c1_rows, c2_rows, c3_rows = w1.shape[0] // c1_chunks, c2_worker_outputs // c2_chunks, w3.shape[0] // c3_chunks
+
+    chunks: list[tuple[np.ndarray, np.ndarray]] = []
+    for index in range(c1_chunks):
+        sl = slice(index * c1_rows, (index + 1) * c1_rows)
+        chunks.append((w1[sl], b1[sl]))
+    for worker in range(2):
+        for index in range(c2_chunks):
+            start = worker * c2_worker_outputs + index * c2_rows
+            sl = slice(start, start + c2_rows)
+            chunks.append((w2[sl], b2[sl]))
+    for index in range(c3_chunks):
+        sl = slice(index * c3_rows, (index + 1) * c3_rows)
+        chunks.append((w3[sl], b3[sl]))
+    chunk_sizes = []
+    offsets = []
+    payloads = []
+    cursor = 0
+    for weight, bias in chunks:
+        raw_weight = np.ascontiguousarray(weight).view(np.uint8).reshape(-1)
+        bias_offset = _align4(raw_weight.size)
+        packed = np.zeros(bias_offset + bias.nbytes, dtype=np.uint8)
+        packed[:raw_weight.size] = raw_weight
+        packed[bias_offset:] = bias.view(np.uint8)
+        offsets.append(cursor)
+        chunk_sizes.append(packed.size)
+        payloads.append(packed)
+        cursor += packed.size
+    params = np.concatenate(payloads)
 
     q_type = "u8"
     q_nodes = [edges[edge.output_name] for edge in (*quantizers, final_quantizer)]
@@ -229,7 +251,10 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         "covered_nodes": covered,
         "quantizers": quantizers,
         "final_quantizer": final_quantizer,
-        "offsets": (w1_offset, b1_offset, w2_offset, b2_offset, w3_offset, b3_offset),
+        "chunk_counts": (c1_chunks, c2_chunks, c3_chunks),
+        "chunk_sizes": tuple(chunk_sizes),
+        "chunk_offsets": tuple(offsets),
+        "chunk_output_counts": (c1_rows, c2_rows, c3_rows),
         "residual_shift": residual_shift,
         "input_shift": input_shift,
     }

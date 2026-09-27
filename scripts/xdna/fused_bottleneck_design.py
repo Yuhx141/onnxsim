@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Compile one fused INT8 identity ResNet bottleneck for an XDNA NPU."""
-
+"""Compile a chunk-streamed fused INT8 identity ResNet bottleneck for XDNA."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +9,8 @@ import aie.iron as iron
 import numpy as np
 from aie.iron import CompileTime, ExternalFunction, In, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
-from aie.iron.device import AnyMemTile, Tile
+from aie.iron.dataflow import ObjectFifoLink
+from aie.iron.device import Tile
 from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
 from aie.utils.hostruntime.cli import run_design_cli
 
@@ -36,183 +36,116 @@ def fused_identity_bottleneck(
     shift3: CompileTime[int] = 7,
     residual_shift: CompileTime[int] = 2,
     input_shift: CompileTime[int] = 0,
+    chunks1: CompileTime[int] = 1,
+    chunks2: CompileTime[int] = 1,
+    chunks3: CompileTime[int] = 1,
 ):
     pixels = width * height
-    weight1_bytes = channels * mid_channels
-    bias1_bytes = mid_channels * 4
-    weight2_bytes = mid_channels * mid_channels * 9
-    bias2_bytes = mid_channels * 4
-    weight3_bytes = mid_channels * channels
-    bias3_bytes = channels * 4
-    bias1_offset = _align4(weight1_bytes)
-    bias2_offset = _align4(weight2_bytes)
-    bias3_offset = _align4(weight3_bytes)
-    parameter1_bytes = bias1_offset + bias1_bytes
-    parameter2_bytes = bias2_offset + bias2_bytes
-    parameter3_bytes = bias3_offset + bias3_bytes
-    total_parameter_bytes = parameter1_bytes + parameter2_bytes + parameter3_bytes
+    outputs1 = mid_channels // chunks1
+    outputs2 = (mid_channels // 2) // chunks2
+    outputs3 = channels // chunks3
+    bytes1 = _align4(outputs1 * channels) + outputs1 * 4
+    bytes2 = _align4(outputs2 * mid_channels * 9) + outputs2 * 4
+    bytes3 = _align4(outputs3 * mid_channels) + outputs3 * 4
 
-    activation_full_ty = np.ndarray[(pixels * channels,), np.dtype[np.int8]]
-    activation_row_ty = np.ndarray[(width * channels,), np.dtype[np.int8]]
-    mid_row_ty = np.ndarray[(width * mid_channels,), np.dtype[np.uint8]]
-    mid_half_row_ty = np.ndarray[(width * (mid_channels // 2),), np.dtype[np.uint8]]
-    output_row_ty = np.ndarray[(width * channels,), np.dtype[np.uint8]]
-    output_full_ty = np.ndarray[(pixels * channels,), np.dtype[np.int8]]
-    parameters_full_ty = np.ndarray[(total_parameter_bytes,), np.dtype[np.uint8]]
-    params1_ty = np.ndarray[(parameter1_bytes,), np.dtype[np.uint8]]
-    params2_ty = np.ndarray[(parameter2_bytes,), np.dtype[np.uint8]]
-    params3_ty = np.ndarray[(parameter3_bytes,), np.dtype[np.uint8]]
+    activation_ty = np.ndarray[(pixels * channels,), np.dtype[np.int8]]
+    params_ty = np.ndarray[(chunks1 * bytes1 + 2 * chunks2 * bytes2 + chunks3 * bytes3,), np.dtype[np.uint8]]
+    max_weight_bytes = max(bytes1, bytes2, bytes3)
+    weight_ty = np.ndarray[(max_weight_bytes,), np.dtype[np.uint8]]
+    stage1_ty = np.ndarray[(pixels * (mid_channels + channels),), np.dtype[np.int8]]
+    stage2a_ty = np.ndarray[(pixels * (mid_channels // 2 + channels),), np.dtype[np.int8]]
+    stage2b_ty = np.ndarray[(pixels * (mid_channels // 2),), np.dtype[np.int8]]
+    stage2_ty = np.ndarray[(pixels * (mid_channels + channels),), np.dtype[np.int8]]
+    output_ty = np.ndarray[(pixels * channels,), np.dtype[np.int8]]
 
-    common_flags = [
-        f"-DFUSED_W={width}",
-        f"-DFUSED_H={height}",
-        f"-DFUSED_C={channels}",
-        f"-DFUSED_MID={mid_channels}",
-        f"-DFUSED_SHIFT1={shift1}",
-        f"-DFUSED_SHIFT2={shift2}",
-        f"-DFUSED_SHIFT3={shift3}",
-        f"-DFUSED_RESIDUAL_SHIFT={residual_shift}",
-        f"-DFUSED_INPUT_SHIFT={input_shift}",
-        f"-DFUSED_BIAS1_OFFSET={bias1_offset}",
-        f"-DFUSED_BIAS2_OFFSET={bias2_offset}",
-        f"-DFUSED_BIAS3_OFFSET={bias3_offset}",
+    flags = [
+        f"-DFUSED_W={width}", f"-DFUSED_H={height}", f"-DFUSED_C={channels}",
+        f"-DFUSED_MID={mid_channels}", f"-DFUSED_SHIFT1={shift1}",
+        f"-DFUSED_SHIFT2={shift2}", f"-DFUSED_SHIFT3={shift3}",
+        f"-DFUSED_RESIDUAL_SHIFT={residual_shift}", f"-DFUSED_INPUT_SHIFT={input_shift}",
+        f"-DFUSED_C1_CHUNKS={chunks1}", f"-DFUSED_C2_CHUNKS={chunks2}",
+        f"-DFUSED_C3_CHUNKS={chunks3}", f"-DFUSED_C1_OUTPUTS={outputs1}",
+        f"-DFUSED_C2_OUTPUTS={outputs2}", f"-DFUSED_C3_OUTPUTS={outputs3}",
+        f"-DFUSED_BIAS1_OFFSET={_align4(outputs1 * channels)}",
+        f"-DFUSED_BIAS2_OFFSET={_align4(outputs2 * mid_channels * 9)}",
+        f"-DFUSED_BIAS3_OFFSET={_align4(outputs3 * mid_channels)}",
     ]
-    conv1_kernel = ExternalFunction(
-        "fused_bottleneck_conv1_row",
-        source_file=str(_KERNEL),
-        arg_types=[activation_row_ty, params1_ty, mid_row_ty],
-        compile_flags=common_flags,
-    )
-    conv2_kernel = ExternalFunction(
-        "fused_bottleneck_conv2_row",
-        source_file=str(_KERNEL),
-        arg_types=[
-            mid_row_ty,
-            mid_row_ty,
-            mid_row_ty,
-            params2_ty,
-            mid_half_row_ty,
-            np.int32,
-            np.int32,
-        ],
-        compile_flags=common_flags,
-    )
-    conv3_kernel = ExternalFunction(
-        "fused_bottleneck_conv3_residual_row",
-        source_file=str(_KERNEL),
-        arg_types=[mid_half_row_ty, mid_half_row_ty, params3_ty, activation_row_ty, output_row_ty],
-        compile_flags=common_flags,
-    )
+    k1 = ExternalFunction("fused_bottleneck_conv1_chunk", source_file=str(_KERNEL), arg_types=[activation_ty, weight_ty, stage1_ty, np.int32], compile_flags=flags)
+    k2 = ExternalFunction("fused_bottleneck_conv2_chunk", source_file=str(_KERNEL), arg_types=[stage1_ty, weight_ty, stage2a_ty, np.int32, np.int32], compile_flags=flags)
+    k2b = ExternalFunction("fused_bottleneck_conv2_chunk_b", source_file=str(_KERNEL), arg_types=[stage1_ty, weight_ty, stage2b_ty, np.int32, np.int32], compile_flags=flags)
+    k3 = ExternalFunction("fused_bottleneck_conv3_chunk", source_file=str(_KERNEL), arg_types=[stage2_ty, weight_ty, output_ty, np.int32], compile_flags=flags)
 
-    activation_fifo = ObjectFifo(activation_row_ty, name="bottleneck_activation")
-    skip_fifo = activation_fifo.cons(4).forward(
-        depth=2, tile=AnyMemTile, name="bottleneck_skip_buffer"
-    )
-    weights_fifo = ObjectFifo(parameters_full_ty, depth=1, name="bottleneck_weights")
-    weight1_fifo, weight2_fifo, weight3_fifo = weights_fifo.cons().split(
-        [0, parameter1_bytes, parameter1_bytes + parameter2_bytes],
-        obj_types=[params1_ty, params2_ty, params3_ty],
-        names=["bottleneck_conv1_weights", "bottleneck_conv2_weights", "bottleneck_conv3_weights"],
-    )
-    stage1_fifo = ObjectFifo(mid_row_ty, name="bottleneck_stage1")
-    stage2a_fifo = ObjectFifo(mid_half_row_ty, name="bottleneck_stage2a")
-    stage2b_fifo = ObjectFifo(mid_half_row_ty, name="bottleneck_stage2b")
-    output_fifo = ObjectFifo(output_row_ty, name="bottleneck_output")
+    activation_fifo = ObjectFifo(activation_ty, depth=1, name="bottleneck_activation")
+    weights_fifo = ObjectFifo(weight_ty, depth=1, name="bottleneck_weight_chunks")
+    stage1_fifo = ObjectFifo(stage1_ty, depth=1, name="bottleneck_stage1_bundle")
+    stage2a_fifo = ObjectFifo(stage2a_ty, depth=1, name="bottleneck_stage2a")
+    stage2b_fifo = ObjectFifo(stage2b_ty, depth=1, name="bottleneck_stage2b")
+    stage2_fifo = ObjectFifo(stage2_ty, depth=1, name="bottleneck_stage2_bundle")
+    output_fifo = ObjectFifo(output_ty, depth=1, name="bottleneck_output")
 
-    def conv1_worker(input_fifo, weights_fifo, output_fifo, kernel):
-        weights = weights_fifo.acquire(1)
-        for _ in range_(height):
-            input_row = input_fifo.acquire(1)
-            output_row = output_fifo.acquire(1)
-            kernel(input_row, weights, output_row)
-            input_fifo.release(1)
-            output_fifo.release(1)
-        weights_fifo.release(1)
+    def discard(weights, count):
+        for _ in range_(count):
+            weights.acquire(1)
+            weights.release(1)
 
-    def conv2_worker(input_fifo, weights_fifo, output_fifo, kernel, channel_offset):
-        weights = weights_fifo.acquire(1)
-        rows = input_fifo.acquire(2)
-        output = output_fifo.acquire(1)
-        kernel(rows[0], rows[0], rows[1], weights, output, 0, channel_offset)
-        output_fifo.release(1)
-        for _ in range_(height - 2):
-            rows = input_fifo.acquire(3)
-            output = output_fifo.acquire(1)
-            kernel(rows[0], rows[1], rows[2], weights, output, 1, channel_offset)
-            output_fifo.release(1)
-            input_fifo.release(1)
-        rows = input_fifo.acquire(2)
-        output = output_fifo.acquire(1)
-        kernel(rows[0], rows[1], rows[1], weights, output, height - 1, channel_offset)
-        output_fifo.release(1)
-        input_fifo.release(1)
-        input_fifo.release(1)
-        weights_fifo.release(1)
+    def conv1_worker(inp, weights, out, kernel):
+        x = inp.acquire(1)
+        bundle = out.acquire(1)
+        for i in range_(chunks1):
+            w = weights.acquire(1)
+            kernel(x, w, bundle, i)
+            weights.release(1)
+        # Append centered identity branch after q1 tensor.
+        for i in range_(pixels * channels):
+            bundle[pixels * mid_channels + i] = x[i]
+        out.release(1)
+        inp.release(1)
+        discard(weights, 2 * chunks2 + chunks3)
 
-    def conv3_worker(main0_fifo, main1_fifo, weights_fifo, skip_fifo, output_fifo, kernel):
-        weights = weights_fifo.acquire(1)
-        for _ in range_(height):
-            main0_row = main0_fifo.acquire(1)
-            main1_row = main1_fifo.acquire(1)
-            skip_row = skip_fifo.acquire(1)
-            output_row = output_fifo.acquire(1)
-            kernel(main0_row, main1_row, weights, skip_row, output_row)
-            main0_fifo.release(1)
-            main1_fifo.release(1)
-            skip_fifo.release(1)
-            output_fifo.release(1)
-        weights_fifo.release(1)
+    def conv2_worker(inp, weights, out, kernel, channel_offset, is_a):
+        discard(weights, chunks1 + (0 if is_a else chunks2))
+        bundle = inp.acquire(1)
+        output = out.acquire(1)
+        for i in range_(chunks2):
+            w = weights.acquire(1)
+            kernel(bundle, w, output, i, channel_offset)
+            weights.release(1)
+        discard(weights, (chunks2 if is_a else 0) + chunks3)
+        if is_a:
+            for i in range_(pixels * channels):
+                output[pixels * (mid_channels // 2) + i] = bundle[pixels * mid_channels + i]
+        out.release(1)
+        inp.release(1)
+
+    def conv3_worker(inp, weights, out, kernel):
+        discard(weights, chunks1 + 2 * chunks2)
+        bundle = inp.acquire(1)
+        output = out.acquire(1)
+        for i in range_(chunks3):
+            w = weights.acquire(1)
+            kernel(bundle, w, output, i)
+            weights.release(1)
+        out.release(1)
+        inp.release(1)
 
     workers = [
-        Worker(
-            conv1_worker,
-            fn_args=[activation_fifo.cons(), weight1_fifo.cons(), stage1_fifo.prod(), conv1_kernel],
-            tile=Tile(0, 2),
-            stack_size=0x1000,
-        ),
-        Worker(
-            conv2_worker,
-            fn_args=[stage1_fifo.cons(4), weight2_fifo.cons(), stage2a_fifo.prod(), conv2_kernel, 0],
-            tile=Tile(0, 3),
-            stack_size=4736,
-        ),
-        Worker(
-            conv2_worker,
-            fn_args=[stage1_fifo.cons(4), weight2_fifo.cons(), stage2b_fifo.prod(), conv2_kernel, mid_channels // 2],
-            tile=Tile(0, 5),
-            stack_size=4736,
-        ),
-        Worker(
-            conv3_worker,
-            fn_args=[
-                stage2a_fifo.cons(),
-                stage2b_fifo.cons(),
-                weight3_fifo.cons(),
-                skip_fifo.cons(),
-                output_fifo.prod(),
-                conv3_kernel,
-            ],
-            tile=Tile(0, 4),
-            stack_size=0x1000,
-        ),
+        Worker(conv1_worker, fn_args=[activation_fifo.cons(), weights_fifo.cons(), stage1_fifo.prod(), k1], tile=Tile(0, 2), stack_size=0x1000),
+        Worker(conv2_worker, fn_args=[stage1_fifo.cons(), weights_fifo.cons(), stage2a_fifo.prod(), k2, 0, True], tile=Tile(0, 3), stack_size=0x1000),
+        Worker(conv2_worker, fn_args=[stage1_fifo.cons(), weights_fifo.cons(), stage2b_fifo.prod(), k2b, mid_channels // 2, False], tile=Tile(0, 5), stack_size=0x1000),
+        Worker(conv3_worker, fn_args=[stage2_fifo.cons(), weights_fifo.cons(), output_fifo.prod(), k3], tile=Tile(0, 4), stack_size=0x1000),
     ]
+    ObjectFifoLink([stage2a_fifo.cons(), stage2b_fifo.cons()], stage2_fifo.prod(), src_offsets=[0, pixels * (mid_channels // 2 + channels)])
 
-    def sequence(x, w, y, activation_prod, weights_prod, output_cons):
-        activation_prod.fill(x)
-        weights_prod.fill(w)
-        output_cons.drain(y, wait=True)
+    def sequence(x, w, y, xprod, weights_prod, ycons):
+        xprod.fill(x)
+        sizes = [bytes1] * chunks1 + [bytes2] * (2 * chunks2) + [bytes3] * chunks3
+        offset = 0
+        for size in sizes:
+            weights_prod.fill(w, wait=True, sizes=[size], strides=[1], offset=offset, transfer_len=size)
+            offset += size
+        ycons.drain(y, wait=True)
 
-    runtime = Runtime(
-        sequence,
-        [
-            activation_full_ty,
-            parameters_full_ty,
-            output_full_ty,
-            activation_fifo.prod(),
-            weights_fifo.prod(),
-            output_fifo.cons(),
-        ],
-    )
+    runtime = Runtime(sequence, [activation_ty, params_ty, output_ty, activation_fifo.prod(), weights_fifo.prod(), output_fifo.cons()])
     return Program(iron.get_current_device(), runtime, workers=workers).resolve_program()
 
 
@@ -238,7 +171,6 @@ def _compile_kwargs(opts):
         if opts.model is None or opts.block is None:
             raise ValueError("--model and --block must be used together")
         import onnx
-
         try:
             from .benchmark_fused_bottleneck import bind_fused_bottleneck
             from .resnet_bottleneck import plan_bottleneck_blocks
@@ -251,40 +183,18 @@ def _compile_kwargs(opts):
             raise ValueError(f"no bottleneck block found for {opts.block!r}")
         binding = bind_fused_bottleneck(model, block)
         height, width = binding["input_shape"][2:]
-        channels = binding["input_shape"][1]
-        mid_channels = binding["block"].conv_plans[1].weight_shape[0]
-        return {
-            "width": width,
-            "height": height,
-            "channels": channels,
-            "mid_channels": mid_channels,
-            "shift1": binding["shifts"][0],
-            "shift2": binding["shifts"][1],
-            "shift3": binding["shifts"][2],
-            "residual_shift": binding["residual_shift"],
-            "input_shift": binding["input_shift"],
-        }
-    return {
-        "width": opts.width,
-        "height": opts.height,
-        "channels": opts.channels,
-        "mid_channels": opts.mid_channels,
-        "shift1": opts.shift1,
-        "shift2": opts.shift2,
-        "shift3": opts.shift3,
-        "residual_shift": opts.residual_shift,
-        "input_shift": opts.input_shift,
-    }
+        return {"width": width, "height": height, "channels": binding["input_shape"][1], "mid_channels": block.conv_plans[1].weight_shape[0],
+                "shift1": binding["shifts"][0], "shift2": binding["shifts"][1], "shift3": binding["shifts"][2],
+                "residual_shift": binding["residual_shift"], "input_shift": binding["input_shift"],
+                "chunks1": binding["chunk_counts"][0], "chunks2": binding["chunk_counts"][1], "chunks3": binding["chunk_counts"][2]}
+    return {"width": opts.width, "height": opts.height, "channels": opts.channels, "mid_channels": opts.mid_channels,
+            "shift1": opts.shift1, "shift2": opts.shift2, "shift3": opts.shift3,
+            "residual_shift": opts.residual_shift, "input_shift": opts.input_shift}
 
 
 def main() -> None:
     opts = _parser().parse_args()
-    run_design_cli(
-        fused_identity_bottleneck,
-        opts,
-        compile_kwargs=_compile_kwargs,
-        device=lambda value: device_from_args(value, n_cols=1),
-    )
+    run_design_cli(fused_identity_bottleneck, opts, compile_kwargs=_compile_kwargs, device=lambda value: device_from_args(value, n_cols=1))
 
 
 if __name__ == "__main__":
