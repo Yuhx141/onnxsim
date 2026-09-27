@@ -93,6 +93,10 @@ message LoadArtifactResponse {
   uint64 request_id = 1;
   bool ok = 2;
   string error = 3;
+  // True when this gateway has already acknowledged the same artifact ID,
+  // bytes, and manifest in this process. Native v5 workers do not expose a
+  // definitive cache-hit bit, so this is an upload-history hint rather than
+  // a claim about a restarted or independently managed runner cache.
   bool already_present = 4;
 }
 

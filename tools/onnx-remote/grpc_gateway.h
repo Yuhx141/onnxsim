@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -47,6 +49,11 @@ class Service final : public onnxsim::remote::v1::OnnxSimExecutor::Service {
 
  private:
   Options options_;
+  // This is deliberately gateway-local knowledge: the native v5 worker does
+  // not expose a cache-hit bit, so the gateway reports whether it has
+  // successfully uploaded the same artifact ID and bytes before.
+  std::mutex artifact_cache_mu_;
+  std::unordered_map<std::string, std::string> loaded_artifacts_;
 };
 
 }  // namespace onnx_remote::grpc_gateway

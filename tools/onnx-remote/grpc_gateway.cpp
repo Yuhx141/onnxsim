@@ -30,6 +30,21 @@ grpc::Status unavailable(const std::string& message) {
   return {grpc::StatusCode::UNAVAILABLE, message};
 }
 
+std::string artifact_fingerprint(const std::string& artifact,
+                                 const std::string& manifest) {
+  // This is a process-local equality key, not a security digest. Keeping it
+  // dependency-free lets the optional gateway share the native build's small
+  // footprint; the runner remains responsible for validating artifact ABI.
+  uint64_t first = 1469598103934665603ull;
+  uint64_t second = 1099511628211ull;
+  for (const unsigned char byte : artifact + '\0' + manifest) {
+    first = (first ^ byte) * 1099511628211ull;
+    second = (second ^ (static_cast<uint64_t>(byte) + 0x9d)) *
+             14029467366897019727ull;
+  }
+  return std::to_string(first) + ":" + std::to_string(second);
+}
+
 size_t element_bytes(uint32_t dtype) {
   switch (dtype) {
     case 1:  // FLOAT
@@ -220,11 +235,15 @@ grpc::Status Service::LoadArtifact(grpc::ServerContext*, const LoadArtifactReque
   grpc::Status status = roundtrip(options_, std::move(native), native_response);
   if (!status.ok()) return status;
   set_common_response(request->request_id(), native_response, response);
-  // The native v5 load operation is an upload/replace operation and does not
-  // expose a cache-hit bit.  Report a successful upload conservatively; a
-  // future worker capability can add an explicit hit field without changing
-  // this RPC shape.
-  response->set_already_present(false);
+  if (native_response.ok) {
+    const std::string fingerprint =
+        artifact_fingerprint(request->artifact(), request->manifest());
+    std::lock_guard<std::mutex> lock(artifact_cache_mu_);
+    const auto it = loaded_artifacts_.find(request->artifact_id());
+    response->set_already_present(it != loaded_artifacts_.end() &&
+                                  it->second == fingerprint);
+    loaded_artifacts_[request->artifact_id()] = fingerprint;
+  }
   return grpc::Status::OK;
 }
 

@@ -28,7 +28,7 @@ constexpr uint16_t kWorkerPort = 39671;
 void serve_requests() {
   const int listener = listen_tcp(kWorkerPort, 1);
   assert(listener >= 0);
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < 5; ++i) {
     const int fd = accept_tcp(listener);
     assert(fd >= 0);
 
@@ -173,6 +173,17 @@ int main() {
   status = stub->LoadArtifact(&load_context, load_request, &load_response);
   assert(status.ok());
   assert(load_response.ok());
+  assert(!load_response.already_present());
+
+  LoadArtifactRequest repeated_load_request = load_request;
+  repeated_load_request.set_request_id(20);
+  LoadArtifactResponse repeated_load_response;
+  grpc::ClientContext repeated_load_context;
+  status = stub->LoadArtifact(&repeated_load_context, repeated_load_request,
+                              &repeated_load_response);
+  assert(status.ok());
+  assert(repeated_load_response.ok());
+  assert(repeated_load_response.already_present());
 
   server->Shutdown();
   worker.join();
