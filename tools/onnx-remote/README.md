@@ -93,7 +93,7 @@ enabled, the plugin also reports the returned remote kernel events through
 transport-native JSON copy.
 
 The provider partitions `Identity`, `Relu`, `Add`, `Mul`, `Sub`, `Div`, `Max`,
-and `Min` by default and
+`Min`, `Abs`, `Neg`, and `Sqrt` by default and
 executes float32 tensors through the dependency-free worker. Unsupported ops
 remain on the normal CPU EP. `Options::profiling` forwards worker events into
 onnxsim's profiler. Applications using ORT's internal provider registration
