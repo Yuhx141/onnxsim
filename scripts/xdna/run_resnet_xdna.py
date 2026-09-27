@@ -169,6 +169,7 @@ class XDNAResNetRunner:
         # state inference only packs the changing activation matrix.
         self._packed_weight_cache: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
         self._cpu_weight_cache: dict[int, np.ndarray] = {}
+        self._torch_weight_cache: dict[int, Any] = {}
 
     def _quant_source(self, value_name: str, values: dict[str, np.ndarray]) -> tuple[np.ndarray, float, int]:
         dq = self.nodes_by_output.get(value_name)
@@ -344,16 +345,22 @@ class XDNAResNetRunner:
             pads = tuple(int(v) for v in attrs.get("pads", (0, 0, 0, 0)))
             strides = tuple(int(v) for v in attrs.get("strides", (1, 1)))
             dilations = tuple(int(v) for v in attrs.get("dilations", (1, 1)))
-            tx = torch.from_numpy(np.array(x, copy=True, order="C")).to(torch.float32)
-            tw = torch.from_numpy(np.array(weights, copy=True, order="C")).to(torch.float32)
-            if any(pads):
+            tx = torch.from_numpy(np.array(x, dtype=np.float32, copy=True, order="C"))
+            tw = self._torch_weight_cache.get(index)
+            if tw is None:
+                tw = torch.from_numpy(np.array(weights, dtype=np.float32, copy=True, order="C"))
+                self._torch_weight_cache[index] = tw
+            conv_padding = (0, 0)
+            if pads[0] == pads[2] and pads[1] == pads[3]:
+                conv_padding = (pads[0], pads[1])
+            elif any(pads):
                 tx = torch_f.pad(tx, (pads[1], pads[3], pads[0], pads[2]))
             raw = torch_f.conv2d(
                 tx,
                 tw,
                 bias=None,
                 stride=strides,
-                padding=0,
+                padding=conv_padding,
                 dilation=dilations,
                 groups=plan.groups,
             ).numpy()

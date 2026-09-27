@@ -134,10 +134,11 @@ requires graph-level XDNA fusion and moving the
 intermediate QDQ/residual operations into the device program, like Vitis does.
 
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
-hybrid Conv layers and skips their unused im2col staging. Two intra-op threads
-measured 15.7 ms and 19.0 ms in repeated quicktest runs (2 warmups/10
-iterations), with exact output agreement against ONNX Runtime CPU. These runs
-were 9.8x–11.9x slower than Vitis. It is opt-in because its float32
+hybrid Conv layers and skips their unused im2col staging. Converted constant
+weights are cached and symmetric padding is passed directly to Conv2d. Two
+intra-op threads measured 15.3 ms and 16.4 ms in repeated quicktest runs (2
+warmups/10 iterations), with exact output agreement against ONNX Runtime CPU.
+These runs were 9.6x–10.3x slower than Vitis. It is opt-in because its float32
 accumulations can round very long integer dot products on other inputs; the
 default NumPy integer path retains integer accumulation semantics.
 
