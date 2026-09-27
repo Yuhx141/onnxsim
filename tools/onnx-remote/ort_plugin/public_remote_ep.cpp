@@ -442,6 +442,28 @@ OrtStatus* ORT_API_CALL RemoteNodeComputeInfo::ComputeImpl(
       return Error(api, ORT_FAIL, "onnxsim_remote returned an unexpected output count");
     }
     const auto& result = response.outputs[0];
+    const size_t element_bytes = ElementBytes(
+        static_cast<ONNXTensorElementDataType>(result.dtype));
+    if (element_bytes == 0) {
+      return Error(api, ORT_FAIL, "onnxsim_remote returned an unsupported output dtype");
+    }
+    size_t element_count = 1;
+    for (int64_t dimension : result.shape) {
+      if (dimension < 0 ||
+          static_cast<uint64_t>(dimension) >
+              std::numeric_limits<size_t>::max() / element_count) {
+        return Error(api, ORT_FAIL, "onnxsim_remote returned an invalid output shape");
+      }
+      element_count *= static_cast<size_t>(dimension);
+    }
+    const size_t result_bytes = result.dtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+                                    ? result.data.size() * sizeof(float)
+                                    : result.raw_data.size();
+    if (element_count > std::numeric_limits<size_t>::max() / element_bytes ||
+        result_bytes != element_count * element_bytes) {
+      return Error(api, ORT_FAIL,
+                   "onnxsim_remote output shape and payload size mismatch");
+    }
     OrtValue* output = nullptr;
     if (OrtStatus* status = api->KernelContext_GetOutput(
             context, 0, result.shape.data(), result.shape.size(), &output)) {
@@ -453,9 +475,7 @@ OrtStatus* ORT_API_CALL RemoteNodeComputeInfo::ComputeImpl(
       api->ReleaseStatus(status);
       return Error(api, ORT_FAIL, "cannot access onnxsim_remote output");
     }
-    const size_t byte_count = result.dtype == 1
-                                  ? result.data.size() * sizeof(float)
-                                  : result.raw_data.size();
+    const size_t byte_count = result_bytes;
     if (result.dtype != 1) {
       std::memcpy(destination, result.raw_data.data(), byte_count);
     } else {

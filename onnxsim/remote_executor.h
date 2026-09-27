@@ -54,7 +54,8 @@ struct RemoteExecutorOptions {
   // runners only understand the inline artifact form.
   bool attach_compiled_artifact = false;
   // Send artifact bytes with every compiled run. This is reliable for a
-  // stateless worker; a future load/cache handshake can disable it.
+  // stateless worker; attach_compiled_artifact can disable it for a runner
+  // with persistent artifact storage.
   bool send_compiled_artifact = true;
   // Off keeps profiling work at the minimum. Summary is suitable for
   // constrained cards; Detailed may include one event per device operation.
