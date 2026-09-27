@@ -156,7 +156,7 @@ jobs:
       - name: Install onnxsim + conversion deps
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pytest huggingface_hub pillow numpy onnxruntime
+          python3 -m pip install pytest huggingface_hub pillow numpy onnxruntime tinygrad==0.14.0
           python3 -m pip install .
       - name: Show environment
         working-directory: ${{ runner.temp }}
@@ -167,7 +167,7 @@ jobs:
       - name: Run hf-config+safetensors -> onnx -> axmodel integration test
         working-directory: ${{ runner.temp }}
         run: |
-          pytest -v "$GITHUB_WORKSPACE/tests/test_pulsar2_hf_to_axmodel.py" "$GITHUB_WORKSPACE/tests/test_axera_conv_matmul_coverage_hardware.py" "$GITHUB_WORKSPACE/tests/test_axera_neu_format_arith_ops.py" "$GITHUB_WORKSPACE/tests/test_axera_op_coverage_hardware.py" "$GITHUB_WORKSPACE/tests/test_axera_quantonnx.py" "$GITHUB_WORKSPACE/tests/test_axera_mcode_structure.py"
+          pytest -v "$GITHUB_WORKSPACE/tests/test_pulsar2_hf_to_axmodel.py" "$GITHUB_WORKSPACE/tests/test_axera_conv_matmul_coverage_hardware.py" "$GITHUB_WORKSPACE/tests/test_axera_neu_format_arith_ops.py" "$GITHUB_WORKSPACE/tests/test_axera_op_coverage_hardware.py" "$GITHUB_WORKSPACE/tests/test_axera_quantonnx.py" "$GITHUB_WORKSPACE/tests/test_axera_mcode_structure.py" "$GITHUB_WORKSPACE/tests/test_axera_step_runner.py"
       - name: Run real conversion
         working-directory: ${{ runner.temp }}
         env:
