@@ -154,6 +154,8 @@ grpc::Status roundtrip(const Options& options, NativeRequest request,
     return unavailable(error.empty() ? "native worker I/O failed" : error);
   }
   close_socket(fd);
+  if (response.request_id != request.request_id)
+    return unavailable("native worker response request id mismatch");
   return grpc::Status::OK;
 }
 

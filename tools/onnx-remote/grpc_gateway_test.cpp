@@ -96,6 +96,10 @@ int main() {
   assert(capability_response.ready());
   assert(capability_response.protocol() == "onnx-remote-v5");
   assert(capability_response.runner_id() == "smoke-runner");
+  assert(capability_response.supported_ops_size() == 11);
+  assert(capability_response.supported_ops(8) == "abs");
+  assert(capability_response.supported_ops(9) == "neg");
+  assert(capability_response.supported_ops(10) == "sqrt");
 
   ExecuteRequest invalid_request;
   invalid_request.set_op(std::string(kMaxOpBytes + 1, 'x'));
