@@ -18,7 +18,44 @@ static uint64_t micros_since(
       std::chrono::steady_clock::now() - start).count());
 }
 
-static bool same_shape(const Tensor& a, const Tensor& b) { return a.shape == b.shape; }
+static bool broadcast_shape(const Tensor& a, const Tensor& b,
+                            std::vector<int64_t>& shape) {
+  const size_t rank = std::max(a.shape.size(), b.shape.size());
+  shape.assign(rank, 1);
+  for (size_t i = 0; i < rank; ++i) {
+    const int64_t adim = i < rank - a.shape.size()
+                             ? 1
+                             : a.shape[i - (rank - a.shape.size())];
+    const int64_t bdim = i < rank - b.shape.size()
+                             ? 1
+                             : b.shape[i - (rank - b.shape.size())];
+    if (adim <= 0 || bdim <= 0 || (adim != bdim && adim != 1 && bdim != 1))
+      return false;
+    shape[i] = std::max(adim, bdim);
+  }
+  return true;
+}
+
+static size_t broadcast_index(size_t output_index,
+                              const std::vector<int64_t>& output_shape,
+                              const std::vector<int64_t>& input_shape) {
+  if (input_shape.empty()) return 0;
+  const size_t rank = output_shape.size();
+  const size_t input_rank = input_shape.size();
+  size_t input_index = 0;
+  size_t output_stride = 1;
+  size_t input_stride = 1;
+  for (size_t axis = rank; axis-- > 0;) {
+    const size_t coordinate = (output_index / output_stride) %
+                              static_cast<size_t>(output_shape[axis]);
+    output_stride *= static_cast<size_t>(output_shape[axis]);
+    if (axis < rank - input_rank) continue;
+    const int64_t input_dim = input_shape[axis - (rank - input_rank)];
+    input_index += (input_dim == 1 ? 0 : coordinate) * input_stride;
+    input_stride *= static_cast<size_t>(input_dim);
+  }
+  return input_index;
+}
 
 static Response execute(const Request& r) {
   Response out; out.request_id = r.request_id; out.ok = false;
@@ -82,18 +119,27 @@ static Response execute(const Request& r) {
   }
   if (r.op == "add" || r.op == "mul" || r.op == "sub" ||
       r.op == "div" || r.op == "max" || r.op == "min") {
-    if (r.inputs.size() != 2 || !same_shape(r.inputs[0], r.inputs[1])) {
-      out.error = r.op + " expects two tensors with the same shape"; return out;
+    std::vector<int64_t> output_shape;
+    if (r.inputs.size() != 2 ||
+        !broadcast_shape(r.inputs[0], r.inputs[1], output_shape)) {
+      out.error = r.op + " expects broadcast-compatible tensors"; return out;
     }
     if (r.inputs[0].dtype != 1 || r.inputs[1].dtype != 1) {
       out.error = r.op + " reference implementation supports float32 tensors only";
       return out;
     }
     Tensor y = r.inputs[0];
+    y.shape = output_shape;
+    size_t output_elements = 1;
+    for (const int64_t dimension : output_shape)
+      output_elements *= static_cast<size_t>(dimension);
+    y.data.resize(output_elements);
     execute_op([&] {
       for (size_t i = 0; i < y.data.size(); ++i) {
-        const float lhs = r.inputs[0].data[i];
-        const float rhs = r.inputs[1].data[i];
+        const float lhs = r.inputs[0].data[broadcast_index(
+            i, output_shape, r.inputs[0].shape)];
+        const float rhs = r.inputs[1].data[broadcast_index(
+            i, output_shape, r.inputs[1].shape)];
         if (r.op == "add") y.data[i] = lhs + rhs;
         else if (r.op == "mul") y.data[i] = lhs * rhs;
         else if (r.op == "sub") y.data[i] = lhs - rhs;

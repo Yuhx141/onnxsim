@@ -85,6 +85,32 @@ static int self_test() {
     profile_events += response.profile.size();
     close_socket(fd);
   }
+  {
+    int fd = connect_tcp("127.0.0.1", 39501);
+    if (fd < 0) return 1;
+    Request request;
+    request.request_id = 99;
+    request.op = "add";
+    request.profiling = ProfilingLevel::Detailed;
+    request.inputs.push_back(Tensor{{2, 3}, {1, 2, 3, 1, 2, 3}});
+    request.inputs.push_back(Tensor{{3}, {4, 5, 6}});
+    if (!send_request(fd, request, error)) {
+      close_socket(fd);
+      return 1;
+    }
+    Response response;
+    if (!receive_response(fd, response, error) || !response.ok ||
+        response.outputs.size() != 1 || response.outputs[0].shape !=
+            std::vector<int64_t>({2, 3}) ||
+        response.outputs[0].data !=
+            std::vector<float>({5, 7, 9, 5, 7, 9})) {
+      std::cerr << "broadcast add self-test failed\n";
+      close_socket(fd);
+      return 1;
+    }
+    profile_events += response.profile.size();
+    close_socket(fd);
+  }
   std::cout << "remote transport self-test passed (profile events: "
             << profile_events << ")\n";
   return 0;
