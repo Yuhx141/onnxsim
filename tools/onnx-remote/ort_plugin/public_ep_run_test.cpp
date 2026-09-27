@@ -34,15 +34,27 @@ int main(int argc, char** argv) {
     std::cerr << "usage: onnxsim_remote_ep_run_test PLUGIN MODEL.onnx [ORT_PROFILE_PREFIX]\n";
     return 2;
   }
+  const char* verbose = std::getenv("ONNXSIM_REMOTE_EP_TEST_VERBOSE");
   try {
-    Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "onnxsim-remote-ep-run-test"};
+    Ort::Env env{verbose != nullptr && std::string(verbose) != "0"
+                     ? ORT_LOGGING_LEVEL_VERBOSE
+                     : ORT_LOGGING_LEVEL_WARNING,
+                "onnxsim-remote-ep-run-test"};
     env.RegisterExecutionProviderLibrary("onnxsim_remote", argv[1]);
     const auto devices = env.GetEpDevices();
-    auto device = std::find_if(devices.begin(), devices.end(), [](const auto& value) {
-      return std::string(value.EpName()) == "onnxsim_remote";
-    });
+    if (verbose != nullptr && std::string(verbose) != "0") {
+      for (const auto& value : devices)
+        std::cerr << "[devices] ep=" << value.EpName() << '\n';
+    }
+    const char* append_name = std::getenv("ONNXSIM_REMOTE_EP_TEST_APPEND");
+    const std::string target = append_name != nullptr ? append_name
+                                                      : "onnxsim_remote";
+    auto device = std::find_if(devices.begin(), devices.end(),
+                               [&target](const auto& value) {
+                                 return std::string(value.EpName()) == target;
+                               });
     if (device == devices.end()) {
-      std::cerr << "onnxsim_remote device was not discovered\n";
+      std::cerr << target << " device was not discovered\n";
       return 1;
     }
     Ort::SessionOptions options;

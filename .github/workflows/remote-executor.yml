@@ -205,12 +205,15 @@ jobs:
             --args $RUNTEST "$PLUGIN" \
             scripts/convertmodel/test/webgpu_kernel_add.onnx \
             "$RUNNER_TEMP/public-ep-ort-profile" || echo "PROBE_A_RC=$?"
+          ONNXSIM_REMOTE_EP_TEST_APPEND=CPUExecutionProvider \
+          ONNXSIM_REMOTE_EP_EXPECT_REMOTE=0 \
           $RUNTEST "$PLUGIN" \
             scripts/convertmodel/test/webgpu_kernel_add.onnx \
-            || echo "PROBE_B_RC=$?"
-          ONNXSIM_REMOTE_EP_SUPPORTED_OPS=Conv $RUNTEST "$PLUGIN" \
-            scripts/convertmodel/test/webgpu_kernel_add.onnx \
-            "$RUNNER_TEMP/public-ep-ort-profile" || echo "PROBE_C_RC=$?"
+            || echo "PROBE_D_RC=$?"
+          ONNXSIM_REMOTE_EP_TEST_VERBOSE=1 ONNXSIM_REMOTE_EP_EXPECT_REMOTE=0 \
+          $RUNTEST "$PLUGIN" \
+            scripts/convertmodel/test/webgpu_kernel_add.onnx 2>&1 | tail -40 \
+            || echo "PROBE_F_RC=$?"
           test -s "$RUNNER_TEMP/public-ep-profile.json"
           grep -q '"name":"add"' "$RUNNER_TEMP/public-ep-profile.json"
           ls "$RUNNER_TEMP"/public-ep-ort-profile*.json
