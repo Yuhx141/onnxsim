@@ -188,7 +188,16 @@ jobs:
             >"$RUNNER_TEMP/public-ep-worker.log" 2>&1 &
           worker_pid=$!
           trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
-          sleep 0.2
+          for attempt in $(seq 1 50); do
+            if ! kill -0 "$worker_pid" 2>/dev/null; then
+              echo "worker exited early:"; cat "$RUNNER_TEMP/public-ep-worker.log"; exit 1
+            fi
+            (exec 3<>"/dev/tcp/127.0.0.1/39501") 2>/dev/null && { exec 3>&-; break; }
+            sleep 0.1
+          done
+          (exec 3<>"/dev/tcp/127.0.0.1/39501") 2>/dev/null || {
+            echo "worker never became ready:"; cat "$RUNNER_TEMP/public-ep-worker.log"; exit 1
+          }
           build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
             "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
             scripts/convertmodel/test/webgpu_kernel_add.onnx \
