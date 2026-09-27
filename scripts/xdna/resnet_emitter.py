@@ -229,6 +229,8 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
         qadd = None
         mul_scalar = None
         mul_identity = False
+        gap = None
+        gap_identity = False
         qadd_inputs = tuple(str(value) for value in node.input if value)
         qadd_outputs = tuple(str(value) for value in node.output if value)
         qadd_node_indices: Tuple[int, ...] = (node_index,)
@@ -301,12 +303,38 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
                     mul_identity = scalar == 1.0
                     qadd_inputs = (data_name,)
                     qadd_outputs = (out_name,)
+        if op == "GlobalAveragePool" and len(node.input) == 1 and node.output:
+            input_name, output_name = str(node.input[0]), str(node.output[0])
+            input_shape = shapes.get(input_name)
+            output_shape = shapes.get(output_name)
+            if (
+                input_name in float32_values
+                and input_shape is not None
+                and len(input_shape) == 4
+                and input_shape[0] == 1
+                and output_shape == (1, input_shape[1], 1, 1)
+            ):
+                channels, spatial = input_shape[1], input_shape[2] * input_shape[3]
+                gap_identity = spatial == 1
+                tile_channels = next(
+                    (tile for tile in (64, 32, 16, 8, 4, 2, 1) if channels % tile == 0),
+                    1,
+                )
+                if not gap_identity:
+                    gap = {
+                        "channels": channels,
+                        "spatial": spatial,
+                        "tile_channels": tile_channels,
+                        "dtype": "float32",
+                    }
         result.append(OperationArtifactSpec(
             node_index=node_index,
             node_name=dispatch.node_names[0],
             op_type=op,
             lowering=(
                 "quantized_add_relu_u8" if qadd is not None
+                else "global_avgpool_nchw_f32" if gap is not None
+                else "identity_device_view" if gap_identity
                 else "identity_device_view" if mul_identity
                 else "mul_scalar_f32" if mul_scalar is not None
                 else _OP_LOWERINGS.get(op, "unsupported_native_lowering")
@@ -318,6 +346,8 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             output_shapes=tuple(shapes.get(str(value)) for value in qadd_outputs),
             status=(
                 "compilable_quantized_add_relu" if qadd is not None
+                else "compilable_global_avgpool_f32" if gap is not None
+                else "zero_copy_device_view" if gap_identity
                 else "zero_copy_device_view" if mul_identity
                 else "compilable_mul_scalar_f32" if mul_scalar is not None
                 else "compilable_iron_kernel" if op == "Relu"
@@ -328,7 +358,10 @@ def emit_operation_specs(plan: ResNetCodegenPlan, model: Any) -> Tuple[Operation
             quantization=(
                 {**qadd, "fused_node_indices": list(qadd_node_indices)} if qadd is not None else None
             ),
-            parameters=mul_scalar,
+            parameters=(
+                {**gap, "input_name": str(node.input[0])} if gap is not None
+                else mul_scalar
+            ),
         ))
     # Q/DQ nodes are graph-edge semantics rather than dispatches. Emit them
     # too, including graph-boundary conversions that are outside a region.

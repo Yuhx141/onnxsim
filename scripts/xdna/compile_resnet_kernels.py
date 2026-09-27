@@ -131,6 +131,28 @@ def _compile_mul_scalar(elements: int, scalar: float, device: str, output_dir: P
     return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
 
 
+def _compile_global_avgpool(
+    channels: int, spatial: int, tile_channels: int, device: str, output_dir: Path
+) -> dict[str, str]:
+    key = f"global_avgpool_nchw_f32_c{channels}_s{spatial}_tc{tile_channels}"
+    xclbin = output_dir / f"{key}.xclbin"
+    insts = output_dir / f"{key}.insts.bin"
+    design = Path(__file__).with_name("global_avgpool_design.py")
+    command = [
+        sys.executable, str(design), "--dev", device,
+        "--channels", str(channels), "--spatial", str(spatial),
+        "--tile-channels", str(tile_channels),
+        "--xclbin-path", str(xclbin), "--insts-path", str(insts),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.returncode:
+        raise RuntimeError(f"IRON GlobalAveragePool compile failed for {key}:\n{completed.stdout}\n{completed.stderr}")
+    missing = [str(path) for path in (xclbin, insts) if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"compiler reported success but did not create: {', '.join(missing)}")
+    return {"key": key, "xclbin": str(xclbin), "insts": str(insts)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
@@ -173,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     compiled_relu: dict[int, dict[str, str]] = {}
     compiled_qadd: dict[tuple[Any, ...], dict[str, str]] = {}
     compiled_mul: dict[tuple[int, float], dict[str, str]] = {}
+    compiled_gap: dict[tuple[int, int, int], dict[str, str]] = {}
     report = dict(render_build_manifest(plan, model=model, columns=args.columns, source=str(args.example)))
     fused_relu_indices = {
         int(index)
@@ -180,6 +203,17 @@ def main(argv: list[str] | None = None) -> int:
         if item["status"] == "compilable_quantized_add_relu" and item.get("quantization")
         for index in item["quantization"]["fused_node_indices"][1:2]
     }
+    for item in report["operation_kernels"]:
+        if item["status"] != "compilable_global_avgpool_f32":
+            continue
+        params = item["parameters"]
+        cache_key = (int(params["channels"]), int(params["spatial"]), int(params["tile_channels"]))
+        artifact = compiled_gap.get(cache_key)
+        if artifact is None:
+            artifact = _compile_global_avgpool(*cache_key, args.device, args.artifact_dir)
+            compiled_gap[cache_key] = artifact
+        item["compiled_artifact"] = artifact
+        item["compile_status"] = "compiled"
     for item in report["operation_kernels"]:
         if item["op_type"] == "Relu" and int(item["node_index"]) in fused_relu_indices:
             item["status"] = "fused_into_quantized_add_relu"
@@ -249,13 +283,13 @@ def main(argv: list[str] | None = None) -> int:
     report["compile_all_specs"] = args.compile_all
     report["optimize_small_m"] = args.optimize_small_m
     report["compile_device"] = args.device
-    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu) + len(compiled_qadd) + len(compiled_mul)
-    report["compiled_operator_kernel_count"] = len(compiled_relu) + len(compiled_qadd) + len(compiled_mul)
+    report["compiled_kernel_count"] = len(compiled) + len(compiled_relu) + len(compiled_qadd) + len(compiled_mul) + len(compiled_gap)
+    report["compiled_operator_kernel_count"] = len(compiled_relu) + len(compiled_qadd) + len(compiled_mul) + len(compiled_gap)
     report["graph_runtime_blockers"] = [
         "NCHW im2col packing and logical-to-padded GEMM staging",
         "QDQ scale/zero-point conversion and Conv bias/requantization",
         "runtime dispatch wiring for compiled standalone operators",
-        "pooling, generic QDQ conversion, and tensor-layout kernels",
+        "MaxPool, generic QDQ conversion, and tensor-layout kernels",
     ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

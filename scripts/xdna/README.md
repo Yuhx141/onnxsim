@@ -250,6 +250,12 @@ ResNet's scalar is exactly `1.0`, so codegen removes it as a zero-copy view.
 A non-identity `Mul` kernel was compiled and verified on the NPU against NumPy
 for 2,048 elements. Broadcasts by non-scalar tensors remain unsupported.
 
+Batch-one NCHW float32 `GlobalAveragePool` now lowers to a channel-tiled AIE
+reduction. Each tile reads contiguous channel planes and emits their means;
+the 2,048-channel, 7×7 shape compiled and matched NumPy on the NPU. A 1×1
+spatial input is emitted as a zero-copy view. MaxPool and general AveragePool
+remain native-kernel gaps.
+
 `Flatten` and `Reshape` are emitted as zero-copy contiguous tensor views, with
 their input/output shapes carried in the operation record. They require no AIE
 instruction artifact; the future runner can preserve the same device buffer
