@@ -60,6 +60,11 @@ int main(int argc, char** argv) {
     Ort::SessionOptions options;
     if (argc == 4) options.EnableProfiling(argv[3]);
     options.AppendExecutionProvider_V2(env, {*device}, Ort::KeyValuePairs{});
+    // The session and everything referencing it must be released before
+    // UnregisterExecutionProviderLibrary dlcloses the plugin: ORT releases
+    // EP kernels during session teardown, and those vtables live in the
+    // library being closed.
+    {
     Ort::Session session{env, argv[2], options};
     Ort::MemoryInfo memory = Ort::MemoryInfo::CreateCpu(
         OrtAllocatorType::OrtArenaAllocator, OrtMemTypeDefault);
@@ -145,6 +150,7 @@ int main(int argc, char** argv) {
                           : "ORT profile unexpectedly contained the remote EP event\n");
         return 1;
       }
+    }
     }
     env.UnregisterExecutionProviderLibrary("onnxsim_remote");
     std::cout << "public OrtEp remote execution passed\n";
