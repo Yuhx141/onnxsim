@@ -605,3 +605,26 @@ The model is loaded for each request in this first correctness-oriented
 adapter.  That is deliberately simple and isolates model-load failures; a
 persistent model cache should be added once the wire protocol is exercised on
 the card.
+
+## Hexagon cDSP worker (tinygrad-generated v65 programs)
+
+`remote_hexagon_worker.cpp` is the runner for `tghx-v65` artifacts: whole ONNX models compiled by the tinygrad fork into one
+standalone Hexagon v65 program (the Snapdragon 845's cDSP class; newer cDSPs run it too). The compiler side is
+`scripts/android/tinygrad_hexagon_bridge/openpilot_v65/compile_v65.sh`, a `--command` for `onnx-remote-compiler`. It runs the
+tinygrad capture, checks the emitted program bit for bit under qemu, builds the FastRPC skel, and packs the skel, the weights
+and a plain-text I/O contract. The artifact is a small little-endian container, so the worker needs no JSON or archive library.
+
+```sh
+onnx-remote-compiler --port 39502 --cache-dir ~/.cache/onnxsim-v65 --target hexagon-v65 \
+  --compiler-id tinygrad-dsp_graph_v65 --command '.../openpilot_v65/compile_v65.sh {input} {output} {manifest}'
+.../openpilot_v65/build_worker.sh out/          # Android aarch64: NDK + the Hexagon SDK's qaic and libcdsprpc
+CLIENT=build/onnx-remote/onnx-remote-client .../openpilot_v65/e2e.sh out/onnx-remote-hexagon-worker model.onnx \
+  --input-raw 2:1,1382400:img.bin --input-raw 1:1,3:calib.bin --dump out.bin --iters 5
+```
+
+`load_compiled` writes the skel as `tg_graph_<id>.so` into `--cache-dir` (put on `ADSP_LIBRARY_PATH` at startup), opens it in
+an unsigned PD, and uploads the weights once in 8 MB chunks. Several programs can be resident at once. `run_compiled` takes
+the ONNX inputs in graph order (FLOAT or UINT8, exact sizes), leaves out inputs the program never reads, and returns every
+ONNX output as float32 in graph order. `--threads N` overrides the DSP thread count baked into the program. `Summary`
+profiling reports the DSP-side run time; `Detailed` adds one event per kernel call. `onnx-remote-client --compile-run` drives
+compile, `load_compiled` and `run_compiled` against separate compiler and runner endpoints and can compare or dump the outputs.
