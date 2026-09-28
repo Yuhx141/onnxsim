@@ -22,7 +22,7 @@ extern "C" void maxpool2d_nchw_u8(
             if (value > maximum) maximum = value;
           }
         }
-        output[c * tile_output_rows * output_width + oy * output_width + ox] = maximum;
+        output[(oy * output_width + ox) * tile_channels + c] = maximum;
       }
     }
   }

@@ -86,7 +86,11 @@ def maxpool2d(
             channel = (chunk // output_row_groups) * tile_channels
             row_group = chunk % output_row_groups
             input_offset = channel * input_height * input_width + row_group * tile_output_rows * stride_height * input_width
-            output_offset = channel * output_height * output_width + row_group * tile_output_rows * output_width
+            output_offset = (
+                row_group * tile_output_rows * output_width * channels + channel
+                if uint8 else
+                channel * output_height * output_width + row_group * tile_output_rows * output_width
+            )
             group = TaskGroup()
             source_prod.fill(
                 source, wait=True,
@@ -97,13 +101,22 @@ def maxpool2d(
             )
             group.finish()
             group = TaskGroup()
-            result_cons.drain(
-                result, wait=True,
-                sizes=[tile_channels, tile_output_rows * output_width],
-                strides=[output_height * output_width, 1],
-                offset=output_offset, transfer_len=tile_channels * tile_output_rows * output_width,
-                group=group,
-            )
+            if uint8:
+                result_cons.drain(
+                    result, wait=True,
+                    sizes=[tile_output_rows, output_width, tile_channels],
+                    strides=[output_width * channels, channels, 1],
+                    offset=output_offset, transfer_len=tile_channels * tile_output_rows * output_width,
+                    group=group,
+                )
+            else:
+                result_cons.drain(
+                    result, wait=True,
+                    sizes=[tile_channels, tile_output_rows * output_width],
+                    strides=[output_height * output_width, 1],
+                    offset=output_offset, transfer_len=tile_channels * tile_output_rows * output_width,
+                    group=group,
+                )
             group.finish()
 
     runtime = Runtime(
@@ -163,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         _parser().error("output height must be divisible by tile output rows")
     if opts.channels % opts.tile_channels:
         _parser().error("channels must be divisible by tile_channels")
+    if opts.uint8 and opts.tile_channels % 4:
+        _parser().error("uint8 channel-last DMA requires tile_channels to be a multiple of 4")
     kwargs = {
         "channels": opts.channels, "input_height": opts.input_height,
         "input_width": opts.input_width, "output_height": opts.output_height,
@@ -198,7 +213,11 @@ def main(argv: list[str] | None = None) -> int:
         input_tensor = iron.tensor(padded.reshape(-1), dtype=dtype, device="npu")
         output_tensor = iron.tensor(output, dtype=dtype, device="npu")
         maxpool2d(input_tensor, output_tensor, **kwargs)
-        actual = output_tensor.numpy().reshape(run_opts.channels, run_opts.output_height, run_opts.output_width)
+        actual = output_tensor.numpy()
+        if run_opts.uint8:
+            actual = actual.reshape(run_opts.output_height, run_opts.output_width, run_opts.channels).transpose(2, 0, 1)
+        else:
+            actual = actual.reshape(run_opts.channels, run_opts.output_height, run_opts.output_width)
         expected = _pool_reference(
             source.astype(np.float32),
             kernel=(run_opts.kernel_height, run_opts.kernel_width),

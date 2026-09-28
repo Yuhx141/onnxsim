@@ -236,14 +236,16 @@ An optional uint8 MaxPool kernel fuses the stem's
 `Relu→Quantize→Dequantize→MaxPool→Quantize→Dequantize` region. The runner
 enables it only when the input comes from ReLU and both quantization
 boundaries have the same scalar uint8 parameters. It skips the pre-pool
-Dequantize and keeps the post-pool QDQ edge resident on XDNA. Compile the NPU2
+Dequantize and keeps the post-pool QDQ edge resident on XDNA. The uint8 kernel
+writes channel-last output, so a following fused bottleneck can consume the
+pool buffer directly without reading it back and uploading it again. Compile the NPU2
 quicktest specialization and pass it to the graph runner:
 
 ```bash
 python scripts/xdna/maxpool_design.py --dev npu2 --channels 64 \
   --input-height 18 --input-width 20 --output-height 8 --output-width 8 \
   --kernel-height 3 --kernel-width 3 --stride-height 2 --stride-width 2 \
-  --tile-output-rows 8 --tile-channels 2 --uint8 \
+  --tile-output-rows 8 --tile-channels 4 --uint8 \
   --xclbin-path maxpool-u8.xclbin --insts-path maxpool-u8.insts.bin
 python scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
   --maxpool-uint8-xclbin maxpool-u8.xclbin --maxpool-uint8-insts maxpool-u8.insts.bin
@@ -253,7 +255,11 @@ For the quicktest graph, the quantized pool path matched the CPU reference
 exactly. Its measured pad/upload plus pool time was 1.25 ms versus 1.76 ms for
 the float pool path; full-graph timing was noisy and did not improve in that
 A/B run, so this specialization remains opt-in. Runtime aligns the right-side
-input padding to four bytes for the NPU DMA descriptor.
+input padding to four bytes for the NPU DMA descriptor. With
+`/layer1/layer1.0` fused, the channel-last pool output fed the block directly
+on-device (`device_resident_input: true`); the full graph retained exact
+CPU-reference output and recorded one device-resident handoff. The uint8
+channel tile must be a multiple of four to satisfy DMA alignment.
 
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
 hybrid Conv layers and skips their unused im2col staging. Converted constant

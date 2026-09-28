@@ -745,7 +745,7 @@ class XDNAResNetRunner:
         fusion = self._maxpool_qdq_fusions[index]
         return _DeviceValue(
             output_tensor, output_shape, float(fusion["scale"]), int(fusion["zero_point"]),
-            as_real=True, producer=f"maxpool:{index}", layout="nchw",
+            as_real=True, producer=f"maxpool:{index}", layout="nhwc",
         )
 
     def _run_quantized_add_relu(self, index: int, values: dict[str, Any]) -> _DeviceValue:
