@@ -193,6 +193,16 @@ Vitis AI baseline is 1.609 ms on the same model. A fresh Vitis rerun failed
 during provider initialization in the current environment, so 1.609 ms remains
 the last valid measurement.
 
+After Conv3 vectorization, the full fused run measured 158.3 ms with exact
+output; using the two-thread Torch backend for its seven CPU fallback Conv
+calls measured 154.2 ms. Profiling attributes about 144.5 ms to fused
+bottleneck kernel calls, while CPU Conv execution takes about 1.3 ms with
+Torch. The current faster hybrid setting (`--cpu-small-m 64 --cpu-backend torch
+--cpu-threads 2`) measured 15.7 ms with exact output. Its 52 small-spatial Conv
+calls take about 8.9 ms; the stem Conv, MaxPool, and quantized residual Add+ReLU
+remain on XDNA. The 1.609 ms Vitis result is still about 9.8× faster than this
+hybrid run.
+
 The NPU2 data mover limits a single weight descriptor to 65,532 bytes. The
 fused path streams weights in bounded chunks, and the binder now covers
 projection/downsample residuals with power-of-two QDQ scales. The four
