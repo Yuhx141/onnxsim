@@ -266,6 +266,16 @@
                                 }
                             }
                             break;
+                        case "convert-error":
+                            // A bad upload must leave the page usable: the
+                            // worker has reported the detailed error through
+                            // stderr, so restore the picker and keep download
+                            // disabled until a later conversion succeeds.
+                            input.disabled = false;
+                            dl_btn.disabled = true;
+                            format_select.disabled = false;
+                            format_status.textContent = "";
+                            break;
                     }
                 };
 

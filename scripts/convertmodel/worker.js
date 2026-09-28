@@ -304,10 +304,12 @@ create_onnxsim({
             } else {
                 postMessage(["stderr", e.data[0] + " failed: " + detail]);
             }
+            postMessage(["convert-error"]);
             return;
         }
         if (!model) {
             postMessage(["stderr", e.data[0] + " failed!"]);
+            postMessage(["convert-error"]);
             return;
         }
         const data_url = "data:application/octet-stream;base64," + model.toBase64();
