@@ -10,6 +10,7 @@ from typing import Any
 from ._protocol import RPCError
 from .client import (
     ProfileResult,
+    RandomInput,
     RemoteModel,
     Session,
     TrackerClient,
@@ -20,6 +21,7 @@ from .client import (
 
 __all__ = [
     "ProfileResult",
+    "RandomInput",
     "RPCError",
     "RPCServer",
     "RemoteModel",

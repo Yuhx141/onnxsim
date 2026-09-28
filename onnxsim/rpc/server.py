@@ -65,7 +65,32 @@ def _random_tensors(specs, seed: Optional[int]) -> Dict[str, np.ndarray]:
             raise proto.RPCError(
                 f"random tensor {name!r} exceeds the tensor size limit"
             )
-        if dtype == "bool":
+        has_low, has_high = "low" in spec, "high" in spec
+        if has_low != has_high:
+            raise proto.RPCError(f"random tensor {name!r} needs both low and high")
+        if has_low:
+            low, high = spec["low"], spec["high"]
+            if dtype.startswith("float"):
+                if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+                    raise proto.RPCError(f"invalid random range for tensor {name!r}")
+                value = rng.uniform(low, high, size=shape).astype(np_dtype)
+            else:
+                if int(low) != low or int(high) != high or low >= high:
+                    raise proto.RPCError(f"invalid integer random range for tensor {name!r}")
+                minimum, maximum = (0, 2) if dtype == "bool" else (
+                    np.iinfo(np_dtype).min,
+                    np.iinfo(np_dtype).max + 1,
+                )
+                if low < minimum or high > maximum:
+                    raise proto.RPCError(f"random range is outside dtype {dtype!r}")
+                value = rng.integers(
+                    low,
+                    high - 1,
+                    size=shape,
+                    dtype=np.uint8 if dtype == "bool" else np_dtype,
+                    endpoint=True,
+                ).astype(np_dtype)
+        elif dtype == "bool":
             value = rng.integers(0, 2, size=shape, dtype=np.uint8).astype(np.bool_)
         elif dtype.startswith("float"):
             value = rng.standard_normal(size=shape).astype(np_dtype)
