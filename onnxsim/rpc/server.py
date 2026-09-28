@@ -523,6 +523,16 @@ class _Handler(socketserver.BaseRequestHandler):
                 _close(runner)
             specs, out_blobs = proto.encode_tensors(outputs)
             return {"tensors": specs}, out_blobs
+        if op == "xdna_compile_resnet":
+            from .xdna import compile_resnet
+
+            result, out_blobs = compile_resnet(header, blobs, server.work_dir)
+            return {"result": result}, out_blobs
+        if op == "xdna_run_resnet":
+            from .xdna import run_resnet
+
+            result, out_blobs = run_resnet(header, blobs, server.work_dir)
+            return {"result": result}, out_blobs
         raise proto.RPCError(f"unknown operation {op!r}")
 
     @staticmethod

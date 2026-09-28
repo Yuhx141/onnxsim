@@ -156,6 +156,55 @@ caches Python constants between calls, so this suits static-shape models. `scrip
 has a benchmark built on this; a server started with `MOCKDSP=1` also exposes tinygrad's Hexagon
 renderer (kernels executed under `qemu-hexagon-static`, where "time" is an instruction count).
 
+## XDNA ResNet compilation and execution
+
+Run the RPC server on the machine with IRON, XRT, and the XDNA device. Start it
+with that machine's Python environment so compiler subprocesses inherit the
+same toolchain:
+
+```bash
+PYTHONPATH=/path/to/onnx-simplifier:$PYTHONPATH \
+  python -m onnxsim.rpc server --host 127.0.0.1 --port 9192 --key xdna
+```
+
+The client can compile a fused bottleneck and quantized MaxPool remotely, then
+pass their server-side artifact paths to a graph run:
+
+```python
+import onnxsim.rpc as rpc
+
+remote = rpc.connect("127.0.0.1", 9192, key="xdna")
+model = "/client/path/resnet.onnx"
+build = remote.xdna_compile_resnet(model, "resnet", {
+    "example": "/server/path/whole_array.py", "device": "npu2",
+    "optimize_small_m": True,
+})
+block = remote.xdna_compile_resnet(
+    model, "fused_bottleneck", {"block": "/layer1/layer1.0", "device": "npu2"}
+)
+pool = remote.xdna_compile_resnet(model, "maxpool_u8", {
+    "channels": 64, "input_height": 18, "input_width": 20,
+    "output_height": 8, "output_width": 8,
+    "kernel_height": 3, "kernel_width": 3,
+    "stride_height": 2, "stride_width": 2,
+    "tile_output_rows": 8, "tile_channels": 4,
+})
+report = remote.xdna_run_resnet(model, build["manifest"], {
+    "cpu_small_m": 64, "cpu_backend": "torch", "cpu_threads": 2,
+    "warmup": 2, "iters": 10,
+    "fused_blocks": [{"prefix": "/layer1/layer1.0",
+                      "xclbin": block["xclbin"], "insts": block["insts"]}],
+    "maxpool_uint8": {"xclbin": pool["xclbin"], "insts": pool["insts"]},
+})
+print(report["avg_ms"], report["cpu_reference"])
+remote.close()
+```
+
+`xdna_compile_resnet` also supports `kind="resnet"`; provide the server-side
+IRON `whole_array.py` path as `options["example"]`. Compiled paths remain on the
+server, so compile and run calls must use the same server. Compiler failures
+are returned with the subprocess log tail for diagnosis.
+
 ## Remote constant folding
 
 onnxsim's folder builds a throwaway sub-model per fold group and hands it to a `ModelExecutor`

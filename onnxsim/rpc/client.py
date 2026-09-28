@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import statistics
@@ -232,6 +233,51 @@ class Session:
             header.update(runtime=runtime, device=device, options=options or {})
         reply, out = self._call(header, [_model_bytes(model), *blobs])
         return proto.decode_tensors(reply["tensors"], out)
+
+    def xdna_compile_resnet(
+        self,
+        model: ModelLike,
+        kind: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Compile a supported XDNA ResNet artifact on the RPC server.
+
+        ``kind`` is ``"resnet"`` (needs a server-side IRON example path in options),
+        ``"fused_bottleneck"`` (needs ``options["block"]``), or ``"maxpool_u8"``.
+        Returned artifact paths are on the RPC server and can be passed to
+        :meth:`xdna_run_resnet` on the same server.
+        """
+        if kind not in ("resnet", "fused_bottleneck", "maxpool_u8"):
+            raise ValueError(f"unsupported XDNA compile kind {kind!r}")
+        reply, _ = self._call(
+            {"op": "xdna_compile_resnet", "kind": kind, "options": options or {}},
+            [_model_bytes(model)],
+        )
+        return reply["result"]
+
+    def xdna_run_resnet(
+        self,
+        model: ModelLike,
+        manifest: Union[str, os.PathLike, bytes, Dict[str, Any]],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Run and profile the XDNA ResNet graph on the RPC server.
+
+        Manifest artifact paths and any fused-kernel paths must be valid on the
+        server. The result contains the graph runner's profile and correctness report.
+        """
+        if isinstance(manifest, bytes):
+            manifest_bytes = manifest
+        elif isinstance(manifest, dict):
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+        else:
+            with open(manifest, "rb") as stream:
+                manifest_bytes = stream.read()
+        reply, _ = self._call(
+            {"op": "xdna_run_resnet", "options": options or {}},
+            [_model_bytes(model), manifest_bytes],
+        )
+        return reply["result"]["report"]
 
     def executor(self, providers: Optional[Sequence[str]] = None):
         from .executor import RemoteModelExecutor
