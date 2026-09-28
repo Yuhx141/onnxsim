@@ -199,6 +199,90 @@ extern "C" void fused_bottleneck_conv3_chunk(const uint8_t *bundle, const uint8_
   const int8_t *residual = (const int8_t *)(bundle + pixels * FUSED_MID);
   const uint8_t *q2b = bundle + pixels * half;
 #endif
+  using MMUL3 = aie::mmul<8,  8, 8, int8, int8>;
+  alignas(32) int8_t a30_tile[64], a31_tile[64];
+  alignas(32) int8_t b30_tile[64], b31_tile[64];
+  if (outputs >= 16 && (outputs % 16) == 0 && pixels >= 16) {
+    for (int p0 = 0; p0 < pixels; p0 += 16) {
+      const int valid0 = pixels - p0 < 8 ? pixels - p0 : 8;
+      const int valid1 = pixels - (p0 + 8) < 8 ? pixels - (p0 + 8) : 8;
+      for (int oc0 = 0; oc0 < outputs; oc0 += 16) {
+        MMUL3 c300 = aie::zeros<acc32, 64>();
+        MMUL3 c301 = aie::zeros<acc32, 64>();
+        MMUL3 c310 = aie::zeros<acc32, 64>();
+        MMUL3 c311 = aie::zeros<acc32, 64>();
+        for (int ic0 = 0; ic0 < FUSED_MID; ic0 += 8) {
+          for (int m = 0; m < 16; ++m) for (int k = 0; k < 8; ++k) {
+            const int p = p0 + m;
+            const bool valid = (m < 8) ? (m < valid0) : ((m - 8) < valid1);
+            const uint8_t *source = ic0 + k < half ? q2a : q2b;
+            const int source_k = ic0 + k < half ? ic0 + k : ic0 + k - half;
+            const int8_t value = valid ? (int8_t)((int32_t)source[p * half + source_k] - 128) : 0;
+            if (m < 8) a30_tile[m * 8 + k] = value;
+            else a31_tile[(m - 8) * 8 + k] = value;
+          }
+          for (int k = 0; k < 8; ++k) for (int n = 0; n < 8; ++n) {
+            b30_tile[k * 8 + n] = weights[(ic0 + k) * outputs + oc0 + n];
+            b31_tile[k * 8 + n] = weights[(ic0 + k) * outputs + oc0 + 8 + n];
+          }
+          auto av0 = aie::load_v<64>(a30_tile);
+          auto av1 = aie::load_v<64>(a31_tile);
+          auto bv0 = aie::load_v<64>(b30_tile);
+          auto bv1 = aie::load_v<64>(b31_tile);
+          c300.mac(av0, bv0); c301.mac(av0, bv1);
+          c310.mac(av1, bv0); c311.mac(av1, bv1);
+        }
+        auto s300 = c300.to_vector<int32>(); auto s301 = c301.to_vector<int32>();
+        auto s310 = c310.to_vector<int32>(); auto s311 = c311.to_vector<int32>();
+        for (int m = 0; m < valid0; ++m) for (int n = 0; n < 16; ++n) {
+          const int p = p0 + m;
+          const int oc = oc0 + n;
+          const int32_t acc = (n < 8 ? s300[m * 8 + n] : s301[m * 8 + n - 8]) + bias[oc];
+          int32_t q3 = 128 + round_shift_even(acc, FUSED_SHIFT3);
+          if (q3 < 0) q3 = 0; else if (q3 > 255) q3 = 255;
+#if FUSED_PROJECTION
+          const int common = FUSED_MAIN_RESIDUAL_SHIFT < FUSED_SKIP_RESIDUAL_SHIFT
+              ? (FUSED_MAIN_RESIDUAL_SHIFT < 0 ? -FUSED_MAIN_RESIDUAL_SHIFT : 0)
+              : (FUSED_SKIP_RESIDUAL_SHIFT < 0 ? -FUSED_SKIP_RESIDUAL_SHIFT : 0);
+          int64_t sum = scale_pow2(q3 - 128, FUSED_MAIN_RESIDUAL_SHIFT, common) +
+                        scale_pow2((int32_t)skip[p * FUSED_OUT_C + chunk * outputs + oc] - 128, FUSED_SKIP_RESIDUAL_SHIFT, common);
+#else
+          const int common = FUSED_RESIDUAL_SHIFT < FUSED_INPUT_SHIFT
+              ? (FUSED_RESIDUAL_SHIFT < 0 ? -FUSED_RESIDUAL_SHIFT : 0)
+              : (FUSED_INPUT_SHIFT < 0 ? -FUSED_INPUT_SHIFT : 0);
+          int64_t sum = scale_pow2(q3 - 128, FUSED_RESIDUAL_SHIFT, common) +
+                        scale_pow2((int8_t)residual[p * FUSED_C + chunk * outputs + oc], FUSED_INPUT_SHIFT, common);
+#endif
+          int64_t value = round_shift_even64(sum, common);
+          if (value < 0) value = 0; else if (value > 127) value = 127;
+          output[p * FUSED_OUT_C + chunk * outputs + oc] = (uint8_t)(128 + value);
+        }
+        for (int m = 0; m < valid1; ++m) for (int n = 0; n < 16; ++n) {
+          const int p = p0 + 8 + m, oc = oc0 + n;
+          const int32_t acc = (n < 8 ? s310[m * 8 + n] : s311[m * 8 + n - 8]) + bias[oc];
+          int32_t q3 = 128 + round_shift_even(acc, FUSED_SHIFT3);
+          if (q3 < 0) q3 = 0; else if (q3 > 255) q3 = 255;
+#if FUSED_PROJECTION
+          const int common = FUSED_MAIN_RESIDUAL_SHIFT < FUSED_SKIP_RESIDUAL_SHIFT
+              ? (FUSED_MAIN_RESIDUAL_SHIFT < 0 ? -FUSED_MAIN_RESIDUAL_SHIFT : 0)
+              : (FUSED_SKIP_RESIDUAL_SHIFT < 0 ? -FUSED_SKIP_RESIDUAL_SHIFT : 0);
+          int64_t sum = scale_pow2(q3 - 128, FUSED_MAIN_RESIDUAL_SHIFT, common) +
+                        scale_pow2((int32_t)skip[p * FUSED_OUT_C + chunk * outputs + oc] - 128, FUSED_SKIP_RESIDUAL_SHIFT, common);
+#else
+          const int common = FUSED_RESIDUAL_SHIFT < FUSED_INPUT_SHIFT
+              ? (FUSED_RESIDUAL_SHIFT < 0 ? -FUSED_RESIDUAL_SHIFT : 0)
+              : (FUSED_INPUT_SHIFT < 0 ? -FUSED_INPUT_SHIFT : 0);
+          int64_t sum = scale_pow2(q3 - 128, FUSED_RESIDUAL_SHIFT, common) +
+                        scale_pow2((int8_t)residual[p * FUSED_C + chunk * outputs + oc], FUSED_INPUT_SHIFT, common);
+#endif
+          int64_t value = round_shift_even64(sum, common);
+          if (value < 0) value = 0; else if (value > 127) value = 127;
+          output[p * FUSED_OUT_C + chunk * outputs + oc] = (uint8_t)(128 + value);
+        }
+      }
+    }
+    return;
+  }
   for (int p = 0; p < pixels; ++p) for (int oc = 0; oc < outputs; ++oc) {
     int out_channel = chunk * outputs + oc;
     int32_t acc = bias[oc];

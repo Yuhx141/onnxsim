@@ -176,6 +176,13 @@ The transformed constant weights are packed as contiguous K×N tiles. Exact
 quantized results were verified for layer1.1 and layer2.1: 8.87 ms vs 12.08 ms
 and 9.06 ms vs 10.41 ms, respectively.
 
+Conv3 now uses the same 2×2 MMUL schedule when both its output-channel chunks
+and spatial tile are large enough. The binder packs its 1×1 weights as K×N;
+smaller stage-3/4 tensors keep the scalar fallback. Exact block results improved
+from 8.87 to 7.08 ms for `/layer1/layer1.1`, 9.06 to 7.98 ms for
+`/layer2/layer2.1`, and 18.83 to 16.43 ms for projection block
+`/layer2/layer2.0`.
+
 With the 16-context budget, the full quicktest selected 14 fused bottlenecks,
 XDNA MaxPool, one residual Add+ReLU kernel, and CPU fallback for
 `/layer1/layer1.1` and `/layer1/layer1.2`. It measured 166.1 ms (2 warmups, 10

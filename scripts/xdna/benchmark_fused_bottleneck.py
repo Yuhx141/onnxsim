@@ -304,7 +304,14 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
             chunks.append((packed_w2, b2[sl]))
     for index in range(c3_chunks):
         sl = slice(index * c3_rows, (index + 1) * c3_rows)
-        chunks.append((w3[sl], b3[sl]))
+        # Conv3 uses the same tiled KxN MMUL layout as Conv2 when the output
+        # channel and spatial tiles are large enough. Keep small late-stage
+        # chunks in their original OI layout for the scalar fallback.
+        packed_w3 = (
+            np.ascontiguousarray(w3[sl].reshape(c3_rows, -1).transpose(1, 0))
+            if c3_rows >= 16 and output_height * output_width >= 16 else w3[sl]
+        )
+        chunks.append((packed_w3, b3[sl]))
     chunk_sizes = []
     offsets = []
     packed_chunks = []
