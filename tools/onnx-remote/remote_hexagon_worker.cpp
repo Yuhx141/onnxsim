@@ -213,11 +213,19 @@ Response execute(const Request& request) {
   if (rc) { response.error = "tg_graph_run failed: " + std::to_string(rc); return response; }
   profile(response, request, "hexagon_run", run0 - t0, now_us() - run0,
           "dsp_us=" + std::to_string(times[0]) + " threads=" + std::to_string(threads));
-  if (detailed)
-    for (int i = 0, k = 0; i < p.ncalls && k < static_cast<int>(kMaxProfileEvents) - 2; ++i)
-      if (times[1 + i] > 0)
-        response.profile.push_back(ProfileEvent{"call_" + std::to_string(i), "hexagon_call", 0, times[1 + i],
-                                                i < static_cast<int>(p.names.size()) ? p.names[i] : ""}), ++k;
+  if (detailed) {
+    // the transport carries at most kMaxProfileEvents events: send the slowest calls, not the first ones
+    std::vector<int> order(p.ncalls);
+    for (int i = 0; i < p.ncalls; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return times[1 + a] > times[1 + b]; });
+    const size_t room = kMaxProfileEvents - response.profile.size() - 1;
+    for (size_t k = 0; k < order.size() && k < room; ++k) {
+      const int i = order[k];
+      if (times[1 + i] == 0) break;
+      response.profile.push_back(ProfileEvent{"call_" + std::to_string(i), "hexagon_call", 0, times[1 + i],
+                                              i < static_cast<int>(p.names.size()) ? p.names[i] : ""});
+    }
+  }
   size_t at = 0;
   for (const auto& o : p.outputs) {
     Tensor t;
