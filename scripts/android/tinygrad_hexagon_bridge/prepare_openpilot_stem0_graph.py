@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Build a v65 graph with only the packed, qfloat stem.0 kernel retargeted to v68."""
+"""Build a v65 graph with selected captured calls replaced by optimized sources.
+
+The optimized calls are compiled for v68 (qfloat, the historical default) or, with `--opt-arch v65`,
+for v65 with a v65-capable clang, so the whole graph still runs on a Snapdragon 845.
+"""
 from __future__ import annotations
 
 import argparse
@@ -21,8 +25,9 @@ def main() -> None:
   p.add_argument("--out-graph", type=Path, required=True)
   p.add_argument("--tinygrad-bridge", type=Path, default=Path(__file__).parent)
   p.add_argument("--hexagon-clang", type=Path, required=True)
-  p.add_argument("--v68-call", type=int, action="append", default=[0],
-                 help="also select a captured v68 kernel call; repeat to select multiple calls (default: 0)")
+  p.add_argument("--v68-call", "--opt-call", dest="v68_call", type=int, action="append", default=None,
+                 help="select an optimized kernel call; repeat to select multiple calls (default: 0, the stem)")
+  p.add_argument("--opt-arch", default="v68", help="HVX arch the selected calls are compiled for (v65 or v68+)")
   a = p.parse_args()
 
   base_manifest = json.loads((a.base_bundle / "manifest.json").read_text())
@@ -32,9 +37,13 @@ def main() -> None:
   base_stem_call = next((c for c in base_manifest["calls"] if c["name"] == "r_2_64_128_32_24_3_3"), None)
   if stem_call is None or base_stem_call is None or stem_call["call"] != base_stem_call["call"]:
     raise ValueError("stem.0 call is missing or has moved")
-  selected_calls = set(a.v68_call)
-  if base_stem_call["call"] not in selected_calls or any(i < 0 or i >= len(base_manifest["calls"]) for i in selected_calls):
-    raise ValueError("selected calls must include stem.0 call 0 and stay within the graph")
+  selected_calls = set(a.v68_call if a.v68_call is not None else [0])
+  packed_stem = bool(opt_manifest.get("packed_optimizations"))
+  if packed_stem and base_stem_call["call"] not in selected_calls:
+    # the packed weight blob only matches the packed stem.0 source
+    raise ValueError("an optimized bundle with packed stem.0 weights must select stem.0 call 0")
+  if any(i < 0 or i >= len(base_manifest["calls"]) for i in selected_calls):
+    raise ValueError("selected calls must stay within the graph")
 
   shutil.copytree(a.base_bundle, a.out_bundle, dirs_exist_ok=True)
   shutil.copytree(a.baseline_graph, a.out_graph, dirs_exist_ok=True)
@@ -58,12 +67,12 @@ def main() -> None:
     manifest_call = manifest["calls"][call_index]
     manifest_call["source_sha256"] = hashlib.sha256(opt_source).hexdigest()
     manifest_call["exported_name"] = opt_call["exported_name"]
-  manifest["hvx_arch"] = "v65+v68-selected"
-  manifest["weights"] = opt_manifest["weights"]
-  manifest["weights_nbytes"] = opt_manifest["weights_nbytes"]
-  manifest["packed_optimizations"] = opt_manifest.get("packed_optimizations", [])
-  if not manifest["packed_optimizations"]: raise ValueError("optimized export lacks packed stem metadata")
-  shutil.copyfile(a.optimized_bundle / "weights.bin", a.out_bundle / "weights.bin")
+  manifest["hvx_arch"] = "v65" if a.opt_arch == "v65" else f"v65+{a.opt_arch}-selected"
+  if packed_stem:
+    manifest["weights"] = opt_manifest["weights"]
+    manifest["weights_nbytes"] = opt_manifest["weights_nbytes"]
+    manifest["packed_optimizations"] = opt_manifest["packed_optimizations"]
+    shutil.copyfile(a.optimized_bundle / "weights.bin", a.out_bundle / "weights.bin")
   manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
   driver_script = a.tinygrad_bridge / "generate_openpilot_graph_driver.py"
@@ -85,7 +94,7 @@ def main() -> None:
     if source in selected_sources:
       subprocess.run([
         str(a.hexagon_clang), "--target=hexagon", "-c", "-O2", "-Wall", "-Werror", "-fno-stack-protector",
-        "-x", "c", "-fPIC", "-ffreestanding", "-nostdlib", "-mcpu=hexagonv68", "-mhvx=v68",
+        "-x", "c", "-fPIC", "-ffreestanding", "-nostdlib", f"-mcpu=hexagon{a.opt_arch}", f"-mhvx={a.opt_arch}",
         "-mhvx-length=128b", "-o", str(out_obj), str(a.out_bundle / source),
       ], check=True)
     else:
@@ -94,7 +103,7 @@ def main() -> None:
       if not (a.out_graph / old_obj).is_file(): raise FileNotFoundError(a.out_graph / old_obj)
       if (a.out_graph / old_obj).resolve() != out_obj.resolve(): shutil.copyfile(a.out_graph / old_obj, out_obj)
   layout_path.write_text(json.dumps(layout, indent=2) + "\n")
-  print(f"prepared {len(new_objects)} objects: v68 calls {sorted(selected_calls)} plus validated v65 kernels")
+  print(f"prepared {len(new_objects)} objects: {a.opt_arch} calls {sorted(selected_calls)} plus validated v65 kernels")
 
 
 if __name__ == "__main__": main()
