@@ -75,9 +75,20 @@ def test_fake_quant_supports_explicit_16bit_segment_params(bits, signed, zp):
 
 
 def test_step_planner_accepts_explicit_exact_16bit_binary_template():
-    with open(os.path.join(HERE, "..", "scripts", "axera", "fixtures", "binary_op_precision", "index.json")) as stream:
+    with open(
+        os.path.join(
+            HERE,
+            "..",
+            "scripts",
+            "axera",
+            "fixtures",
+            "binary_op_precision",
+            "index.json",
+        )
+    ) as stream:
         entry = next(
-            item for item in json.load(stream)
+            item
+            for item in json.load(stream)
             if item["op"] == "Add" and item["precision"] == "S16"
         )
     shape = entry["shape"]
@@ -95,15 +106,29 @@ def test_step_planner_accepts_explicit_exact_16bit_binary_template():
     )
     model.ir_version = 10
     record = {
-        "op": "Add", "name": "add16", "attrs": {"form": "same_shape"},
-        "inputs": ["x", "z"], "outputs": ["y"], "shapes": [shape],
+        "op": "Add",
+        "name": "add16",
+        "attrs": {"form": "same_shape"},
+        "inputs": ["x", "z"],
+        "outputs": ["y"],
+        "shapes": [shape],
     }
     override = {
         "layer_precision": entry["precision"],
-        "scales": dict(zip(("x", "z", "y"), (entry["scales"][0], entry["scales"][1], entry["scales"][2]))),
+        "scales": dict(
+            zip(
+                ("x", "z", "y"),
+                (entry["scales"][0], entry["scales"][1], entry["scales"][2]),
+            )
+        ),
         "zero_points": dict(zip(("x", "y", "z"), entry["zero_points"])),
     }
-    u8_calib = {"tensors": {name: {"scale": 0.01, "zero_point": 0, "signed": False} for name in ("x", "z", "y")}}
+    u8_calib = {
+        "tensors": {
+            name: {"scale": 0.01, "zero_point": 0, "signed": False}
+            for name in ("x", "z", "y")
+        }
+    }
     segments, host = sr.build_plan(
         model, [record], u8_calib, precision_overrides={"add16": override}
     )
@@ -133,7 +158,17 @@ def test_explicit_16bit_segment_runs_through_step_runner_on_axcl_vm():
     entry = next(
         item
         for item in json.load(
-            open(os.path.join(HERE, "..", "scripts", "axera", "fixtures", "binary_op_precision", "index.json"))
+            open(
+                os.path.join(
+                    HERE,
+                    "..",
+                    "scripts",
+                    "axera",
+                    "fixtures",
+                    "binary_op_precision",
+                    "index.json",
+                )
+            )
         )
         if item["op"] == "Add" and item["precision"] == "S16"
     )
@@ -153,8 +188,12 @@ def test_explicit_16bit_segment_runs_through_step_runner_on_axcl_vm():
     # ORT's schema registry in the pinned runtime supports IR <= 13.
     model.ir_version = 10
     record = {
-        "op": "Add", "name": "add16", "attrs": {"form": "same_shape"},
-        "inputs": ["x", "z"], "outputs": ["y"], "shapes": [shape],
+        "op": "Add",
+        "name": "add16",
+        "attrs": {"form": "same_shape"},
+        "inputs": ["x", "z"],
+        "outputs": ["y"],
+        "shapes": [shape],
     }
     override = {
         "layer_precision": entry["precision"],
@@ -173,8 +212,7 @@ def test_explicit_16bit_segment_runs_through_step_runner_on_axcl_vm():
     assert not host
     rng = np.random.default_rng(97)
     feeds = {
-        name: rng.uniform(-0.75, 0.75, shape).astype(np.float32)
-        for name in ("x", "z")
+        name: rng.uniform(-0.75, 0.75, shape).astype(np.float32) for name in ("x", "z")
     }
     with axcl_session.AXSession(subdir="step_binary_precision_bridge") as session:
         _, stats = sr.StepRunner(model, segments, session, health_every=0).run(
@@ -273,9 +311,7 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     synthetic += sum(s.kind == "mul_mask_exact" for s in everything)
     # Captured unquantized binaries are outside tinygrad_ax_backend's
     # calibration coverage report, just like the other synthetic segments.
-    synthetic += sum(
-        len(s.nodes) for s in everything if s.kind == "fp32_binary"
-    )
+    synthetic += sum(len(s.nodes) for s in everything if s.kind == "fp32_binary")
     # Singleton scalar divisions fold to guarded host constants, not AX models.
     synthetic += sum(s.kind == "algebraic_constant" for s in everything)
     assert covered + nonemittable - synthetic == report_covered
@@ -326,8 +362,13 @@ def test_emission_cache_reuses_a_validated_segment(tmp_path):
 
 def test_algebraic_identity_is_kept_without_model_emission():
     segment = sr.Segment(
-        "ones_mul", "algebraic_identity", ["ones_mul"], ["x"], ["y"],
-        "all-ones Mul is an identity", lambda: None,
+        "ones_mul",
+        "algebraic_identity",
+        ["ones_mul"],
+        ["x"],
+        ["y"],
+        "all-ones Mul is an identity",
+        lambda: None,
     )
     kept, blobs = sr.drop_unemittable([segment], {})
     assert kept == [segment]
@@ -385,7 +426,9 @@ def test_resnet_native_templates_reduce_host_fallbacks():
     assert not set(selected) & host.keys()
     assert len(host) == 126
     assert not {"Sub_446", "Sub_449"} & host.keys()
-    assert {"Greater_444", "Less_447"} <= {s.name for s in segments if s.kind == "compare_complement"}
+    assert {"Greater_444", "Less_447"} <= {
+        s.name for s in segments if s.kind == "compare_complement"
+    }
     folded = {s.name: s for s in segments if s.kind == "algebraic_constant"}
     assert {"Div_18", "Div_26"} <= folded.keys()
     for segment in selected.values():
@@ -405,14 +448,21 @@ def test_singleton_scalar_div_is_folded_and_guarded():
             "singleton_div",
             [onnx.helper.make_tensor_value_info("batch", onnx.TensorProto.FLOAT, [1])],
             [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])],
-            initializer=[numpy_helper.from_array(np.array([-0.5], np.float32), "numerator")],
+            initializer=[
+                numpy_helper.from_array(np.array([-0.5], np.float32), "numerator")
+            ],
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
     )
     model.ir_version = 10
     segment = sr._singleton_scalar_div_fold(
-        {"name": "div", "op": "Div", "inputs": ["numerator", "batch"],
-         "outputs": ["y"], "attrs": {"constant_input": 0}},
+        {
+            "name": "div",
+            "op": "Div",
+            "inputs": ["numerator", "batch"],
+            "outputs": ["y"],
+            "attrs": {"constant_input": 0},
+        },
         {"ranges": {"batch": [16.0, 16.0]}},
         {"numerator": np.array([-0.5], np.float32)},
     )
@@ -428,10 +478,26 @@ def test_singleton_scalar_div_is_folded_and_guarded():
 @pytest.mark.parametrize(
     "node_name",
     [
-        "Mul_5", "Mul_11", "Mul_25", "Mul_33", "Mul_46", "Mul_68",
-        "Mul_91", "Mul_113", "Mul_148", "Mul_170", "Mul_193", "Mul_215",
-        "Mul_250", "Mul_272", "Mul_295", "Mul_317", "Mul_352", "Mul_374",
-        "Mul_397", "Mul_419",
+        "Mul_5",
+        "Mul_11",
+        "Mul_25",
+        "Mul_33",
+        "Mul_46",
+        "Mul_68",
+        "Mul_91",
+        "Mul_113",
+        "Mul_148",
+        "Mul_170",
+        "Mul_193",
+        "Mul_215",
+        "Mul_250",
+        "Mul_272",
+        "Mul_295",
+        "Mul_317",
+        "Mul_352",
+        "Mul_374",
+        "Mul_397",
+        "Mul_419",
     ],
 )
 @needs_device
@@ -497,7 +563,9 @@ def test_resnet_s16_mul_range_matched_template_on_axcl_vm(node_name):
         env = {left: x, right: z}
     runner = sr.StepRunner(model, [segment])
     simulated = runner._sim(segment, env)[0]
-    with axcl_session.AXSession(subdir=f"resnet_{node_name.lower()}_matched_s16") as session:
+    with axcl_session.AXSession(
+        subdir=f"resnet_{node_name.lower()}_matched_s16"
+    ) as session:
         runner.session = session
         actual = runner._device(segment, env)[0]
     max_lsb = float(np.abs(actual - simulated).max() / segment.out_q[0][0])
@@ -507,8 +575,18 @@ def test_resnet_s16_mul_range_matched_template_on_axcl_vm(node_name):
 @pytest.mark.parametrize(
     "node_name",
     [
-        "Mul_485", "Mul_499", "Mul_555", "Mul_569", "Mul_583", "Mul_625",
-        "Mul_639", "Mul_653", "Mul_695", "Mul_709", "Mul_723", "Mul_765",
+        "Mul_485",
+        "Mul_499",
+        "Mul_555",
+        "Mul_569",
+        "Mul_583",
+        "Mul_625",
+        "Mul_639",
+        "Mul_653",
+        "Mul_695",
+        "Mul_709",
+        "Mul_723",
+        "Mul_765",
     ],
 )
 @needs_device
@@ -578,11 +656,15 @@ def test_resnet_lr_vector_s16_template_on_axcl_vm(node_name):
     assert segment.input_transforms.get(tensor) is not None
     env = {
         "lr": np.array([1e-4], dtype=np.float32),
-        tensor: rng.uniform(*calib["ranges"][tensor], value_shapes[tensor]).astype(np.float32),
+        tensor: rng.uniform(*calib["ranges"][tensor], value_shapes[tensor]).astype(
+            np.float32
+        ),
     }
     runner = sr.StepRunner(model, [segment])
     simulated = runner._sim(segment, env)[0]
-    with axcl_session.AXSession(subdir=f"resnet_{node_name.lower()}_lr_vector_s16") as session:
+    with axcl_session.AXSession(
+        subdir=f"resnet_{node_name.lower()}_lr_vector_s16"
+    ) as session:
         runner.session = session
         actual = runner._device(segment, env)[0]
     assert actual.ndim == 1
@@ -637,9 +719,7 @@ def test_resnet_comparison_complement_template_on_axcl_vm(node_name):
 
     model = sr.load_step()
     calib = sr.axb.load_calibration(sr.STEP_CALIB)
-    segments, host = sr.build_plan(
-        model, sr.load_records(), calib
-    )
+    segments, host = sr.build_plan(model, sr.load_records(), calib)
     segment = next(s for s in segments if s.name == node_name)
     assert segment.kind == "compare_complement"
     assert not {"Sub_446", "Sub_449"} & host.keys()
@@ -653,10 +733,16 @@ def test_resnet_comparison_complement_template_on_axcl_vm(node_name):
     z.reshape(-1)[:6] = [0.0, 0.0, 0.0, 2.0, -2.0, 1.0]
     env = {x_name: x, z_name: z}
     runner = sr.StepRunner(model, [segment])
-    with axcl_session.AXSession(subdir=f"resnet_{node_name.lower()}_complement") as session:
+    with axcl_session.AXSession(
+        subdir=f"resnet_{node_name.lower()}_complement"
+    ) as session:
         runner.session = session
         actual = runner._device(segment, env)[0].reshape(-1)[:6]
-    expected = x.reshape(-1)[:6] <= z.reshape(-1)[:6] if node_name == "Greater_444" else x.reshape(-1)[:6] >= z.reshape(-1)[:6]
+    expected = (
+        x.reshape(-1)[:6] <= z.reshape(-1)[:6]
+        if node_name == "Greater_444"
+        else x.reshape(-1)[:6] >= z.reshape(-1)[:6]
+    )
     np.testing.assert_array_equal(actual, expected.astype(np.float32))
 
 
@@ -667,7 +753,9 @@ def test_comparison_complement_nan_guard_uses_original_host_semantics():
         onnx.helper.make_graph(
             [
                 onnx.helper.make_node("Greater", ["x", "z"], ["cmp"], name="greater"),
-                onnx.helper.make_node("Cast", ["cmp"], ["cast"], name="cast", to=onnx.TensorProto.FLOAT),
+                onnx.helper.make_node(
+                    "Cast", ["cmp"], ["cast"], name="cast", to=onnx.TensorProto.FLOAT
+                ),
                 onnx.helper.make_node("Sub", ["one", "cast"], ["y"], name="sub"),
             ],
             "nan_guard",
@@ -697,7 +785,10 @@ def test_comparison_complement_nan_guard_uses_original_host_semantics():
     )
     runner = sr.StepRunner(model, [segment])
     outputs, stats = runner.run(
-        {"x": np.array([np.nan, 2.0], np.float32), "z": np.array([0.0, 1.0], np.float32)},
+        {
+            "x": np.array([np.nan, 2.0], np.float32),
+            "z": np.array([0.0, 1.0], np.float32),
+        },
         mode="npu",
         check=False,
     )
@@ -857,7 +948,14 @@ def test_exact_mask_mul_template_requires_its_measured_calibration():
     segment = sr._exact_mask_mul_segment_for(rec, calib, model)
     assert segment is not None and segment.kind == "mul_mask_exact"
     assert not sr._exact_mask_mul_segment_for(
-        rec, {"tensors": {**calib["tensors"], "y": {**calib["tensors"]["y"], "scale": 0.001}}}, model
+        rec,
+        {
+            "tensors": {
+                **calib["tensors"],
+                "y": {**calib["tensors"]["y"], "scale": 0.001},
+            }
+        },
+        model,
     )
 
 
@@ -904,7 +1002,12 @@ def test_exact_loss_sub_template_requires_its_measured_calibration():
     segment = sr._exact_loss_sub_segment_for(rec, calibration, model)
     assert segment is not None and segment.kind == "sub_loss_exact"
     assert segment.output_shape == (16, 1000)
-    changed = {"tensors": {**calibration["tensors"], "y": {**calibration["tensors"]["y"], "zero_point": 128}}}
+    changed = {
+        "tensors": {
+            **calibration["tensors"],
+            "y": {**calibration["tensors"]["y"], "zero_point": 128},
+        }
+    }
     assert sr._exact_loss_sub_segment_for(rec, changed, model) is None
 
 
@@ -989,7 +1092,9 @@ def test_exact_loss_sub_template_matches_runner_simulation_on_axcl_vm():
     rec = {"op": "Sub", "name": "loss_sub", "inputs": ["x", "z"], "outputs": ["y"]}
     segment = sr._exact_loss_sub_segment_for(rec, _loss_sub_calibration(), model)
     assert segment is not None
-    x = np.linspace(-6.96580696105957 * 255, 0.0, 16000, dtype=np.float32).reshape(16, 1000)
+    x = np.linspace(-6.96580696105957 * 255, 0.0, 16000, dtype=np.float32).reshape(
+        16, 1000
+    )
     z = np.linspace(-0.03125, 0.0, 16, dtype=np.float32).reshape(16, 1)
     runner = sr.StepRunner(model, [segment])
     simulated = runner._sim(segment, {"x": x, "z": z})[0]

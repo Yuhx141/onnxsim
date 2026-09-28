@@ -69,8 +69,12 @@ def _gather_key():
 
 def test_template_key_json_round_trip():
     key = axb.TemplateKey(
-        "Transpose", ((16, 512),), (("perm", (1, 0)),), calibration_class="",
-        layer_precision="S16", calibration_scales=(0.125, 0.25, 0.5),
+        "Transpose",
+        ((16, 512),),
+        (("perm", (1, 0)),),
+        calibration_class="",
+        layer_precision="S16",
+        calibration_scales=(0.125, 0.25, 0.5),
     )
     assert axb.TemplateKey.from_json(json.loads(json.dumps(key.to_json()))) == key
     assert dataclasses.replace(key, layer_precision="U16") != key
@@ -113,9 +117,7 @@ def test_template_key_refuses_unknown_layer_precision():
 
 
 def test_precision_selection_flows_through_generic_compiler_request():
-    key = axb.TemplateKey(
-        "Mul", ((1000, 512),), calibration_class="x0,y0,z0"
-    )
+    key = axb.TemplateKey("Mul", ((1000, 512),), calibration_class="x0,y0,z0")
     request = axb.build_request(key, [axb.BinaryTemplateOnly()])
     u8_model = onnx.load_model_from_string(axb.compile_request(request))
     fixture, _ = bse.load_template("Mul", (1000, 512), {"x": 0, "y": 0, "z": 0})
@@ -192,9 +194,7 @@ def test_high_precision_mul_template_on_axcl_vm(precision):
 
     scale = 2.7466237952467054e-05
     output_scale = (
-        1.2359806532913353e-05
-        if precision == "U16"
-        else 2.4719613065826707e-05
+        1.2359806532913353e-05 if precision == "U16" else 2.4719613065826707e-05
     )
     zp = "x32768,y0,z32768" if precision == "U16" else "x0,y0,z0"
     key = axb.TemplateKey(
@@ -228,12 +228,13 @@ def _binary_precision_cases():
     return [
         entry
         for entry in entries
-        if entry["shape"] == [16, 1000]
-        and "ResNet18 step" not in entry["source"]
+        if entry["shape"] == [16, 1000] and "ResNet18 step" not in entry["source"]
     ]
 
 
-@pytest.mark.parametrize("entry", _binary_precision_cases(), ids=lambda e: f"{e['op']}-{e['precision']}")
+@pytest.mark.parametrize(
+    "entry", _binary_precision_cases(), ids=lambda e: f"{e['op']}-{e['precision']}"
+)
 def test_high_precision_binary_template_through_onnx_uop_mcode(entry, tmp_path):
     op, precision = entry["op"], entry["precision"]
     shape = entry["shape"]
@@ -264,15 +265,31 @@ def test_high_precision_binary_template_through_onnx_uop_mcode(entry, tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
 
 
-@pytest.mark.parametrize("entry", _binary_precision_cases(), ids=lambda e: f"{e['op']}-{e['precision']}")
+@pytest.mark.parametrize(
+    "entry", _binary_precision_cases(), ids=lambda e: f"{e['op']}-{e['precision']}"
+)
 def test_high_precision_binary_template_on_axcl_vm(entry):
     vm = os.environ.get("AXCL_LXD_VM", "axcl-vm")
     try:
-        ready = subprocess.run(
-            ["lxc", "exec", vm, "--", "test", "-x", "/usr/bin/axcl/axcl_run_model", "-a", "-e", "/dev/axcl_host"],
-            capture_output=True,
-            timeout=30,
-        ).returncode == 0
+        ready = (
+            subprocess.run(
+                [
+                    "lxc",
+                    "exec",
+                    vm,
+                    "--",
+                    "test",
+                    "-x",
+                    "/usr/bin/axcl/axcl_run_model",
+                    "-a",
+                    "-e",
+                    "/dev/axcl_host",
+                ],
+                capture_output=True,
+                timeout=30,
+            ).returncode
+            == 0
+        )
     except (OSError, subprocess.TimeoutExpired):
         ready = False
     if not ready:
@@ -298,13 +315,18 @@ def test_high_precision_binary_template_on_axcl_vm(entry):
             "Mul": ((-0.9, 0.9), (-0.9, 0.9)),
             "Div": ((-0.9, 0.9), (0.5, 0.9)),
         }[op]
-    x, z = (
-        rng.uniform(*bounds, shape).astype(np.float32) for bounds in ranges
-    )
-    with axcl_session.AXSession(subdir=f"binary_{op.lower()}_{precision.lower()}") as session:
+    x, z = (rng.uniform(*bounds, shape).astype(np.float32) for bounds in ranges)
+    with axcl_session.AXSession(
+        subdir=f"binary_{op.lower()}_{precision.lower()}"
+    ) as session:
         compiled = session.load(model.SerializeToString())
         (actual,) = session.run(compiled, [x, z])
-    expected = {"Add": np.add, "Sub": np.subtract, "Mul": np.multiply, "Div": np.divide}[op](x, z)
+    expected = {
+        "Add": np.add,
+        "Sub": np.subtract,
+        "Mul": np.multiply,
+        "Div": np.divide,
+    }[op](x, z)
     np.testing.assert_allclose(actual, expected, atol=1.2e-4, rtol=2e-4)
 
 
