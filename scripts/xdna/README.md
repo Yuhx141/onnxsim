@@ -304,6 +304,12 @@ compiled and matched NumPy on the NPU. General `AveragePool`, MaxPool indices,
 and other data types remain unsupported. Padding is currently prepared on the
 host before upload, and adjacent operator fusion is future work.
 
+Pooling now groups adjacent NCHW channels into each DMA transfer, selecting a
+group size under a 48 KiB tile-buffer budget. For the 64-channel quicktest pool,
+eight-channel groups reduced the measured kernel time from 1.35 ms to 1.16 ms
+in a 40-iteration device-only run; the grouped kernel also matched the NumPy
+reference and retained its output in device memory.
+
 `Flatten` and `Reshape` are emitted as zero-copy contiguous tensor views, with
 their input/output shapes carried in the operation record. They require no AIE
 instruction artifact; the future runner can preserve the same device buffer

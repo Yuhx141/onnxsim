@@ -155,12 +155,21 @@ def _compile_global_avgpool(
 
 def _compile_maxpool(params: dict[str, Any], device: str, output_dir: Path) -> dict[str, str]:
     pads = tuple(int(value) for value in params["pads"])
+    input_rows = (int(params["tile_output_rows"]) - 1) * int(params["stride_height"]) + int(params["kernel_height"])
+    tile_bytes = (
+        input_rows * int(params["input_width"])
+        + int(params["tile_output_rows"]) * int(params["output_width"])
+    ) * 4
+    tile_channels = int(params.get("tile_channels") or next(
+        tile for tile in (8, 4, 2, 1)
+        if int(params["channels"]) % tile == 0 and tile * tile_bytes <= 48 * 1024
+    ))
     key = (
         f"maxpool2d_nchw_f32_c{params['channels']}_i{params['input_height']}x{params['input_width']}"
         f"_o{params['output_height']}x{params['output_width']}"
         f"_k{params['kernel_height']}x{params['kernel_width']}"
         f"_s{params['stride_height']}x{params['stride_width']}"
-        f"_p{'_'.join(str(value) for value in pads)}_tr{params['tile_output_rows']}"
+        f"_p{'_'.join(str(value) for value in pads)}_tr{params['tile_output_rows']}_tc{tile_channels}"
     )
     xclbin = output_dir / f"{key}.xclbin"
     insts = output_dir / f"{key}.insts.bin"
@@ -177,6 +186,7 @@ def _compile_maxpool(params: dict[str, Any], device: str, output_dir: Path) -> d
         "--stride-height", str(params["stride_height"]),
         "--stride-width", str(params["stride_width"]),
         "--tile-output-rows", str(params["tile_output_rows"]),
+        "--tile-channels", str(tile_channels),
         "--pad-top", str(pads[0]), "--pad-left", str(pads[1]),
         "--pad-bottom", str(pads[2]), "--pad-right", str(pads[3]),
         "--xclbin-path", str(xclbin), "--insts-path", str(insts),

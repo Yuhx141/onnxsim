@@ -34,23 +34,27 @@ def maxpool2d(
     stride_height: CompileTime[int] = 2,
     stride_width: CompileTime[int] = 2,
     tile_output_rows: CompileTime[int] = 8,
+    tile_channels: CompileTime[int] = 1,
 ):
     if output_height % tile_output_rows:
         raise ValueError("output height must be divisible by tile_output_rows")
     if input_height < (output_height - 1) * stride_height + kernel_height:
         raise ValueError("padded input height is too small for the pooling window")
+    if channels % tile_channels:
+        raise ValueError("channels must be divisible by tile_channels")
     output_row_groups = output_height // tile_output_rows
     input_rows_per_tile = (tile_output_rows - 1) * stride_height + kernel_height
-    chunks = channels * output_row_groups
+    channel_groups = channels // tile_channels
+    chunks = channel_groups * output_row_groups
     input_type = np.ndarray[(channels * input_height * input_width,), np.dtype[np.float32]]
     output_type = np.ndarray[(channels * output_height * output_width,), np.dtype[np.float32]]
-    input_tile = np.ndarray[(input_rows_per_tile * input_width,), np.dtype[np.float32]]
-    output_tile = np.ndarray[(tile_output_rows * output_width,), np.dtype[np.float32]]
+    input_tile = np.ndarray[(tile_channels * input_rows_per_tile * input_width,), np.dtype[np.float32]]
+    output_tile = np.ndarray[(tile_channels * tile_output_rows * output_width,), np.dtype[np.float32]]
     kernel = ExternalFunction(
         "maxpool2d_nchw_f32",
         source_file=str(_KERNEL),
         arg_types=[input_tile, output_tile, np.int32, np.int32, np.int32, np.int32,
-                   np.int32, np.int32, np.int32],
+                   np.int32, np.int32, np.int32, np.int32],
     )
     input_fifo = ObjectFifo(input_tile, depth=1, name="maxpool_input")
     output_fifo = ObjectFifo(output_tile, depth=1, name="maxpool_output")
@@ -62,7 +66,7 @@ def maxpool2d(
             kernel_fn(
                 source, result, input_width, output_width,
                 kernel_height, kernel_width, stride_height, stride_width,
-                tile_output_rows,
+                tile_output_rows, tile_channels,
             )
             output_prod.release(1)
             input_cons.release(1)
@@ -76,23 +80,25 @@ def maxpool2d(
 
     def sequence(source, result, source_prod, result_cons):
         for chunk in range(chunks):
-            channel = chunk // output_row_groups
+            channel = (chunk // output_row_groups) * tile_channels
             row_group = chunk % output_row_groups
             input_offset = channel * input_height * input_width + row_group * tile_output_rows * stride_height * input_width
             output_offset = channel * output_height * output_width + row_group * tile_output_rows * output_width
             group = TaskGroup()
             source_prod.fill(
                 source, wait=True,
-                sizes=[input_rows_per_tile * input_width], strides=[1],
-                offset=input_offset, transfer_len=input_rows_per_tile * input_width,
+                sizes=[tile_channels, input_rows_per_tile * input_width],
+                strides=[input_height * input_width, 1],
+                offset=input_offset, transfer_len=tile_channels * input_rows_per_tile * input_width,
                 group=group,
             )
             group.finish()
             group = TaskGroup()
             result_cons.drain(
                 result, wait=True,
-                sizes=[tile_output_rows * output_width], strides=[1],
-                offset=output_offset, transfer_len=tile_output_rows * output_width,
+                sizes=[tile_channels, tile_output_rows * output_width],
+                strides=[output_height * output_width, 1],
+                offset=output_offset, transfer_len=tile_channels * tile_output_rows * output_width,
                 group=group,
             )
             group.finish()
@@ -135,6 +141,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--stride-height", type=int, default=2)
     parser.add_argument("--stride-width", type=int, default=2)
     parser.add_argument("--tile-output-rows", type=int, default=8)
+    parser.add_argument("--tile-channels", type=int, default=1)
     parser.add_argument("--pad-top", type=int, default=1)
     parser.add_argument("--pad-left", type=int, default=1)
     parser.add_argument("--pad-bottom", type=int, default=1)
@@ -146,16 +153,19 @@ def main(argv: list[str] | None = None) -> int:
     opts = _parser().parse_args(argv)
     if min(opts.channels, opts.input_height, opts.input_width, opts.output_height,
            opts.output_width, opts.kernel_height, opts.kernel_width,
-           opts.stride_height, opts.stride_width, opts.tile_output_rows) < 1:
+           opts.stride_height, opts.stride_width, opts.tile_output_rows, opts.tile_channels) < 1:
         _parser().error("all pooling dimensions and strides must be positive")
     if opts.output_height % opts.tile_output_rows:
         _parser().error("output height must be divisible by tile output rows")
+    if opts.channels % opts.tile_channels:
+        _parser().error("channels must be divisible by tile_channels")
     kwargs = {
         "channels": opts.channels, "input_height": opts.input_height,
         "input_width": opts.input_width, "output_height": opts.output_height,
         "output_width": opts.output_width, "kernel_height": opts.kernel_height,
         "kernel_width": opts.kernel_width, "stride_height": opts.stride_height,
         "stride_width": opts.stride_width, "tile_output_rows": opts.tile_output_rows,
+        "tile_channels": opts.tile_channels,
     }
 
     def verify(run_opts: Any) -> None:
