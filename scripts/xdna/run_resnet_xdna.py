@@ -860,19 +860,25 @@ class XDNAResNetRunner:
             offloaded = False
             attrs = _attrs(node)
             result = self._device_view(index, node, values)
+            native_qadd = (
+                op == "Add"
+                and index in self.operation_specs
+                and self.operation_specs[index].get("compiled_artifact")
+                and self.operation_specs[index].get("quantization")
+            )
             if result is not None:
                 offloaded = True
                 self._executed["device_view_ops"] += 1
                 args = []
             else:
-                args = [] if op == "Conv" else [self._host_value(values[name]) for name in node.input if name]
+                args = [] if op == "Conv" or native_qadd else [
+                    self._host_value(values[name]) for name in node.input if name
+                ]
             if result is not None:
                 pass
             elif op == "Constant":
                 result = numpy_helper.to_array(attrs["value"])
-            elif (op == "Add" and index in self.operation_specs
-                  and self.operation_specs[index].get("compiled_artifact")
-                  and self.operation_specs[index].get("quantization")):
+            elif native_qadd:
                 result = self._run_quantized_add_relu(index, values)
                 quant = self.operation_specs[index]["quantization"]
                 values[str(quant["raw_output"])] = result
