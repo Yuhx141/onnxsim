@@ -228,6 +228,11 @@ def _compile_kwargs(opts):
     kwargs = fused_compile_kwargs(opts)
     if not kwargs.get("skip_chunks", 0):
         raise ValueError("parallel projection scheduling requires a projection bottleneck")
+    if (kwargs["chunks1"], kwargs["chunks2"], kwargs["chunks3"], kwargs["skip_chunks"]) != (1, 1, 1, 1):
+        raise ValueError(
+            "parallel projection scheduling currently requires one weight chunk per Conv; "
+            "larger blocks need per-stage weight-stream routing to avoid FIFO contention"
+        )
     return kwargs
 
 

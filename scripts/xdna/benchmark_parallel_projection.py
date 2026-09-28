@@ -33,6 +33,11 @@ def main() -> int:
     if not args.xclbin.is_file() or not args.insts.is_file():
         parser.error("compiled xclbin and instruction stream must both exist")
     binding = bind_fused_bottleneck(model, block)
+    if (*binding["chunk_counts"], binding["skip_chunk_count"]) != (1, 1, 1, 1):
+        parser.error(
+            "this schedule requires one weight chunk per Conv; "
+            "larger blocks currently hit shared weight-FIFO contention"
+        )
 
     ref_model = onnx.ModelProto()
     ref_model.CopyFrom(model)

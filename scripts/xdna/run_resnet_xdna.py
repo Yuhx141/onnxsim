@@ -223,6 +223,12 @@ class XDNAResNetRunner:
             if not Path(xclbin).is_file() or not Path(insts).is_file():
                 raise ValueError("fused block xclbin and instruction stream must exist")
             binding = bind_fused_bottleneck(model, block)
+            if prefix in parallel_prefixes and (
+                *binding["chunk_counts"], binding["skip_chunk_count"]
+            ) != (1, 1, 1, 1):
+                raise ValueError(
+                    f"parallel projection block {prefix!r} requires one weight chunk per Conv"
+                )
             prepared_blocks[prefix] = (block, binding, set(binding["covered_nodes"]), str(xclbin), str(insts))
 
         # Strix Halo supports 16 simultaneous hardware contexts. Reserve those
