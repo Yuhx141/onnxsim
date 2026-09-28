@@ -266,6 +266,14 @@ are recorded in `fixtures/fp32_binary/device_comparisons.json`. This is a
 kernel-time comparison, not a whole-step speedup claim; apparent wins with
 different broadcast input shapes were excluded.
 
+For the native scalar-broadcast Mul segments, shape-correct profiling found
+nine signatures where FP32 was at least 10% faster than the S16 template.
+The planner now chooses their FP32 templates with operands reordered to match
+the captured model IO, replacing 18 S16 nodes. Measured median speedups range
+from 1.14x to 2.16x over 40 paired runs; marginal results below the 10%
+threshold remain on S16. Details are in
+`fixtures/fp32_binary/native_mul_speed_profiles.json`.
+
 The updated plan now assigns all 1,104 graph nodes to NPU segments with zero
 ONNX Runtime fallback. The full training graph ran on AX8850: all 127 FP32
 binary segments had zero errors, zero LSB difference, and zero difference

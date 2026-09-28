@@ -279,6 +279,7 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     segs, host = sr.build_plan(model, records, calib)
     everything, _ = sr.build_plan(model, records, calib, include_unsafe=True)
     assert any(s.kind == "fp32_binary" for s in everything)
+    assert sum(s.profiled_faster for s in everything) == 18
     assert any(s.name == "Mul_20" and s.kind == "mul_mask_exact" for s in segs)
     assert any(s.name == "Sub_24" and s.kind == "sub_loss_exact" for s in segs)
     assert {s.name for s in segs if s.kind == "div2_exact"} == {
@@ -309,8 +310,8 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     synthetic += sum(s.kind == "sub_loss_exact" for s in everything)
     synthetic += sum(s.kind == "div2_exact" for s in everything)
     synthetic += sum(s.kind == "mul_mask_exact" for s in everything)
-    # Captured unquantized binaries are outside tinygrad_ax_backend's
-    # calibration coverage report, just like the other synthetic segments.
+    # Captured FP32 routes, including speed-selected S16 overrides, are outside
+    # the generic backend coverage report.
     synthetic += sum(len(s.nodes) for s in everything if s.kind == "fp32_binary")
     # Singleton scalar divisions fold to guarded host constants, not AX models.
     synthetic += sum(s.kind == "algebraic_constant" for s in everything)
@@ -872,6 +873,46 @@ def test_fp32_binary_fixture_is_exact_shape_and_unquantized():
         onnx.helper.make_model(graph),
     )
     assert segment is not None and not segment.in_q and not segment.out_q
+
+
+@needs_device
+def test_profiled_fast_broadcast_mul_reorders_scalar_operand_on_axcl_vm():
+    import axcl_session
+
+    shape = [128, 64, 3, 3]
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Mul", ["scale", "x"], ["y"], name="binary")],
+        "profiled_broadcast_mul",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        initializer=[
+            onnx.numpy_helper.from_array(np.array([0.73], np.float32), "scale")
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    segment = sr._fp32_binary_segment_for(
+        {
+            "op": "Mul",
+            "name": "binary",
+            "inputs": ["scale", "x"],
+            "outputs": ["y"],
+        },
+        model,
+    )
+    assert segment is not None and segment.profiled_faster
+    assert segment.inputs == ["x", "scale"]
+    assert segment.constant_inputs == ["scale"]
+
+    rng = np.random.default_rng(12864)
+    x = rng.normal(size=shape).astype(np.float32)
+    with axcl_session.AXSession(subdir="step_runner_fp32_broadcast_mul_test") as sess:
+        runner = sr.StepRunner(model, [segment])
+        runner.session = sess
+        actual = runner._device(segment, {"x": x})[0]
+    np.testing.assert_array_equal(actual, x * np.float32(0.73))
 
 
 @needs_device
