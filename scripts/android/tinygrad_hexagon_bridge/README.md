@@ -376,16 +376,32 @@ Phone results (Xiaomi 12S V69 running v65 code; RPC-inclusive, best of N; every 
 
 | program | 1 thread | 4 threads |
 |---|---:|---:|
-| `driving_supercombo` (all four outputs, recurrent state included) | 2991 ms | 1234 ms |
-| `dmonitoring_model` | 1044 ms | 388 ms |
+| `driving_supercombo` (all four outputs, recurrent state included) | 2057 ms | 768 ms |
+| `dmonitoring_model` | 893 ms | 342 ms |
 | driving warp, 1928x1208 | 87.9 ms | 50.3 ms |
 | driving warp, 1344x760 | 75.2 ms | 43.0 ms |
 | DM warp, 1928x1208 | 238.9 ms | 78.3 ms |
 | DM warp, 1344x760 | 225.3 ms | 70.1 ms |
 
-The model rows include scalar register blocking and materialized conv padding (below). The progression for driving (1 / 4
-threads) was 3831 / 1702 ms, then 3796 / 1493 ms with blocking, then 2991 / 1234 ms with padding. For DM it was 1623 / 620,
-then 1094 / 419, then 1044 / 388 ms.
+The model rows include every codegen change below. Each step, as 1 / 4 threads:
+
+| step | driving | DM |
+|---|---:|---:|
+| fp32 weights, `DSP_THREADS` | 3831 / 1702 ms | 1623 / 620 ms |
+| + scalar register blocking | 3796 / 1493 | 1094 / 419 |
+| + materialized conv padding | 2991 / 1234 | 1044 / 388 |
+| + strided sub-line prefetch | 2156 / 1089 | 1024 / 370 |
+| + scalar GEMV upcast | 2057 / 768 | 893 / 342 |
+
+**Strided sub-line prefetch (`HVX_PREFETCH_SUBLINE`, default on).** Scalar float code loads a float4 per reduction step. A 1x1
+conv over NCHW channels, or a GEMM over weight rows, walks those loads at a multi-KB stride and missed on every step, because
+the existing vector-load prefetch skips anything under a line. One `dcfetch` `HVX_PREFETCH_STRIDES` steps ahead on such loads
+took driving's 192->64 1x1 conv from 371 to 105 ms single-threaded (102 -> 30 ms with 4 threads).
+
+**Scalar GEMV (`DSP_SCALAR_GEMV`, default on).** A reduction that nothing broadcasts into used to get the HVX rule, which
+upcasts the innermost output axis to 128. On v65 float that is a 128-float accumulator in memory, and for the policy head's
+`[out, in]` Gemm weights it reads 128 rows per step. With threads it got slower (59.7 ms with 4 threads vs 20.3 with 1). A
+4-wide upcast plus reduce unroll gives 12.4 / 3.8 ms; `[in, out]` GEMVs are unchanged.
 
 **Materialized conv padding (`CONV_PAD_MATERIALIZE=1`).** tinygrad pads a conv input lazily, so the zero padding becomes a
 mask on every input load inside the conv. On scalar v65 the masked loads and their address math cost more than the MACs. With
