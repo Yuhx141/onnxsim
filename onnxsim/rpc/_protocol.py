@@ -91,19 +91,28 @@ def recv_message(
 def encode_tensors(
     tensors: Dict[str, np.ndarray],
 ) -> Tuple[List[Dict[str, Any]], List[bytes]]:
-    specs, blobs = [], []
+    specs = encode_tensor_specs(tensors)
+    blobs = []
+    for name, value in tensors.items():
+        array = np.asarray(value)
+        array = np.ascontiguousarray(
+            array.astype(array.dtype.newbyteorder("<"), copy=False)
+        )
+        blobs.append(array.tobytes())
+    return specs, blobs
+
+
+def encode_tensor_specs(tensors: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+    """Describe tensor inputs without serializing their values."""
+    specs = []
     for name, value in tensors.items():
         array = np.asarray(value)
         if array.dtype.name not in DTYPES:
             raise RPCError(f"tensor {name!r} has unsupported dtype {array.dtype.name}")
-        array = np.ascontiguousarray(
-            array.astype(array.dtype.newbyteorder("<"), copy=False)
-        )
         specs.append(
             {"name": name, "dtype": array.dtype.name, "shape": list(array.shape)}
         )
-        blobs.append(array.tobytes())
-    return specs, blobs
+    return specs
 
 
 def decode_tensors(

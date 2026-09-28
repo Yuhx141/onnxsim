@@ -1,0 +1,182 @@
+#include "remote_transport.h"
+#include "remote_profile.h"
+#include "remote_capabilities.h"
+
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+using namespace onnx_remote;
+
+int main() {
+  CapabilitySummary capabilities;
+  std::string capability_error;
+  assert(parse_capability_manifest(
+      "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
+      "\"runner_id\":\"ort-cpu-worker\",\"graph_execution\":true,"
+      "\"profiling\":true,\"supported_ops\":[\"subgraph\",\"onnx\"]}",
+      capabilities, capability_error));
+  assert(capabilities.graph_execution);
+  assert(capabilities.profiling);
+  assert(capabilities.runner_id == "ort-cpu-worker");
+  assert(capabilities.supported_ops.size() == 2);
+  assert(capabilities.supported_ops[0] == "subgraph");
+  assert(capabilities.supported_ops[1] == "onnx");
+  assert(parse_capability_manifest(
+      "{\n  \"schema_version\" : 1,\n"
+      "  \"protocol\" : \"onnx-remote-v5\",\n"
+      "  \"runner_id\" : \"pretty-worker\",\n"
+      "  \"graph_execution\" : true\n}",
+      capabilities, capability_error));
+  assert(capabilities.runner_id == "pretty-worker");
+  assert(capabilities.graph_execution);
+  assert(capabilities.supported_ops.empty());
+  assert(!parse_capability_manifest(
+      "{\"schema_version\":2,\"protocol\":\"onnx-remote-v5\","
+      "\"runner_id\":\"old-worker\"}", capabilities, capability_error));
+
+  Request request;
+  request.request_id = 42;
+  request.op = "run_compiled";
+  request.artifact_id = "qairt-test-1";
+  request.model = {0x01, 0x02, 0x03};
+  request.artifact = {0xaa, 0xbb};
+  request.profiling = ProfilingLevel::Detailed;
+  request.inputs.push_back(Tensor{{2, 2}, {1.0f, 2.0f, 3.0f, 4.0f}});
+
+  std::vector<uint8_t> payload;
+  std::string error;
+  assert(encode_request_payload(request, payload, error));
+  Request decoded_request;
+  assert(decode_request_payload(payload.data(), payload.size(), decoded_request,
+                                error));
+  assert(decoded_request.op == request.op);
+  assert(decoded_request.request_id == request.request_id);
+  assert(decoded_request.artifact_id == request.artifact_id);
+  assert(decoded_request.model == request.model);
+  assert(decoded_request.artifact == request.artifact);
+  assert(decoded_request.profiling == request.profiling);
+  assert(decoded_request.inputs.size() == 1);
+  assert(decoded_request.inputs[0].shape == request.inputs[0].shape);
+  assert(decoded_request.inputs[0].data == request.inputs[0].data);
+
+  const Request subgraph = MakeSubgraphRequest(
+      77, {0x08, 0x4f, 0x4e, 0x4e, 0x58}, request.inputs,
+      ProfilingLevel::Summary);
+  assert(subgraph.op == kSubgraphOperation);
+  assert(subgraph.model.size() == 5);
+  assert(subgraph.inputs.size() == request.inputs.size());
+  assert(subgraph.profiling == ProfilingLevel::Summary);
+  assert(encode_request_payload(subgraph, payload, error));
+  Request decoded_subgraph;
+  assert(decode_request_payload(payload.data(), payload.size(), decoded_subgraph,
+                                error));
+  assert(decoded_subgraph.op == kSubgraphOperation);
+  assert(decoded_subgraph.model == subgraph.model);
+  assert(decoded_subgraph.inputs[0].data == subgraph.inputs[0].data);
+
+  Request typed_request;
+  typed_request.op = "run_compiled";
+  Tensor fp16;
+  fp16.shape = {2};
+  fp16.dtype = 10;  // FLOAT16
+  fp16.raw_data = {0x00, 0x3c, 0x00, 0xc0};
+  typed_request.inputs.push_back(fp16);
+  assert(encode_request_payload(typed_request, payload, error));
+  Request decoded_typed;
+  assert(decode_request_payload(payload.data(), payload.size(), decoded_typed,
+                                error));
+  assert(decoded_typed.inputs[0].dtype == 10);
+  assert(decoded_typed.inputs[0].raw_data == fp16.raw_data);
+  assert(decoded_typed.inputs[0].data.empty());
+
+  Response response;
+  response.request_id = request.request_id;
+  response.ok = true;
+  response.outputs = request.inputs;
+  response.profile.push_back(
+      ProfileEvent{"qnn_execute", "qnn", 12, 34, "test"});
+  response.artifact_id = request.artifact_id;
+  response.artifact = {0x10, 0x20};
+  response.manifest = "{\"schema_version\":1}";
+  assert(encode_response_payload(response, payload, error));
+  Response decoded_response;
+  assert(decode_response_payload(payload.data(), payload.size(),
+                                decoded_response, error));
+  assert(decoded_response.ok);
+  assert(decoded_response.request_id == response.request_id);
+  assert(decoded_response.outputs[0].data == response.outputs[0].data);
+  assert(decoded_response.profile.size() == 1);
+  assert(decoded_response.profile[0].duration_us == 34);
+  size_t received_events = 0;
+  uint64_t received_duration = 0;
+  receive_profile(response, [&](const ProfileEvent& event) {
+    ++received_events;
+    received_duration += event.duration_us;
+  });
+  assert(received_events == 1);
+  assert(received_duration == 34);
+  assert(decoded_response.artifact_id == response.artifact_id);
+  assert(decoded_response.artifact == response.artifact);
+  assert(decoded_response.manifest == response.manifest);
+  const std::string profile = profile_json(response);
+  assert(profile.find("qnn_execute") != std::string::npos);
+  assert(profile.find("\"duration_us\":34") != std::string::npos);
+
+  Response escaped_response;
+  escaped_response.request_id = 9;
+  escaped_response.profile.push_back(ProfileEvent{
+      "quote\\\"\\backslash", "line\nfeed", 1, 2,
+      "tab\tbackspace\bformfeed\fcontrol\x01"});
+  const std::string escaped_profile = profile_json(escaped_response);
+  assert(escaped_profile.find("quote\\\\\\\"\\\\backslash") !=
+         std::string::npos);
+  assert(escaped_profile.find("line\\nfeed") != std::string::npos);
+  assert(escaped_profile.find("tab\\tbackspace\\bformfeed\\fcontrol\\u0001") !=
+         std::string::npos);
+  const std::string trace = profile_chrome_trace_json(response);
+  assert(trace.find("\"displayTimeUnit\":\"us\"") != std::string::npos);
+  assert(trace.find("\"ph\":\"X\"") != std::string::npos);
+  assert(trace.find("\"ts\":12") != std::string::npos);
+  assert(trace.find("\"dur\":34") != std::string::npos);
+
+  Request invalid = request;
+  invalid.op.assign(kMaxOpBytes + 1, 'x');
+  assert(!encode_request_payload(invalid, payload, error));
+  Response oversized = response;
+  oversized.manifest.assign(kMaxManifestBytes + 1, 'x');
+  assert(!encode_response_payload(oversized, payload, error));
+
+  Request bad_shape = request;
+  bad_shape.inputs[0].shape = {2, 2};
+  bad_shape.inputs[0].data.resize(3);
+  assert(!encode_request_payload(bad_shape, payload, error));
+
+  Request bad_dtype = request;
+  bad_dtype.inputs[0].dtype = 8;  // STRING is not a supported raw dtype.
+  bad_dtype.inputs[0].data.clear();
+  bad_dtype.inputs[0].raw_data = {0, 0, 0, 0};
+  assert(!encode_request_payload(bad_dtype, payload, error));
+
+  Request malformed_request;
+  assert(!decode_request_payload(nullptr, 0, malformed_request, error));
+  assert(!decode_request_payload(payload.data(), 0, malformed_request, error));
+  Response malformed_response;
+  assert(!decode_response_payload(nullptr, 0, malformed_response, error));
+  std::vector<uint8_t> status_only = {1};
+  assert(!decode_response_payload(status_only.data(), status_only.size(),
+                                  malformed_response, error));
+
+  Request truncated_request;
+  assert(encode_request_payload(request, payload, error));
+  payload.pop_back();
+  assert(!decode_request_payload(payload.data(), payload.size(),
+                                 truncated_request, error));
+  Response truncated_response;
+  assert(encode_response_payload(response, payload, error));
+  payload.pop_back();
+  assert(!decode_response_payload(payload.data(), payload.size(),
+                                  truncated_response, error));
+  return 0;
+}

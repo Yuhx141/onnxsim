@@ -1,16 +1,19 @@
 #include "js_model_executor.h"
 
-#if defined(__EMSCRIPTEN__) && defined(ONNXSIM_WASM_ORT_WEB)
+#if defined(__EMSCRIPTEN__) && defined(ONNXSIM_WASM_HOOKABLE_EXECUTOR)
 
 #include <emscripten/val.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "dlpack_bridge.h"
+#include "profiler.h"
 
 // wasm is always little-endian; the (de)serialization below memcpy's typed data
 // to/from raw little-endian bytes, so bail loudly if that ever stops holding.
@@ -21,54 +24,58 @@ namespace {
 
 using emscripten::val;
 
-// The page registers its onnxruntime-web runner on the Emscripten Module under
-// this name (see ort_executor.mjs / worker.js). The crossing is batched: all of
+// The host registers a runner on the Emscripten Module under this name. The
+// legacy onnxruntime-web name is accepted as a compatibility alias. The
+// crossing is batched: all of
 // a fold group's tensors travel in one concatenated byte blob plus one flat
 // [dtype, ndim, dims...] metadata array, in both directions. Signature, in JS:
 //   async (modelBytes: Uint8Array,
 //          inputsData: Uint8Array,      // all feed bytes concatenated
 //          inputsMeta: Float64Array)    // [dtype, ndim, dims...] per feed
-//     => Promise<{ data: Uint8Array, meta: Float64Array }>  // same layout
+//     => Promise<{ data: Uint8Array, meta: Float64Array,
+//                  profile?: ProfileEvent[] }>  // same layout
 // `dtype` is the ONNX TensorProto.DataType enum value; tensor bytes are raw
 // little-endian element data. Tensors are positional (no names cross).
-constexpr const char* kRunnerProp = "onnxsimOrtWebRun";
+constexpr const char *kRunnerProp = "onnxsimModelExecutorRun";
+constexpr const char *kLegacyRunnerProp = "onnxsimOrtWebRun";
+constexpr size_t kMaxRunnerProfileEvents = 256;
 
 // Copy `len` bytes at `data` into a fresh JS-owned Uint8Array. Constructing
 // `new Uint8Array(view)` from a view over the wasm heap copies the bytes into a
 // new ArrayBuffer, so the result stays valid across the Asyncify suspend in
 // Run() -- while suspended the wasm heap can grow (ALLOW_MEMORY_GROWTH=1) and
 // any view still pointing at the old heap would be detached.
-val RawToJsU8Copy(const uint8_t* data, size_t len) {
+val RawToJsU8Copy(const uint8_t *data, size_t len) {
   val view = val(emscripten::typed_memory_view(len, data));
   return val::global("Uint8Array").new_(view);
 }
 
-val StringToJsU8Copy(const std::string& s) {
-  return RawToJsU8Copy(reinterpret_cast<const uint8_t*>(s.data()), s.size());
+val StringToJsU8Copy(const std::string &s) {
+  return RawToJsU8Copy(reinterpret_cast<const uint8_t *>(s.data()), s.size());
 }
 
 // Copy a JS Uint8Array back into a std::string. Called after the await, so the
 // destination view is created against the current (post-suspend) heap.
-std::string JsU8ToString(const val& u8) {
+std::string JsU8ToString(const val &u8) {
   const size_t len = u8["length"].as<size_t>();
   std::string out;
   out.resize(len);
   val dest = val(emscripten::typed_memory_view(
-      len, reinterpret_cast<uint8_t*>(out.data())));
+      len, reinterpret_cast<uint8_t *>(out.data())));
   dest.call<void>("set", u8);
   return out;
 }
 
 // Copy a std::vector<double> into a fresh JS-owned Float64Array (the batched
 // input metadata). Like the byte copies, this survives the Asyncify suspend.
-val DoublesToJsF64Copy(const std::vector<double>& v) {
+val DoublesToJsF64Copy(const std::vector<double> &v) {
   val view = val(emscripten::typed_memory_view(v.size(), v.data()));
   return val::global("Float64Array").new_(view);
 }
 
 // Copy a JS Float64Array (the batched output metadata) into a vector. Called
 // after the await, against the current heap.
-std::vector<double> JsF64ToVector(const val& arr) {
+std::vector<double> JsF64ToVector(const val &arr) {
   const size_t len = arr["length"].as<size_t>();
   std::vector<double> out(len);
   if (len != 0) {
@@ -76,6 +83,43 @@ std::vector<double> JsF64ToVector(const val& arr) {
     dest.call<void>("set", arr);
   }
   return out;
+}
+
+std::string JsonEscape(const std::string &value) {
+  std::string escaped;
+  for (const char c : value) {
+    if (c == '"' || c == '\\')
+      escaped.push_back('\\');
+    escaped.push_back(c);
+  }
+  return escaped;
+}
+
+void RecordRunnerProfile(const val &result, uint64_t anchor_us) {
+  auto &profiler = onnxsim::Profiler::Instance();
+  if (!profiler.enabled())
+    return;
+  const val profile = result["profile"];
+  if (profile.isUndefined() || profile.isNull())
+    return;
+  const size_t count = profile["length"].as<size_t>();
+  if (count > kMaxRunnerProfileEvents) {
+    throw std::runtime_error("hookable WASM executor: too many profile events");
+  }
+  for (size_t i = 0; i < count; ++i) {
+    const val event = profile[i];
+    const std::string name = event["name"].as<std::string>();
+    const std::string category = event["category"].as<std::string>();
+    const uint64_t start_us = event["start_us"].as<uint64_t>();
+    const uint64_t duration_us = event["duration_us"].as<uint64_t>();
+    const val detail_value = event["detail"];
+    const std::string detail = detail_value.isUndefined()
+                                   ? std::string{}
+                                   : detail_value.as<std::string>();
+    profiler.RecordExternalEvent(
+        name, category, anchor_us + start_us, duration_us,
+        detail.empty() ? "{}" : "{\"detail\":\"" + JsonEscape(detail) + "\"}");
+  }
 }
 
 // A ModelExecutor that evaluates each constant-folding sub-model with
@@ -88,16 +132,25 @@ std::vector<double> JsF64ToVector(const val& arr) {
 // plus raw little-endian bytes, matching the built-in CppModelExecutor's dtype
 // set.
 struct JsModelExecutor : public ModelExecutor {
-  std::vector<DLManagedTensorPtr> Run(
-      const onnx::ModelProto& model,
-      const std::vector<const DLManagedTensor*>& inputs) const override {
+  std::vector<DLManagedTensorPtr>
+  Run(const onnx::ModelProto &model,
+      const std::vector<const DLManagedTensor *> &inputs) const override {
     // Reach the runner the page registered on the Module.
     val runner = val::module_property(kRunnerProp);
     if (runner.isUndefined() || runner.isNull()) {
+      runner = val::module_property(kLegacyRunnerProp);
+    }
+    if (runner.isUndefined() || runner.isNull()) {
+#ifdef ONNXSIM_HAS_ORT
+      // The hook is optional in the default WASM build. This preserves the
+      // in-module ORT behavior while allowing the page to replace folding with
+      // WebGPU, a worker, or a remote runner by installing the callback.
+      return GetBuiltinModelExecutor()->Run(model, inputs);
+#else
       throw std::runtime_error(
-          "onnxruntime-web executor: Module." + std::string(kRunnerProp) +
-          " is not set. The hosting page must register an onnxruntime-web "
-          "runner (see ort_executor.mjs) before constant folding runs.");
+          "hookable WASM executor: Module." + std::string(kRunnerProp) +
+          " is not set and this build has no built-in ORT fallback");
+#endif
     }
 
     // Marshal the sub-model and its feeds into JS-owned buffers *before* the
@@ -113,8 +166,8 @@ struct JsModelExecutor : public ModelExecutor {
     // session's input names in the same order (DLPack tensors carry no name).
     std::string in_blob;
     std::vector<double> in_meta;
-    for (const DLManagedTensor* in : inputs) {
-      const DLTensor& t = in->dl_tensor;
+    for (const DLManagedTensor *in : inputs) {
+      const DLTensor &t = in->dl_tensor;
       int32_t onnx_dtype;
       if (!onnxsim::dlpack::TryDLToOnnx(t.dtype, &onnx_dtype)) {
         throw std::invalid_argument(
@@ -130,7 +183,7 @@ struct JsModelExecutor : public ModelExecutor {
       const size_t nbytes =
           static_cast<size_t>(onnxsim::dlpack::NumElements(t.shape, t.ndim)) *
           onnxsim::dlpack::SizeOf(t.dtype);
-      const char* base = static_cast<const char*>(t.data) + t.byte_offset;
+      const char *base = static_cast<const char *>(t.data) + t.byte_offset;
       in_blob.append(base, nbytes);
     }
     val js_data = StringToJsU8Copy(in_blob);
@@ -139,7 +192,12 @@ struct JsModelExecutor : public ModelExecutor {
     // Run onnxruntime-web and block on its Promise. val::await() unwinds the
     // wasm stack via Asyncify and resumes here once the Promise settles; a
     // rejected Promise surfaces as a C++ exception.
+    const uint64_t profile_anchor =
+        onnxsim::Profiler::Instance().enabled()
+            ? onnxsim::Profiler::Instance().ElapsedMicros()
+            : 0;
     val result = runner(js_model, js_data, js_meta).await();
+    RecordRunnerProfile(result, profile_anchor);
 
     // The runner returns { data, meta } in the same batched layout, with
     // outputs in graph-output order (which is how RunOps names them
@@ -151,16 +209,30 @@ struct JsModelExecutor : public ModelExecutor {
 
     std::vector<DLManagedTensorPtr> outputs;
     outputs.reserve(model.graph().output_size());
-    size_t m = 0;    // index into out_meta
-    size_t off = 0;  // byte offset into out_blob
+    size_t m = 0;   // index into out_meta
+    size_t off = 0; // byte offset into out_blob
     while (m < out_meta.size()) {
+      if (out_meta.size() - m < 2) {
+        throw std::runtime_error(
+            "onnxruntime-web executor: truncated output metadata");
+      }
       const int32_t onnx_dtype = static_cast<int32_t>(out_meta[m++]);
       const int32_t ndim = static_cast<int32_t>(out_meta[m++]);
+      if (ndim < 0 || ndim > 8 ||
+          static_cast<size_t>(ndim) > out_meta.size() - m) {
+        throw std::runtime_error(
+            "onnxruntime-web executor: invalid output rank metadata");
+      }
       onnx::TensorProto tp;
       tp.set_data_type(static_cast<onnx::TensorProto::DataType>(onnx_dtype));
       int64_t numel = 1;
       for (int32_t d = 0; d < ndim; d++) {
         const int64_t dim = static_cast<int64_t>(out_meta[m++]);
+        if (dim < 0 ||
+            (dim != 0 && numel > std::numeric_limits<int64_t>::max() / dim)) {
+          throw std::runtime_error(
+              "onnxruntime-web executor: invalid output dimensions");
+        }
         tp.add_dims(dim);
         numel *= dim;
       }
@@ -170,9 +242,14 @@ struct JsModelExecutor : public ModelExecutor {
             "onnxruntime-web executor: unsupported output dtype " +
             std::to_string(onnx_dtype));
       }
-      const size_t nbytes =
-          static_cast<size_t>(numel) * onnxsim::dlpack::SizeOf(dl);
-      if (off + nbytes > out_blob.size()) {
+      const size_t element_size = onnxsim::dlpack::SizeOf(dl);
+      if (static_cast<uint64_t>(numel) >
+          std::numeric_limits<size_t>::max() / element_size) {
+        throw std::runtime_error(
+            "onnxruntime-web executor: output byte size overflow");
+      }
+      const size_t nbytes = static_cast<size_t>(numel) * element_size;
+      if (nbytes > out_blob.size() - std::min(off, out_blob.size())) {
         throw std::runtime_error(
             "onnxruntime-web executor: output blob shorter than its metadata "
             "implies");
@@ -182,11 +259,16 @@ struct JsModelExecutor : public ModelExecutor {
       outputs.emplace_back(
           onnxsim::dlpack::FromTensorProtoOwning(std::move(tp)));
     }
+    if (outputs.size() != static_cast<size_t>(model.graph().output_size()) ||
+        off != out_blob.size()) {
+      throw std::runtime_error(
+          "onnxruntime-web executor: output metadata/blob count mismatch");
+    }
     return outputs;
   }
 };
 
-}  // namespace
+} // namespace
 
 std::shared_ptr<const ModelExecutor> GetJsModelExecutor() {
   static std::shared_ptr<const ModelExecutor> executor =
@@ -194,4 +276,4 @@ std::shared_ptr<const ModelExecutor> GetJsModelExecutor() {
   return executor;
 }
 
-#endif  // __EMSCRIPTEN__ && ONNXSIM_WASM_ORT_WEB
+#endif // __EMSCRIPTEN__ && ONNXSIM_WASM_HOOKABLE_EXECUTOR

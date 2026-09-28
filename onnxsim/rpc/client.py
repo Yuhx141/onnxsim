@@ -63,6 +63,39 @@ class ProfileResult:
         return statistics.pstdev(self.results) if len(self.results) > 1 else 0.0
 
 
+@dataclass(frozen=True)
+class RandomInput:
+    """Shape and dtype metadata for server-generated benchmark input values.
+
+    Set both ``low`` and ``high`` to sample uniformly in ``[low, high)``.
+    Without bounds, floats use a normal distribution and integers span their
+    dtype's full range.
+    """
+
+    shape: Tuple[int, ...]
+    dtype: str = "float32"
+    low: Optional[float] = None
+    high: Optional[float] = None
+
+
+def _random_input_specs(inputs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    specs = []
+    for name, value in inputs.items():
+        if isinstance(value, RandomInput):
+            dtype = np.dtype(value.dtype).name
+            if dtype not in proto.DTYPES:
+                raise RPCError(f"tensor {name!r} has unsupported dtype {dtype}")
+            spec = {"name": name, "dtype": dtype, "shape": list(value.shape)}
+            if value.low is not None or value.high is not None:
+                if value.low is None or value.high is None:
+                    raise ValueError("random input low and high must be set together")
+                spec.update(low=value.low, high=value.high)
+            specs.append(spec)
+        else:
+            specs.extend(proto.encode_tensor_specs({name: value}))
+    return specs
+
+
 def _model_bytes(model: ModelLike) -> bytes:
     if isinstance(model, bytes):
         return model
@@ -86,20 +119,40 @@ class RemoteModel:
         return proto.decode_tensors(reply["tensors"], out)
 
     def time_evaluator(
-        self, inputs: Dict[str, np.ndarray], number: int = 1, repeat: int = 3
+        self,
+        inputs: Dict[str, Union[np.ndarray, RandomInput]],
+        number: int = 1,
+        repeat: int = 3,
+        random_inputs: bool = False,
+        seed: Optional[int] = None,
     ) -> ProfileResult:
-        """Time ``session.run`` on the device only: transfers and session creation are excluded."""
-        specs, blobs = proto.encode_tensors(inputs)
-        reply, _ = self._session._call(
-            {
-                "op": "time",
-                "handle": self.handle,
-                "tensors": specs,
-                "number": number,
-                "repeat": repeat,
-            },
-            blobs,
-        )
+        """Time server-side calls, optionally generating input values on the server.
+
+        In random mode, ``inputs`` supplies only input names, shapes and dtypes. The
+        server generates one seeded random set and reuses it for this timing request.
+        """
+        specs: List[Dict[str, Any]]
+        blobs: List[bytes]
+        if random_inputs:
+            specs, blobs = _random_input_specs(inputs), []
+        else:
+            if any(isinstance(value, RandomInput) for value in inputs.values()):
+                raise ValueError(
+                    "RandomInput specifications require random_inputs=True"
+                )
+            specs, blobs = proto.encode_tensors(inputs)
+        header: Dict[str, Any] = {
+            "op": "time",
+            "handle": self.handle,
+            "tensors": specs,
+            "number": number,
+            "repeat": repeat,
+        }
+        if random_inputs:
+            header["random_inputs"] = True
+            if seed is not None:
+                header["seed"] = int(seed)
+        reply, _ = self._session._call(header, blobs)
         return ProfileResult(list(reply["results"]), reply.get("stats"))
 
     def close(self) -> None:

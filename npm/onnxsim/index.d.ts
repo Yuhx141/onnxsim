@@ -37,6 +37,24 @@ export interface Versions {
   [key: string]: string;
 }
 
+/** Hook for executing constant-folding subgraphs outside the WASM module. */
+export type ModelExecutorRunner = (
+  modelBytes: Uint8Array,
+  inputsData: Uint8Array,
+  inputsMeta: Float64Array,
+) =>
+  | Promise<{ data: Uint8Array; meta: Float64Array; profile?: ExecutorProfileEvent[] }>
+  | { data: Uint8Array; meta: Float64Array; profile?: ExecutorProfileEvent[] };
+
+/** Optional runner-side profile event, anchored into onnxsim's trace. */
+export interface ExecutorProfileEvent {
+  name: string;
+  category: string;
+  start_us: number;
+  duration_us: number;
+  detail?: string;
+}
+
 /**
  * Simplify a serialized ONNX model.
  *
@@ -46,6 +64,9 @@ export function simplify(
   model: Uint8Array | ArrayBuffer,
   options?: SimplifyOptions,
 ): Promise<SimplifyResult>;
+
+/** Install a custom remote, WebGPU, or embedded model executor hook. */
+export function setModelExecutorRunner(runner: ModelExecutorRunner): Promise<void>;
 
 /** onnxsim / onnx-optimizer version strings baked into this build. */
 export function versions(): Promise<Versions>;

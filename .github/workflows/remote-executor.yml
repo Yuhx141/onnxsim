@@ -1,0 +1,292 @@
+name: Native remote executor
+
+on:
+  pull_request:
+    paths:
+      - "onnxsim/remote_executor.*"
+      - "onnxsim/profiler.*"
+      - "onnxsim/profile_merge.py"
+      - "onnxsim/remote_manifest.py"
+      - "tools/onnx-remote/**"
+      - "scripts/qualcomm/**"
+      - "scripts/nvidia/trt_compile.py"
+      - "tests/test_qnn_compat_cli.py"
+      - "tests/test_trt_compile_cli.py"
+      - "tests/test_remote_manifest.py"
+      - "tests/test_remote_ep_manifest.py"
+      - "tests/test_tvm_compat.py"
+      - "docs/remote-manifest.md"
+      - ".github/workflows/remote-executor.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "onnxsim/remote_executor.*"
+      - "onnxsim/profiler.*"
+      - "onnxsim/profile_merge.py"
+      - "onnxsim/remote_manifest.py"
+      - "tools/onnx-remote/**"
+      - "scripts/qualcomm/**"
+      - "scripts/nvidia/trt_compile.py"
+      - "tests/test_qnn_compat_cli.py"
+      - "tests/test_trt_compile_cli.py"
+      - "tests/test_remote_manifest.py"
+      - "tests/test_remote_ep_manifest.py"
+      - "tests/test_tvm_compat.py"
+      - "docs/remote-manifest.md"
+      - ".github/workflows/remote-executor.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  transport:
+    name: transport and compiler service
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S tools/onnx-remote -B build/onnx-remote -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build/onnx-remote -j2
+      - name: Unit tests
+        run: ctest --test-dir build/onnx-remote --output-on-failure
+      - name: Reference worker smoke test
+        run: |
+          build/onnx-remote/onnx-remote-worker --port 39501 >"${RUNNER_TEMP}/remote-worker.log" 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote/onnx-remote-client --self-test
+          build/onnx-remote/onnx-remote-client --capabilities 127.0.0.1 39501 | grep -q '"ready":true'
+          build/onnx-remote/onnx-remote-profile-fixture |
+            build/onnx-remote/onnx-remote-profile-dump --input - --format chrome |
+            grep -q '"name":"fixture_execute"'
+      - name: Compiled artifact attach smoke test
+        run: |
+          cache_dir="${RUNNER_TEMP}/mock-runner-cache"
+          build/onnx-remote/onnx-remote-mock-runner --port 39510 --cache-dir "$cache_dir" >"${RUNNER_TEMP}/mock-runner.log" 2>&1 &
+          mock_pid=$!
+          trap 'kill "$mock_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote/onnx-remote-attach-test 127.0.0.1 39510
+          kill "$mock_pid"
+          wait "$mock_pid" 2>/dev/null || true
+          build/onnx-remote/onnx-remote-mock-runner --port 39510 --cache-dir "$cache_dir" >>"${RUNNER_TEMP}/mock-runner.log" 2>&1 &
+          mock_pid=$!
+          sleep 0.2
+          build/onnx-remote/onnx-remote-attach-test 127.0.0.1 39510 --run-only
+      - name: Compiler service cache smoke test
+        run: |
+          python3 -c "from pathlib import Path; Path('${RUNNER_TEMP}/model.onnx').write_bytes(b'smoke-model')"
+          build/onnx-remote/onnx-remote-compiler \
+            --port 39502 --cache-dir "${RUNNER_TEMP}/compiler-cache" \
+            --compiler-id ci-passthrough >"${RUNNER_TEMP}/remote-compiler.log" 2>&1 &
+          compiler_pid=$!
+          trap 'kill "$compiler_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          first=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          second=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          first_id=$(printf '%s\n' "$first" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
+          second_id=$(printf '%s\n' "$second" | sed -n 's/^artifact_id=\([^ ]*\).*/\1/p')
+          test -n "$first_id" && test "$first_id" = "$second_id"
+          pids=()
+          for i in 1 2 3 4; do
+            build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 \
+              "${RUNNER_TEMP}/model.onnx" >"${RUNNER_TEMP}/parallel-${i}.txt" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+          for i in 1 2 3 4; do
+            parallel_id=$(sed -n 's/^artifact_id=\([^ ]*\).*/\1/p' \
+              "${RUNNER_TEMP}/parallel-${i}.txt")
+            test "$parallel_id" = "$first_id"
+          done
+          marker=$(find "${RUNNER_TEMP}/compiler-cache" -name '*.complete' -print -quit)
+          artifact="${marker%.complete}.artifact"
+          test -n "$marker" && test -f "$artifact"
+          printf 'corrupt-cache-entry' >"$artifact"
+          recovered=$(build/onnx-remote/onnx-remote-client --compile 127.0.0.1 39502 "${RUNNER_TEMP}/model.onnx")
+          recovered_bytes=$(printf '%s\n' "$recovered" | sed -n 's/^artifact_id=[^ ]* bytes=\([0-9]*\).*/\1/p')
+          test "$recovered_bytes" = 11
+
+  python-driver:
+    name: Qualcomm harness driver tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install test dependency
+        run: python -m pip install pytest
+      - name: Run dependency-light tests
+        run: python -m pytest -q tests/test_qnn_compat_cli.py tests/test_trt_compile_cli.py tests/test_remote_manifest.py tests/test_remote_ep_manifest.py tests/test_tvm_compat.py
+
+  grpc-gateway:
+    name: optional gRPC gateway
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install gRPC toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgrpc++-dev protobuf-compiler-grpc \
+            libabsl-dev libre2-dev libc-ares-dev zlib1g-dev
+      - name: Configure
+        run: |
+          cmake -S tools/onnx-remote -B build/onnx-remote-grpc \
+            -DONNXSIM_REMOTE_GRPC=ON -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build/onnx-remote-grpc -j2
+      - name: Test
+        run: ctest --test-dir build/onnx-remote-grpc --output-on-failure
+      - name: Verify installed package metadata
+        run: |
+          cmake --install build/onnx-remote-grpc --prefix "$RUNNER_TEMP/onnx-remote-install"
+          test -f "$RUNNER_TEMP/onnx-remote-install/lib/libonnx_remote_transport.a"
+          test -f "$RUNNER_TEMP/onnx-remote-install/share/onnx-remote/ort-plugin/onnxsim_remote_ep.manifest.json"
+          test -f "$RUNNER_TEMP/onnx-remote-install/include/onnx-remote/remote_profile.h"
+
+  ort-public-ep:
+    name: public ORT EP plugin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download public ORT SDK
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-1.29.0.tgz \
+            --output "$RUNNER_TEMP/onnxruntime.tgz"
+          tar -xzf "$RUNNER_TEMP/onnxruntime.tgz" -C "$RUNNER_TEMP"
+      - name: Configure public plugin
+        run: |
+          cmake -S tools/onnx-remote -B build/onnx-remote-public-ep \
+            -DONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN=ON \
+            -DONNXSIM_ORT_PUBLIC_INCLUDE_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-1.29.0/include" \
+            -DONNXSIM_ORT_PUBLIC_LIBRARY="$RUNNER_TEMP/onnxruntime-linux-x64-1.29.0/lib/libonnxruntime.so" \
+            -DBUILD_TESTING=ON
+      - name: Build public plugin and tests
+        run: |
+          cmake --build build/onnx-remote-public-ep --target \
+            onnxsim_remote_ep onnxsim_remote_ep_load_test \
+            onnxsim_remote_ep_run_test onnx-remote-worker -j2
+      - name: Test plugin discovery
+        env:
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.29.0/lib
+        run: ctest --test-dir build/onnx-remote-public-ep -R public-ep --output-on-failure
+      - name: Test remote execution through public EP
+        env:
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.29.0/lib
+          ONNXSIM_REMOTE_EP_HOST: 127.0.0.1
+          ONNXSIM_REMOTE_EP_PORT: 39501
+          ONNXSIM_REMOTE_EP_PROFILING: detailed
+          ONNXSIM_REMOTE_EP_PROFILE_FILE: ${{ runner.temp }}/public-ep-profile.json
+        run: |
+          test -x build/onnx-remote-public-ep/onnx-remote-worker
+          build/onnx-remote-public-ep/onnx-remote-worker --port 39501 \
+            >"$RUNNER_TEMP/public-ep-worker.log" 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 50); do
+            if ! kill -0 "$worker_pid" 2>/dev/null; then
+              echo "worker exited early:"; cat "$RUNNER_TEMP/public-ep-worker.log"; exit 1
+            fi
+            (exec 3<>"/dev/tcp/127.0.0.1/39501") 2>/dev/null && { exec 3>&-; break; }
+            sleep 0.1
+          done
+          (exec 3<>"/dev/tcp/127.0.0.1/39501") 2>/dev/null || {
+            echo "worker never became ready:"; cat "$RUNNER_TEMP/public-ep-worker.log"; exit 1
+          }
+          build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
+            "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
+            scripts/convertmodel/test/webgpu_kernel_add.onnx \
+            "$RUNNER_TEMP/public-ep-ort-profile"
+          test -s "$RUNNER_TEMP/public-ep-profile.json"
+          grep -q '"name":"add"' "$RUNNER_TEMP/public-ep-profile.json"
+          ls "$RUNNER_TEMP"/public-ep-ort-profile*.json
+          ONNXSIM_REMOTE_EP_SUPPORTED_OPS=Relu \
+          ONNXSIM_REMOTE_EP_EXPECT_REMOTE=0 \
+          build/onnx-remote-public-ep/onnxsim_remote_ep_run_test \
+            "$GITHUB_WORKSPACE/build/onnx-remote-public-ep/libonnxsim_remote_ep.so" \
+            scripts/convertmodel/test/webgpu_kernel_add.onnx \
+            "$RUNNER_TEMP/public-ep-cpu-fallback-profile"
+
+  ort-graph-worker:
+    name: ORT graph worker
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download public ORT SDK
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-1.29.0.tgz \
+            --output "$RUNNER_TEMP/onnxruntime.tgz"
+          tar -xzf "$RUNNER_TEMP/onnxruntime.tgz" -C "$RUNNER_TEMP"
+      - name: Configure ORT graph worker
+        run: |
+          cmake -S tools/onnx-remote -B build/onnx-remote-ort-worker \
+            -DONNXSIM_REMOTE_ORT_WORKER=ON \
+            -DONNXSIM_ORT_WORKER_INCLUDE_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-1.29.0/include" \
+            -DONNXSIM_ORT_WORKER_LIBRARY="$RUNNER_TEMP/onnxruntime-linux-x64-1.29.0/lib/libonnxruntime.so" \
+            -DBUILD_TESTING=ON
+      - name: Build ORT graph worker
+        run: |
+          cmake --build build/onnx-remote-ort-worker --target \
+            onnx-remote-ort-worker onnx-remote-ort-worker-test \
+            onnx-remote-client -j2
+      - name: Test graph execution round trip
+        env:
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.29.0/lib
+        run: |
+          build/onnx-remote-ort-worker/onnx-remote-ort-worker --port 39503 \
+            >"$RUNNER_TEMP/ort-worker.log" 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
+          sleep 0.2
+          build/onnx-remote-ort-worker/onnx-remote-ort-worker-test \
+            scripts/convertmodel/test/webgpu_kernel_add.onnx 39503
+
+  dora-compile:
+    name: DORA adapter compile contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure dependency-free DORA stub build
+        run: |
+          cmake -S tools/onnx-remote -B build/onnx-remote-dora \
+            -DONNXSIM_REMOTE_DORA=ON \
+            -DONNXSIM_REMOTE_DORA_STUB=ON
+      - name: Build DORA adapter and reference worker
+        run: |
+          cmake --build build/onnx-remote-dora --target \
+            onnx-remote-dora-node onnx-remote-worker -j2
+      - name: Exercise DORA readiness discovery and run forwarding
+        run: |
+          bash tools/onnx-remote/test/dora_discovery_e2e.sh \
+            build/onnx-remote-dora/onnx-remote-worker \
+            build/onnx-remote-dora/onnx-remote-dora-node
+
+  ros2-compile:
+    name: ROS2 bridge compile contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Build ROS2 bridge in nix-ros-overlay shell
+        working-directory: tools/onnx-remote
+        run: |
+          nix develop --accept-flake-config --command bash -lc '
+            cmake -S . -B build/ros2 -DONNXSIM_REMOTE_ROS2=ON -DBUILD_TESTING=ON
+            cmake --build build/ros2 --target \
+              onnx-remote-worker onnx-remote-ros2-bridge \
+              onnx-remote-ros2-service-smoke \
+              onnx-remote-ros2-discovery-smoke \
+              onnx-remote-ros2-failover-smoke -j2
+            bash test/ros2_discovery_e2e.sh \
+              build/ros2/onnx-remote-worker \
+              build/ros2/onnx-remote-ros2-bridge \
+              build/ros2/onnx-remote-ros2-service-smoke \
+              build/ros2/onnx-remote-ros2-discovery-smoke \
+              build/ros2/onnx-remote-ros2-failover-smoke
+          '

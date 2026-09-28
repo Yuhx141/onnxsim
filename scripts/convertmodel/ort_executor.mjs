@@ -3,7 +3,8 @@
 // When onnxsim's WASM module is built with ONNXSIM_WASM_ORT_WEB, its C++
 // constant folder does not link ONNX Runtime; instead JsModelExecutor::Run
 // (js_model_executor.cpp) calls a runner registered on the Emscripten Module as
-// `Module.onnxsimOrtWebRun`. This file builds that runner on top of an
+// `Module.onnxsimModelExecutorRun` (with the legacy
+// `Module.onnxsimOrtWebRun` alias). This file builds that runner on top of an
 // already-loaded `onnxruntime-web` module.
 //
 // Contract (must match js_model_executor.cpp) -- a *batched* crossing: rather
@@ -15,7 +16,8 @@
 //          inputsData: Uint8Array,     // all input tensors' bytes, concatenated
 //          inputsMeta: Float64Array)   // [dtype, ndim, dims...] per input
 //     => Promise<{ data: Uint8Array,   // all output tensors' bytes, concatenated
-//                  meta: Float64Array }>// [dtype, ndim, dims...] per output
+//                  meta: Float64Array, // [dtype, ndim, dims...] per output
+//                  profile?: ProfileEvent[] }>
 //
 // `dtype` is the ONNX TensorProto.DataType enum value; tensor bytes are raw
 // little-endian element data. Tensors are positional: input i binds to
@@ -53,6 +55,12 @@ const ORT_TYPE_TO_ONNX = {
   uint64: 13,
 };
 
+function clockMs() {
+  return typeof globalThis.performance?.now === "function"
+    ? globalThis.performance.now()
+    : Date.now();
+}
+
 // Reinterpret a Uint8Array's bytes as `Ctor` elements. The bytes come from a
 // slice of the concatenated input blob, so the byte offset may not be aligned
 // to the element size; fall back to a copy (onto a fresh 0-offset buffer) when
@@ -87,6 +95,7 @@ function elementCount(dims) {
 // correctness does not depend on the provider.
 export function makeOrtRunner(ort, { providers = ["wasm"] } = {}) {
   return async function onnxsimOrtWebRun(modelBytes, inputsData, inputsMeta) {
+    const started = clockMs();
     const session = await ort.InferenceSession.create(modelBytes, {
       executionProviders: providers,
       graphOptimizationLevel: "disabled",
@@ -100,10 +109,26 @@ export function makeOrtRunner(ort, { providers = ["wasm"] } = {}) {
     let off = 0; // byte offset into inputsData
     let i = 0; // input index
     while (m < inputsMeta.length) {
+      if (inputsMeta.length - m < 2) {
+        throw new Error("onnxruntime-web executor: truncated input metadata");
+      }
       const dataType = inputsMeta[m++];
       const ndim = inputsMeta[m++];
+      if (!Number.isInteger(ndim) || ndim < 0 || ndim > 8 ||
+          ndim > inputsMeta.length - m) {
+        throw new Error("onnxruntime-web executor: invalid input rank metadata");
+      }
       const dims = [];
-      for (let d = 0; d < ndim; d++) dims.push(inputsMeta[m++]);
+      for (let d = 0; d < ndim; d++) {
+        const dim = inputsMeta[m++];
+        if (!Number.isSafeInteger(dim) || dim < 0) {
+          throw new Error("onnxruntime-web executor: invalid input dimensions");
+        }
+        dims.push(dim);
+      }
+      if (i >= inputNames.length) {
+        throw new Error("onnxruntime-web executor: too many input tensors");
+      }
       const entry = ONNX_DTYPE_TO_ORT[dataType];
       if (!entry) {
         throw new Error(
@@ -112,10 +137,16 @@ export function makeOrtRunner(ort, { providers = ["wasm"] } = {}) {
       }
       const [type, Ctor] = entry;
       const byteLen = elementCount(dims) * Ctor.BYTES_PER_ELEMENT;
+      if (!Number.isSafeInteger(byteLen) || byteLen > inputsData.byteLength - off) {
+        throw new Error("onnxruntime-web executor: input blob is too short");
+      }
       const sub = inputsData.subarray(off, off + byteLen);
       off += byteLen;
       feeds[inputNames[i]] = new ort.Tensor(type, typedFromBytes(Ctor, sub), dims);
       i++;
+    }
+    if (i !== inputNames.length || off !== inputsData.byteLength) {
+      throw new Error("onnxruntime-web executor: input metadata/blob mismatch");
     }
 
     const results = await session.run(feeds);
@@ -149,6 +180,18 @@ export function makeOrtRunner(ort, { providers = ["wasm"] } = {}) {
     if (typeof session.release === "function") {
       await session.release();
     }
-    return { data, meta: new Float64Array(meta) };
+    return {
+      data,
+      meta: new Float64Array(meta),
+      profile: [
+        {
+          name: "ort_web_run",
+          category: "ort-web",
+          start_us: 0,
+          duration_us: Math.max(0, Math.round((clockMs() - started) * 1000)),
+          detail: "InferenceSession.create+run",
+        },
+      ],
+    };
   };
 }

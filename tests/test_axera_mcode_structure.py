@@ -2758,17 +2758,18 @@ def test_short_bank_tagged_forms_are_far_above_a_permutation_null(tmp_path):
     )
     ladder = _permutation_ratio(
         non_verb,
-        lambda b, i: i + 3 < len(b)
-        and b[i] == 0
-        and b[i + 1] % 0x10 == 0
-        and b[i + 2] == 0x84,
+        lambda b, i: (
+            i + 3 < len(b) and b[i] == 0 and b[i + 1] % 0x10 == 0 and b[i + 2] == 0x84
+        ),
     )
     complement = _permutation_ratio(
         non_verb,
-        lambda b, i: i + 3 < len(b)
-        and b[i] <= 3
-        and i + 2 + b[i] < len(b)
-        and b[i + 2 + b[i]] == 0x84 - b[i],
+        lambda b, i: (
+            i + 3 < len(b)
+            and b[i] <= 3
+            and i + 2 + b[i] < len(b)
+            and b[i + 2 + b[i]] == 0x84 - b[i]
+        ),
     )
     assert w4 >= 2.5, w4
     assert ladder >= 5.0, ladder
@@ -2780,9 +2781,9 @@ def test_short_bank_tagged_forms_are_far_above_a_permutation_null(tmp_path):
         ratios = {
             k: _permutation_ratio(
                 non_verb,
-                lambda b, i, k=k, p=prefix: i + k < len(b)
-                and b[i] == p
-                and b[i + k] in tags,
+                lambda b, i, k=k, p=prefix: (
+                    i + k < len(b) and b[i] == p and b[i + k] in tags
+                ),
                 shuffles=5,
             )
             for k in range(1, 6)

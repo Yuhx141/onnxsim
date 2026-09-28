@@ -10,6 +10,7 @@ from typing import Any
 from ._protocol import RPCError
 from .client import (
     ProfileResult,
+    RandomInput,
     RemoteModel,
     Session,
     TrackerClient,
@@ -20,6 +21,7 @@ from .client import (
 
 __all__ = [
     "ProfileResult",
+    "RandomInput",
     "RPCError",
     "RPCServer",
     "RemoteModel",
@@ -30,10 +32,15 @@ __all__ = [
     "connect",
     "connect_tracker",
     "remote_executor",
+    "tvm_compat",
 ]
 
 
 def __getattr__(name: str) -> Any:
+    if name == "tvm_compat":
+        import importlib
+
+        return importlib.import_module(".tvm_compat", __name__)
     if name == "RPCServer":
         from .server import RPCServer
 

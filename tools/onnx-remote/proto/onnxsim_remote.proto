@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+// Optional gRPC control-plane schema for onnxsim's remote executor.
+//
+// This file is intentionally not required by the native transport.  A small
+// runner can continue to use remote_transport.h without protobuf or gRPC.
+// Hosts and gateways may generate bindings from this schema when they need a
+// typed RPC API.  The field layout mirrors the v5 binary protocol; payloads
+// are deliberately raw bytes rather than TensorProto messages.
+package onnxsim.remote.v1;
+
+service OnnxSimExecutor {
+  // Execute one operation or subgraph.  `op` is a backend operation/model
+  // handle; `artifact_id` can refer to a previously loaded compiled artifact.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Compile an ONNX ModelProto on a compiler host.  The returned artifact is
+  // opaque to onnxsim and is normally handed to a separate execution host.
+  rpc Compile(CompileRequest) returns (CompileResponse);
+
+  // Upload an artifact to a runner's persistent cache.  Repeating a load with
+  // the same artifact ID and bytes is idempotent. The manifest is carried
+  // for gateway-local bookkeeping only; native v5 load requests forward
+  // the artifact ID and bytes.
+  rpc LoadArtifact(LoadArtifactRequest) returns (LoadArtifactResponse);
+
+  // Lightweight capability and liveness query for ROS2/DORA gateways.
+  rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+
+  // Lightweight KServe-style inference mapping. This keeps model identity
+  // and named tensors at the gateway boundary without importing KServe's
+  // protobuf package into constrained workers. It is intentionally not a
+  // wire-compatible replacement for inference.GRPCInferenceService.
+  rpc ModelInfer(ModelInferRequest) returns (ModelInferResponse);
+}
+
+message Tensor {
+  string name = 1;
+  // ONNX TensorProto.DataType numeric value (FLOAT=1, INT64=7, etc.).
+  uint32 dtype = 2;
+  repeated int64 shape = 3;
+  // Little-endian, flattened row-major tensor bytes.  For FLOAT (dtype=1),
+  // this is IEEE-754 binary32, matching the native protocol's float vector.
+  bytes raw_data = 4;
+}
+
+message ProfileEvent {
+  string name = 1;
+  string category = 2;
+  uint64 start_us = 3;
+  uint64 duration_us = 4;
+  string detail = 5;
+}
+
+message ExecuteRequest {
+  uint64 request_id = 1;
+  string op = 2;
+  string artifact_id = 3;
+  repeated Tensor inputs = 4;
+  ProfilingLevel profiling = 5;
+  // Small control values only; large model/artifact data belongs in the
+  // dedicated compile/load RPCs.
+  map<string, string> parameters = 6;
+  // Serialized ONNX ModelProto for `subgraph` execution. Empty for unary
+  // ops and artifact-ID-only compiled runs. Bounded by the native
+  // transport's message limit.
+  bytes model = 7;
+}
+
+message ExecuteResponse {
+  uint64 request_id = 1;
+  bool ok = 2;
+  string error = 3;
+  repeated Tensor outputs = 4;
+  repeated ProfileEvent profile = 5;
+}
+
+message ModelInferRequest {
+  string id = 1;
+  string model_name = 2;
+  string model_version = 3;
+  repeated Tensor inputs = 4;
+  ProfilingLevel profiling = 5;
+  map<string, string> parameters = 6;
+  // Serialized ONNX ModelProto for graph execution. Empty for unary
+  // model-handle inference. Bounded by the native transport's message limit.
+  // Prefer Execute for new onnxsim-specific compile/load/run workflows;
+  // this field keeps graph execution reachable through the KServe-style
+  // mapping at the gateway boundary.
+  bytes model = 7;
+}
+
+message ModelInferResponse {
+  string id = 1;
+  string model_name = 2;
+  string model_version = 3;
+  bool ok = 4;
+  string error = 5;
+  repeated Tensor outputs = 6;
+  repeated ProfileEvent profile = 7;
+}
+
+message CompileRequest {
+  uint64 request_id = 1;
+  bytes model = 2; // serialized ONNX ModelProto
+  string target = 3;
+  string compiler_id = 4;
+  ProfilingLevel profiling = 5;
+  map<string, string> parameters = 6;
+}
+
+message CompileResponse {
+  uint64 request_id = 1;
+  bool ok = 2;
+  string error = 3;
+  string artifact_id = 4;
+  bytes artifact = 5;
+  string manifest = 6;
+  repeated ProfileEvent profile = 7;
+}
+
+message LoadArtifactRequest {
+  uint64 request_id = 1;
+  string artifact_id = 2;
+  bytes artifact = 3;
+  string manifest = 4;
+}
+
+message LoadArtifactResponse {
+  uint64 request_id = 1;
+  bool ok = 2;
+  string error = 3;
+  // True when this gateway has already acknowledged the same artifact ID,
+  // bytes, and manifest in this process. Native v5 workers do not expose a
+  // definitive cache-hit bit, so this is an upload-history hint rather than
+  // a claim about a restarted or independently managed runner cache.
+  bool already_present = 4;
+}
+
+message CapabilitiesRequest {
+  uint64 request_id = 1;
+}
+
+message CapabilitiesResponse {
+  uint64 request_id = 1;
+  bool ready = 2;
+  string runner_id = 3;
+  string protocol = 4;
+  repeated string supported_ops = 5;
+  repeated string supported_dtypes = 6;
+  uint64 max_message_bytes = 7;
+  bool profiling = 8;
+  // True when the runner accepts serialized ONNX subgraphs as execution
+  // requests. This is capability-based dispatch; supported_ops is retained
+  // for legacy unary smoke clients.
+  bool graph_execution = 9;
+}
+
+enum ProfilingLevel {
+  PROFILING_OFF = 0;
+  PROFILING_SUMMARY = 1;
+  PROFILING_DETAILED = 2;
+}

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "name": "onnxsim_remote",
+  "status": "public_plugin_and_legacy_source_adapter",
+  "ort_version": "public_plugin_requires_ort_1.29_plus",
+  "entrypoint": "onnxsim::ort_remote::CreateRemoteExecutionProviderFromOptions",
+  "registration": "internal_cpp",
+  "graph_execution": false,
+  "execution_mode": "legacy_unary_dispatch",
+  "public_plugin_entrypoints": ["CreateEpFactories", "ReleaseEpFactory"],
+  "supported_ops": ["Identity", "Relu", "Add", "Mul", "Sub", "Div", "Max", "Min", "Abs", "Neg", "Sqrt", "Exp", "Log", "Tanh"],
+  "supported_ops_env": "ONNXSIM_REMOTE_EP_SUPPORTED_OPS",
+  "tensor_types": ["float32"],
+  "profiling": {
+    "levels": ["off", "summary", "detailed"],
+    "transport": "response_profile_events",
+    "onnxsim_bridge": true
+  },
+  "transport": {
+    "protocol": "onnx-remote-v5",
+    "default_host": "127.0.0.1",
+    "default_port": 39501
+  },
+  "public_plugin": {
+    "library": "onnxsim_remote_ep",
+    "api": "onnxruntime_ep_c_api.h",
+    "configuration": "ONNXSIM_REMOTE_EP_HOST,ONNXSIM_REMOTE_EP_PORT,ONNXSIM_REMOTE_EP_CONNECT_TIMEOUT_MS,ONNXSIM_REMOTE_EP_IO_TIMEOUT_MS,ONNXSIM_REMOTE_EP_PROFILING,ONNXSIM_REMOTE_EP_PROFILE_FILE,ONNXSIM_REMOTE_EP_SUPPORTED_OPS",
+    "runtime_test": "onnxsim_remote_ep_run_test"
+  }
+}

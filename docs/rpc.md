@@ -7,6 +7,70 @@ host, or let `onnxsim.simplify` evaluate constant folding on that machine. It bo
 smaller protocol of its own. It is **not** wire-compatible with TVM's RPC; see
 [Relationship to TVM RPC](#relationship-to-tvm-rpc).
 
+The dependency-free native transport also supports optional worker-side
+profiling. `Off` adds no profile payload, `Summary` returns aggregate runner
+timings, and `Detailed` returns bounded events with request-relative timestamps.
+The host anchors those events into the onnxsim Chrome/Perfetto trace alongside
+the host-side `RemoteRPC` duration. This is suitable for constrained
+Snapdragon/AX8850 workers because the device needs neither a JSON library nor
+clock synchronization.
+
+The transport is independent of the control-plane protocol. A ROS2/rosbridge
+or DORA gateway can expose discovery, compile, run, and profile actions while
+forwarding the same binary tensor and profile payloads. Large tensors and
+traces should stay binary; use the control plane for metadata, request IDs,
+health, and progress.
+
+Graph-aware native clients should use the `subgraph` operation with serialized
+graph bytes in the request model field. Profile events can be consumed through
+the C++ `receive_profile` callback, while the response retains the complete
+bounded event list for lossless forwarding.
+
+For DORA specifically, `tools/onnx-remote/onnx-remote-dora-node` is an optional
+C node adapter. Its `run` input and `result` output carry the transport's
+payload-only format as raw UInt8 messages, so DORA does not need to understand
+the ONNX tensor schema. The adapter forwards to the existing TCP worker and
+can therefore be used with the reference or AXCL worker.
+
+## External compiler and artifact caching
+
+The native executor keeps the original model-per-run path as the default. With
+`RemoteExecutorOptions.compile_model=true`, each distinct serialized fold-group
+is compiled once and subsequent runs use the returned artifact ID. The
+compiler response may include an opaque manifest and inline artifact bytes.
+
+Compilation and execution may use different endpoints: `compile_host` and
+`compile_port` select the compiler, while the existing `host` and `port` select
+the runner. An empty compiler host or zero compiler port falls back to the
+runner endpoint.
+
+Caching is split deliberately: onnxsim owns a short-lived in-process cache to
+avoid compiling the same subgraph repeatedly during one simplification; the
+compiler/runner owns persistent artifact caching and compatibility validation.
+The latter is the only component that knows whether an artifact remains valid
+for a particular compiler, SDK, driver, device, and I/O ABI.
+
+`tools/onnx-remote/onnx-remote-compiler` provides a small dependency-free
+compiler endpoint for this split. It accepts `COMPILE` requests, invokes a
+trusted command template with `{input}`, `{output}`, `{manifest}`, and
+`{target}` paths, and persists the resulting artifact and manifest. This is a
+convenient SNPE replacement boundary: a QAIRT/QNN wrapper can perform ONNX
+conversion, legalization, and context-binary generation on the compile host,
+while the execution host only receives the final artifact. The service has a
+passthrough mode for transport tests; it is not itself a QNN compiler.
+
+Set `RemoteExecutorOptions.require_graph_execution=true` to probe the
+runner's capability manifest before the first model run and fail fast unless
+it advertises `graph_execution:true`. The probe result is cached per
+executor; legacy manifests without the field are rejected under this flag,
+so leave it off for pre-graph unary workers.
+
+Compiled execution can optionally use a load/attach handshake: the host sends
+`load_compiled(artifact_id, artifact)` once to the runner, then sends
+`run_compiled(artifact_id, tensors)` without repeating the artifact bytes. The
+native executor keeps this disabled by default for stateless compatibility; set
+`attach_compiled_artifact=true` for a runner with persistent artifact storage.
+
 ```python
 import numpy as np
 import onnxsim
@@ -19,6 +83,15 @@ remote.upload("model.onnx")                              # copy into the server'
 model = remote.load_model("model.onnx")                  # keeps an onnxruntime session alive
 out = model.run({"x": np.zeros((1, 3, 224, 224), "float32")})
 t = model.time_evaluator({"x": x}, number=5, repeat=3)   # device-side timing only
+# Or send only shape/dtype metadata; the server generates and reuses random inputs.
+t = model.time_evaluator({"x": x}, number=5, repeat=3, random_inputs=True, seed=7)
+# Shape-only inputs avoid allocating template arrays on the host. Bounds are [low, high).
+t = model.time_evaluator(
+    {"tokens": rpc.RandomInput((1, 128), "int32", low=0, high=32000)},
+    number=5,
+    repeat=3,
+    random_inputs=True,
+)
 print(f"{t.median * 1e3:.2f} ms", t.results)
 
 with rpc.remote_executor(remote):                        # constant folding runs on the device
@@ -41,10 +114,10 @@ python -m onnxsim.rpc server --port 9090 --key pixel --tracker host:9190     # r
   per loaded model, so `time_evaluator` excludes session creation) and with onnxsim's pure-Python
   reference evaluator otherwise. `providers=[...]` selects onnxruntime execution providers, and is
   checked against what the server actually has.
-- **Where it runs.** The server is Python, so the target needs Python, `onnx` and ideally
-  `onnxruntime`: Linux boards and servers, containers, Termux. Stock Android has no Python, so
-  the phone in this repo's Hexagon experiments would need either Termux or a native server that
-  speaks the same protocol (it is deliberately small: see below) -- not provided yet.
+- **Where it runs.** This high-level Python RPC server needs Python, `onnx` and ideally
+  `onnxruntime`: Linux boards and servers, containers, Termux. Stock Android has no Python;
+  use the dependency-free native worker under `tools/onnx-remote` for the binary v5 transport
+  and remote EP path instead.
 
 ## API
 
@@ -56,7 +129,7 @@ python -m onnxsim.rpc server --port 9090 --key pixel --tracker host:9190     # r
 | `Session.upload(path_or_bytes, name=None)` | store a file in the server workspace (name sanitised) |
 | `Session.load_model(name/path/bytes/ModelProto, providers=None)` | returns a `RemoteModel` |
 | `RemoteModel.run(inputs)` | outputs by name as NumPy arrays |
-| `RemoteModel.time_evaluator(inputs, number, repeat)` | `ProfileResult` (`results`, `mean`, `median`, `min`, `max`, `std`), seconds per call |
+| `RemoteModel.time_evaluator(inputs, number, repeat, random_inputs=False, seed=None)` | `ProfileResult` (`results`, `mean`, `median`, `min`, `max`, `std`), seconds per call; random mode accepts arrays as templates or `rpc.RandomInput(shape, dtype, low, high)` and generates values on the server |
 | `Session.run(model, inputs)` | one-shot run without keeping a handle |
 | `rpc.remote_executor(session)` | context manager: `onnxsim.simplify` folds constants remotely |
 
@@ -116,6 +189,32 @@ argument marshalling, module and device APIs) and tracking TVM's protocol across
 was judged out of proportion for what onnxsim needs (running ONNX models and folding remotely).
 If interop with an existing TVM RPC server is needed, TVM's own client can be used alongside: the
 two are independent.
+
+For applications that already compile a TVM module, `onnxsim.rpc.tvm_compat`
+provides a small version-tolerant wrapper around the installed TVM Python
+client. It also works with TVM FFI-enabled builds: the session still comes
+from `tvm.rpc`, and uploaded FFI-compatible modules and their exported
+functions are loaded and called through TVM's remote module interface. The
+adapter returns the TVM module and function objects unchanged, so FFI tensor
+and object arguments are marshalled by the installed TVM client rather than
+converted by onnxsim.
+
+```python
+from onnxsim.rpc import tvm_compat
+
+with tvm_compat.connect_tracker("tracker", 9190, "hexagon") as session:
+    session.upload("model.so")
+    module = session.load_module("model.so")
+    run = module.get_function("run")
+    run(...)
+```
+
+For an FFI-enabled TVM application, import and use `tvm_ffi` as that module's
+API requires; `tvm_compat` does not need to import or wrap FFI values. The
+native TVM RPC server must have a compatible TVM runtime and any target-side
+runtime libraries available. This does not make a TVM RPC server an ONNX
+executor. The binary onnxsim-v5 transport remains the portable protocol for
+the remote EP and compiler/runner services.
 
 ## Security
 

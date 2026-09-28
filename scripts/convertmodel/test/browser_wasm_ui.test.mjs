@@ -87,6 +87,14 @@ try {
     { timeout },
   );
 
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.locator("#download-button").click(),
+  ]);
+  assert.equal(download.suggestedFilename(), "model.simplify.onnx");
+  const downloadedPath = await download.path();
+  assert(downloadedPath && statSync(downloadedPath).size > 0, "downloaded ONNX file was empty");
+
   await page.locator("#inference-ep").selectOption("wasm");
   await page.locator("#inference-iters").fill("2");
   await page.locator("#inference-warmup").fill("0");
@@ -102,8 +110,9 @@ try {
   const inferenceLog = await page.locator("#inference-output").inputValue();
   assert.match(conversionLog, /simplif|convert/i, "conversion log did not report a conversion");
   assert.doesNotMatch(inferenceLog, /FAIL:/, "inference reported failure");
+
   assert.equal(browserErrors.length, 0, browserErrors.join("\n"));
-  console.log("PASS: WASM converter UI converted a model and ran WASM inference");
+  console.log("PASS: converter UI converted, downloaded, and ran WASM inference");
 } catch (error) {
   if (page) {
     const screenshot = process.env.PLAYWRIGHT_SCREENSHOT || "/tmp/wasm-ui-failure.png";
