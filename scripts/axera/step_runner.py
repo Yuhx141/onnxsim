@@ -68,6 +68,11 @@ STEP_OPS = os.path.join(
 STEP_CALIB = os.path.join(
     _HERE, "fixtures", "step_calibration", "resnet18_step_calibration.json.gz"
 )
+STEP_PRECISION_OVERRIDES = os.path.join(
+    _HERE, "fixtures", "step_calibration", "resnet18_s16_overrides.json"
+)
+FP32_BINARY_FIXTURES = os.path.join(_HERE, "fixtures", "fp32_binary")
+STEP_BINARY_FIXTURES = os.path.join(_HERE, "fixtures", "step_binary_templates")
 
 
 # --------------------------------------------------------------------------
@@ -79,8 +84,75 @@ def qparams_of(calib: Mapping, name: str) -> tuple[float, int, bool]:
     return float(q["scale"]), int(q["zero_point"]), bool(q.get("signed"))
 
 
-def fake_quant(x: np.ndarray, scale: float, zp: int, signed: bool) -> np.ndarray:
-    lo, hi = (-128, 127) if signed else (0, 255)
+def load_step_precision_overrides(
+    model: onnx.ModelProto,
+    records: Sequence[Mapping],
+    calib: Mapping,
+    path: str = STEP_PRECISION_OVERRIDES,
+) -> dict[str, dict]:
+    """Load exact overrides and expand validated shared-scale ``lr * tensor`` templates."""
+    with open(path) as stream:
+        overrides = json.load(stream)
+    if not isinstance(overrides, dict):
+        raise ValueError("precision override JSON must map node names to calibration")
+    index_path = os.path.join(
+        _HERE, "fixtures", "binary_op_precision", "index.json"
+    )
+    with open(index_path) as stream:
+        index = json.load(stream)
+    lr_templates = {
+        tuple(entry["shape"]): entry
+        for entry in index
+        if entry.get("source", "").startswith((
+            "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration",
+            "Pulsar2 7.0-lite S16 ResNet18 lr-times-vector broadcast shared calibration",
+        ))
+    }
+    shapes = {
+        value.name: tuple(int(d.dim_value) for d in value.type.tensor_type.shape.dim)
+        for value in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    records_by_name = {record["name"]: record for record in records}
+    for node in model.graph.node:
+        if node.op_type != "Mul" or not node.input or node.input[0] != "lr":
+            continue
+        record = records_by_name.get(node.name)
+        if record is None or len(record.get("inputs", ())) != 2:
+            continue
+        shape = shapes.get(node.output[0], ())
+        entry = lr_templates.get(shape)
+        if entry is None and len(shape) == 1:
+            entry = lr_templates.get((1, *shape))
+        if entry is None:
+            continue
+        scales = dict(zip(("x", "z", "y"), entry["scales"]))
+        zero_points = dict(zip(("x", "y", "z"), entry["zero_points"]))
+        limit = 32767
+        tensors = ("lr", node.input[1], node.output[0])
+        roles = ("x", "z", "y")
+        if any(
+            tensor not in calib.get("ranges", {})
+            or calib["ranges"][tensor][0] < -scales[role] * limit - scales[role]
+            or calib["ranges"][tensor][1] > scales[role] * limit + scales[role]
+            for tensor, role in zip(tensors, roles)
+        ):
+            continue
+        overrides[node.name] = {
+            "layer_precision": "S16",
+            "scales": scales,
+            "zero_points": zero_points,
+        }
+        if tuple(entry["shape"]) != shape:
+            overrides[node.name]["template_shape"] = list(entry["shape"])
+    return overrides
+
+
+def fake_quant(
+    x: np.ndarray, scale: float, zp: int, signed: bool, bits: int = 8
+) -> np.ndarray:
+    if bits not in (8, 16):
+        raise ValueError(f"unsupported fake-quant precision: {bits}")
+    lo, hi = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, (1 << bits) - 1)
     s = np.float32(scale)
     q = np.clip(np.rint(x.astype(np.float32) / s) + zp, lo, hi)
     return ((q - zp) * s).astype(np.float32)
@@ -177,6 +249,11 @@ class Segment:
     # Shape decompositions may run a replicated lane template and retain only
     # the prefix corresponding to the graph output.
     output_take: int | None = None
+    # Calibration-exact scalar folds are guarded at runtime; an input outside
+    # the singleton calibration point is evaluated by the normal host path.
+    constant_value: np.ndarray | None = dataclasses.field(default=None, repr=False)
+    constant_guard: tuple[str, np.ndarray] | None = dataclasses.field(default=None, repr=False)
+    nan_guard: bool = False
     input_transforms: dict[str, Callable[[np.ndarray], np.ndarray]] = dataclasses.field(
         default_factory=dict, repr=False
     )
@@ -310,6 +387,32 @@ def _segment_for(
         cast = [c for c in consumers.get(outs[0], []) if c.op_type == "Cast"]
         if len(cast) != 1:
             return None
+        cast_out = cast[0].output[0]
+        subtract = [c for c in consumers.get(cast_out, []) if c.op_type == "Sub"]
+        if len(subtract) == 1:
+            sub = subtract[0]
+            if (
+                len(sub.input) == 2
+                and sub.input[1] == cast_out
+                and sub.input[0] in inits
+                and np.all(np.asarray(inits[sub.input[0]]) == 1)
+            ):
+                shape = rec.get("shapes", [[]])[0]
+                inverse_key = misc.template_key(
+                    "GreaterOrEqualCast" if op == "Greater" else "LessOrEqualCast",
+                    shape,
+                )
+                misc.load_template(inverse_key)
+                return Segment(
+                    name,
+                    "compare_complement",
+                    [name, cast[0].name, sub.name],
+                    [ins[1], ins[0]],
+                    [sub.output[0]],
+                    f"{inverse_key}: reversed inclusive comparison replaces 1-Cast({op})",
+                    lambda: misc.emit_model(inverse_key),
+                    nan_guard=True,
+                )
         tmpl, _ = misc.load_template(key)
         live = [t for t in ins if t not in inits][: len(tmpl.graph.input)]
         # not quantized: the device compares the float input directly
@@ -641,12 +744,363 @@ def _segment_for(
     return None
 
 
+def _fp32_binary_segment_for(
+    rec: Mapping, model: onnx.ModelProto
+) -> Segment | None:
+    """Use a captured, unquantized binary template for an exact shape tuple."""
+    op = rec.get("op")
+    if op not in ("Add", "Sub", "Mul", "Div") or len(rec.get("inputs", ())) != 2:
+        return None
+    if len(rec.get("outputs", ())) != 1:
+        return None
+    by_name = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    by_name.update({t.name: tuple(int(d) for d in t.dims) for t in model.graph.initializer})
+    inputs, output = list(rec["inputs"]), rec["outputs"][0]
+    if any(t not in by_name for t in (*inputs, output)):
+        return None
+    input_shapes = [list(by_name[t]) for t in inputs]
+    output_shape = list(by_name[output])
+    path = None
+    index_path = os.path.join(FP32_BINARY_FIXTURES, "index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as stream:
+            entries = json.load(stream).get("templates", [])
+        entry = next(
+            (
+                item
+                for item in entries
+                if item.get("validated") is True
+                and item.get("op") == op
+                and item.get("input_shapes") == input_shapes
+                and item.get("output_shape") == output_shape
+            ),
+            None,
+        )
+        if entry is not None:
+            path = os.path.join(FP32_BINARY_FIXTURES, entry["file"])
+    # Preserve the initial one-off Add capture as a compatible legacy entry.
+    if path is None and op == "Add" and input_shapes == [[16, 1000], [16, 1000]] and output_shape == [16, 1000]:
+        path = os.path.join(FP32_BINARY_FIXTURES, "add_16x1000.axmodel.gz")
+    if path is None or not os.path.isfile(path):
+        return None
+    node = next((n for n in model.graph.node if n.name == rec["name"]), None)
+    if node is None or node.op_type != op or list(node.input) != inputs:
+        return None
+    # Restrict this entry point to ordinary float32 tensors. In particular,
+    # don't route integer/bool ONNX binaries through an FP32 template.
+    elem_types = {
+        v.name: v.type.tensor_type.elem_type
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    elem_types.update({t.name: t.data_type for t in model.graph.initializer})
+    if any(elem_types.get(t) != onnx.TensorProto.FLOAT for t in (*inputs, output)):
+        return None
+
+    def emit_fp32():
+        with gzip.open(path, "rb") as f:
+            return onnx.load_model_from_string(f.read())
+
+    constants = {item.name for item in model.graph.initializer}
+    return Segment(
+        rec["name"], "fp32_binary", [rec["name"]], inputs, [output],
+        f"Pulsar2 FP32 {op} exact template for {input_shapes} -> {output_shape}",
+        emit_fp32, [], [], constant_inputs=[t for t in inputs if t in constants],
+    )
+
+
+def _exact_mask_mul_segment_for(
+    rec: Mapping, calib: Mapping, model: onnx.ModelProto
+) -> Segment | None:
+    """Exact-calibration native Mul for a common one-hot mask frame.
+
+    The frame is calibrated so x and y share a scale (making the scale
+    retarget registers ambiguous); only this exact measured scale/zp tuple is
+    accepted. Other masks still use the regular retargetable templates.
+    """
+    if rec.get("op") != "Mul" or rec.get("attrs", {}).get("form") != "same_shape":
+        return None
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if len(inputs) != 2 or len(outputs) != 1:
+        return None
+    shape = (16, 1000)
+    by_name = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    if any(by_name.get(t) != shape for t in (*inputs, outputs[0])):
+        return None
+    expected = {
+        inputs[0]: (0.00012254902685526758, 255),
+        inputs[1]: (0.003921568859368563, 0),
+        outputs[0]: (0.00012254902685526758, 255),
+    }
+    for tensor, (scale, zp) in expected.items():
+        if tensor not in calib.get("tensors", {}):
+            return None
+        actual = calib["tensors"][tensor]
+        if (
+            bool(actual.get("signed"))
+            or int(actual["zero_point"]) != zp
+            or abs(float(actual["scale"]) - scale) > 1e-10
+        ):
+            return None
+    path = os.path.join(STEP_BINARY_FIXTURES, "mul_mask_16x1000.axmodel.gz")
+    if not os.path.isfile(path):
+        return None
+
+    def emit_mask_mul():
+        with gzip.open(path, "rb") as f:
+            return onnx.load_model_from_string(f.read())
+
+    return Segment(
+        rec["name"], "mul_mask_exact", [rec["name"]], inputs, outputs,
+        "native Mul mask template at exact x255/y255/z0 calibration, shape 16x1000",
+        emit_mask_mul, [qparams_of(calib, t) for t in inputs],
+        [qparams_of(calib, outputs[0])],
+    )
+
+
+def _exact_loss_sub_segment_for(
+    rec: Mapping, calib: Mapping, model: onnx.ModelProto
+) -> Segment | None:
+    """Exact-calibration native Sub for the loss-tail broadcast at 16x1000."""
+    if rec.get("op") != "Sub" or len(rec.get("inputs", ())) != 2:
+        return None
+    inputs, outputs = list(rec["inputs"]), list(rec.get("outputs", ()))
+    if len(outputs) != 1:
+        return None
+    shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    output_shape = (16, 1000)
+    if (
+        shapes.get(inputs[0]) != output_shape
+        or shapes.get(inputs[1]) != (16, 1)
+        or shapes.get(outputs[0]) != output_shape
+    ):
+        return None
+    expected = (
+        (6.96580696105957, 255),
+        (0.00012254902685526758, 255),
+        (6.96580696105957, 255),
+    )
+    for tensor, (scale, zp) in zip((*inputs, outputs[0]), expected):
+        actual = calib.get("tensors", {}).get(tensor)
+        if (
+            actual is None
+            or bool(actual.get("signed"))
+            or int(actual["zero_point"]) != zp
+            or abs(float(actual["scale"]) - scale) > 1e-10
+        ):
+            return None
+    path = os.path.join(STEP_BINARY_FIXTURES, "sub_loss_16x1000.axmodel.gz")
+    if not os.path.isfile(path):
+        return None
+
+    def emit_loss_sub():
+        with gzip.open(path, "rb") as f:
+            return onnx.load_model_from_string(f.read())
+
+    return Segment(
+        rec["name"], "sub_loss_exact", [rec["name"]], inputs, outputs,
+        "native Sub loss-tail template at exact calibration, broadcast to 16x1000",
+        emit_loss_sub, [qparams_of(calib, t) for t in inputs],
+        [qparams_of(calib, outputs[0])], input_shapes=[shapes[t] for t in inputs],
+        output_shape=output_shape,
+    )
+
+
+def _exact_div2_segment_for(
+    rec: Mapping,
+    calib: Mapping,
+    model: onnx.ModelProto,
+    inits: Mapping[str, np.ndarray],
+) -> Segment | None:
+    """Native Pulsar2 lowering for exact ``x / 2`` loss-tail templates."""
+    if rec.get("op") != "Div" or rec.get("attrs", {}).get("form") != "const":
+        return None
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if len(inputs) != 2 or len(outputs) != 1:
+        return None
+    const_index = rec.get("attrs", {}).get("constant_input")
+    if const_index is None or int(const_index) != 1:
+        return None
+    const_name, live_name, output = inputs[1], inputs[0], outputs[0]
+    if const_name not in inits or not np.all(np.asarray(inits[const_name]) == 2.0):
+        return None
+    shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    shape = (16, 1000)
+    if shapes.get(live_name) != shape or shapes.get(output) != shape:
+        return None
+    qx = calib.get("tensors", {}).get(live_name)
+    qy = calib.get("tensors", {}).get(output)
+    if qx is None or qy is None or qx.get("signed") or qy.get("signed"):
+        return None
+    zp = int(qx["zero_point"])
+    if int(qy["zero_point"]) != zp:
+        return None
+    scales = {
+        98: (0.05171579495072365, 0.025857897475361824),
+        101: (0.0531538687646389, 0.02657693438231945),
+        211: (2.16483895201236e-05, 1.08241947600618e-05),
+    }
+    expected = scales.get(zp)
+    if expected is None:
+        return None
+    sx, sy = expected
+    if (
+        abs(float(qx["scale"]) - sx) > 1e-10
+        or abs(float(qy["scale"]) - sy) > 1e-10
+    ):
+        return None
+    path = os.path.join(STEP_BINARY_FIXTURES, f"div2_16x1000_z{zp}.axmodel.gz")
+    if not os.path.isfile(path):
+        return None
+
+    def emit_div2():
+        with gzip.open(path, "rb") as f:
+            return onnx.load_model_from_string(f.read())
+
+    return Segment(
+        rec["name"], "div2_exact", [rec["name"]], [live_name], [output],
+        f"native Pulsar2 x/2 template at exact zp{zp} calibration, shape 16x1000",
+        emit_div2, [qparams_of(calib, live_name)], [qparams_of(calib, output)],
+    )
+
+
+def _singleton_scalar_div_fold(
+    rec: Mapping, calib: Mapping, inits: Mapping[str, np.ndarray]
+) -> Segment | None:
+    """Fold scalar constant/live Div only at a calibrated singleton input."""
+    if rec.get("op") != "Div" or rec.get("attrs", {}).get("constant_input") != 0:
+        return None
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if len(inputs) != 2 or len(outputs) != 1 or inputs[0] not in inits:
+        return None
+    ranges = calib.get("ranges", {})
+    bounds = ranges.get(inputs[1])
+    if not bounds or len(bounds) != 2 or float(bounds[0]) != float(bounds[1]):
+        return None
+    numerator = np.asarray(inits[inputs[0]], dtype=np.float32)
+    if numerator.size != 1 or float(bounds[0]) == 0.0:
+        return None
+    value = np.asarray(numerator / np.float32(bounds[0]), dtype=np.float32)
+    return Segment(
+        rec["name"], "algebraic_constant", [rec["name"]], [inputs[1]], outputs,
+        f"constant Div folded at singleton calibrated input {float(bounds[0])}",
+        lambda: None, constant_value=value,
+        constant_guard=(inputs[1], np.asarray(bounds[0], dtype=np.float32)),
+    )
+
+
+def _precision_binary_segment_for(
+    rec: Mapping,
+    override: Mapping | None,
+    model: onnx.ModelProto,
+) -> Segment | None:
+    """Build a binary segment only for an explicitly selected exact template.
+
+    Overrides use the same role-keyed scale/zero-point contract as compile_onnx.
+    This path is deliberately opt-in: high-precision fixtures are not
+    interchangeable with the step graph's U8 activation calibration.
+    """
+    if override is None:
+        return None
+    op = rec.get("op")
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if op not in axb.bse.OPS or len(inputs) != 2 or len(outputs) != 1:
+        raise ValueError(f"{rec.get('name')}: precision override requires a binary op")
+    values = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    input_shapes = [values.get(t, ()) for t in inputs]
+    output_shape = values.get(outputs[0], ())
+    shape = output_shape
+    input_transforms = {}
+    if not shape or any(not item for item in input_shapes):
+        raise ValueError(f"{rec.get('name')}: precision override requires known tensor shapes")
+    packed_vector = (
+        op == "Mul"
+        and len(output_shape) == 1
+        and tuple(override.get("template_shape", ())) == (1, *output_shape)
+    )
+    if packed_vector:
+        shape = (1, *output_shape)
+    if input_shapes != [shape, shape]:
+        if (
+            np.broadcast_shapes(*input_shapes) != output_shape
+            or (not packed_vector and np.broadcast_shapes(*input_shapes) != shape)
+        ):
+            raise ValueError(
+                f"{rec.get('name')}: precision override inputs must broadcast to "
+                "the output shape"
+            )
+        for tensor, actual_shape in zip(inputs, input_shapes):
+            if actual_shape != shape:
+                if packed_vector and int(np.prod(actual_shape)) == 1:
+                    # Keep a scalar-shaped port scalar. The compiled `[1,N]`
+                    # model performs the broadcast inside its Mul node.
+                    continue
+                input_transforms[tensor] = lambda value, target=shape: np.broadcast_to(
+                    value, target
+                ).copy()
+    precision = override.get("layer_precision")
+    scales, zero_points = override.get("scales"), override.get("zero_points")
+    roles = {"x", "z", "y"}
+    if precision not in ("U16", "S16") or not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+        raise ValueError(f"{rec.get('name')}: precision override needs U16/S16 scales and zero_points")
+    if not roles <= set(scales) or not roles <= set(zero_points):
+        raise ValueError(f"{rec.get('name')}: precision override needs x, z, and y calibration")
+    zps = {role: int(zero_points[role]) for role in roles}
+    if any(float(zero_points[role]) != zps[role] for role in roles):
+        raise ValueError(f"{rec.get('name')}: precision override zero points must be integral")
+    key = axb.TemplateKey(
+        op,
+        (shape,),
+        calibration_class=",".join(f"{r}{zps[r]}" for r in ("x", "y", "z")),
+        layer_precision=precision,
+        calibration_scales=tuple(float(scales[r]) for r in ("x", "z", "y")),
+    )
+    cache = axb.TemplateCache()
+    entry = cache.lookup(key)
+    template = cache.load(key)
+    signed = precision == "S16"
+    quant = lambda role: (
+        float(scales[role]), zps[role], signed, 16
+    )
+    segment_input_shapes = [shape, shape]
+    return Segment(
+        rec["name"],
+        "binary_precision",
+        [rec["name"]],
+        inputs,
+        outputs,
+        f"exact {precision} binary template ({entry.meta['file']})",
+        lambda: template,
+        [quant("x"), quant("z")],
+        [quant("y")],
+        input_shapes=segment_input_shapes,
+        output_shape=() if packed_vector else output_shape,
+        input_transforms=input_transforms,
+    )
+
+
 def build_plan(
     model: onnx.ModelProto,
     records: Sequence[Mapping],
     calib: Mapping,
     kinds: set[str] | None = None,
     include_unsafe: bool = False,
+    *,
+    precision_overrides: Mapping[str, Mapping] | None = None,
 ) -> tuple[list[Segment], dict[str, str]]:
     """NPU segments (only of ``kinds`` if given) and a per-node reason for
     every node left on the host."""
@@ -814,6 +1268,13 @@ def build_plan(
                         rec["shapes"] = [list(attrs["template_shape"])]
         rec["attrs"] = attrs
         planned_records.append(rec)
+    unknown_overrides = set(precision_overrides or {}) - {
+        rec["name"] for rec in planned_records
+    }
+    if unknown_overrides:
+        raise ValueError(
+            f"precision overrides name unknown step nodes: {sorted(unknown_overrides)}"
+        )
     # Live MatMul/Conv validation scans the compiled MCode.  The same scan is
     # required by the segment emitter below, so defer it to
     # ``drop_unemittable`` instead of doing it once during planning and again
@@ -835,6 +1296,24 @@ def build_plan(
         for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
     }
     for rec, (status, detail) in zip(planned_records, plans):
+        folded = _singleton_scalar_div_fold(rec, calib, inits)
+        if folded is not None:
+            if not kinds or folded.kind in kinds:
+                candidates.append(folded)
+            else:
+                host[rec["name"]] = f"covered, kind {folded.kind} not selected"
+            continue
+        precision_seg = _precision_binary_segment_for(
+            rec,
+            (precision_overrides or {}).get(rec["name"]),
+            model,
+        )
+        if precision_seg is not None:
+            if not kinds or precision_seg.kind in kinds:
+                candidates.append(precision_seg)
+                continue
+            host[rec["name"]] = f"covered, kind {precision_seg.kind} not selected"
+            continue
         if (
             status in ("refused", "covered")
             and rec["op"] in axb.bse.OPS
@@ -865,11 +1344,37 @@ def build_plan(
                     expanded, calib, cache, validate_live=False
                 )
                 rec = expanded
+        exact_seg = _exact_mask_mul_segment_for(rec, calib, model)
+        if exact_seg is None:
+            exact_seg = _exact_loss_sub_segment_for(rec, calib, model)
+        if exact_seg is None:
+            exact_seg = _exact_div2_segment_for(rec, calib, model, inits)
+        if exact_seg is not None and (not kinds or exact_seg.kind in kinds):
+            candidates.append(exact_seg)
+            continue
+        fp32_seg = _fp32_binary_segment_for(rec, model)
+        legacy_fp32_add = (
+            rec.get("op") == "Add"
+            and [value_shapes.get(t) for t in rec.get("inputs", ())]
+            == [(16, 1000), (16, 1000)]
+        )
+        use_fp32 = fp32_seg is not None and (not kinds or fp32_seg.kind in kinds)
+        if use_fp32 and legacy_fp32_add:
+            # Keep the original exact Add probe as the one explicit override
+            # of a regular calibrated segment.
+            candidates.append(fp32_seg)
+            continue
         if status != "covered":
+            if use_fp32:
+                candidates.append(fp32_seg)
+                continue
             host[rec["name"]] = f"{status}: {detail}"
             continue
         seg = _segment_for(rec, detail, calib, model, consumers, inits)
         if seg is None or (kinds and seg.kind not in kinds):
+            if use_fp32:
+                candidates.append(fp32_seg)
+                continue
             host[rec["name"]] = (
                 f"covered ({detail}) but no runner segment"
                 if seg is None
@@ -877,6 +1382,9 @@ def build_plan(
             )
             continue
         if seg.unsafe and not include_unsafe:
+            if use_fp32:
+                candidates.append(fp32_seg)
+                continue
             host[rec["name"]] = f"covered, but unsafe: {seg.unsafe}"
             continue
         candidates.append(seg)
@@ -928,6 +1436,8 @@ def drop_unemittable(
 
     def emit_one(seg: Segment) -> tuple[Segment, bytes | None, Exception | None]:
         try:
+            if seg.kind in ("algebraic_identity", "algebraic_constant"):
+                return seg, None, None
             cache_path = None
             if emit_cache_dir:
                 payload = {
@@ -975,6 +1485,11 @@ def drop_unemittable(
         if error is not None:
             for n in seg.nodes:
                 host[n] = f"covered, but the emitter refused: {error}"
+            continue
+        if seg.kind in ("algebraic_identity", "algebraic_constant"):
+            # Algebraic segments need no AX program and must not be demoted to
+            # HostOps/ORT unless a guarded fold sees a different runtime value.
+            keep.append(seg)
             continue
         assert blob is not None
         blobs[seg.name] = blob
@@ -1091,6 +1606,8 @@ class StepRunner:
 
     def _float(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
         local = dict(env)
+        for tensor in seg.constant_inputs:
+            local[tensor] = np.asarray(self.host.inits[tensor], dtype=np.float32)
         for n in sorted(seg.nodes, key=self.index.get):
             node = self.by_name[n]
             for t, v in zip([t for t in node.output if t], self.host.run(node, local)):
@@ -1125,12 +1642,19 @@ class StepRunner:
     def _device(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
         m = self.session.load(self.emitted(seg))
         try:
-            ins = [
-                seg.input_transforms.get(t, lambda x: x)(
-                    np.asarray(env[t], dtype=np.float32)
+            ins = []
+            for t in seg.inputs:
+                if t in env:
+                    value = env[t]
+                elif t in seg.constant_inputs:
+                    value = self.host.inits[t]
+                else:
+                    raise KeyError(t)
+                ins.append(
+                    seg.input_transforms.get(t, lambda x: x)(
+                        np.asarray(value, dtype=np.float32)
+                    )
                 )
-                for t in seg.inputs
-            ]
             model_inputs = getattr(m, "inputs", None)
             if model_inputs is not None and len(model_inputs) > len(ins):
                 initializer = {
@@ -1227,6 +1751,27 @@ class StepRunner:
             if seg is not None and mode != "float" and self.fire_at[seg.name] == k:
                 if seg.kind == "algebraic_identity":
                     env[seg.outputs[0]] = env[seg.inputs[0]]
+                    stats.append(SegStat(seg.name, seg.kind, len(seg.nodes)))
+                    continue
+                if seg.kind == "algebraic_constant":
+                    assert seg.constant_value is not None and seg.constant_guard is not None
+                    guard_name, expected = seg.constant_guard
+                    actual = np.asarray(env[guard_name])
+                    if actual.size == 1 and np.array_equal(actual.reshape(()), expected.reshape(())):
+                        env[seg.outputs[0]] = seg.constant_value.copy()
+                    else:
+                        for t, v in zip(
+                            [t for t in node.output if t], self.host.run(node, env)
+                        ):
+                            env[t] = v
+                    stats.append(SegStat(seg.name, seg.kind, len(seg.nodes)))
+                    continue
+                if mode == "npu" and seg.nan_guard and any(
+                    np.isnan(np.asarray(env[t])).any() for t in seg.inputs
+                ):
+                    for tensor, value in zip(seg.outputs, self._float(seg, env)):
+                        env[tensor] = value
+                    stats.append(SegStat(seg.name, "host_nan_guard", len(seg.nodes)))
                     continue
                 st = SegStat(seg.name, seg.kind, len(seg.nodes))
                 t1 = time.time()
@@ -1469,6 +2014,12 @@ def summarize(stats: Sequence[SegStat]) -> dict:
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--kinds", help="comma-separated segment kinds to put on the NPU")
+    p.add_argument(
+        "--precision-overrides",
+        default=STEP_PRECISION_OVERRIDES,
+        help="JSON file mapping node names to exact U16/S16 binary calibration "
+        f"(default: {os.path.basename(STEP_PRECISION_OVERRIDES)})",
+    )
     p.add_argument("--mode", default="npu", choices=["npu", "sim", "float"])
     p.add_argument("--out", required=True)
     p.add_argument("--emit-dir")
@@ -1511,7 +2062,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     records = load_records()
     calib = axb.load_calibration(STEP_CALIB)
     kinds = set(args.kinds.split(",")) if args.kinds else None
-    segs, host = build_plan(model, records, calib, kinds, args.include_unsafe)
+    precision_overrides = None
+    if args.precision_overrides:
+        if os.path.abspath(args.precision_overrides) == os.path.abspath(
+            STEP_PRECISION_OVERRIDES
+        ):
+            precision_overrides = load_step_precision_overrides(
+                model, records, calib, args.precision_overrides
+            )
+        else:
+            with open(args.precision_overrides) as stream:
+                precision_overrides = json.load(stream)
+            if not isinstance(precision_overrides, dict):
+                raise ValueError(
+                    "precision override JSON must map node names to calibration"
+                )
+    segs, host = build_plan(
+        model,
+        records,
+        calib,
+        kinds,
+        args.include_unsafe,
+        precision_overrides=precision_overrides,
+    )
     if args.only:
         only = set(args.only.split(","))
         segs = [s for s in segs if s.name in only]

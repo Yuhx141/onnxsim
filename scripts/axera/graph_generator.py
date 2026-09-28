@@ -15,6 +15,7 @@ import dataclasses
 import math
 import os
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 import binary_op_scale_emit
 import compose_emit
@@ -719,7 +720,7 @@ def generate(
     *,
     indices: Sequence[int] | None = None,
     schedule_path: str | None = None,
-    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+    calibration: Mapping[str, Any] | None = None,
 ) -> GraphPlan:
     """Generate an AX model from a supported ONNX graph without Pulsar2.
 
@@ -969,13 +970,46 @@ def generate(
             raise ValueError(
                 f"{plan.chain.title()} calibration requires scales and zero_points mappings"
             )
-        binary_op_scale_emit.emit(
-            plan.chain.title(),
-            plan.segments[0].input_shape,
-            scales,
-            zero_points,
-            output_path,
-        )
+        precision = calibration.get("layer_precision", "U8")
+        if precision == "U8":
+            binary_op_scale_emit.emit(
+                plan.chain.title(),
+                plan.segments[0].input_shape,
+                scales,
+                zero_points,
+                output_path,
+            )
+        else:
+            if precision not in ("U16", "S16"):
+                raise ValueError(
+                    f"unsupported binary layer precision {precision!r}; "
+                    "expected U8, U16, or S16"
+                )
+            if not {"x", "z", "y"} <= set(scales) or not {
+                "x",
+                "z",
+                "y",
+            } <= set(zero_points):
+                raise ValueError(
+                    "high-precision binary calibration needs x, z, and y scales/zero_points"
+                )
+            zps = {name: int(zero_points[name]) for name in ("x", "y", "z")}
+            if any(float(zero_points[name]) != zps[name] for name in zps):
+                raise ValueError("binary zero points must be integral")
+            from tinygrad_ax_backend import TemplateCache, TemplateKey
+
+            key = TemplateKey(
+                plan.chain.title(),
+                (plan.segments[0].input_shape,),
+                calibration_class=",".join(
+                    f"{name}{zps[name]}" for name in ("x", "y", "z")
+                ),
+                layer_precision=precision,
+                calibration_scales=tuple(
+                    float(scales[name]) for name in ("x", "z", "y")
+                ),
+            )
+            onnx.save(TemplateCache().load(key), output_path)
     else:
         if indices is None:
             init = _initializer_map(model)

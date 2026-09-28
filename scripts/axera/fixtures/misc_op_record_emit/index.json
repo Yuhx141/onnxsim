@@ -1,4 +1,16 @@
 {
+ "GreaterOrEqualCast:1024x9x3136": {
+  "file": "misc_op_step_templates/GreaterOrEqualCast_1024x9x3136.axmodel.gz",
+  "op": "GreaterOrEqualCast",
+  "shape": [1024, 9, 3136],
+  "source": "Pulsar2 7.0-lite comparison-cast complement template; reverses Greater then includes equality"
+ },
+ "LessOrEqualCast:1024x9x3136": {
+  "file": "misc_op_step_templates/LessOrEqualCast_1024x9x3136.axmodel.gz",
+  "op": "LessOrEqualCast",
+  "shape": [1024, 9, 3136],
+  "source": "Pulsar2 7.0-lite comparison-cast complement template; reverses Less then includes equality"
+ },
  "GreaterCast:1024x9x3136": {
   "file": "misc_op_step_templates/GreaterCast_1024x9x3136.axmodel.gz",
   "op": "GreaterCast",

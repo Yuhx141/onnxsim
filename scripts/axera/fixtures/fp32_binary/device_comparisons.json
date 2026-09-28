@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "device": "AX8850 via axcl-vm",
+  "method": "Same-shape float32 IO; 10 warmups, 100 paired executions per model; median and p95 are axclrtEngineExecute microseconds.",
+  "comparisons": [
+    {
+      "op": "Mul",
+      "input_shapes": [[128, 128, 3, 3], [128, 128, 3, 3]],
+      "output_shape": [128, 128, 3, 3],
+      "fp32_model": "mul_128x128x3x3_1050c7d60c5c.axmodel.gz",
+      "s16_model": "../binary_op_precision/mul_lr_broadcast_128x128x3x3_s16.axmodel.gz",
+      "runs": 100,
+      "fp32_us": {"median": 589.5, "p95": 645.05},
+      "s16_us": {"median": 673.0, "p95": 707.25},
+      "fp32_speedup": 1.1416,
+      "planner_route": "fp32_binary"
+    },
+    {
+      "op": "Mul",
+      "input_shapes": [[1000, 512], [1000, 512]],
+      "output_shape": [1000, 512],
+      "fp32_model": "mul_1000x512_66dff6956473.axmodel.gz",
+      "s16_model": "../binary_op_precision/mul_lr_broadcast_1000x512_s16.axmodel.gz",
+      "runs": 100,
+      "fp32_us": {"median": 661.0, "p95": 729.1},
+      "s16_us": {"median": 720.0, "p95": 803.3},
+      "fp32_speedup": 1.0893,
+      "planner_route": "fp32_binary"
+    }
+  ]
+}

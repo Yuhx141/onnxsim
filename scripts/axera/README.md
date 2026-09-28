@@ -3253,6 +3253,17 @@ its decode mcode and re-running, every outcome reproduced 3 of 3 times:
 | in-program `a7.1e` channel 1e -> 02 | 103 | runs, outputs identical |
 | segment-opening `a7.1e` markers, operand 0 -> 1 | 15 | **fault `0x8030070C`** |
 
+**SDK-version difference (Pulsar 7.0-lite, checked on AXCL in `axcl-vm`,
+2026-09-27):** rebuilding SmolLM2-135M and applying the test's in-program
+`a7.1e` operand-0-to-1 edit to every matching instruction ran twice instead
+of faulting. The output was repeatable within each build; output digests
+differed across two fresh builds, so this does not establish whether that
+mutation is semantically inert. The other two controls reproduced:
+`a7.02` operand 2 -> 0 changed all three outputs, and channel 02 -> 1e
+preserved them. Segment-opening `a7.1e` markers were not modified in this
+7.0 probe. Treat the fault observation above as specific to the earlier
+SDK/runtime until a baseline-vs-patched comparison is repeated on 7.0.
+
 So the operand-0 form (`a7.1e`, at every segment start and before each
 op's dispatch verbs) is a wait or reset that must read 0, the operand-2
 form (`a7.02`, after each op's dispatch) is a post whose value fixes

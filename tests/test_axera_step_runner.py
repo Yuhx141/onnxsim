@@ -10,6 +10,7 @@ test here, and hold ``/tmp/axcl-device.lock`` while they do.
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import sys
 
@@ -62,6 +63,126 @@ def test_fake_quant_rounds_and_clips():
     np.testing.assert_allclose(got, [-1.0, 0.0, 0.0, 0.01, 1.55], atol=1e-6)
     got = sr.fake_quant(x, 0.01, 0, True)
     np.testing.assert_allclose(got, [-1.0, 0.0, 0.0, 0.01, 1.27], atol=1e-6)
+
+
+@pytest.mark.parametrize("bits,signed,zp", [(16, False, 32768), (16, True, 0)])
+def test_fake_quant_supports_explicit_16bit_segment_params(bits, signed, zp):
+    x = np.array([-1.0, 0.0, 1.0, 2.0], dtype=np.float32)
+    got = sr.fake_quant(x, 1.0, zp, signed, bits)
+    lo, hi = (-32768, 32767) if signed else (0, 65535)
+    expected = (np.clip(np.rint(x) + zp, lo, hi) - zp).astype(np.float32)
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_step_planner_accepts_explicit_exact_16bit_binary_template():
+    with open(os.path.join(HERE, "..", "scripts", "axera", "fixtures", "binary_op_precision", "index.json")) as stream:
+        entry = next(
+            item for item in json.load(stream)
+            if item["op"] == "Add" and item["precision"] == "S16"
+        )
+    shape = entry["shape"]
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Add", ["x", "z"], ["y"], name="add16")],
+            "explicit_16bit_plan",
+            [
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, shape),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    model.ir_version = 10
+    record = {
+        "op": "Add", "name": "add16", "attrs": {"form": "same_shape"},
+        "inputs": ["x", "z"], "outputs": ["y"], "shapes": [shape],
+    }
+    override = {
+        "layer_precision": entry["precision"],
+        "scales": dict(zip(("x", "z", "y"), (entry["scales"][0], entry["scales"][1], entry["scales"][2]))),
+        "zero_points": dict(zip(("x", "y", "z"), entry["zero_points"])),
+    }
+    u8_calib = {"tensors": {name: {"scale": 0.01, "zero_point": 0, "signed": False} for name in ("x", "z", "y")}}
+    segments, host = sr.build_plan(
+        model, [record], u8_calib, precision_overrides={"add16": override}
+    )
+    assert not host
+    assert len(segments) == 1 and segments[0].kind == "binary_precision"
+    assert segments[0].in_q == [
+        (override["scales"]["x"], 0, True, 16),
+        (override["scales"]["z"], 0, True, 16),
+    ]
+    emitted, blobs = sr.drop_unemittable(segments, host)
+    assert emitted == segments
+    assert blobs["add16"]
+    bad_override = {
+        **override,
+        "scales": {**override["scales"], "y": override["scales"]["y"] * 1.01},
+    }
+    with pytest.raises(ValueError, match="no exact-calibration S16 template"):
+        sr.build_plan(
+            model, [record], u8_calib, precision_overrides={"add16": bad_override}
+        )
+
+
+@needs_device
+def test_explicit_16bit_segment_runs_through_step_runner_on_axcl_vm():
+    import axcl_session
+
+    entry = next(
+        item
+        for item in json.load(
+            open(os.path.join(HERE, "..", "scripts", "axera", "fixtures", "binary_op_precision", "index.json"))
+        )
+        if item["op"] == "Add" and item["precision"] == "S16"
+    )
+    shape = entry["shape"]
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Add", ["x", "z"], ["y"], name="add16")],
+            "step_precision_vm",
+            [
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, shape),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    # ORT's schema registry in the pinned runtime supports IR <= 13.
+    model.ir_version = 10
+    record = {
+        "op": "Add", "name": "add16", "attrs": {"form": "same_shape"},
+        "inputs": ["x", "z"], "outputs": ["y"], "shapes": [shape],
+    }
+    override = {
+        "layer_precision": entry["precision"],
+        "scales": dict(zip(("x", "z", "y"), entry["scales"])),
+        "zero_points": dict(zip(("x", "y", "z"), entry["zero_points"])),
+    }
+    calibration = {
+        "tensors": {
+            name: {"scale": 0.01, "zero_point": 0, "signed": False}
+            for name in ("x", "z", "y")
+        }
+    }
+    segments, host = sr.build_plan(
+        model, [record], calibration, precision_overrides={"add16": override}
+    )
+    assert not host
+    rng = np.random.default_rng(97)
+    feeds = {
+        name: rng.uniform(-0.75, 0.75, shape).astype(np.float32)
+        for name in ("x", "z")
+    }
+    with axcl_session.AXSession(subdir="step_binary_precision_bridge") as session:
+        _, stats = sr.StepRunner(model, segments, session, health_every=0).run(
+            feeds, "npu"
+        )
+    assert len(stats) == 1 and stats[0].kind == "binary_precision"
+    assert not stats[0].error, stats[0]
+    assert stats[0].max_lsb <= 2.01, stats[0]
 
 
 def _adam_graph() -> onnx.ModelProto:
@@ -119,6 +240,18 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     records = sr.load_records()
     segs, host = sr.build_plan(model, records, calib)
     everything, _ = sr.build_plan(model, records, calib, include_unsafe=True)
+    assert any(s.kind == "fp32_binary" for s in everything)
+    assert any(s.name == "Mul_20" and s.kind == "mul_mask_exact" for s in segs)
+    assert any(s.name == "Sub_24" and s.kind == "sub_loss_exact" for s in segs)
+    assert {s.name for s in segs if s.kind == "div2_exact"} == {
+        "Div_0",
+        "Div_1",
+        "Div_34",
+    }
+    assert "Mul_20" not in host
+    assert "Sub_24" not in host
+    assert not {"Div_0", "Div_1", "Div_34"} & host.keys()
+    assert "Sub_32" in host  # different output scale/zp: exact fixture must not match
     # a node inside two chains is recomputed by both: count it once
     covered = len({n for s in everything for n in s.nodes})
     report_covered = sr.axb.coverage_report(records, calibration=calib)["totals"][
@@ -134,6 +267,17 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
         or ("constant from" in s.detail and bool(s.output_shape))
         for s in everything
     )
+    # Sub_24 is a full-shape replacement for a refused broadcast shape.
+    synthetic += sum(s.kind == "sub_loss_exact" for s in everything)
+    synthetic += sum(s.kind == "div2_exact" for s in everything)
+    synthetic += sum(s.kind == "mul_mask_exact" for s in everything)
+    # Captured unquantized binaries are outside tinygrad_ax_backend's
+    # calibration coverage report, just like the other synthetic segments.
+    synthetic += sum(
+        len(s.nodes) for s in everything if s.kind == "fp32_binary"
+    )
+    # Singleton scalar divisions fold to guarded host constants, not AX models.
+    synthetic += sum(s.kind == "algebraic_constant" for s in everything)
     assert covered + nonemittable - synthetic == report_covered
     unsafe = [s for s in everything if s.unsafe]
     # signed Reshapes take the Reshape -> Identity templates, so none is unsafe
@@ -178,6 +322,709 @@ def test_emission_cache_reuses_a_validated_segment(tmp_path):
     second, _ = sr.drop_unemittable([segment], {}, str(tmp_path))
     assert first and second
     assert calls == 1
+
+
+def test_algebraic_identity_is_kept_without_model_emission():
+    segment = sr.Segment(
+        "ones_mul", "algebraic_identity", ["ones_mul"], ["x"], ["y"],
+        "all-ones Mul is an identity", lambda: None,
+    )
+    kept, blobs = sr.drop_unemittable([segment], {})
+    assert kept == [segment]
+    assert blobs == {}
+
+
+def _step_add35_s16_override():
+    path = os.path.join(
+        HERE, "..", "scripts", "axera", "fixtures", "binary_op_precision", "index.json"
+    )
+    with open(path) as stream:
+        entry = next(
+            item
+            for item in json.load(stream)
+            if item.get("source", "").startswith("Pulsar2 7.0-lite S16")
+        )
+    return {
+        "layer_precision": entry["precision"],
+        "scales": dict(zip(("x", "z", "y"), entry["scales"])),
+        "zero_points": dict(zip(("x", "y", "z"), entry["zero_points"])),
+    }
+
+
+def _step_mul_s16_override(node_name):
+    path = os.path.join(
+        HERE, "..", "scripts", "axera", "fixtures", "binary_op_precision", "index.json"
+    )
+    with open(path) as stream:
+        entry = next(
+            item
+            for item in json.load(stream)
+            if item.get("file", "").startswith(f"mul_step_{node_name.lower()}_")
+        )
+    return {
+        "layer_precision": entry["precision"],
+        "scales": dict(zip(("x", "z", "y"), entry["scales"])),
+        "zero_points": dict(zip(("x", "y", "z"), entry["zero_points"])),
+    }
+
+
+@needs_step
+def test_resnet_native_templates_reduce_host_fallbacks():
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    records = sr.load_records()
+    overrides = sr.load_step_precision_overrides(model, records, calib)
+    segments, host = sr.build_plan(
+        model,
+        records,
+        calib,
+        precision_overrides=overrides,
+    )
+    selected = {s.name: s for s in segments if s.kind == "binary_precision"}
+    assert set(selected) == set(overrides)
+    assert not set(selected) & host.keys()
+    assert len(host) == 126
+    assert not {"Sub_446", "Sub_449"} & host.keys()
+    assert {"Greater_444", "Less_447"} <= {s.name for s in segments if s.kind == "compare_complement"}
+    folded = {s.name: s for s in segments if s.kind == "algebraic_constant"}
+    assert {"Div_18", "Div_26"} <= folded.keys()
+    for segment in selected.values():
+        for tensor, q in zip(
+            (*segment.inputs, *segment.outputs), (*segment.in_q, *segment.out_q)
+        ):
+            lo, hi = calib["ranges"][tensor]
+            limit = q[0] * 32767
+            assert lo >= -limit - q[0]
+            assert hi <= limit + q[0]
+
+
+def test_singleton_scalar_div_is_folded_and_guarded():
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Div", ["numerator", "batch"], ["y"], name="div")],
+            "singleton_div",
+            [onnx.helper.make_tensor_value_info("batch", onnx.TensorProto.FLOAT, [1])],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])],
+            initializer=[numpy_helper.from_array(np.array([-0.5], np.float32), "numerator")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    model.ir_version = 10
+    segment = sr._singleton_scalar_div_fold(
+        {"name": "div", "op": "Div", "inputs": ["numerator", "batch"],
+         "outputs": ["y"], "attrs": {"constant_input": 0}},
+        {"ranges": {"batch": [16.0, 16.0]}},
+        {"numerator": np.array([-0.5], np.float32)},
+    )
+    assert segment is not None
+    runner = sr.StepRunner(model, [segment])
+    result, _ = runner.run({"batch": np.array([16.0], np.float32)}, mode="npu")
+    np.testing.assert_array_equal(result["y"], [-0.03125])
+    # Inputs outside the calibrated singleton retain exact ONNX/ORT behavior.
+    result, _ = runner.run({"batch": np.array([8.0], np.float32)}, mode="npu")
+    np.testing.assert_array_equal(result["y"], [-0.0625])
+
+
+@pytest.mark.parametrize(
+    "node_name",
+    [
+        "Mul_5", "Mul_11", "Mul_25", "Mul_33", "Mul_46", "Mul_68",
+        "Mul_91", "Mul_113", "Mul_148", "Mul_170", "Mul_193", "Mul_215",
+        "Mul_250", "Mul_272", "Mul_295", "Mul_317", "Mul_352", "Mul_374",
+        "Mul_397", "Mul_419",
+    ],
+)
+@needs_device
+@needs_step
+def test_resnet_s16_mul_range_matched_template_on_axcl_vm(node_name):
+    import axcl_session
+
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, _ = sr.build_plan(
+        model,
+        sr.load_records(),
+        calib,
+        kinds={"binary_precision"},
+        precision_overrides={node_name: _step_mul_s16_override(node_name)},
+    )
+    segment = next(s for s in segments if s.name == node_name)
+    left, right = segment.inputs
+    shape = segment.input_shapes[0]
+    ranges = calib["ranges"]
+    rng = np.random.default_rng(508)
+    if node_name == "Mul_5":
+        env = {
+            left: rng.uniform(*ranges[left], shape).astype(np.float32),
+            right: rng.uniform(-6.5, -3.25, shape).astype(np.float32),
+        }
+    elif node_name == "Mul_11":
+        labels = np.zeros(shape, dtype=np.float32)
+        labels[np.arange(shape[0]), rng.integers(0, shape[1], shape[0])] = 1.0
+        env = {
+            left: labels,
+            right: rng.uniform(-10.5, -0.98, shape).astype(np.float32),
+        }
+    elif node_name == "Mul_25":
+        # Keep the paired products in the measured output range while
+        # spanning the extreme input value pair seen by the real loss path.
+        x = rng.uniform(0.001, 0.375055, shape).astype(np.float32)
+        product = rng.uniform(-0.0312495, 0.0117205, shape).astype(np.float32)
+        z = product / x
+        x[0, 0] = np.float32(0.031249450519680977 / 1776.24951171875)
+        z[0, 0] = np.float32(-1776.24951171875)
+        env = {left: x, right: z}
+    elif node_name == "Mul_33":
+        x = rng.uniform(0.01, 0.0385606, shape).astype(np.float32)
+        product = rng.uniform(-0.0045767, 0.0009436, shape).astype(np.float32)
+        z = product / x
+        x[0, 0] = np.float32(5.278477692627348e-5)
+        z[0, 0] = np.float32(-4.416831016540527)
+        env = {left: x, right: z}
+    else:
+        x = rng.uniform(*ranges[left], shape).astype(np.float32)
+        z = rng.integers(0, 2, size=shape).astype(np.float32)
+        ylo, yhi = ranges[segment.outputs[0]]
+        z[(x < ylo) | (x > yhi)] = 0.0
+        x[0, 0, 0, 0] = ylo
+        z[0, 0, 0, 0] = 1.0
+        x[0, 0, 0, 1] = yhi
+        z[0, 0, 0, 1] = 1.0
+        x[0, 0, 0, 2] = ranges[left][0]
+        z[0, 0, 0, 2] = 0.0
+        x[0, 0, 0, 3] = ranges[left][1]
+        z[0, 0, 0, 3] = 0.0
+        env = {left: x, right: z}
+    runner = sr.StepRunner(model, [segment])
+    simulated = runner._sim(segment, env)[0]
+    with axcl_session.AXSession(subdir=f"resnet_{node_name.lower()}_matched_s16") as session:
+        runner.session = session
+        actual = runner._device(segment, env)[0]
+    max_lsb = float(np.abs(actual - simulated).max() / segment.out_q[0][0])
+    assert max_lsb <= 2.01
+
+
+@pytest.mark.parametrize(
+    "node_name",
+    [
+        "Mul_485", "Mul_499", "Mul_555", "Mul_569", "Mul_583", "Mul_625",
+        "Mul_639", "Mul_653", "Mul_695", "Mul_709", "Mul_723", "Mul_765",
+    ],
+)
+@needs_device
+@needs_step
+def test_resnet_lr_broadcast_s16_template_on_axcl_vm(node_name):
+    import axcl_session
+
+    model = sr.load_step()
+    records = sr.load_records()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    overrides = sr.load_step_precision_overrides(model, records, calib)
+    assert node_name in overrides
+    segments, _ = sr.build_plan(
+        model,
+        records,
+        calib,
+        kinds={"binary_precision"},
+        precision_overrides={node_name: overrides[node_name]},
+    )
+    segment = next(s for s in segments if s.name == node_name)
+    assert segment.input_transforms.get("lr") is not None
+    rng = np.random.default_rng(985 + int(node_name.split("_")[1]))
+    shape = segment.input_shapes[0]
+    tensor = segment.inputs[1]
+    env = {
+        "lr": np.array([1e-4], dtype=np.float32),
+        tensor: rng.uniform(*calib["ranges"][tensor], shape).astype(np.float32),
+    }
+    runner = sr.StepRunner(model, [segment])
+    simulated = runner._sim(segment, env)[0]
+    with axcl_session.AXSession(subdir=f"resnet_{node_name.lower()}_lr_s16") as session:
+        runner.session = session
+        actual = runner._device(segment, env)[0]
+    max_lsb = float(np.abs(actual - simulated).max() / segment.out_q[0][0])
+    assert max_lsb <= 2.01
+
+
+@pytest.mark.parametrize(
+    "node_name", ["Mul_793", "Mul_779", "Mul_863", "Mul_930", "Mul_997"]
+)
+@needs_device
+@needs_step
+def test_resnet_lr_vector_s16_template_on_axcl_vm(node_name):
+    import axcl_session
+
+    model = sr.load_step()
+    records = sr.load_records()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    overrides = sr.load_step_precision_overrides(model, records, calib)
+    assert node_name in overrides
+    segments, _ = sr.build_plan(
+        model,
+        records,
+        calib,
+        kinds={"binary_precision"},
+        precision_overrides={node_name: overrides[node_name]},
+    )
+    segment = next(s for s in segments if s.name == node_name)
+    assert segment.output_shape == ()
+    assert segment.input_transforms.get("lr") is None
+    rng = np.random.default_rng(1985 + int(node_name.split("_")[1]))
+    tensor = segment.inputs[1]
+    value_shapes = {
+        value.name: tuple(int(d.dim_value) for d in value.type.tensor_type.shape.dim)
+        for value in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    assert segment.input_transforms.get(tensor) is not None
+    env = {
+        "lr": np.array([1e-4], dtype=np.float32),
+        tensor: rng.uniform(*calib["ranges"][tensor], value_shapes[tensor]).astype(np.float32),
+    }
+    runner = sr.StepRunner(model, [segment])
+    simulated = runner._sim(segment, env)[0]
+    with axcl_session.AXSession(subdir=f"resnet_{node_name.lower()}_lr_vector_s16") as session:
+        runner.session = session
+        actual = runner._device(segment, env)[0]
+    assert actual.ndim == 1
+    assert simulated.shape == actual.shape
+    max_lsb = float(np.abs(actual - simulated).max() / segment.out_q[0][0])
+    assert max_lsb <= 2.01
+
+
+@needs_device
+@needs_step
+def test_resnet_sub32_s16_broadcast_template_on_axcl_vm():
+    import axcl_session
+
+    model = sr.load_step()
+    records = sr.load_records()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    overrides = sr.load_step_precision_overrides(model, records, calib)
+    segments, host = sr.build_plan(
+        model,
+        records,
+        calib,
+        kinds={"binary_precision"},
+        precision_overrides={"Sub_32": overrides["Sub_32"]},
+    )
+    assert "Sub_32" not in host
+    segment = next(s for s in segments if s.name == "Sub_32")
+    assert segment.input_transforms.get(segment.inputs[1]) is not None
+    rng = np.random.default_rng(2032)
+    env = {
+        segment.inputs[0]: rng.uniform(
+            *calib["ranges"][segment.inputs[0]], (16, 1000)
+        ).astype(np.float32),
+        segment.inputs[1]: rng.uniform(
+            *calib["ranges"][segment.inputs[1]], (16, 1)
+        ).astype(np.float32),
+    }
+    runner = sr.StepRunner(model, [segment])
+    simulated = runner._sim(segment, env)[0]
+    with axcl_session.AXSession(subdir="resnet_sub32_s16_broadcast") as session:
+        runner.session = session
+        actual = runner._device(segment, env)[0]
+    assert actual.shape == (16, 1000)
+    max_lsb = float(np.abs(actual - simulated).max() / segment.out_q[0][0])
+    assert max_lsb <= 2.01
+
+
+@pytest.mark.parametrize("node_name", ["Greater_444", "Less_447"])
+@needs_device
+@needs_step
+def test_resnet_comparison_complement_template_on_axcl_vm(node_name):
+    import axcl_session
+
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, host = sr.build_plan(
+        model, sr.load_records(), calib
+    )
+    segment = next(s for s in segments if s.name == node_name)
+    assert segment.kind == "compare_complement"
+    assert not {"Sub_446", "Sub_449"} & host.keys()
+    x_name, z_name = model.graph.node[
+        next(i for i, node in enumerate(model.graph.node) if node.name == node_name)
+    ].input
+    shape = (1024, 9, 3136)
+    x = np.zeros(shape, dtype=np.float32)
+    z = np.zeros(shape, dtype=np.float32)
+    x.reshape(-1)[:6] = [0.0, 1.0, -1.0, 2.0, -2.0, 0.0]
+    z.reshape(-1)[:6] = [0.0, 0.0, 0.0, 2.0, -2.0, 1.0]
+    env = {x_name: x, z_name: z}
+    runner = sr.StepRunner(model, [segment])
+    with axcl_session.AXSession(subdir=f"resnet_{node_name.lower()}_complement") as session:
+        runner.session = session
+        actual = runner._device(segment, env)[0].reshape(-1)[:6]
+    expected = x.reshape(-1)[:6] <= z.reshape(-1)[:6] if node_name == "Greater_444" else x.reshape(-1)[:6] >= z.reshape(-1)[:6]
+    np.testing.assert_array_equal(actual, expected.astype(np.float32))
+
+
+def test_comparison_complement_nan_guard_uses_original_host_semantics():
+    from onnx import numpy_helper
+
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Greater", ["x", "z"], ["cmp"], name="greater"),
+                onnx.helper.make_node("Cast", ["cmp"], ["cast"], name="cast", to=onnx.TensorProto.FLOAT),
+                onnx.helper.make_node("Sub", ["one", "cast"], ["y"], name="sub"),
+            ],
+            "nan_guard",
+            [
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [2]),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, [2]),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [2])],
+            [numpy_helper.from_array(np.array(1.0, np.float32), name="one")],
+            value_info=[
+                onnx.helper.make_tensor_value_info("cmp", onnx.TensorProto.BOOL, [2]),
+                onnx.helper.make_tensor_value_info("cast", onnx.TensorProto.FLOAT, [2]),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    model.ir_version = 8
+    segment = sr.Segment(
+        "greater",
+        "compare_complement",
+        ["greater", "cast", "sub"],
+        ["z", "x"],
+        ["y"],
+        "test ordered comparison",
+        lambda: None,
+        nan_guard=True,
+    )
+    runner = sr.StepRunner(model, [segment])
+    outputs, stats = runner.run(
+        {"x": np.array([np.nan, 2.0], np.float32), "z": np.array([0.0, 1.0], np.float32)},
+        mode="npu",
+        check=False,
+    )
+    np.testing.assert_array_equal(outputs["y"], [1.0, 0.0])
+    assert stats[0].kind == "host_nan_guard"
+
+
+@needs_step
+def test_resnet_add35_selects_range_matched_s16_template():
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, _ = sr.build_plan(
+        model,
+        sr.load_records(),
+        calib,
+        kinds={"binary_precision"},
+        precision_overrides={"Add_35": _step_add35_s16_override()},
+    )
+    assert len(segments) == 1
+    segment = segments[0]
+    assert segment.name == "Add_35"
+    assert segment.kind == "binary_precision"
+    assert segment.in_q == [
+        (9.536720995129144e-07, 0, True, 16),
+        (6.983623279666062e-08, 0, True, 16),
+    ]
+
+
+@needs_device
+@needs_step
+def test_resnet_add35_range_matched_s16_template_on_axcl_vm():
+    import axcl_session
+
+    model = sr.load_step()
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    segments, _ = sr.build_plan(
+        model,
+        sr.load_records(),
+        calib,
+        kinds={"binary_precision"},
+        precision_overrides={"Add_35": _step_add35_s16_override()},
+    )
+    segment = segments[0]
+    ranges = calib["ranges"]
+    rng = np.random.default_rng(350)
+    env = {
+        tensor: rng.uniform(*ranges[tensor], (16, 1000)).astype(np.float32)
+        for tensor in ("distill__mul_63", "distill__div_108")
+    }
+    runner = sr.StepRunner(model, [segment])
+    simulated = runner._sim(segment, env)[0]
+    with axcl_session.AXSession(subdir="resnet_add35_matched_s16") as session:
+        runner.session = session
+        actual = runner._device(segment, env)[0]
+    max_lsb = float(np.abs(actual - simulated).max() / segment.out_q[0][0])
+    assert max_lsb <= 2.01
+
+
+def test_fp32_binary_fixture_is_exact_shape_and_unquantized():
+    op = "Add"
+    path = os.path.join(sr.FP32_BINARY_FIXTURES, "add_16x1000.axmodel.gz")
+    with gzip.open(path, "rb") as f:
+        model = onnx.load_model_from_string(f.read())
+    assert [
+        tuple(d.dim_value for d in i.type.tensor_type.shape.dim)
+        for i in model.graph.input
+    ] == [(16, 1000), (16, 1000)]
+    assert len(model.graph.output) == 1
+    assert [n.op_type for n in model.graph.node] == ["neu mode"]
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node(op, ["x", "z"], ["y"], name="n")],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(t, onnx.TensorProto.FLOAT, [16, 1000])
+            for t in ("x", "z")
+        ],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [16, 1000])],
+    )
+    segment = sr._fp32_binary_segment_for(
+        {"op": op, "name": "n", "inputs": ["x", "z"], "outputs": ["y"]},
+        onnx.helper.make_model(graph),
+    )
+    assert segment is not None and not segment.in_q and not segment.out_q
+
+
+@needs_device
+def test_fp32_binary_template_matches_float_on_axcl_vm():
+    import axcl_session
+
+    shape = [16, 1000]
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Add", ["x", "z"], ["y"], name="binary")],
+        "fp32",
+        [
+            onnx.helper.make_tensor_value_info(t, onnx.TensorProto.FLOAT, shape)
+            for t in ("x", "z")
+        ],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    seg = sr._fp32_binary_segment_for(
+        {"op": "Add", "name": "binary", "inputs": ["x", "z"], "outputs": ["y"]},
+        model,
+    )
+    assert seg is not None
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=shape).astype(np.float32)
+    z = rng.uniform(0.5, 1.5, size=shape).astype(np.float32)
+    with axcl_session.AXSession(subdir="step_runner_fp32_binary_test") as sess:
+        runner = sr.StepRunner(model, [seg], sess)
+        actual = runner._device(seg, {"x": x, "z": z})[0]
+    expected = np.add(x, z)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def _mask_mul_model():
+    shape = [16, 1000]
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Mul", ["x", "z"], ["y"], name="mask_mul")],
+        "mask_mul",
+        [
+            onnx.helper.make_tensor_value_info(t, onnx.TensorProto.FLOAT, shape)
+            for t in ("x", "z")
+        ],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    return model
+
+
+def _mask_mul_calibration():
+    return {
+        "tensors": {
+            "x": {"scale": 0.00012254902685526758, "zero_point": 255, "signed": False},
+            "z": {"scale": 0.003921568859368563, "zero_point": 0, "signed": False},
+            "y": {"scale": 0.00012254902685526758, "zero_point": 255, "signed": False},
+        }
+    }
+
+
+def test_exact_mask_mul_template_requires_its_measured_calibration():
+    model = _mask_mul_model()
+    rec = {
+        "op": "Mul",
+        "name": "mask_mul",
+        "attrs": {"form": "same_shape"},
+        "inputs": ["x", "z"],
+        "outputs": ["y"],
+    }
+    calib = _mask_mul_calibration()
+    segment = sr._exact_mask_mul_segment_for(rec, calib, model)
+    assert segment is not None and segment.kind == "mul_mask_exact"
+    assert not sr._exact_mask_mul_segment_for(
+        rec, {"tensors": {**calib["tensors"], "y": {**calib["tensors"]["y"], "scale": 0.001}}}, model
+    )
+
+
+def _loss_sub_model():
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Sub", ["x", "z"], ["y"], name="loss_sub")],
+        "loss_sub",
+        [
+            onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [16, 1000]),
+            onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, [16, 1]),
+        ],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [16, 1000])],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    return model
+
+
+def _loss_sub_calibration():
+    return {
+        "tensors": {
+            "x": {"scale": 6.96580696105957, "zero_point": 255, "signed": False},
+            "z": {
+                "scale": 0.00012254902685526758,
+                "zero_point": 255,
+                "signed": False,
+            },
+            "y": {"scale": 6.96580696105957, "zero_point": 255, "signed": False},
+        }
+    }
+
+
+def test_exact_loss_sub_template_requires_its_measured_calibration():
+    rec = {
+        "op": "Sub",
+        "name": "loss_sub",
+        "inputs": ["x", "z"],
+        "outputs": ["y"],
+    }
+    model = _loss_sub_model()
+    calibration = _loss_sub_calibration()
+    segment = sr._exact_loss_sub_segment_for(rec, calibration, model)
+    assert segment is not None and segment.kind == "sub_loss_exact"
+    assert segment.output_shape == (16, 1000)
+    changed = {"tensors": {**calibration["tensors"], "y": {**calibration["tensors"]["y"], "zero_point": 128}}}
+    assert sr._exact_loss_sub_segment_for(rec, changed, model) is None
+
+
+def _div2_model():
+    shape = [16, 1000]
+    two = numpy_helper.from_array(np.asarray(2.0, dtype=np.float32), "two")
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Div", ["x", "two"], ["y"], name="div2")],
+        "div2",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        [two],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    return model
+
+
+def _div2_calibration(zp):
+    scales = {
+        98: (0.05171579495072365, 0.025857897475361824),
+        101: (0.0531538687646389, 0.02657693438231945),
+        211: (2.16483895201236e-05, 1.08241947600618e-05),
+    }
+    sx, sy = scales[zp]
+    return {
+        "tensors": {
+            "x": {"scale": sx, "zero_point": zp, "signed": False},
+            "y": {"scale": sy, "zero_point": zp, "signed": False},
+        }
+    }
+
+
+@pytest.mark.parametrize("zp", [98, 101, 211])
+def test_exact_div2_template_requires_its_measured_calibration(zp):
+    model = _div2_model()
+    rec = {
+        "op": "Div",
+        "name": "div2",
+        "attrs": {"form": "const", "constant_input": 1},
+        "inputs": ["x", "two"],
+        "outputs": ["y"],
+    }
+    inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+    segment = sr._exact_div2_segment_for(rec, _div2_calibration(zp), model, inits)
+    assert segment is not None and segment.kind == "div2_exact"
+    assert segment.inputs == ["x"] and segment.outputs == ["y"]
+
+
+@needs_device
+def test_exact_mask_mul_template_matches_runner_simulation_on_axcl_vm():
+    import axcl_session
+
+    model = _mask_mul_model()
+    rec = {
+        "op": "Mul",
+        "name": "mask_mul",
+        "attrs": {"form": "same_shape"},
+        "inputs": ["x", "z"],
+        "outputs": ["y"],
+    }
+    segment = sr._exact_mask_mul_segment_for(rec, _mask_mul_calibration(), model)
+    assert segment is not None
+    x = np.linspace(-0.03125, 0.0, 16000, dtype=np.float32).reshape(16, 1000)
+    z = np.zeros((16, 1000), dtype=np.float32)
+    z[:, ::2] = 1.0
+    runner = sr.StepRunner(model, [segment])
+    simulated = runner._sim(segment, {"x": x, "z": z})[0]
+    with axcl_session.AXSession(subdir="step_runner_exact_mask_test") as sess:
+        runner.session = sess
+        actual = runner._device(segment, {"x": x, "z": z})[0]
+    np.testing.assert_array_equal(actual, simulated)
+
+
+@needs_device
+def test_exact_loss_sub_template_matches_runner_simulation_on_axcl_vm():
+    import axcl_session
+
+    model = _loss_sub_model()
+    rec = {"op": "Sub", "name": "loss_sub", "inputs": ["x", "z"], "outputs": ["y"]}
+    segment = sr._exact_loss_sub_segment_for(rec, _loss_sub_calibration(), model)
+    assert segment is not None
+    x = np.linspace(-6.96580696105957 * 255, 0.0, 16000, dtype=np.float32).reshape(16, 1000)
+    z = np.linspace(-0.03125, 0.0, 16, dtype=np.float32).reshape(16, 1)
+    runner = sr.StepRunner(model, [segment])
+    simulated = runner._sim(segment, {"x": x, "z": z})[0]
+    with axcl_session.AXSession(subdir="step_runner_exact_loss_sub_test") as sess:
+        runner.session = sess
+        actual = runner._device(segment, {"x": x, "z": z})[0]
+    np.testing.assert_array_equal(actual, simulated)
+
+
+@needs_device
+@pytest.mark.parametrize("zp", [98, 101, 211])
+def test_exact_div2_template_matches_runner_simulation_on_axcl_vm(zp):
+    import axcl_session
+
+    model = _div2_model()
+    rec = {
+        "op": "Div",
+        "name": "div2",
+        "attrs": {"form": "const", "constant_input": 1},
+        "inputs": ["x", "two"],
+        "outputs": ["y"],
+    }
+    inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+    segment = sr._exact_div2_segment_for(rec, _div2_calibration(zp), model, inits)
+    assert segment is not None
+    sx = _div2_calibration(zp)["tensors"]["x"]["scale"]
+    x = np.linspace(-zp * sx, (255 - zp) * sx, 16000, dtype=np.float32).reshape(
+        16, 1000
+    )
+    runner = sr.StepRunner(model, [segment])
+    simulated = runner._sim(segment, {"x": x})[0]
+    with axcl_session.AXSession(subdir=f"step_runner_div2_z{zp}_test") as sess:
+        runner.session = sess
+        actual = runner._device(segment, {"x": x})[0]
+    np.testing.assert_array_equal(actual, simulated)
 
 
 @needs_step

@@ -10,6 +10,7 @@ import gzip
 import json
 import os
 import struct
+import subprocess
 import sys
 
 import numpy as np
@@ -68,9 +69,11 @@ def _gather_key():
 
 def test_template_key_json_round_trip():
     key = axb.TemplateKey(
-        "Transpose", ((16, 512),), (("perm", (1, 0)),), calibration_class=""
+        "Transpose", ((16, 512),), (("perm", (1, 0)),), calibration_class="",
+        layer_precision="S16", calibration_scales=(0.125, 0.25, 0.5),
     )
     assert axb.TemplateKey.from_json(json.loads(json.dumps(key.to_json()))) == key
+    assert dataclasses.replace(key, layer_precision="U16") != key
 
 
 @pytest.mark.parametrize(
@@ -87,6 +90,222 @@ def test_template_key_json_round_trip():
 def test_cache_refuses_unmeasured_keys(key):
     with pytest.raises(ValueError):
         axb.TemplateCache().lookup(key)
+
+
+@pytest.mark.parametrize("precision", ["U16", "S16", "FP32"])
+def test_cache_does_not_reuse_u8_binary_template_for_other_layer_precision(
+    precision,
+):
+    key = axb.TemplateKey("Mul", ((16, 64, 56, 56),), layer_precision=precision)
+    expected_error = (
+        "no validated FP32 layer-precision"
+        if precision == "FP32"
+        else "needs exact x,z,y calibration_scales"
+    )
+    with pytest.raises(ValueError, match=expected_error):
+        axb.TemplateCache().lookup(key)
+
+
+def test_template_key_refuses_unknown_layer_precision():
+    key = axb.TemplateKey("Mul", ((16, 64, 56, 56),), layer_precision="S4")
+    with pytest.raises(ValueError, match="unsupported layer precision"):
+        axb.TemplateCache().lookup(key)
+
+
+def test_precision_selection_flows_through_generic_compiler_request():
+    key = axb.TemplateKey(
+        "Mul", ((1000, 512),), calibration_class="x0,y0,z0"
+    )
+    request = axb.build_request(key, [axb.BinaryTemplateOnly()])
+    u8_model = onnx.load_model_from_string(axb.compile_request(request))
+    fixture, _ = bse.load_template("Mul", (1000, 512), {"x": 0, "y": 0, "z": 0})
+    assert u8_model.SerializeToString() == fixture.SerializeToString()
+
+    precision_cases = {
+        "U16": (
+            (
+                2.7466237952467054e-05,
+                2.7466237952467054e-05,
+                1.2359806532913353e-05,
+            ),
+            "x32768,y0,z32768",
+            "mul_16x64x56x56_u16.axmodel.gz",
+        ),
+        "S16": (
+            (
+                2.7466237952467054e-05,
+                2.7466237952467054e-05,
+                2.4719613065826707e-05,
+            ),
+            "x0,y0,z0",
+            "mul_16x64x56x56_s16.axmodel.gz",
+        ),
+    }
+    for precision, (scales, calibration_class, filename) in precision_cases.items():
+        high_key = axb.TemplateKey(
+            "Mul",
+            ((16, 64, 56, 56),),
+            calibration_class=calibration_class,
+            layer_precision=precision,
+            calibration_scales=scales,
+        )
+        high_request = axb.build_request(high_key, [axb.BinaryTemplateOnly()])
+        high_model = onnx.load_model_from_string(axb.compile_request(high_request))
+        expected = _load_gz(os.path.join(_FIX, "binary_op_precision", filename))
+        assert high_model.SerializeToString() == expected.SerializeToString()
+
+        miss = dataclasses.replace(
+            high_key, calibration_scales=(scales[0], scales[1], 0.01)
+        )
+        with pytest.raises(ValueError, match="no exact-calibration"):
+            axb.TemplateCache().lookup(miss)
+
+
+@pytest.mark.parametrize("precision", ["U16", "S16"])
+def test_high_precision_mul_template_on_axcl_vm(precision):
+    vm = os.environ.get("AXCL_LXD_VM", "axcl-vm")
+    try:
+        ready = (
+            subprocess.run(
+                [
+                    "lxc",
+                    "exec",
+                    vm,
+                    "--",
+                    "test",
+                    "-x",
+                    "/usr/bin/axcl/axcl_run_model",
+                    "-a",
+                    "-e",
+                    "/dev/axcl_host",
+                ],
+                capture_output=True,
+                timeout=30,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        ready = False
+    if not ready:
+        pytest.skip("needs the AX650 device via AXCL_LXD_VM")
+    import axcl_session
+
+    scale = 2.7466237952467054e-05
+    output_scale = (
+        1.2359806532913353e-05
+        if precision == "U16"
+        else 2.4719613065826707e-05
+    )
+    zp = "x32768,y0,z32768" if precision == "U16" else "x0,y0,z0"
+    key = axb.TemplateKey(
+        "Mul",
+        ((16, 64, 56, 56),),
+        calibration_class=zp,
+        layer_precision=precision,
+        calibration_scales=(scale, scale, output_scale),
+    )
+    model = onnx.load_model_from_string(
+        axb.compile_request(axb.build_request(key, [axb.BinaryTemplateOnly()]))
+    )
+    rng = np.random.default_rng(18)
+    if precision == "U16":
+        # This fixture's calibration reuses identical x/z samples, so its
+        # output calibration is nonnegative (output zero point 0).
+        x = rng.uniform(0.1, 0.9, key.shapes[0]).astype(np.float32)
+        z = rng.uniform(0.1, 0.9, key.shapes[0]).astype(np.float32)
+    else:
+        x = rng.uniform(-0.9, 0.9, key.shapes[0]).astype(np.float32)
+        z = rng.uniform(-0.9, 0.9, key.shapes[0]).astype(np.float32)
+    with axcl_session.AXSession(subdir=f"precision_mul_{precision.lower()}") as session:
+        compiled = session.load(model.SerializeToString())
+        (actual,) = session.run(compiled, [x, z])
+    np.testing.assert_allclose(actual, x * z, atol=5e-5, rtol=0)
+
+
+def _binary_precision_cases():
+    with open(os.path.join(_FIX, "binary_op_precision", "index.json")) as stream:
+        entries = json.load(stream)
+    return [
+        entry
+        for entry in entries
+        if entry["shape"] == [16, 1000]
+        and "ResNet18 step" not in entry["source"]
+    ]
+
+
+@pytest.mark.parametrize("entry", _binary_precision_cases(), ids=lambda e: f"{e['op']}-{e['precision']}")
+def test_high_precision_binary_template_through_onnx_uop_mcode(entry, tmp_path):
+    op, precision = entry["op"], entry["precision"]
+    shape = entry["shape"]
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node(op, ["x", "z"], ["y"])],
+            f"{op.lower()}_{precision.lower()}",
+            [
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, shape),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    calibration = {
+        "layer_precision": precision,
+        "scales": dict(zip(("x", "z", "y"), entry["scales"])),
+        "zero_points": dict(zip(("x", "y", "z"), entry["zero_points"])),
+    }
+    schedule = tmp_path / f"{op.lower()}_{precision.lower()}.json"
+    actual = onnx.load_model_from_string(
+        axb.compile_onnx(model, str(schedule), calibration)
+    )
+    expected = _load_gz(os.path.join(_FIX, "binary_op_precision", entry["file"]))
+    assert [node.op_type for node in actual.graph.node] == ["neu mode"]
+    assert _mcode(actual) == _mcode(expected)
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
+
+
+@pytest.mark.parametrize("entry", _binary_precision_cases(), ids=lambda e: f"{e['op']}-{e['precision']}")
+def test_high_precision_binary_template_on_axcl_vm(entry):
+    vm = os.environ.get("AXCL_LXD_VM", "axcl-vm")
+    try:
+        ready = subprocess.run(
+            ["lxc", "exec", vm, "--", "test", "-x", "/usr/bin/axcl/axcl_run_model", "-a", "-e", "/dev/axcl_host"],
+            capture_output=True,
+            timeout=30,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ready = False
+    if not ready:
+        pytest.skip("needs the AX650 device via AXCL_LXD_VM")
+    import axcl_session
+
+    op, precision = entry["op"], entry["precision"]
+    shape = tuple(entry["shape"])
+    model = _load_gz(os.path.join(_FIX, "binary_op_precision", entry["file"]))
+    rng = np.random.default_rng(1965)
+    if precision == "U16":
+        ranges = {
+            "Add": ((0.1, 0.9), (0.1, 0.9)),
+            "Sub": ((0.5, 0.9), (0.1, 0.4)),
+            "Mul": ((0.1, 0.9), (0.1, 0.9)),
+            "Div": ((0.1, 0.9), (0.5, 0.9)),
+        }[op]
+    else:
+        ranges = {
+            "Add": ((-0.9, 0.9), (-0.9, 0.9)),
+            # Keep differences inside the pinned output calibration interval.
+            "Sub": ((-0.75, 0.75), (-0.75, 0.75)),
+            "Mul": ((-0.9, 0.9), (-0.9, 0.9)),
+            "Div": ((-0.9, 0.9), (0.5, 0.9)),
+        }[op]
+    x, z = (
+        rng.uniform(*bounds, shape).astype(np.float32) for bounds in ranges
+    )
+    with axcl_session.AXSession(subdir=f"binary_{op.lower()}_{precision.lower()}") as session:
+        compiled = session.load(model.SerializeToString())
+        (actual,) = session.run(compiled, [x, z])
+    expected = {"Add": np.add, "Sub": np.subtract, "Mul": np.multiply, "Div": np.divide}[op](x, z)
+    np.testing.assert_allclose(actual, expected, atol=1.2e-4, rtol=2e-4)
 
 
 def test_cache_miss_is_not_built():

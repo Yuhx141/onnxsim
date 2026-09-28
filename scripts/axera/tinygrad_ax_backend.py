@@ -121,6 +121,11 @@ class TemplateKey:
     ``weight_dtype`` is how a constant weight is stored (``WEIGHT_DTYPES``
     names, see ``axera_weight_dtype``). It is ``""`` for ops without a
     constant weight, and for a Conv it means the template's own (``s8``).
+    ``layer_precision`` is the compiler's per-layer activation precision,
+    separate from the source graph's float32 tensor dtype, and participates in
+    cache identity so different arithmetic formats cannot alias templates.
+    ``calibration_scales`` is the exact (x, z, y) float scale tuple required
+    by high-precision binary templates, which do not support scale retargeting.
     """
 
     op: str
@@ -130,6 +135,8 @@ class TemplateKey:
     calibration_class: str = ""
     toolchain: str = TOOLCHAIN
     weight_dtype: str = ""
+    layer_precision: str = "U8"
+    calibration_scales: tuple[float, ...] = ()
 
     def attr(self, name: str, default=None):
         return dict(self.attrs).get(name, default)
@@ -145,6 +152,8 @@ class TemplateKey:
             "calibration_class": self.calibration_class,
             "toolchain": self.toolchain,
             "weight_dtype": self.weight_dtype,
+            "layer_precision": self.layer_precision,
+            "calibration_scales": list(self.calibration_scales),
         }
 
     @classmethod
@@ -163,6 +172,10 @@ class TemplateKey:
             calibration_class=d.get("calibration_class", ""),
             toolchain=d.get("toolchain", TOOLCHAIN),
             weight_dtype=d.get("weight_dtype", ""),
+            layer_precision=d.get("layer_precision", "U8"),
+            calibration_scales=tuple(
+                float(x) for x in d.get("calibration_scales", ())
+            ),
         )
 
 
@@ -543,12 +556,22 @@ class TemplateCache:
     def _lookup(self, key: TemplateKey) -> TemplateEntry:
         if key.toolchain != TOOLCHAIN:
             raise ValueError(f"no templates for toolchain {key.toolchain!r}")
+        if key.layer_precision not in ("U8", "U16", "S16", "FP32"):
+            raise ValueError(
+                f"unsupported layer precision {key.layer_precision!r}; "
+                "expected U8, U16, S16, or FP32"
+            )
         if key.dtypes != ("float32",):
             raise ValueError(
                 f"only float32-activation templates exist, got {key.dtypes} "
                 "(a weight's storage type is weight_dtype)"
             )
         op = key.op
+        if key.layer_precision != "U8" and op not in bse.OPS:
+            raise ValueError(
+                f"no validated {key.layer_precision} layer-precision template "
+                f"for {op} at {key.shapes}"
+            )
         if op == "Conv":
             validate_weight_choice("build", "Conv", key.weight_dtype or "s8")
         elif key.weight_dtype:
@@ -576,6 +599,45 @@ class TemplateCache:
         if op in bse.OPS:
             (shape,) = key.shapes
             zps = _zero_points_from_class(key.calibration_class)
+            if key.layer_precision != "U8":
+                if key.layer_precision not in ("U16", "S16"):
+                    raise ValueError(
+                        f"no validated {key.layer_precision} layer-precision "
+                        f"template for {op} at {key.shapes}"
+                    )
+                index_path = os.path.join(
+                    _FIXTURES, "binary_op_precision", "index.json"
+                )
+                if not os.path.isfile(index_path):
+                    raise ValueError(
+                        f"no validated {key.layer_precision} layer-precision "
+                        f"template for {op} at {key.shapes}"
+                    )
+                with open(index_path) as f:
+                    index = json.load(f)
+                scales = tuple(float(x) for x in key.calibration_scales)
+                if len(scales) != 3:
+                    raise ValueError(
+                        "high-precision binary template needs exact x,z,y calibration_scales"
+                    )
+                for meta in index:
+                    if (
+                        meta["op"] == op
+                        and tuple(meta["shape"]) == shape
+                        and meta["precision"] == key.layer_precision
+                        and tuple(meta["zero_points"]) == (zps["x"], zps["y"], zps["z"])
+                        and tuple(meta["scales"]) == scales
+                    ):
+                        return TemplateEntry(
+                            "binary_precision",
+                            os.path.join(
+                                _FIXTURES, "binary_op_precision", meta["file"]
+                            ),
+                            meta,
+                        )
+                raise ValueError(
+                    f"no exact-calibration {key.layer_precision} template for {op} at {shape}"
+                )
             _, meta = bse.load_template(op, shape, zps)
             return TemplateEntry(
                 "binary", os.path.join(bse.TEMPLATE_DIR, meta["file"]), meta
@@ -704,7 +766,7 @@ class BinaryTemplateOnly:
     """
 
     def validate(self, key, entry):
-        if entry.kind != "binary":
+        if entry.kind not in ("binary", "binary_precision"):
             raise ValueError(f"{key.op} template is not a binary template")
 
     def apply(self, key, entry, model):
@@ -1752,7 +1814,7 @@ def build_onnx_uop_request(
     source_path: str,
     output_path: str | None = None,
     schedule_path: str | None = None,
-    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+    calibration: Mapping[str, Any] | None = None,
 ) -> str:
     """Build an ``AXCompiler`` request for ONNX -> tinygrad UOp -> mcode."""
     req = {"kind": "onnx_uop", "source": source_path}
@@ -2815,7 +2877,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
 def compile_uop(
     root,
     schedule_path: str | None = None,
-    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+    calibration: Mapping[str, Any] | None = None,
 ) -> bytes:
     """Lower a supported tinygrad UOp and emit an AX model without Pulsar2.
 
@@ -2928,7 +2990,7 @@ def onnx_to_uop(model_or_path):
 def compile_onnx(
     model_or_path,
     schedule_path: str | None = None,
-    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+    calibration: Mapping[str, Any] | None = None,
 ) -> bytes:
     """Compile ONNX through the complete ``ONNX -> tinygrad UOp -> mcode`` path.
 

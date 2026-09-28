@@ -130,7 +130,12 @@ OPS = (
 CALIBRATED = ("ReduceSum", "Sqrt", "Softmax", "Log", "MaxPool", "ReduceMean", "Neg")
 LOG_TABLE_BASE = 0x1050
 LOG_TABLE_RECORDS = 129  # 258 u16 entries
-CALIBRATION_FREE = ("GreaterCast", "LessCast")
+CALIBRATION_FREE = (
+    "GreaterCast",
+    "LessCast",
+    "GreaterOrEqualCast",
+    "LessOrEqualCast",
+)
 # Neg [1,1] compiles to one of two programs depending on the scale alone
 # (zero points 0..255 on both sides): float32 s < 1/64 gives the small program,
 # s >= 1/64 the large one (0.01562 small, 0.015625 and 0.01563 large).

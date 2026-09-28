@@ -1,0 +1,611 @@
+[
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      64,
+      56,
+      56
+    ],
+    "precision": "S16",
+    "scales": [
+      2.7466237952467054e-05,
+      2.7466237952467054e-05,
+      2.4719613065826707e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_16x64x56x56_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned [-0.9,0.9], standalone Mul; x1/x2 use identical seeded samples, so output is nonnegative"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      64,
+      56,
+      56
+    ],
+    "precision": "U16",
+    "scales": [
+      2.7466237952467054e-05,
+      2.7466237952467054e-05,
+      1.2359806532913353e-05
+    ],
+    "zero_points": [
+      32768,
+      0,
+      32768
+    ],
+    "file": "mul_16x64x56x56_u16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned [-0.9,0.9], standalone Mul; x1/x2 use identical seeded samples, so output is nonnegative"
+  },
+  {
+    "op": "Add",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      2.7466237952467054e-05,
+      2.7466237952467054e-05,
+      5.493247590493411e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "add_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned per-input; standalone Add"
+  },
+  {
+    "op": "Add",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "U16",
+    "scales": [
+      1.3733118976233527e-05,
+      1.3733118976233527e-05,
+      2.7466237952467054e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "add_16x1000_u16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned per-input; standalone Add"
+  },
+  {
+    "op": "Div",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      2.7466237952467054e-05,
+      2.7466237952467054e-05,
+      5.493247590493411e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "div_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned per-input; standalone Div"
+  },
+  {
+    "op": "Div",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "U16",
+    "scales": [
+      1.3733118976233527e-05,
+      1.3733118976233527e-05,
+      2.7231590138399042e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "div_16x1000_u16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned per-input; standalone Div"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      2.7466237952467054e-05,
+      2.7466237952467054e-05,
+      2.4719613065826707e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned per-input; standalone Mul"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "U16",
+    "scales": [
+      1.3733118976233527e-05,
+      1.3733118976233527e-05,
+      1.2359806532913353e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_16x1000_u16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned per-input; standalone Mul"
+  },
+  {
+    "op": "Sub",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      2.7466237952467054e-05,
+      2.7466237952467054e-05,
+      5.4654028645018116e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "sub_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned per-input; standalone Sub"
+  },
+  {
+    "op": "Sub",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "U16",
+    "scales": [
+      1.3733118976233527e-05,
+      6.103608939156402e-06,
+      1.2155594959040172e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "sub_16x1000_u16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite, MinMax pinned per-input; standalone Sub"
+  },
+  {
+    "op": "Add",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      9.536720995129144e-07,
+      6.983623279666062e-08,
+      1.0235082754661562e-06
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "add_step_add35_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax built from ResNet18 step calibration ranges for Add_35 inputs distill__mul_63 and distill__div_108; independent calibration samples span the measured per-tensor ranges"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      1.1767964451792068e-06,
+      0.00030058101401664317,
+      1.1520281987031922e-05
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_5_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from ResNet18 step ranges for Mul_5 inputs distill__softmax_9 and distill__log_8"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      3.051804378628731e-05,
+      0.0004323860921431333,
+      0.0004321761953178793
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_11_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from ResNet18 step ranges for Mul_11 inputs labels_onehot and distill__log_18; labels use per-row one-hot calibration samples"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      1.1445949894550722e-05,
+      0.054207660257816315,
+      9.536720995129144e-07
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_25_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from paired ResNet18 step ranges for Mul_25 inputs distill__softmax_17 and distill__sub_62; product samples bounded by measured output range"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      1000
+    ],
+    "precision": "S16",
+    "scales": [
+      1.1767950809371541e-06,
+      0.0001347930374322459,
+      1.3967246559332125e-07
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_33_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from paired ResNet18 step ranges for Mul_33 inputs distill__softmax_7 and distill__sub_95; product samples bounded by measured output range"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      512,
+      7,
+      7
+    ],
+    "precision": "S16",
+    "scales": [
+      1.010002304013824e-08,
+      3.051804378628731e-05,
+      1.010002304013824e-08
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_46_16x512x7x7_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from ResNet18 step ranges for Mul_46 input distill__mul_126 and binary dropout mask distill__cast_129"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      512,
+      7,
+      7
+    ],
+    "precision": "S16",
+    "scales": [
+      3.565532722404896e-07,
+      3.051804378628731e-05,
+      3.565532722404896e-07
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_68_16x512x7x7_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from ResNet18 step ranges for Mul_68 input distill__reshape_148 and binary dropout mask distill__cast_169"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      512,
+      7,
+      7
+    ],
+    "precision": "S16",
+    "scales": [
+      2.3084207612100727e-07,
+      3.051804378628731e-05,
+      1.8904556498000602e-07
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_91_16x512x7x7_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from paired ResNet18 ranges for Mul_91 input distill__add_205 and binary dropout mask distill__cast_208; output range matched with masked samples"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      512,
+      7,
+      7
+    ],
+    "precision": "S16",
+    "scales": [
+      6.63637365505565e-07,
+      3.051804378628731e-05,
+      6.63637365505565e-07
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_113_16x512x7x7_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from paired ResNet18 ranges for Mul_113 input distill__reshape_227 and binary dropout mask distill__cast_248; output range matched with masked samples"
+  },
+  {
+    "op": "Mul",
+    "shape": [
+      16,
+      256,
+      14,
+      14
+    ],
+    "precision": "S16",
+    "scales": [
+      1.627194876618887e-07,
+      3.051804378628731e-05,
+      1.627194876618887e-07
+    ],
+    "zero_points": [
+      0,
+      0,
+      0
+    ],
+    "file": "mul_step_mul_148_16x256x14x14_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax calibrated from paired ResNet18 ranges for Mul_148 input distill__add_318 and binary dropout mask distill__cast_321; output range matched with masked samples"
+  },
+  {
+    "op": "Mul",
+    "shape": [16, 256, 14, 14],
+    "precision": "S16",
+    "scales": [
+      2.558415985731699e-07,
+      3.051804378628731e-05,
+      2.1579907638624718e-07
+    ],
+    "zero_points": [0, 0, 0],
+    "file": "mul_step_mul_170_16x256x14x14_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_170; paired activation/mask samples bound output to observed range"
+  },
+  {
+    "op": "Mul",
+    "shape": [16, 256, 14, 14],
+    "precision": "S16",
+    "scales": [
+      1.8459222417277488e-07,
+      3.051804378628731e-05,
+      1.8459222417277488e-07
+    ],
+    "zero_points": [0, 0, 0],
+    "file": "mul_step_mul_193_16x256x14x14_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_193; paired activation/mask samples bound output to observed range"
+  },
+  {
+    "op": "Mul",
+    "shape": [16, 256, 14, 14],
+    "precision": "S16",
+    "scales": [
+      2.3783387348430551e-07,
+      3.051804378628731e-05,
+      1.78578957843456e-07
+    ],
+    "zero_points": [0, 0, 0],
+    "file": "mul_step_mul_215_16x256x14x14_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_215; paired activation/mask samples bound output to observed range"
+  },
+  {
+    "op": "Mul", "shape": [16, 128, 28, 28], "precision": "S16",
+    "scales": [6.57464127584717e-08, 3.051804378628731e-05, 6.57464127584717e-08],
+    "zero_points": [0, 0, 0], "file": "mul_step_mul_250_16x128x28x28_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_250; measured activation and output extrema paired with mask=1"
+  },
+  {
+    "op": "Mul", "shape": [16, 128, 28, 28], "precision": "S16",
+    "scales": [1.0990730459070619e-07, 3.051804378628731e-05, 9.768294972900549e-08],
+    "zero_points": [0, 0, 0], "file": "mul_step_mul_272_16x128x28x28_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_272; measured activation and output extrema paired with mask=1"
+  },
+  {
+    "op": "Mul", "shape": [16, 128, 28, 28], "precision": "S16",
+    "scales": [1.115170888965622e-07, 3.051804378628731e-05, 1.115170888965622e-07],
+    "zero_points": [0, 0, 0], "file": "mul_step_mul_295_16x128x28x28_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_295; measured activation and output extrema paired with mask=1"
+  },
+  {
+    "op": "Mul", "shape": [16, 128, 28, 28], "precision": "S16",
+    "scales": [1.368360358355858e-07, 3.051804378628731e-05, 1.368360358355858e-07],
+    "zero_points": [0, 0, 0], "file": "mul_step_mul_317_16x128x28x28_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_317; measured activation and output extrema paired with mask=1"
+  },
+  {
+    "op": "Mul", "shape": [16, 64, 56, 56], "precision": "S16",
+    "scales": [4.503615613771217e-08, 3.051804378628731e-05, 3.909424961534569e-08],
+    "zero_points": [0, 0, 0], "file": "mul_step_mul_352_16x64x56x56_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_352; measured activation and output extrema paired with mask=1"
+  },
+  {
+    "op": "Mul", "shape": [16, 64, 56, 56], "precision": "S16",
+    "scales": [1.059188008412093e-07, 3.051804378628731e-05, 1.059188008412093e-07],
+    "zero_points": [0, 0, 0], "file": "mul_step_mul_374_16x64x56x56_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_374; measured activation and output extrema paired with mask=1"
+  },
+  {
+    "op": "Mul", "shape": [16, 64, 56, 56], "precision": "S16",
+    "scales": [5.5413597266351644e-08, 3.051804378628731e-05, 5.5413597266351644e-08],
+    "zero_points": [0, 0, 0], "file": "mul_step_mul_397_16x64x56x56_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_397; measured activation and output extrema paired with mask=1"
+  },
+  {
+    "op": "Mul", "shape": [16, 64, 56, 56], "precision": "S16",
+    "scales": [1.0485249646308148e-07, 3.051804378628731e-05, 1.0485249646308148e-07],
+    "zero_points": [0, 0, 0], "file": "mul_step_mul_419_16x64x56x56_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 MinMax range-matched ResNet18 dropout Mul_419; measured activation and output extrema paired with mask=1"
+  },
+  {
+    "op": "Mul", "shape": [64, 3, 7, 7], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 0.00010238828690489754, 1.0238828451747395e-08],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_64x3x7x7_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_485"
+  },
+  {
+    "op": "Mul", "shape": [64, 64, 3, 3], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 0.00015204983355943114, 1.5204983938588157e-08],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_64x64x3x3_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_499,Mul_513,Mul_527,Mul_541"
+  },
+  {
+    "op": "Mul", "shape": [128, 64, 1, 1], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 7.77532477513887e-05, 7.775325272518785e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_128x64x1x1_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_555"
+  },
+  {
+    "op": "Mul", "shape": [128, 64, 3, 3], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 8.91077215783298e-05, 8.910771676085005e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_128x64x3x3_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_569"
+  },
+  {
+    "op": "Mul", "shape": [128, 128, 3, 3], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 3.428852869546972e-05, 3.42885275728122e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_128x128x3x3_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_583,Mul_597,Mul_611"
+  },
+  {
+    "op": "Mul", "shape": [256, 128, 1, 1], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 2.715625669225119e-05, 2.715625724292181e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_256x128x1x1_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_625"
+  },
+  {
+    "op": "Mul", "shape": [256, 128, 3, 3], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 2.544623384892475e-05, 2.5446234008796864e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_256x128x3x3_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_639"
+  },
+  {
+    "op": "Mul", "shape": [256, 256, 3, 3], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 3.8600632251473144e-05, 3.860063380045631e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_256x256x3x3_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_653,Mul_667,Mul_681"
+  },
+  {
+    "op": "Mul", "shape": [512, 256, 1, 1], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 1.355781114398269e-05, 1.355781042988724e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_512x256x1x1_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_695"
+  },
+  {
+    "op": "Mul", "shape": [512, 256, 3, 3], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 2.8742158974637277e-05, 2.8742159763339714e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_512x256x3x3_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_709"
+  },
+  {
+    "op": "Mul", "shape": [512, 512, 3, 3], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 2.780765134957619e-05, 2.780765173682198e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_512x512x3x3_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_723,Mul_737,Mul_751"
+  },
+  {
+    "op": "Mul", "shape": [1000, 512], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 1.3235126971267164e-05, 1.3235126328225988e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_1000x512_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration; shape-group nodes: Mul_765"
+  },
+  {
+    "op": "Mul", "shape": [1, 64], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 6.397367542376742e-05, 6.397367524613173e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_1x64_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-vector broadcast shared calibration; rank-1 vector length 64 packed as 1x64"
+  },
+  {
+    "op": "Mul", "shape": [1, 128], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 4.2687861423473805e-05, 4.268786213401654e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_1x128_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-vector broadcast shared calibration; rank-1 vector length 128 packed as 1x128"
+  },
+  {
+    "op": "Mul", "shape": [1, 256], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 7.513152377214283e-05, 7.513151878413282e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_1x256_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-vector broadcast shared calibration; rank-1 vector length 256 packed as 1x256"
+  },
+  {
+    "op": "Mul", "shape": [1, 512], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 5.049200262874365e-05, 5.049199724993514e-09],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_1x512_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-vector broadcast shared calibration; rank-1 vector length 512 packed as 1x512"
+  },
+  {
+    "op": "Mul", "shape": [1, 1000], "precision": "S16",
+    "scales": [3.0518043647731474e-09, 3.1763265724293888e-06, 3.176326701659349e-10],
+    "zero_points": [0, 0, 0], "file": "mul_lr_broadcast_1x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 lr-times-vector broadcast shared calibration; rank-1 vector length 1000 packed as 1x1000"
+  },
+  {
+    "op": "Sub", "shape": [16, 1000], "precision": "S16",
+    "scales": [0.00013860779290553182, 3.814756382780615e-06, 0.0001347930374322459],
+    "zero_points": [0, 0, 0], "file": "sub_step_sub_32_16x1000_s16.axmodel.gz",
+    "source": "Pulsar2 7.0-lite S16 ResNet18 Sub_32 range-matched; broadcast [16,1] input packed across width"
+  }
+]
