@@ -82,7 +82,7 @@
             let last_run_info = null;
 
             window.onload = () => {
-                const worker = new Worker(window.__onnxsimWorkerUrl || "worker.js");
+                let worker = new Worker(window.__onnxsimWorkerUrl || "worker.js");
                 const log_output = document.getElementById("log-output");
                 const input = document.getElementById("file-input");
                 const dl_btn = document.getElementById("download-button");
@@ -108,7 +108,7 @@
                 // serves (picking a new file makes any previous one moot).
                 let pendingImport = null;
 
-                worker.onmessage = (e) => {
+                const handleWorkerMessage = (e) => {
                     switch (e.data[0]) {
                         case "import-format-done":
                             // e.data[2] is the decoded model's raw bytes (an
@@ -271,6 +271,11 @@
                             // worker has reported the detailed error through
                             // stderr, so restore the picker and keep download
                             // disabled until a later conversion succeeds.
+                            const recentLog = log_output.value.split("\n").slice(-3).join("\n");
+                            if (!/failed:/i.test(recentLog)) {
+                                log_output.value += "conversion failed\n";
+                                log_output.scrollTop = log_output.scrollHeight;
+                            }
                             input.disabled = false;
                             dl_btn.disabled = true;
                             format_select.disabled = false;
@@ -278,6 +283,26 @@
                             break;
                     }
                 };
+                worker.onmessage = handleWorkerMessage;
+                const handleWorkerError = (e) => {
+                    // Some malformed models make the WASM runtime trap instead
+                    // of throwing a catchable JS exception. Recover the UI and
+                    // start a fresh worker so another upload can be attempted.
+                    e.preventDefault();
+                    log_output.value += "conversion failed: worker stopped unexpectedly\n";
+                    log_output.scrollTop = log_output.scrollHeight;
+                    window.__onnxsimConverted = null;
+                    window.__onnxsimOriginalAnnotated = null;
+                    input.disabled = true;
+                    dl_btn.disabled = true;
+                    format_select.disabled = false;
+                    format_status.textContent = "";
+                    worker.terminate();
+                    worker = new Worker(window.__onnxsimWorkerUrl || "worker.js");
+                    worker.onmessage = handleWorkerMessage;
+                    worker.onerror = handleWorkerError;
+                };
+                worker.onerror = handleWorkerError;
 
                 // Run one conversion. `modelName` names the source (for the
                 // download filename and issue report); `buf` is an ArrayBuffer

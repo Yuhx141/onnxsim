@@ -64,16 +64,26 @@ def test_tracker_falls_back_for_old_request_signature(monkeypatch):
 
 
 def test_loaded_tvm_ffi_module_functions_are_forwarded_unchanged(monkeypatch):
+    # Use an opaque sentinel: the wrapper must leave FFI object marshalling to
+    # the installed TVM client rather than inspecting or converting the value.
     ffi_tensor = object()
 
     class Module:
         def get_function(self, name):
-            return lambda value: (name, value)
+            assert name == "add_one"
+
+            def function(value):
+                assert value is ffi_tensor
+                return ffi_tensor
+
+            return function
+
+    module = Module()
 
     class Session(_Session):
         def load_module(self, path):
             assert path == "kernel.so"
-            return Module()
+            return module
 
     session = Session()
 
@@ -84,5 +94,33 @@ def test_loaded_tvm_ffi_module_functions_are_forwarded_unchanged(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "tvm", types.SimpleNamespace(rpc=Rpc))
     wrapped = tvm_compat.connect("runner", 9090)
-    module = wrapped.load_module("kernel.so")
-    assert module.get_function("add_one")(ffi_tensor) == ("add_one", ffi_tensor)
+    assert wrapped.load_module("kernel.so") is module
+    assert wrapped.load_module("kernel.so").get_function("add_one")(ffi_tensor) is ffi_tensor
+
+
+def test_session_forwards_time_evaluator_and_closes_on_context_exit(monkeypatch):
+    evaluator = object()
+    calls = []
+
+    class Session(_Session):
+        def time_evaluator(self, function_name, device, **kwargs):
+            calls.append((function_name, device, kwargs))
+            return evaluator
+
+        def close(self):
+            calls.append(("close",))
+
+    session = Session()
+
+    class Rpc:
+        @staticmethod
+        def connect(host, port, *, key, timeout):
+            assert (host, port, key, timeout) == ("runner", 9090, "hexagon", 30)
+            return session
+
+    monkeypatch.setitem(sys.modules, "tvm", types.SimpleNamespace(rpc=Rpc))
+    with tvm_compat.connect("runner", 9090, key="hexagon", timeout=30) as wrapped:
+        device = object()
+        assert wrapped.time_evaluator("run", device, number=5) is evaluator
+        assert calls == [("run", device, {"number": 5})]
+    assert calls[-1] == ("close",)
