@@ -265,7 +265,9 @@ the best schedule for larger spatial dimensions.
 The optional `--cpu-backend torch-int8` path uses PyTorch integer GEMM for
 small Conv panels and keeps the accumulator exact. On this quicktest graph it
 averaged 13.18 ms over 20 measured runs with exact ONNX CPU output; the
-float32 Torch path measured 14.82 ms over 10 runs in the same setup. The
+float32 Torch path measured 14.82 ms over 10 runs in the same setup. Replacing
+the float32 `unfold` conversion with an int8 view-based spatial pack reduced
+the hybrid run to 11.17 ms over 20 measured runs, still with exact output. The
 runner also fuses each scalar-quantized residual `Dequantize → Add → Relu →
 Quantize → Dequantize` chain into one host step when no native Add artifact is
 selected. That covers 16 residuals here and reduces interpreted host nodes from

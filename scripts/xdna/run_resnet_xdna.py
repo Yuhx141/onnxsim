@@ -796,8 +796,6 @@ class XDNAResNetRunner:
             self._cpu_weight_cache[index] = weights
         if self.cpu_backend == "torch-int8" and plan.groups == 1:
             import torch
-            import torch.nn.functional as torch_f
-
             if not hasattr(torch, "_int_mm"):
                 raise RuntimeError("--cpu-backend torch-int8 requires PyTorch with torch._int_mm support")
             if not self._torch_initialized:
@@ -805,16 +803,19 @@ class XDNAResNetRunner:
                 self._torch_initialized = True
             attrs = _attrs(node)
             pads = tuple(int(v) for v in attrs.get("pads", (0, 0, 0, 0)))
-            tx = torch.from_numpy(np.ascontiguousarray(x)).to(torch.float32)
+            tx = torch.from_numpy(np.ascontiguousarray(x))
             if any(pads):
-                tx = torch_f.pad(tx, (pads[1], pads[3], pads[0], pads[2]))
-            panels_tensor = torch_f.unfold(
-                tx,
-                kernel_size=plan.weight_shape[2:],
-                dilation=plan.dilation,
-                padding=0,
-                stride=plan.stride,
-            ).transpose(1, 2).contiguous().to(torch.int8)
+                tx = torch.nn.functional.pad(tx, (pads[1], pads[3], pads[0], pads[2]))
+            kh, kw = plan.weight_shape[2:]
+            dh, dw = plan.dilation
+            sh, sw = plan.stride
+            effective_h = dh * (kh - 1) + 1
+            effective_w = dw * (kw - 1) + 1
+            windows = tx.unfold(2, effective_h, sh).unfold(3, effective_w, sw)
+            windows = windows[..., ::dh, ::dw]
+            panels_tensor = windows.permute(0, 2, 3, 1, 4, 5).reshape(
+                tx.shape[0], -1, tx.shape[1] * kh * kw
+            ).contiguous()
             panels = panels_tensor[0].numpy()[None, ...]
         elif self.cpu_backend in {"numpy", "torch-int8"}:
             panels = im2col_nchw(x, plan)
