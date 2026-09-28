@@ -51,7 +51,10 @@ The latter is the only component that knows whether an artifact remains valid
 for a particular compiler, SDK, driver, device, and I/O ABI.
 
 `tools/onnx-remote/onnx-remote-compiler` provides a small dependency-free
-compiler endpoint for this split. It accepts `COMPILE` requests, invokes a
+compiler endpoint for this split. It serves each request on its own thread:
+cache hits are answered while other models compile, `--jobs N` (default 2)
+bounds concurrent cold compiles, and a second request for a model already being
+compiled waits for that compile and reuses its artifact. It accepts `COMPILE` requests, invokes a
 trusted command template with `{input}`, `{output}`, `{manifest}`, and
 `{target}` paths, and persists the resulting artifact and manifest. This is a
 convenient SNPE replacement boundary: a QAIRT/QNN wrapper can perform ONNX

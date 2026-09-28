@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <csignal>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -30,9 +34,46 @@ struct Options {
   std::string target = "qnn-htp";
   std::string compiler_id = "unidentified";
   uint64_t max_cache_bytes = 0;
+  // cold compiles running at once; cache hits and other requests are served concurrently regardless
+  unsigned jobs = 2;
 };
 
 std::atomic<uint64_t> cache_write_counter{0};
+
+// Limits concurrent cold compiles (each can use every core of the compile host); requests are handled on their own threads.
+class Slots final {
+ public:
+  explicit Slots(unsigned n) : free_(n == 0 ? 1 : n) {}
+  void acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&] { return free_ > 0; });
+    --free_;
+  }
+  void release() {
+    { std::lock_guard<std::mutex> lock(mutex_); ++free_; }
+    cv_.notify_one();
+  }
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  unsigned free_;
+};
+Slots* compile_slots = nullptr;
+
+// Requests for the same artifact key in this process queue here, however long the compile takes; the cache-directory lock
+// (CacheLock) is for other compiler processes sharing the cache and gives up after a minute
+std::mutex key_mutexes_guard;
+std::unordered_map<std::string, std::shared_ptr<std::mutex>> key_mutexes;
+std::shared_ptr<std::mutex> key_mutex(const std::string& key) {
+  std::lock_guard<std::mutex> lock(key_mutexes_guard);
+  auto& m = key_mutexes[key];
+  if (!m) m = std::make_shared<std::mutex>();
+  return m;
+}
+struct SlotGuard final {
+  SlotGuard() { compile_slots->acquire(); }
+  ~SlotGuard() { compile_slots->release(); }
+};
 
 class CacheLock final {
  public:
@@ -359,7 +400,12 @@ Response compile(const Request& request, const Options& options) {
     return false;
   };
   if (load_cached(false)) return response;
-
+  // a cold compile takes a slot; the per-key cache lock below then makes a second request for the same model wait for the
+  // first and reuse its result instead of compiling it again
+  const auto same_key = key_mutex(key);
+  std::lock_guard<std::mutex> key_lock(*same_key);
+  if (load_cached(false)) return response;  // an earlier request for this key just finished it
+  SlotGuard slot;
   CacheLock cache_lock;
   if (!options.cache_dir.empty()) {
     std::error_code cache_ec;
@@ -462,12 +508,14 @@ bool parse_options(int argc, char** argv, Options& options) {
       options.target = argv[++i];
     } else if (argument == "--compiler-id" && i + 1 < argc) {
       options.compiler_id = argv[++i];
+    } else if (argument == "--jobs" && i + 1 < argc) {
+      options.jobs = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
     } else if (argument == "--max-cache-bytes" && i + 1 < argc) {
       options.max_cache_bytes = std::strtoull(argv[++i], nullptr, 10);
     } else if (argument == "--help") {
       std::cout << "usage: onnx-remote-compiler [--port PORT] [--cache-dir DIR]"
                    " [--target TARGET] [--compiler-id ID]"
-                   " [--max-cache-bytes BYTES] [--command COMMAND]\n"
+                   " [--max-cache-bytes BYTES] [--jobs N] [--command COMMAND]\n"
                    "COMMAND placeholders: {input} {output} {manifest} {target}"
                    " {compiler_id} {shapes}\n"
                    "Without COMMAND, copies the model as a transport smoke-test artifact.\n";
@@ -493,16 +541,27 @@ int main(int argc, char** argv) {
   }
   std::cerr << "onnx-remote-compiler listening on " << options.port
             << " for target " << options.target << '\n';
+  Slots slots(options.jobs);
+  compile_slots = &slots;
   for (;;) {
     int fd = accept_tcp(listener);
     if (fd < 0) continue;
-    Request request;
-    Response response;
-    std::string error;
-    if (!receive_request(fd, request, error)) response.error = error;
-    else response = compile(request, options);
-    if (!response.ok && response.error.empty()) response.error = "compile failed";
-    send_response(fd, response, error);
-    close_socket(fd);
+    // one thread per request: a long compile no longer blocks cache hits or compiles of other models
+    std::thread([fd, &options] {
+      Request request;
+      Response response;
+      std::string error;
+      const auto start = std::chrono::steady_clock::now();
+      if (!receive_request(fd, request, error)) response.error = error;
+      else response = compile(request, options);
+      if (!response.ok && response.error.empty()) response.error = "compile failed";
+      send_response(fd, response, error);
+      close_socket(fd);
+      static std::mutex log_mutex;
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+      std::lock_guard<std::mutex> lock(log_mutex);
+      std::cerr << "request " << request.request_id << ": " << (response.ok ? response.artifact_id : response.error) << " in "
+                << ms << " ms\n";
+    }).detach();
   }
 }

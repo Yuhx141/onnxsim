@@ -7,7 +7,9 @@
 #
 #   run.sh compiler [KEY=VAL...]                              start onnx-remote-compiler (COMPILER_PORT, default 39502) for
 #                                                             hexagon-v65; KEY=VAL extras go into compile_v65.sh's command
-#                                                             (e.g. ONNX_QDQ_INT_CONV=1 ONNX_QDQ_LUT=1 TC_OPT=1 for a QDQ model)
+#                                                             (e.g. ONNX_QDQ_INT_CONV=1 ONNX_QDQ_LUT=1 TC_OPT=1 for a QDQ model).
+#                                                             One service handles requests concurrently; COMPILE_JOBS (default
+#                                                             2) bounds its concurrent cold compiles
 #   run.sh rpc <model.onnx> [client args]                     COMPILE on it, then load_compiled + run_compiled on the phone
 #                                                             (e2e.sh; e.g. --input-raw ... --expect ref.bin --iters 5 --profile)
 #   run.sh model <name> <model.onnx>                          the same capture locally, kept as g_<name> for inspection
@@ -62,6 +64,7 @@ case "$cmd" in
     mkdir -p "$WORK/tmp"
     exec env TINYGRAD_ROOT="$TINYGRAD_ROOT" HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" HEXAGON_TOOLCHAIN="$HEXAGON_TOOLCHAIN" CC="$CC" \
       TMPDIR="$WORK/tmp" "$REMOTE_BUILD/onnx-remote-compiler" --port "${COMPILER_PORT:-39502}" --cache-dir "$WORK/compiler-cache" \
+      --jobs "${COMPILE_JOBS:-2}" \
       --target hexagon-v65 --compiler-id "$id" --command "$here/compile_v65.sh {input} {output} {manifest} ${extras[*]}" ;;
   rpc)
     : "${REMOTE_BUILD:?set REMOTE_BUILD to the tools/onnx-remote build dir}"
