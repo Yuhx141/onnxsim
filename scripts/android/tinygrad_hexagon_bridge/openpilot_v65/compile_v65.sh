@@ -2,7 +2,7 @@
 # onnx-remote-compiler command for the Hexagon v65 target: an ONNX model -> a tinygrad-generated standalone v65 DSP program,
 # packed as a `tghx-v65` artifact for onnx-remote-hexagon-worker.
 #
-#   onnx-remote-compiler --port 39502 --cache-dir ~/.cache/onnxsim-v65 --target hexagon-v65 --compiler-id tinygrad-dsp_graph_v65 \
+#   onnx-remote-compiler --port 39502 --cache-dir ~/.cache/onnxsim-v65 --target hexagon-v65 --compiler-id "tinygrad-$(git -C "$TINYGRAD_ROOT" rev-parse --short HEAD)" \
 #     --command '.../openpilot_v65/compile_v65.sh {input} {output} {manifest}'
 #
 # The model goes through the fork's compile3.py capture (DEV=DSP under qemu, v65 settings) and dsp_graph_v65: emitted, checked
@@ -13,7 +13,7 @@ input=$1; output=$2; manifest=$3
 : "${TINYGRAD_ROOT:?}" "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}"
 work=$(mktemp -d "${TMPDIR:-/tmp}/onnxsim-v65-XXXXXX")
 trap 'rm -rf "$work"' EXIT
-export MOCKDSP=1 DEV=DSP DSP_V65_HW=1 DSP_THREADS="${DSP_THREADS:-4}" NOLOCALS=1 BEAM=0 CC="${CC:-clang-19}" \
+export MOCKDSP=1 DEV=DSP CONV_PAD_MATERIALIZE=1 DSP_V65_HW=1 DSP_THREADS="${DSP_THREADS:-4}" NOLOCALS=1 BEAM=0 CC="${CC:-clang-19}" \
   FLOAT16=0 ONNX_FP16_AS_FP32=1 BENCH_RUNS=1 DSP_ALL_INPUTS=1 ALL_OUTPUTS=1 PYTHONUNBUFFERED=1 \
   PYTHONPATH="$TINYGRAD_ROOT/examples/openpilot:$TINYGRAD_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 log="$work/compile.log"

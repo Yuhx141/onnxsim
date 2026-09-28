@@ -376,14 +376,26 @@ Phone results (Xiaomi 12S V69 running v65 code; RPC-inclusive, best of N; every 
 
 | program | 1 thread | 4 threads |
 |---|---:|---:|
-| `driving_supercombo` (all four outputs, recurrent state included) | 3796 ms | 1493 ms |
-| `dmonitoring_model` | 1094 ms | 419 ms |
+| `driving_supercombo` (all four outputs, recurrent state included) | 2991 ms | 1234 ms |
+| `dmonitoring_model` | 1044 ms | 388 ms |
 | driving warp, 1928x1208 | 87.9 ms | 50.3 ms |
 | driving warp, 1344x760 | 75.2 ms | 43.0 ms |
 | DM warp, 1928x1208 | 238.9 ms | 78.3 ms |
 | DM warp, 1344x760 | 225.3 ms | 70.1 ms |
 
-The model rows include scalar register blocking (below); without it they were driving 3831 / 1702 ms and DM 1623 / 620 ms.
+The model rows include scalar register blocking and materialized conv padding (below). The progression for driving (1 / 4
+threads) was 3831 / 1702 ms, then 3796 / 1493 ms with blocking, then 2991 / 1234 ms with padding. For DM it was 1623 / 620,
+then 1094 / 419, then 1044 / 388 ms.
+
+**Materialized conv padding (`CONV_PAD_MATERIALIZE=1`).** tinygrad pads a conv input lazily, so the zero padding becomes a
+mask on every input load inside the conv. On scalar v65 the masked loads and their address math cost more than the MACs. With
+the flag the conv reads a padded copy made by its own small kernel. Fusing that copy into the producer was worse (DM
+419 -> 547 ms): the producer then computes, masked, over the padded grid and loses its register blocking. As a separate kernel
+the strided 3x3 benchmark stem went 330 -> 89 ms (+5 ms for the copy). Outputs are unchanged in value, and DM's differ from the
+unpadded capture only at rounding level (6e-5 on values up to 862) because fusion changed.
+
+A cheaper exact trunc (the one-instruction truncating convert plus copysign, in place of the bit-mask emulation) left the
+warps' output unchanged but measured no faster, so it was dropped.
 
 **Scalar register blocking.** Under `DSP_V65_HW`, a float reduction with reuse along two axes (a conv) takes tinygrad's CPU
 upcast rules, small upcasts on the reused axes, instead of one vector-wide axis. Accumulators × unrolled taps are capped near
@@ -401,7 +413,7 @@ artifact. `onnx-remote-hexagon-worker` (`build_worker.sh`, Android) is the runne
 `run_compiled` per inference. `e2e.sh` drives `onnx-remote-client --compile-run` against both on an attached phone:
 
 ```sh
-onnx-remote-compiler --port 39502 --cache-dir ~/.cache/onnxsim-v65 --target hexagon-v65 --compiler-id tinygrad-dsp_graph_v65 \
+onnx-remote-compiler --port 39502 --cache-dir ~/.cache/onnxsim-v65 --target hexagon-v65 --compiler-id "tinygrad-$(git -C "$TINYGRAD_ROOT" rev-parse --short HEAD)" \
   --command "$PWD/openpilot_v65/compile_v65.sh {input} {output} {manifest}" &
 openpilot_v65/build_worker.sh worker/
 CLIENT=.../onnx-remote-client openpilot_v65/e2e.sh worker/onnx-remote-hexagon-worker dmonitoring_model.onnx \
@@ -414,7 +426,10 @@ CLIENT=.../onnx-remote-client openpilot_v65/e2e.sh worker/onnx-remote-hexagon-wo
 | `dmonitoring_model` | ~20 min | 14.7 MB | 474 ms | 479 / 437 ms | bit-exact |
 | `driving_supercombo` (4 outputs) | ~45 min | 121 MB | 3580 ms | 1740 / 1494 ms | bit-exact |
 
-The compiler service is one request at a time, so a long compile blocks cache hits behind it. A second instance on the same
+The compiler's cache key is the target, `--compiler-id`, command string and model bytes. It does not include the tinygrad
+checkout the command runs, so put the fork's commit in `--compiler-id` (for example `tinygrad-$(git -C "$TINYGRAD_ROOT"
+rev-parse --short HEAD)`); otherwise a codegen change keeps serving old artifacts. The compiler service is one request at a
+time, so a long compile blocks cache hits behind it. A second instance on the same
 `--cache-dir` (its publication is multi-process safe) serves those. The runner is reached through `adb forward`; a
 `run_compiled` round trip adds about 8 ms of TCP over USB to the DSP time. For driving it adds about 250 ms, mostly from moving
 its 2.4 MB of inputs and 8 MB of outputs, which are mostly the recurrent state.

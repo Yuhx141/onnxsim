@@ -616,12 +616,13 @@ and a plain-text I/O contract. The artifact is a small little-endian container, 
 
 ```sh
 onnx-remote-compiler --port 39502 --cache-dir ~/.cache/onnxsim-v65 --target hexagon-v65 \
-  --compiler-id tinygrad-dsp_graph_v65 --command '.../openpilot_v65/compile_v65.sh {input} {output} {manifest}'
+  --compiler-id "tinygrad-$(git -C "$TINYGRAD_ROOT" rev-parse --short HEAD)" --command '.../openpilot_v65/compile_v65.sh {input} {output} {manifest}'
 .../openpilot_v65/build_worker.sh out/          # Android aarch64: NDK + the Hexagon SDK's qaic and libcdsprpc
 CLIENT=build/onnx-remote/onnx-remote-client .../openpilot_v65/e2e.sh out/onnx-remote-hexagon-worker model.onnx \
   --input-raw 2:1,1382400:img.bin --input-raw 1:1,3:calib.bin --dump out.bin --iters 5
 ```
 
+The compiler's cache does not see the tinygrad checkout behind the command, so include its commit in `--compiler-id`.
 `load_compiled` writes the skel as `tg_graph_<id>.so` into `--cache-dir` (put on `ADSP_LIBRARY_PATH` at startup), opens it in
 an unsigned PD, and uploads the weights once in 8 MB chunks. Several programs can be resident at once. `run_compiled` takes
 the ONNX inputs in graph order (FLOAT or UINT8, exact sizes), leaves out inputs the program never reads, and returns every
