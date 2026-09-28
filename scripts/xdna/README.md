@@ -262,6 +262,17 @@ all-XDNA Conv run averaged 104.0 ms with 51 XDNA Conv calls. These results
 recommend CPU Conv placement for this small input shape; they do not predict
 the best schedule for larger spatial dimensions.
 
+The optional `--cpu-backend torch-int8` path uses PyTorch integer GEMM for
+small Conv panels and keeps the accumulator exact. On this quicktest graph it
+averaged 13.18 ms over 20 measured runs with exact ONNX CPU output; the
+float32 Torch path measured 14.82 ms over 10 runs in the same setup. The
+runner also fuses each scalar-quantized residual `Dequantize → Add → Relu →
+Quantize → Dequantize` chain into one host step when no native Add artifact is
+selected. That covers 16 residuals here and reduces interpreted host nodes from
+209 to 128. Interleaved fused/unfused runs had indistinguishable full-graph
+latency, so this fusion reduces graph-walk work but has not yet narrowed the
+device-performance gap. Vitis still measures about 1.63 ms on this model.
+
 Vitis' ONNX Runtime trace reports a single fused provider node, so it cannot
 show internal Conv timings. Ryzen AI 1.8 documents AI Analyzer's inference
 timeline, but currently does not support INT8 model analysis. Enabling its

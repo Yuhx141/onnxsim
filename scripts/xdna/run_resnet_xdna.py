@@ -192,6 +192,96 @@ class XDNAResNetRunner:
             if entry.get("compiled_artifact")
             or entry.get("status") == "zero_copy_device_view"
         }
+        graph_outputs = {str(value.name) for value in getattr(model.graph, "output", ())}
+        self._host_qadd_fusions: dict[int, dict[str, Any]] = {}
+        self._host_qadd_input_dqs: set[int] = set()
+
+        def single_consumer(value: str, op_type: str) -> int | None:
+            users = self.consumers_by_input.get(value, ())
+            if len(users) != 1 or self.nodes[users[0]].op_type != op_type:
+                return None
+            return users[0]
+
+        def scalar_qparams(node: Any) -> tuple[float, int] | None:
+            if len(node.input) < 3 or node.input[1] not in self.arrays or node.input[2] not in self.arrays:
+                return None
+            scale = np.asarray(self.arrays[node.input[1]]).reshape(-1)
+            zero = np.asarray(self.arrays[node.input[2]]).reshape(-1)
+            if scale.size != 1 or zero.size != 1 or scale.dtype.kind != "f":
+                return None
+            return float(scale[0]), int(zero[0])
+
+        # Fold the common quantized residual sequence into one host executor
+        # step when no native quantized Add artifact is available.
+        for add_index, add_node in enumerate(self.nodes):
+            if (add_node.op_type != "Add" or add_index in self.operation_specs
+                    or len(add_node.input) != 2 or not add_node.output
+                    or add_node.output[0] in graph_outputs):
+                continue
+            input_dq_indices = []
+            input_qparams = []
+            valid = True
+            for input_name in add_node.input:
+                if input_name in graph_outputs:
+                    valid = False
+                    break
+                dq_node = self.nodes_by_output.get(input_name)
+                if dq_node is None or dq_node.op_type != "DequantizeLinear":
+                    valid = False
+                    break
+                dq_index = self.nodes.index(dq_node)
+                dq_users = self.consumers_by_input.get(input_name, ())
+                if not dq_users or any(
+                    user != add_index
+                    and not (
+                        self.nodes[user].op_type == "Conv"
+                        and any(name == input_name and input_index in (0, 1)
+                                for input_index, name in enumerate(self.nodes[user].input))
+                    )
+                    for user in dq_users
+                ):
+                    valid = False
+                    break
+                qparams = scalar_qparams(dq_node)
+                if qparams is None:
+                    valid = False
+                    break
+                input_dq_indices.append(dq_index)
+                input_qparams.append(qparams)
+            if not valid:
+                continue
+            relu_index = single_consumer(add_node.output[0], "Relu")
+            if relu_index is None or self.nodes[relu_index].output[0] in graph_outputs:
+                continue
+            relu_node = self.nodes[relu_index]
+            quantize_index = single_consumer(relu_node.output[0], "QuantizeLinear")
+            if quantize_index is None:
+                continue
+            quantize_node = self.nodes[quantize_index]
+            quantize_params = scalar_qparams(quantize_node)
+            if quantize_params is None or np.asarray(self.arrays[quantize_node.input[2]]).dtype != np.uint8:
+                continue
+            dequantize_index = single_consumer(quantize_node.output[0], "DequantizeLinear")
+            if dequantize_index is None:
+                continue
+            dequantize_node = self.nodes[dequantize_index]
+            dequantize_params = scalar_qparams(dequantize_node)
+            if (dequantize_params is None
+                    or np.asarray(self.arrays[dequantize_node.input[2]]).dtype != np.uint8):
+                continue
+            self._host_qadd_fusions[add_index] = {
+                "input_dq_indices": tuple(input_dq_indices),
+                "input_qparams": tuple(input_qparams),
+                "relu_index": relu_index,
+                "relu_output": relu_node.output[0],
+                "quantize_index": quantize_index,
+                "quantize_output": quantize_node.output[0],
+                "quantize_params": quantize_params,
+                "dequantize_index": dequantize_index,
+                "dequantize_output": dequantize_node.output[0],
+                "dequantize_params": dequantize_params,
+            }
+            self._host_qadd_input_dqs.update(input_dq_indices)
         self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "xdna_quantized_add_relu": 0, "device_resident_pool_outputs": 0, "device_view_ops": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
         self._profile: dict[str, float] = {}
         self._device_readback_cache: dict[tuple[Any, ...], np.ndarray] = {}
@@ -704,7 +794,32 @@ class XDNAResNetRunner:
         if weights is None:
             weights = _centered_int8(wt_raw, wt_zero, f"Conv {plan.node_name} weights")
             self._cpu_weight_cache[index] = weights
-        panels = im2col_nchw(x, plan) if self.cpu_backend in {"numpy", "torch-int8"} else None
+        if self.cpu_backend == "torch-int8" and plan.groups == 1:
+            import torch
+            import torch.nn.functional as torch_f
+
+            if not hasattr(torch, "_int_mm"):
+                raise RuntimeError("--cpu-backend torch-int8 requires PyTorch with torch._int_mm support")
+            if not self._torch_initialized:
+                torch.set_num_threads(self.cpu_threads)
+                self._torch_initialized = True
+            attrs = _attrs(node)
+            pads = tuple(int(v) for v in attrs.get("pads", (0, 0, 0, 0)))
+            tx = torch.from_numpy(np.ascontiguousarray(x)).to(torch.float32)
+            if any(pads):
+                tx = torch_f.pad(tx, (pads[1], pads[3], pads[0], pads[2]))
+            panels_tensor = torch_f.unfold(
+                tx,
+                kernel_size=plan.weight_shape[2:],
+                dilation=plan.dilation,
+                padding=0,
+                stride=plan.stride,
+            ).transpose(1, 2).contiguous().to(torch.int8)
+            panels = panels_tensor[0].numpy()[None, ...]
+        elif self.cpu_backend in {"numpy", "torch-int8"}:
+            panels = im2col_nchw(x, plan)
+        else:
+            panels = None
         bias = values[node.input[2]].astype(np.float32).reshape(-1) if len(node.input) > 2 else None
         self._profile["cpu_conv_prepare_ms"] = self._profile.get("cpu_conv_prepare_ms", 0.0) + (time.perf_counter() - stage_start) * 1000.0
         execute_start = time.perf_counter()
@@ -720,8 +835,6 @@ class XDNAResNetRunner:
             import torch
             import torch.nn.functional as torch_f
 
-            if self.cpu_backend == "torch-int8" and not hasattr(torch, "_int_mm"):
-                raise RuntimeError("--cpu-backend torch-int8 requires PyTorch with torch._int_mm support")
             if not self._torch_initialized:
                 torch.set_num_threads(self.cpu_threads)
                 self._torch_initialized = True
@@ -742,7 +855,14 @@ class XDNAResNetRunner:
                 raw = np.empty(plan.output_shape, dtype=np.float32)
                 for group in range(plan.groups):
                     panel = torch.from_numpy(panels[group])
-                    acc = torch._int_mm(panel, tw_groups[group]).numpy()
+                    valid_rows = panel.shape[0]
+                    if valid_rows % 16:
+                        padded_panel = torch.zeros(
+                            (math.ceil(valid_rows / 16) * 16, panel.shape[1]), dtype=torch.int8
+                        )
+                        padded_panel[:valid_rows] = panel
+                        panel = padded_panel
+                    acc = torch._int_mm(panel, tw_groups[group]).numpy()[:valid_rows]
                     raw[:, group * out_per_group : (group + 1) * out_per_group] = acc.reshape(
                         batch, out_h, out_w, out_per_group
                     ).transpose(0, 3, 1, 2)
@@ -859,6 +979,45 @@ class XDNAResNetRunner:
         )
         self._executed["fused_bottleneck"] += 1
 
+    def _run_host_qadd_fusion(self, add_index: int, values: dict[str, Any]) -> None:
+        """Execute DQ+Add+Relu+Q+DQ as one host-side graph step."""
+        spec = self._host_qadd_fusions[add_index]
+        started = time.perf_counter()
+        inputs = []
+        for dq_index, (scale, zero) in zip(spec["input_dq_indices"], spec["input_qparams"]):
+            raw_name = self.nodes[dq_index].input[0]
+            raw = values[raw_name]
+            if isinstance(raw, _DeviceValue):
+                raw = self._host_value(raw)
+            real = np.asarray(raw).astype(np.float32)
+            np.subtract(real, np.float32(zero), out=real)
+            np.multiply(real, np.float32(scale), out=real)
+            inputs.append(real)
+        summed = inputs[0]
+        np.add(summed, inputs[1], out=summed)
+        np.maximum(summed, np.float32(0), out=summed)
+        q_scale, q_zero = spec["quantize_params"]
+        np.divide(summed, np.float32(q_scale), out=summed)
+        np.rint(summed, out=summed)
+        np.add(summed, np.float32(q_zero), out=summed)
+        quantized = np.clip(summed, 0, 255).astype(np.uint8)
+        dq_scale, dq_zero = spec["dequantize_params"]
+        dequantized = _dequantize(
+            quantized,
+            np.asarray([dq_scale], dtype=np.float32),
+            np.asarray([dq_zero], dtype=np.uint8),
+            1,
+        )
+        values[spec["quantize_output"]] = quantized
+        values[spec["dequantize_output"]] = dequantized
+        self._precomputed_host_nodes.update((
+            spec["relu_index"], spec["quantize_index"], spec["dequantize_index"],
+        ))
+        self._profile["host_fused_qadd_ms"] = (
+            self._profile.get("host_fused_qadd_ms", 0.0) + (time.perf_counter() - started) * 1000.0
+        )
+        self._executed["host_fused_qadd"] += 1
+
     def run(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         self._executed = {
             "xdna_conv": 0,
@@ -873,6 +1032,7 @@ class XDNAResNetRunner:
             "fused_bottleneck": 0,
             "device_resident_handoffs": 0,
             "device_edge_readbacks": 0,
+            "host_fused_qadd": 0,
         }
         self._profile = {}
         self._device_readback_cache = {}
@@ -880,6 +1040,7 @@ class XDNAResNetRunner:
         self._fused_times = []
         self._precomputed_relu_nodes: set[int] = set()
         self._precomputed_native_nodes: set[int] = set()
+        self._precomputed_host_nodes: set[int] = set()
         values = dict(self.arrays)
         values.update(inputs)
         for index, node in enumerate(self.nodes):
@@ -891,6 +1052,8 @@ class XDNAResNetRunner:
             if index in self._precomputed_relu_nodes:
                 continue
             if index in self._precomputed_native_nodes:
+                continue
+            if index in self._precomputed_host_nodes or index in self._host_qadd_input_dqs:
                 continue
             if index in self._fused_input_handoffs:
                 raw = values.get(str(node.input[0]))
@@ -904,6 +1067,9 @@ class XDNAResNetRunner:
                 continue
             node_start = time.perf_counter()
             op = node.op_type
+            if op == "Add" and index in self._host_qadd_fusions:
+                self._run_host_qadd_fusion(index, values)
+                continue
             offloaded = False
             attrs = _attrs(node)
             result = self._device_view(index, node, values)
