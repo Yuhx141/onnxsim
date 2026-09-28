@@ -130,7 +130,7 @@ static Response execute_axmodel(const Request& request) {
   outputs.resize(n_out); output_bytes.resize(n_out);
 
   for (uint32_t i = 0; i < n_in; ++i) {
-    axclrtEngineDataType type = 0;
+    axclrtEngineDataType type{};
     axclrtEngineGetInputDataType(info, i, &type);
     input_bytes[i] = axclrtEngineGetInputSizeByIndex(info, 0, i);
     if (type != 15 || input_bytes[i] != request.inputs[i].data.size() * sizeof(float) ||
@@ -142,7 +142,7 @@ static Response execute_axmodel(const Request& request) {
   }
   response.outputs.resize(n_out);
   for (uint32_t i = 0; i < n_out; ++i) {
-    axclrtEngineDataType type = 0; axclrtEngineIODims dims{};
+    axclrtEngineDataType type{}; axclrtEngineIODims dims{};
     axclrtEngineGetOutputDataType(info, i, &type);
     axclrtEngineGetOutputDims(info, 0, i, &dims);
     output_bytes[i] = axclrtEngineGetOutputSizeByIndex(info, 0, i);
