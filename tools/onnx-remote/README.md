@@ -259,6 +259,33 @@ With `ONNXSIM_DORA_ANNOUNCE=1`, later forwarding failures also publish an
 `unavailable` status event while preserving the lossless binary error response
 on `result`.
 
+In a DORA dataflow, declare the adapter's `status` and `capabilities` outputs
+and connect consumers to those outputs. DORA resolves those graph edges when
+the dataflow starts; the C node API does not provide ROS-style runtime
+advertisement or dynamic target selection. `status` reports worker readiness,
+and `capabilities` publishes the worker's manifest for downstream selection
+logic. The dependency-free DORA integration check starts the reference worker,
+checks both announcement payloads, and forwards a real binary request through
+the adapter.
+
+```yaml
+nodes:
+  - id: remote
+    path: ./onnx-remote-dora-node
+    env:
+      ONNXSIM_DORA_ANNOUNCE: "1"
+    inputs:
+      run: client/run
+    outputs: [result, status, capabilities]
+
+  - id: monitor
+    path: ./runner-monitor
+    inputs:
+      readiness: remote/status
+      capabilities: remote/capabilities
+    outputs: []
+```
+
 ## ROS2 bridge
 
 The optional `onnx-remote-ros2-bridge` uses ROS2 only for discovery and control:

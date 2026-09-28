@@ -257,8 +257,15 @@ jobs:
           cmake -S tools/onnx-remote -B build/onnx-remote-dora \
             -DONNXSIM_REMOTE_DORA=ON \
             -DONNXSIM_REMOTE_DORA_STUB=ON
-      - name: Build DORA adapter
-        run: cmake --build build/onnx-remote-dora --target onnx-remote-dora-node -j2
+      - name: Build DORA adapter and reference worker
+        run: |
+          cmake --build build/onnx-remote-dora --target \
+            onnx-remote-dora-node onnx-remote-worker -j2
+      - name: Exercise DORA readiness discovery and run forwarding
+        run: |
+          bash tools/onnx-remote/test/dora_discovery_e2e.sh \
+            build/onnx-remote-dora/onnx-remote-worker \
+            build/onnx-remote-dora/onnx-remote-dora-node
 
   ros2-compile:
     name: ROS2 bridge compile contract
@@ -271,5 +278,15 @@ jobs:
         run: |
           nix develop --accept-flake-config --command bash -lc '
             cmake -S . -B build/ros2 -DONNXSIM_REMOTE_ROS2=ON -DBUILD_TESTING=ON
-            cmake --build build/ros2 --target onnx-remote-ros2-bridge -j2
+            cmake --build build/ros2 --target \
+              onnx-remote-worker onnx-remote-ros2-bridge \
+              onnx-remote-ros2-service-smoke \
+              onnx-remote-ros2-discovery-smoke \
+              onnx-remote-ros2-failover-smoke -j2
+            bash test/ros2_discovery_e2e.sh \
+              build/ros2/onnx-remote-worker \
+              build/ros2/onnx-remote-ros2-bridge \
+              build/ros2/onnx-remote-ros2-service-smoke \
+              build/ros2/onnx-remote-ros2-discovery-smoke \
+              build/ros2/onnx-remote-ros2-failover-smoke
           '

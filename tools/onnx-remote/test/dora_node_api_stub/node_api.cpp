@@ -86,10 +86,26 @@ int dora_send_output(void* value, const char* id, size_t id_length,
                      const char* data, size_t data_length) {
   auto* ctx = context(value);
   if (!ctx->runtime) return 0;
+  const std::string output_id(id, id_length);
+  const std::string payload(data, data_length);
+  if (output_id == "status") {
+    if (payload.find("\"status\":\"ready\"") == std::string::npos ||
+        payload.find("\"protocol\":\"onnx-remote-v5\"") ==
+            std::string::npos ||
+        payload.find("\"port\":39573") == std::string::npos)
+      ctx->failed = true;
+    return ctx->failed ? -1 : 0;
+  }
+  if (output_id == "capabilities") {
+    if (payload.find("\"ready\":true") == std::string::npos ||
+        payload.find("\"runner_id\":\"reference-worker\"") ==
+            std::string::npos)
+      ctx->failed = true;
+    return ctx->failed ? -1 : 0;
+  }
   if (id_length == 13 && std::memcmp(id, "profile_event", 13) == 0) {
-    const std::string profile(data, data_length);
-    if (profile.find("\"request_id\":41") == std::string::npos ||
-        profile.find("\"event\"") == std::string::npos)
+    if (payload.find("\"request_id\":41") == std::string::npos ||
+        payload.find("\"event\"") == std::string::npos)
       ctx->failed = true;
     return ctx->failed ? -1 : 0;
   }
