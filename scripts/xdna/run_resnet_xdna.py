@@ -1378,6 +1378,8 @@ def main() -> int:
         "cpu_backend": args.cpu_backend,
         "cpu_threads": args.cpu_threads if args.cpu_backend.startswith("torch") else None,
         "model": str(args.model),
+        "input_seed": args.seed,
+        "input_shape": list(shape),
         "graph_dispatches": runner.codegen.estimated_dispatches,
         "execution_counts": runner._executed,
         "unique_fused_xclbins_used": len({item["xclbin"] for item in runner._fused_blocks.values()}),

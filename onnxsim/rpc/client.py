@@ -279,6 +279,31 @@ class Session:
         )
         return reply["result"]["report"]
 
+    def xdna_compare_vitis_resnet(
+        self,
+        model: ModelLike,
+        manifest: Union[str, os.PathLike, bytes, Dict[str, Any]],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Compare full-graph XDNA and Vitis AI runs on the RPC server.
+
+        Both runs use the same model, input seed, warmup count, and iteration count.
+        Vitis AI profiling runs separately from its timed loop. Use the same server
+        for XDNA, Vitis AI, and all artifact paths referenced by the manifest.
+        """
+        if isinstance(manifest, bytes):
+            manifest_bytes = manifest
+        elif isinstance(manifest, dict):
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+        else:
+            with open(manifest, "rb") as stream:
+                manifest_bytes = stream.read()
+        reply, _ = self._call(
+            {"op": "xdna_compare_vitis_resnet", "options": options or {}},
+            [_model_bytes(model), manifest_bytes],
+        )
+        return reply["result"]
+
     def executor(self, providers: Optional[Sequence[str]] = None):
         from .executor import RemoteModelExecutor
 

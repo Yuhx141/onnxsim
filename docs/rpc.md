@@ -163,9 +163,20 @@ with that machine's Python environment so compiler subprocesses inherit the
 same toolchain:
 
 ```bash
+export XILINX_XRT=/path/to/xrt
 PYTHONPATH=/path/to/onnx-simplifier:$PYTHONPATH \
-  python -m onnxsim.rpc server --host 127.0.0.1 --port 9192 --key xdna
+  python -m onnxsim.rpc server --host 127.0.0.1 --port 9192 --key xdna \
+  --xdna-python /path/to/iron-python \
+  --vitis-python /path/to/vitis-ai-python
 ```
+
+The RPC process uses this source checkout for the XDNA scripts.
+`--xdna-python` selects the subprocess environment with IRON/XRT, and
+`--vitis-python` selects the one with `VitisAIExecutionProvider`. This supports
+installations where the two providers are available in separate environments.
+For a Ryzen AI venv, the server also sets `RYZEN_AI_INSTALLATION_PATH` and adds
+its VOE runtime libraries to the Vitis child's library path, keeping system XRT
+libraries first to avoid mixing incompatible XRT versions.
 
 The client can compile a fused bottleneck and quantized MaxPool remotely, then
 pass their server-side artifact paths to a graph run:
@@ -204,6 +215,26 @@ remote.close()
 IRON `whole_array.py` path as `options["example"]`. Compiled paths remain on the
 server, so compile and run calls must use the same server. Compiler failures
 are returned with the subprocess log tail for diagnosis.
+
+For an apples-to-apples full-graph comparison, use
+`Session.xdna_compare_vitis_resnet(model, manifest, options)`. It runs the XDNA
+graph and then Vitis AI sequentially on the same server, with identical input
+seed, warmup count, and measured iteration count. The response includes both
+full reports, XDNA per-op timings, summarized Vitis provider events, CPU
+reference errors, and a latency ratio only when both backends report real NPU
+execution. Both reports must have matching input shape and seed, and the Vitis
+trace must contain NPU-assigned nodes for the comparison to be marked valid.
+Vitis profiling is performed in a separate untimed pass by default; set
+`profile_vitis=False` to skip the trace, in which case NPU node placement and
+the latency ratio cannot be verified.
+
+```python
+comparison = remote.xdna_compare_vitis_resnet(model, build["manifest"], {
+    "warmup": 20, "iters": 200, "seed": 0,
+    "cpu_small_m": 64, "cpu_backend": "torch", "cpu_threads": 2,
+})
+print(comparison["comparison_valid"], comparison.get("xdna_vs_vitis_latency_ratio"))
+```
 
 ## Remote constant folding
 

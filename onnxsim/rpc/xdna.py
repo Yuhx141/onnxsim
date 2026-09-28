@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import uuid
@@ -19,9 +20,13 @@ def _script(name: str) -> Path:
     return path
 
 
-def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
+def _xdna_python(header: Dict[str, Any]) -> str:
+    return str(header.get("_xdna_python") or sys.executable)
+
+
+def _run(command: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        result = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
     except OSError as error:
         raise proto.RPCError(f"could not start XDNA command {command[1]}: {error}") from error
     if result.returncode:
@@ -55,7 +60,7 @@ def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
             raise proto.RPCError("resnet compile requires an existing server-side IRON example path")
         manifest_path = root / "manifest.json"
         command = [
-            sys.executable, str(_script("compile_resnet_kernels.py")), str(model_path),
+            _xdna_python(header), str(_script("compile_resnet_kernels.py")), str(model_path),
             str(example), str(manifest_path), "--artifact-dir", str(artifacts),
             "--device", str(options.get("device", "npu2")),
             "--columns", str(int(options.get("columns", 8))),
@@ -74,7 +79,7 @@ def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
         if not block:
             raise proto.RPCError("fused_bottleneck compile requires options.block")
         command = [
-            sys.executable, str(_script("fused_bottleneck_design.py")), "--dev",
+            _xdna_python(header), str(_script("fused_bottleneck_design.py")), "--dev",
             str(options.get("device", "npu2")), "--model", str(model_path), "--block", block,
             "--xclbin-path", str(xclbin), "--insts-path", str(insts),
         ]
@@ -87,7 +92,7 @@ def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
         if missing:
             raise proto.RPCError(f"maxpool_u8 compile missing options: {', '.join(missing)}")
         command = [
-            sys.executable, str(_script("maxpool_design.py")), "--dev",
+            _xdna_python(header), str(_script("maxpool_design.py")), "--dev",
             str(options.get("device", "npu2")),
         ]
         cli_names = {
@@ -129,9 +134,10 @@ def run_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
     model_path.write_bytes(blobs[0])
     manifest_path.write_bytes(blobs[1])
     command = [
-        sys.executable, str(_script("run_resnet_xdna.py")), str(model_path), str(manifest_path),
+        _xdna_python(header), str(_script("run_resnet_xdna.py")), str(model_path), str(manifest_path),
         "--warmup", str(max(int(options.get("warmup", 1)), 0)),
         "--iters", str(max(int(options.get("iters", 5)), 1)),
+        "--seed", str(int(options.get("seed", 0))),
         "--cpu-backend", str(options.get("cpu_backend", "numpy")),
         "--cpu-threads", str(max(int(options.get("cpu_threads", 2)), 1)),
         "--json", str(report_path),
@@ -153,3 +159,95 @@ def run_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
     except (OSError, json.JSONDecodeError) as error:
         raise proto.RPCError(f"XDNA runner did not produce a valid JSON report: {error}") from error
     return {"report": report}, []
+
+
+def compare_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
+    """Run XDNA and Vitis AI sequentially with matched inputs and timing settings."""
+    if len(blobs) != 2:
+        raise proto.RPCError("XDNA/Vitis comparison requires model and manifest JSON blobs")
+    options = header.get("options") or {}
+    if not isinstance(options, dict):
+        raise proto.RPCError("comparison options must be an object")
+    xdna_result, _ = run_resnet(header, blobs, work_dir)
+    root = Path(work_dir) / "xdna-rpc" / uuid.uuid4().hex
+    root.mkdir(parents=True, exist_ok=False)
+    model_path, report_path = root / "model.onnx", root / "vitis.json"
+    model_path.write_bytes(blobs[0])
+    warmup = max(int(options.get("warmup", 1)), 0)
+    iters = max(int(options.get("iters", 5)), 1)
+    seed = int(options.get("seed", 0))
+    vitis_python = str(header.get("_vitis_python") or _xdna_python(header))
+    command = [
+        vitis_python,
+        str(_script("benchmark_vitis_resnet.py")), str(model_path),
+        "--warmup", str(warmup), "--iters", str(iters), "--seed", str(seed),
+        "--json", str(report_path),
+    ]
+    profile_path = None
+    if options.get("profile_vitis", True):
+        profile_path = root / "vitis-profile.json"
+        command += ["--profile-json", str(profile_path)]
+    vitis_env = os.environ.copy()
+    venv_root = Path(vitis_python).expanduser().resolve().parent.parent
+    inferred_installation = venv_root if (venv_root / "quicktest").is_dir() else None
+    if not vitis_env.get("RYZEN_AI_INSTALLATION_PATH") and inferred_installation:
+        vitis_env["RYZEN_AI_INSTALLATION_PATH"] = str(inferred_installation)
+    installation = (
+        Path(vitis_env["RYZEN_AI_INSTALLATION_PATH"])
+        if vitis_env.get("RYZEN_AI_INSTALLATION_PATH") else inferred_installation
+    )
+    if installation is not None:
+        xrt = Path(vitis_env["XILINX_XRT"]) if vitis_env.get("XILINX_XRT") else None
+        runtime_libs = [xrt / "lib"] if xrt is not None else []
+        runtime_libs += [
+            *installation.glob("lib/python*/site-packages/voe/lib"),
+            installation / "deployment/lib",
+            installation / "onnxruntime/lib",
+        ]
+        existing = [str(path) for path in runtime_libs if path.is_dir()]
+        inherited = [path for path in vitis_env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if path]
+        vitis_env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(existing + inherited))
+    vitis_process = _run(command, env=vitis_env)
+    try:
+        vitis = json.loads(report_path.read_text(encoding="utf-8"))
+        if profile_path is not None:
+            vitis["profile"] = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise proto.RPCError(f"Vitis AI benchmark did not produce valid reports: {error}") from error
+    if vitis.get("execution") != "real_npu":
+        vitis["provider_log_tail"] = (vitis_process.stdout + "\n" + vitis_process.stderr)[-8000:]
+
+    xdna = xdna_result["report"]
+    same_input_shape = xdna.get("input_shape") == vitis.get("input_shape")
+    same_input_seed = xdna.get("input_seed") == vitis.get("input_seed")
+    xdna_npu = xdna.get("execution") in {
+        "full_graph_xdna_conv_host_ops", "full_graph_hybrid_conv_host_ops",
+        "full_graph_with_fused_bottleneck",
+    }
+    valid = (
+        xdna_npu
+        and same_input_shape
+        and same_input_seed
+        and vitis.get("execution") == "real_npu"
+        and int(vitis.get("vitis_npu_node_count") or 0) > 0
+    )
+    result = {
+        "comparison_valid": valid,
+        "input_seed": seed,
+        "warmup": warmup,
+        "iters": iters,
+        "same_server_sequential_runs": True,
+        "same_input_shape": same_input_shape,
+        "same_input_seed": same_input_seed,
+        "xdna": xdna,
+        "vitis": vitis,
+        "comparison_note": (
+            "Both reports are full-graph timings, and the Vitis profile confirms NPU-assigned nodes. XDNA may include the configured CPU Conv fallback."
+            if valid else
+            "Not a verified matched NPU comparison: check input shapes, XDNA graph execution, VitisAIExecutionProvider, and Vitis NPU node events (enable profile_vitis)."
+        ),
+    }
+    if valid and vitis.get("avg_ms"):
+        result["xdna_vs_vitis_latency_ratio"] = float(xdna["avg_ms"]) / float(vitis["avg_ms"])
+        result["xdna_speedup_vs_vitis"] = float(vitis["avg_ms"]) / float(xdna["avg_ms"])
+    return result, []

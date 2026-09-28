@@ -18,6 +18,7 @@ def main() -> int:
     parser.add_argument("model", type=Path)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", type=Path)
     parser.add_argument(
         "--profile-json",
@@ -25,14 +26,18 @@ def main() -> int:
         help="enable ONNX Runtime profiling and write a compact event summary",
     )
     args = parser.parse_args()
+    if args.iters < 1 or args.warmup < 0:
+        parser.error("--iters must be positive and --warmup must be nonnegative")
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
-    if args.profile_json:
-        opts.enable_profiling = True
-        opts.profile_file_prefix = str(args.profile_json.with_suffix(""))
-    session = ort.InferenceSession(str(args.model), sess_options=opts, providers=["VitisAIExecutionProvider"])
-    input_name = session.get_inputs()[0].name
-    input_data = np.random.default_rng(0).random((1, 3, 32, 32), dtype=np.float32)
+    session = ort.InferenceSession(
+        str(args.model), sess_options=opts,
+        providers=["VitisAIExecutionProvider"], provider_options=[{}],
+    )
+    input_info = session.get_inputs()[0]
+    input_name = input_info.name
+    shape = tuple(int(dim) if isinstance(dim, int) and dim > 0 else 1 for dim in input_info.shape)
+    input_data = np.random.default_rng(args.seed).random(shape, dtype=np.float32)
     feeds = {input_name: input_data}
     for _ in range(args.warmup):
         session.run(None, feeds)
@@ -40,9 +45,23 @@ def main() -> int:
     for _ in range(args.iters):
         session.run(None, feeds)
     elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+    provider_output = session.run(None, feeds)[0]
+    cpu_session = ort.InferenceSession(str(args.model), providers=["CPUExecutionProvider"])
+    cpu_output = cpu_session.run(None, feeds)[0]
+    delta = np.abs(provider_output.astype(np.float64) - cpu_output.astype(np.float64))
     profile_trace = None
+    vitis_node_count = None
     if args.profile_json:
-        profile_trace = Path(session.end_profiling())
+        profile_opts = ort.SessionOptions()
+        profile_opts.log_severity_level = 3
+        profile_opts.enable_profiling = True
+        profile_opts.profile_file_prefix = str(args.profile_json.with_suffix(""))
+        profile_session = ort.InferenceSession(
+            str(args.model), sess_options=profile_opts,
+            providers=["VitisAIExecutionProvider"], provider_options=[{}],
+        )
+        profile_session.run(None, feeds)
+        profile_trace = Path(profile_session.end_profiling())
         events = json.loads(profile_trace.read_text(encoding="utf-8"))
         grouped = defaultdict(lambda: {"count": 0, "duration_us": 0.0})
         for event in events:
@@ -53,6 +72,10 @@ def main() -> int:
             key = f"{provider}:{event.get('cat', 'event')}:{event.get('name', 'unknown')}"
             grouped[key]["count"] += 1
             grouped[key]["duration_us"] += float(event["dur"])
+        vitis_node_count = sum(
+            value["count"] for key, value in grouped.items()
+            if key.startswith("VitisAIExecutionProvider:Node:")
+        )
         args.profile_json.parent.mkdir(parents=True, exist_ok=True)
         args.profile_json.write_text(
             json.dumps(
@@ -74,12 +97,21 @@ def main() -> int:
         "execution": "real_npu" if "VitisAIExecutionProvider" in session.get_providers() else "provider_fallback",
         "requested_provider": "VitisAIExecutionProvider",
         "model": str(args.model),
+        "input_seed": args.seed,
         "warmup": args.warmup,
         "iters": args.iters,
         "avg_ms": elapsed_ms / args.iters,
         "fps": 1000.0 * args.iters / elapsed_ms,
         "providers": session.get_providers(),
+        "input_shape": list(shape),
+        "cpu_reference": {
+            "max_abs_error": float(delta.max(initial=0.0)),
+            "mean_abs_error": float(delta.mean()) if delta.size else 0.0,
+            "argmax_match": int(np.argmax(provider_output)) == int(np.argmax(cpu_output)),
+        },
     }
+    if vitis_node_count is not None:
+        result["vitis_npu_node_count"] = vitis_node_count
     if profile_trace is not None:
         result["profile_trace"] = str(profile_trace)
     if result["execution"] != "real_npu":
