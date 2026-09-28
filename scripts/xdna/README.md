@@ -162,13 +162,21 @@ runner can compose multiple non-overlapping blocks in one run by repeating
 identity blocks fused and retained exact ONNX Runtime output; the execution
 counts dropped to 46 CPU Conv calls, one XDNA Conv call, and 194 host ops.
 
-All 16 ResNet bottlenecks, including the four projection blocks, now run on
-XDNA. Adjacent blocks reuse their raw activation buffers on device: a full
-quicktest run reported 15 device-resident handoffs, one edge readback, and
-exact ONNX Runtime output. With the stem Conv on CPU and the classifier-side
-operators on the host, one timed iteration measured 189.4 ms after a 1.33 s
-cold run. The 16 bottleneck calls accounted for 186.1 ms, so this validates
-coverage and data movement rather than a speedup target.
+The NPU2 driver supports at most 16 hardware contexts. Adding the standalone
+MaxPool artifact to 16 fused bottleneck artifacts exceeds that limit and
+causes context eviction and reloads. The runner now accounts for compiled
+pooling and Conv artifacts, then routes the lowest-work Conv specialization
+or bottleneck to CPU when needed to stay within the context budget. The chosen
+fallback blocks and context limit are recorded in the JSON report.
+
+On the quicktest graph, automatic context budgeting selected 15 fused
+bottlenecks, XDNA MaxPool, and CPU fallback for `/layer1/layer1.1`. The
+classifier's 1×1 GlobalAveragePool, identity Mul, matching Q/DQ pair, and
+Flatten stayed as device views. This run measured 178.9 ms (2 warmups, 5
+iterations), with three device-edge readbacks and exact ONNX Runtime output.
+The previous valid Vitis AI baseline is 1.609 ms on the same model, about
+111× faster. A fresh Vitis rerun failed during provider initialization in the
+current environment, so 1.609 ms remains the last valid Vitis measurement.
 
 The NPU2 data mover limits a single weight descriptor to 65,532 bytes. The
 fused path streams weights in bounded chunks, and the binder now covers
@@ -176,10 +184,10 @@ projection/downsample residuals with power-of-two QDQ scales. The four
 projection blocks bind with tile-memory-aware skip chunks. The
 `/layer2/layer2.1` identity block remains an on-device exactness checkpoint.
 Small spatial identity blocks at H=2 and H=1 also matched the reference on
-device. Full graph execution is still incomplete: stem convolution and
-classifier-side operators run on the host; supported pooling dispatches to XDNA
-but stages padded input and output through host memory. The 91-dispatch graph
-schedule remains planning metadata rather than one executable XDNA program.
+device. Full graph execution is still incomplete: stem convolution and the
+classifier Gemm layers run on the host, and pooling padding is prepared on the
+host before upload. The 91-dispatch graph schedule remains planning metadata
+rather than one executable XDNA program.
 
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
 hybrid Conv layers and skips their unused im2col staging. Converted constant
@@ -289,12 +297,10 @@ still materialize values on the host.
 
 A practical implementation sequence is:
 
-1. Extend the device-buffer schedule beyond adjacent bottlenecks. Allocate
-   edge tensors once, launch each block against those allocations, and read
-   back only graph outputs or explicit host fallback boundaries.
-2. Lower the stem pooling, residual/activation cases outside blocks, global
-   average pool, flatten, and classifier. Then let the scheduler join the
-   resulting instructions into one graph-level device schedule.
+1. Fuse stem Conv, activation, quantization, and MaxPool to remove the host
+   padding and upload boundary.
+2. Lower the classifier Gemm layers and their Q/DQ/ReLU edges, then join the
+   stem, bottlenecks, pooling, and classifier into one device-resident schedule.
 3. Mark a region executable only when every instruction has a device binding
    and every internal edge has a device-resident buffer plan. Keep planned
    node coverage, executable node coverage, and measured device execution as

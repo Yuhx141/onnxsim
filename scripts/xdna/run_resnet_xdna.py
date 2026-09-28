@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -187,11 +188,12 @@ class XDNAResNetRunner:
         self.operation_specs = {
             int(entry["node_index"]): entry
             for entry in manifest.get("operation_kernels", [])
-            if entry.get("op_type") == "MaxPool" and entry.get("compiled_artifact")
+            if entry.get("compiled_artifact")
+            or entry.get("status") == "zero_copy_device_view"
         }
-        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "device_resident_pool_outputs": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
+        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "device_resident_pool_outputs": 0, "device_view_ops": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
         self._profile: dict[str, float] = {}
-        self._device_readback_cache: dict[int, np.ndarray] = {}
+        self._device_readback_cache: dict[tuple[Any, ...], np.ndarray] = {}
         self._conv_times: list[dict[str, Any]] = []
         self._fused_times: list[dict[str, Any]] = []
         self._workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
@@ -206,6 +208,90 @@ class XDNAResNetRunner:
             if not all((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
                 raise ValueError("fused block requires its node prefix, xclbin, and instruction stream")
             fused_specs.append((fused_block_prefix, fused_block_xclbin, fused_block_insts))
+        bottleneck_plans = {block.prefix: block for block in plan_bottleneck_blocks(model)}
+        prepared_blocks: dict[str, tuple[Any, dict[str, Any], set[int], str, str]] = {}
+        for prefix, xclbin, insts in fused_specs:
+            if prefix in prepared_blocks:
+                raise ValueError(f"fused block {prefix!r} was specified more than once")
+            block = bottleneck_plans.get(prefix)
+            if block is None:
+                raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
+            if not Path(xclbin).is_file() or not Path(insts).is_file():
+                raise ValueError("fused block xclbin and instruction stream must exist")
+            binding = bind_fused_bottleneck(model, block)
+            prepared_blocks[prefix] = (block, binding, set(binding["covered_nodes"]), str(xclbin), str(insts))
+
+        # Strix Halo supports 16 simultaneous hardware contexts. Reserve those
+        # slots across pooling, fused blocks, and any remaining XDNA Conv shapes.
+        self.context_cache_limit = min(16, max(1, int(os.environ.get("XRT_CONTEXT_CACHE_SIZE", "16"))))
+        self.context_budget_fallback_blocks: list[str] = []
+        self._forced_cpu_convs: set[int] = set()
+        active_prefixes = set(prepared_blocks)
+        pool_contexts = {
+            str(item["compiled_artifact"]["xclbin"])
+            for item in self.operation_specs.values()
+            if item.get("op_type") == "MaxPool"
+        }
+
+        def conv_contexts(covered: set[int]) -> dict[str, list[int]]:
+            contexts: dict[str, list[int]] = {}
+            for conv_index, plan in self.conv_plans.items():
+                if conv_index in covered or conv_index in self._forced_cpu_convs:
+                    continue
+                if self.cpu_small_m and plan.gemm_shape[0] <= self.cpu_small_m:
+                    continue
+                artifact = self._artifact(plan)
+                contexts.setdefault(str(artifact["compiled_artifact"]["xclbin"]), []).append(conv_index)
+            return contexts
+
+        while True:
+            covered = {
+                index
+                for prefix in active_prefixes
+                for index in prepared_blocks[prefix][2]
+                if self.nodes[index].op_type == "Conv"
+            }
+            remaining_conv_contexts = conv_contexts(covered)
+            active_contexts = pool_contexts | {
+                prepared_blocks[prefix][3] for prefix in active_prefixes
+            } | set(remaining_conv_contexts)
+            if len(active_contexts) <= self.context_cache_limit:
+                break
+
+            if remaining_conv_contexts:
+                # Free the least-work Conv specialization first; it remains
+                # correct on CPU and costs fewer contexts than evicting a hot
+                # fused block on every iteration.
+                conv_xclbin, conv_indices = min(
+                    remaining_conv_contexts.items(),
+                    key=lambda item: sum(math.prod(self.conv_plans[index].gemm_shape) for index in item[1]),
+                )
+                self._forced_cpu_convs.update(conv_indices)
+                continue
+
+            if not active_prefixes:
+                raise RuntimeError("compiled operator kernels exceed the XRT context limit")
+            demote = min(
+                active_prefixes,
+                key=lambda prefix: (
+                    sum(
+                        math.prod(self.conv_plans[index].gemm_shape)
+                        for index in prepared_blocks[prefix][2]
+                        if index in self.conv_plans
+                    ),
+                    prefix,
+                ),
+            )
+            self._forced_cpu_convs.update(
+                index for index in prepared_blocks[demote][2] if index in self.conv_plans
+            )
+            active_prefixes.remove(demote)
+            self.context_budget_fallback_blocks.append(demote)
+
+        fused_specs = [
+            (prefix, prepared_blocks[prefix][3], prepared_blocks[prefix][4])
+            for prefix in prepared_blocks if prefix in active_prefixes
+        ]
         self._fused_blocks: dict[str, dict[str, Any]] = {}
         self._fused_nodes: dict[int, tuple[str, bool]] = {}
         self._fused_input_handoffs: dict[int, str] = {}
@@ -213,18 +299,7 @@ class XDNAResNetRunner:
             import aie.iron as iron
 
         for prefix, xclbin, insts in fused_specs:
-            if prefix in self._fused_blocks:
-                raise ValueError(f"fused block {prefix!r} was specified more than once")
-            block = next(
-                (item for item in plan_bottleneck_blocks(model) if item.prefix == prefix),
-                None,
-            )
-            if block is None:
-                raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
-            if not Path(xclbin).is_file() or not Path(insts).is_file():
-                raise ValueError("fused block xclbin and instruction stream must exist")
-            binding = bind_fused_bottleneck(model, block)
-            covered = set(binding["covered_nodes"])
+            block, binding, covered, _xclbin, _insts = prepared_blocks[prefix]
             start_index = min(covered)
             if any(index in self._fused_nodes for index in covered):
                 raise ValueError(f"fused block {prefix!r} overlaps another fused block")
@@ -285,16 +360,18 @@ class XDNAResNetRunner:
     def _host_value(self, value: Any) -> np.ndarray:
         if not isinstance(value, _DeviceValue):
             return np.asarray(value)
-        cache_key = id(value.tensor)
+        cache_key = (id(value.tensor), value.shape, value.layout)
         raw = self._device_readback_cache.get(cache_key)
         if raw is None:
             started = time.perf_counter()
-            n, c, h, w = value.shape
             device_data = value.tensor.numpy()
             if value.layout == "nhwc":
+                n, c, h, w = value.shape
                 raw = device_data.view(np.uint8).reshape(n, h, w, c).transpose(0, 3, 1, 2).copy()
             elif value.layout == "nchw":
                 raw = device_data.reshape(value.shape).copy()
+            elif value.layout == "flat_hwc":
+                raw = device_data.view(np.uint8).reshape(value.shape).copy()
             else:
                 raise ValueError(f"unsupported device tensor layout {value.layout!r}")
             self._device_readback_cache[cache_key] = raw
@@ -303,6 +380,69 @@ class XDNAResNetRunner:
         if value.as_real:
             return _dequantize(raw, np.asarray([value.scale], dtype=np.float32), np.asarray([value.zero_point], dtype=np.uint8), axis=1)
         return raw
+
+    def _qdq_device_view(self, node: Any, values: dict[str, Any]) -> _DeviceValue | None:
+        """Forward unchanged scalar uint8 Q/DQ edges without touching host memory."""
+        if len(node.input) < 3:
+            return None
+        value = values.get(str(node.input[0]))
+        if not isinstance(value, _DeviceValue) or value.zero_point != 128:
+            return None
+        if str(node.input[1]) not in self.arrays or str(node.input[2]) not in self.arrays:
+            return None
+        scale = np.asarray(self.arrays[str(node.input[1])])
+        zero = np.asarray(self.arrays[str(node.input[2])])
+        if scale.size != 1 or zero.size != 1 or zero.dtype != np.uint8 or int(zero.reshape(-1)[0]) != 128:
+            return None
+        if not math.isclose(float(scale.reshape(-1)[0]), value.scale, rel_tol=1e-7, abs_tol=0.0):
+            return None
+        is_quantize = node.op_type == "QuantizeLinear"
+        if value.as_real != is_quantize:
+            return None
+        return _DeviceValue(
+            value.tensor, value.shape, value.scale, value.zero_point,
+            as_real=not is_quantize, producer=f"{node.op_type.lower()}:{node.name or node.output[0]}",
+            layout=value.layout,
+        )
+
+    def _device_view(self, index: int, node: Any, values: dict[str, Any]) -> _DeviceValue | None:
+        """Apply proven identity/view operations to a resident device edge."""
+        if node.op_type in {"QuantizeLinear", "DequantizeLinear"}:
+            return self._qdq_device_view(node, values)
+        spec = self.operation_specs.get(index)
+        if spec is None or spec.get("status") != "zero_copy_device_view":
+            return None
+        if node.op_type == "Mul":
+            params = spec.get("parameters") or {}
+            if float(params.get("scalar", float("nan"))) != 1.0:
+                return None
+            value = next((values.get(str(name)) for name in node.input
+                          if isinstance(values.get(str(name)), _DeviceValue)), None)
+            if value is None or tuple(spec.get("input_shapes", [value.shape])[0]) != value.shape:
+                return None
+            return _DeviceValue(value.tensor, value.shape, value.scale, value.zero_point,
+                                value.as_real, f"device-view:{node.op_type}", value.layout)
+        value = values.get(str(node.input[0])) if node.input else None
+        if not isinstance(value, _DeviceValue):
+            return None
+        if node.op_type == "GlobalAveragePool":
+            if len(value.shape) != 4 or value.shape[-2:] != (1, 1):
+                return None
+            output_shape = tuple(spec["output_shapes"][0])
+            if output_shape != value.shape:
+                return None
+        elif node.op_type == "Flatten":
+            if len(value.shape) != 4 or value.shape[-2:] != (1, 1) or value.layout != "nhwc":
+                return None
+            output_shape = tuple(spec["output_shapes"][0])
+            if output_shape != (value.shape[0], value.shape[1]):
+                return None
+            return _DeviceValue(value.tensor, output_shape, value.scale, value.zero_point,
+                                value.as_real, f"device-view:{node.op_type}", "flat_hwc")
+        else:
+            return None
+        return _DeviceValue(value.tensor, output_shape, value.scale, value.zero_point,
+                            value.as_real, f"device-view:{node.op_type}", value.layout)
 
     def _quant_source(self, value_name: str, values: dict[str, np.ndarray]) -> tuple[np.ndarray, float, int]:
         dq = self.nodes_by_output.get(value_name)
@@ -395,7 +535,7 @@ class XDNAResNetRunner:
     def _run_conv(self, index: int, node: Any, values: dict[str, np.ndarray]) -> np.ndarray:
         total_start = time.perf_counter()
         plan = self.conv_plans[index]
-        if self.cpu_small_m and plan.gemm_shape[0] <= self.cpu_small_m:
+        if index in self._forced_cpu_convs or (self.cpu_small_m and plan.gemm_shape[0] <= self.cpu_small_m):
             return self._run_small_conv_cpu(index, node, values, plan, total_start)
         stage_start = time.perf_counter()
         in_raw, in_scale, in_zero = self._quant_source(node.input[0], values)
@@ -626,6 +766,7 @@ class XDNAResNetRunner:
             "xdna_conv": 0,
             "xdna_maxpool": 0,
             "device_resident_pool_outputs": 0,
+            "device_view_ops": 0,
             "cpu_conv": 0,
             "host_ops": 0,
             "skipped_conv_dq": 0,
@@ -663,8 +804,16 @@ class XDNAResNetRunner:
             op = node.op_type
             offloaded = False
             attrs = _attrs(node)
-            args = [] if op == "Conv" else [self._host_value(values[name]) for name in node.input if name]
-            if op == "Constant":
+            result = self._device_view(index, node, values)
+            if result is not None:
+                offloaded = True
+                self._executed["device_view_ops"] += 1
+                args = []
+            else:
+                args = [] if op == "Conv" else [self._host_value(values[name]) for name in node.input if name]
+            if result is not None:
+                pass
+            elif op == "Constant":
                 result = numpy_helper.to_array(attrs["value"])
             elif op == "QuantizeLinear":
                 result = _quantize(args[0], args[1], args[2], int(attrs.get("axis", 1)))
@@ -782,8 +931,9 @@ def main() -> int:
             "full_graph_xdna_conv_host_ops" if not args.cpu_small_m else "full_graph_hybrid_conv_host_ops"
         ),
         "fused_block_prefix": args.fused_block_prefix,
-        "fused_blocks": [prefix for prefix, _xclbin, _insts in (args.fused_block or [])]
-        + ([args.fused_block_prefix] if args.fused_block_prefix else []),
+        "fused_blocks": list(runner._fused_blocks),
+        "context_cache_limit": runner.context_cache_limit,
+        "context_budget_fallback_blocks": runner.context_budget_fallback_blocks,
         "cpu_small_m_threshold": args.cpu_small_m,
         "cpu_backend": args.cpu_backend,
         "cpu_threads": args.cpu_threads if args.cpu_backend == "torch" else None,
