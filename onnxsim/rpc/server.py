@@ -76,10 +76,16 @@ def _random_tensors(specs, seed: Optional[int]) -> Dict[str, np.ndarray]:
                 value = rng.uniform(low, high, size=shape).astype(np_dtype)
             else:
                 if int(low) != low or int(high) != high or low >= high:
-                    raise proto.RPCError(f"invalid integer random range for tensor {name!r}")
-                minimum, maximum = (0, 2) if dtype == "bool" else (
-                    np.iinfo(np_dtype).min,
-                    np.iinfo(np_dtype).max + 1,
+                    raise proto.RPCError(
+                        f"invalid integer random range for tensor {name!r}"
+                    )
+                minimum, maximum = (
+                    (0, 2)
+                    if dtype == "bool"
+                    else (
+                        np.iinfo(np_dtype).min,
+                        np.iinfo(np_dtype).max + 1,
+                    )
                 )
                 if low < minimum or high > maximum:
                     raise proto.RPCError(f"random range is outside dtype {dtype!r}")
