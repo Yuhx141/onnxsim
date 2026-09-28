@@ -371,6 +371,14 @@ when shape and QDQ scale match. Compiled residual Add+ReLU kernels also retain
 their output on device. Conv blocks outside fused kernels, the stem, classifier
 Gemm, and unsupported graph operators still use host execution.
 
+The current runner has verified a three-block layer2 chain containing a
+projection/downsample block followed by two identity blocks. Both internal
+activations stayed device-resident, with two handoffs and no intermediate
+readback; the final output matched ONNX Runtime exactly. This experimental
+schedule measured 51.4 ms over two iterations, so it expands executable fusion
+coverage but is slower than the 11–12 ms hybrid route. The fused kernel schedule
+and per-block dispatch cost need improvement before this is a performance win.
+
 A practical implementation sequence is:
 
 1. Fuse stem Conv, activation, quantization, and MaxPool to remove the host
