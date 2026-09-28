@@ -376,12 +376,48 @@ Phone results (Xiaomi 12S V69 running v65 code; RPC-inclusive, best of N; every 
 
 | program | 1 thread | 4 threads |
 |---|---:|---:|
-| `driving_supercombo` (all four outputs, recurrent state included) | 3831 ms | 1702 ms |
-| `dmonitoring_model` | 1623 ms | 620 ms |
+| `driving_supercombo` (all four outputs, recurrent state included) | 3796 ms | 1493 ms |
+| `dmonitoring_model` | 1094 ms | 419 ms |
 | driving warp, 1928x1208 | 87.9 ms | 50.3 ms |
 | driving warp, 1344x760 | 75.2 ms | 43.0 ms |
 | DM warp, 1928x1208 | 238.9 ms | 78.3 ms |
 | DM warp, 1344x760 | 225.3 ms | 70.1 ms |
+
+The model rows include scalar register blocking (below); without it they were driving 3831 / 1702 ms and DM 1623 / 620 ms.
+
+**Scalar register blocking.** Under `DSP_V65_HW`, a float reduction with reuse along two axes (a conv) takes tinygrad's CPU
+upcast rules, small upcasts on the reused axes, instead of one vector-wide axis. Accumulators × unrolled taps are capped near
+the 32-register file (`DSP_SCALAR_UNROLL`, default 16). On openpilot-shaped layers (phone, 4 threads) the 1x1 convs went
+22.4 -> 9.2 ms and 43.0 -> 15.7 ms, and a strided 3x3 stem 465 -> 332 ms. A GEMV has one reuse axis and measured 10x slower
+blocked, so it keeps the vector-style upcast. The driving stem's MAC loop is now 16 register accumulators, 16 MACs in 10
+packets. What remains is around that loop: with a 3-tap inner trip count, the padding-masked input loads and address math
+(about 100 packets, with spills) run once per 48 MACs. Pre-padded inputs are the next lever.
+
+### Through the compiler/runner RPC
+
+The same programs go through onnxsim's native remote executor (`tools/onnx-remote`). `openpilot_v65/compile_v65.sh` is an
+`onnx-remote-compiler --command`: it captures, emits, checks the program under qemu, builds the skel and packs a `tghx-v65`
+artifact. `onnx-remote-hexagon-worker` (`build_worker.sh`, Android) is the runner, with `load_compiled` once and
+`run_compiled` per inference. `e2e.sh` drives `onnx-remote-client --compile-run` against both on an attached phone:
+
+```sh
+onnx-remote-compiler --port 39502 --cache-dir ~/.cache/onnxsim-v65 --target hexagon-v65 --compiler-id tinygrad-dsp_graph_v65 \
+  --command "$PWD/openpilot_v65/compile_v65.sh {input} {output} {manifest}" &
+openpilot_v65/build_worker.sh worker/
+CLIENT=.../onnx-remote-client openpilot_v65/e2e.sh worker/onnx-remote-hexagon-worker dmonitoring_model.onnx \
+  --input-raw 2:1,1382400:img.bin --input-raw 1:1,3:calib.bin --expect ref.bin --iters 5
+```
+
+| model | compile (cache miss) | artifact | `load_compiled` | `run_compiled` (RPC-inclusive / DSP) | vs capture reference |
+|---|---:|---:|---:|---:|---|
+| tiny conv (uint8 + float in, 2 outputs) | seconds | 14 KB | 72 ms | 9.6 / 1.3 ms | 4.8e-7 from ORT |
+| `dmonitoring_model` | ~20 min | 14.7 MB | 474 ms | 479 / 437 ms | bit-exact |
+| `driving_supercombo` (4 outputs) | ~45 min | 121 MB | 3580 ms | 1740 / 1494 ms | bit-exact |
+
+The compiler service is one request at a time, so a long compile blocks cache hits behind it. A second instance on the same
+`--cache-dir` (its publication is multi-process safe) serves those. The runner is reached through `adb forward`; a
+`run_compiled` round trip adds about 8 ms of TCP over USB to the DSP time. For driving it adds about 250 ms, mostly from moving
+its 2.4 MB of inputs and 8 MB of outputs, which are mostly the recurrent state.
 
 This makes all of them generatable and correct on v65. They are not fast: openpilot runs at 20 Hz, and these are one to two
 orders of magnitude away. v65 float is scalar. DM's stem converts each uint8 input pixel again for every output-channel group
