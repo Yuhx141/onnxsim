@@ -33,12 +33,15 @@ def find_kernel_name(kernel_src: str) -> str:
     return m.group(1)
 
 
-def compile_kernel(hexagon_clang: Path, kernel_c: Path, out_o: Path, hex_arch: str) -> None:
+def compile_kernel(
+    hexagon_clang: Path, kernel_c: Path, out_o: Path, hex_arch: str, explicit_target: bool
+) -> None:
     import subprocess
 
+    target_args = ["--target=hexagon"] if explicit_target else []
     subprocess.run(
         [
-            str(hexagon_clang), "-c", "-O2", "-Wall", "-fno-stack-protector", "-x", "c", "-fPIC",
+            str(hexagon_clang), *target_args, "-c", "-O2", "-Wall", "-fno-stack-protector", "-x", "c", "-fPIC",
             "-ffreestanding", f"-mcpu=hexagon{hex_arch}", f"-mhvx={hex_arch}", "-mhvx-length=128b",
             "-o", str(out_o), str(kernel_c),
         ],
@@ -46,12 +49,15 @@ def compile_kernel(hexagon_clang: Path, kernel_c: Path, out_o: Path, hex_arch: s
     )
 
 
-def compile_wrapper(hexagon_clang: Path, wrapper_c: Path, out_o: Path, hex_arch: str, tvm_root: Path) -> None:
+def compile_wrapper(
+    hexagon_clang: Path, wrapper_c: Path, out_o: Path, hex_arch: str, tvm_root: Path, explicit_target: bool
+) -> None:
     import subprocess
 
+    target_args = ["--target=hexagon"] if explicit_target else []
     subprocess.run(
         [
-            str(hexagon_clang), "-c", "-O2", "-fPIC", f"-mcpu=hexagon{hex_arch}", f"-mhvx={hex_arch}",
+            str(hexagon_clang), *target_args, "-c", "-O2", "-fPIC", f"-mcpu=hexagon{hex_arch}", f"-mhvx={hex_arch}",
             "-mhvx-length=128b", "-I", str(tvm_root / "include"),
             "-I", str(tvm_root / "3rdparty" / "dlpack" / "include"), "-o", str(out_o), str(wrapper_c),
         ],
@@ -65,8 +71,10 @@ def main() -> None:
     p.add_argument("--workdir", type=Path, default=Path("bridge_work"))
     p.add_argument("--device", default="239dbd8f")
     p.add_argument("--hexagon-toolchain", type=Path, required=True, help="$HEXAGON_TOOLCHAIN")
+    p.add_argument("--hexagon-clang", type=Path, help="override SDK compiler (useful for older targets)")
     p.add_argument("--tvm-root", type=Path, required=True, help="TVM source root (for headers)")
     p.add_argument("--hex-arch", default="v73")
+    p.add_argument("--link-arch", help="link support libraries for this arch (defaults to --hex-arch)")
     p.add_argument("--hw", type=int, default=512)
     p.add_argument("--cin", type=int, default=64)
     p.add_argument("--cout", type=int, default=256)
@@ -84,14 +92,14 @@ def main() -> None:
     wrapper_o = args.workdir / "wrapper.o"
     so_path = args.workdir / "bridge.so"
 
-    hexagon_clang = args.hexagon_toolchain / "bin" / "hexagon-clang"
-    compile_kernel(hexagon_clang, args.kernel, kernel_o, args.hex_arch)
+    hexagon_clang = args.hexagon_clang or (args.hexagon_toolchain / "bin" / "hexagon-clang")
+    compile_kernel(hexagon_clang, args.kernel, kernel_o, args.hex_arch, args.hexagon_clang is not None)
 
     template = (HERE / "wrapper_template.c").read_text()
     wrapper_c.write_text(template.replace("KERNEL_NAME", kernel_name).replace("WRAPPER_NAME", wrapper_name))
-    compile_wrapper(hexagon_clang, wrapper_c, wrapper_o, args.hex_arch, args.tvm_root)
+    compile_wrapper(hexagon_clang, wrapper_c, wrapper_o, args.hex_arch, args.tvm_root, args.hexagon_clang is not None)
 
-    link_shared(str(so_path), [str(kernel_o), str(wrapper_o)], {"hex_arch": args.hex_arch})
+    link_shared(str(so_path), [str(kernel_o), str(wrapper_o)], {"hex_arch": args.link_arch or args.hex_arch})
     print(f"linked {so_path} ({so_path.stat().st_size} bytes)")
 
     rng = np.random.default_rng(5)

@@ -1,0 +1,28 @@
+diff --git a/tinygrad/runtime/ops_dsp.py b/tinygrad/runtime/ops_dsp.py
+index 90858eb37..83c7cd588 100644
+--- a/tinygrad/runtime/ops_dsp.py
++++ b/tinygrad/runtime/ops_dsp.py
+@@ -107,9 +107,22 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
+   c0 = col[0]
+   if c0._shape != () or c0.dtype == dtypes.bool or depth > 32: return False
+   if all(c is c0 for c in col) or all(c.op is Ops.CONST for c in col): return True
++  # A STACK of independent scalar loads is a valid gather as a C vector
++  # constructor. Keep the loads scalar but let qfloat execute the arithmetic
++  # around them as HVX vector operations.
++  if HVX_QFLOAT and c0.op is Ops.LOAD and len(col) == 32 and all(
++    c.op is Ops.LOAD and c.dtype == c0.dtype and c.arg == c0.arg and c._shape == () for c in col): return True
+   if c0.op is Ops.INDEX and len(c0.src) == 2 and c0.src[0]._shape is not None and len(c0.src[0]._shape) == 1:
+     lanes = [_lane(c.src[1]) if c.op is Ops.INDEX and len(c.src) == 2 and c.src[0] is c0.src[0] else None for c in col]
+-    return None not in lanes and lanes == list(range(lanes[0], lanes[0]+len(lanes)))
++    if None not in lanes and lanes == list(range(lanes[0], lanes[0]+len(lanes))): return True
++    # Conv schedules load an eight-element filter slice per output channel,
++    # then gather the same lane from each slice. On qfloat-capable DSPs this
++    # gather can form one arithmetic vector (the exporter can further pack
++    # the filter to make these input lanes contiguous).
++    if HVX_QFLOAT and c0.dtype == dtypes.half and len(col) == 32 and all(
++      c.op is Ops.INDEX and len(c.src) == 2 and c.src[0]._shape == (8,) and
++      c.src[0].dtype == dtypes.half and _lane(c.src[1]) is not None for c in col): return True
++    return False
+   if c0.op in HVX_VEC_OPS and all(c.op is c0.op and c.dtype == c0.dtype and c.arg == c0.arg and len(c.src) == len(c0.src) for c in col):
+     return all(_vec_column_ok(tuple(c.src[j] for c in col), depth+1) for j in range(len(c0.src)))
+   return False
