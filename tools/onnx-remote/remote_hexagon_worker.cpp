@@ -38,6 +38,7 @@ struct Program {
   uint64_t output_bytes = 0;
   std::vector<InputSpec> inputs;  // ONNX graph order
   std::vector<OutputSpec> outputs;
+  std::vector<std::string> names;  // kernel name per call (program.txt "name"), for per-call profile events
   remote_handle64 handle = 0;
 };
 
@@ -108,6 +109,11 @@ bool parse_program(const std::string& text, Program& p, std::string& error) {
       for (int64_t d; f >> d;) o.shape.push_back(d);
       if (dtype != 1) { error = "only float32 program outputs are supported"; return false; }
       p.outputs.push_back(o);
+    } else if (key == "name") {
+      size_t i = 0;
+      std::string name;
+      f >> i >> name;
+      if (i < 100000) { if (p.names.size() <= i) p.names.resize(i + 1); p.names[i] = name; }
     } else if (!key.empty()) { error = "unknown program record: " + key; return false; }
   }
   uint64_t total = 0;
@@ -209,7 +215,9 @@ Response execute(const Request& request) {
           "dsp_us=" + std::to_string(times[0]) + " threads=" + std::to_string(threads));
   if (detailed)
     for (int i = 0, k = 0; i < p.ncalls && k < static_cast<int>(kMaxProfileEvents) - 2; ++i)
-      if (times[1 + i] > 0) response.profile.push_back(ProfileEvent{"call_" + std::to_string(i), "hexagon_call", 0, times[1 + i], ""}), ++k;
+      if (times[1 + i] > 0)
+        response.profile.push_back(ProfileEvent{"call_" + std::to_string(i), "hexagon_call", 0, times[1 + i],
+                                                i < static_cast<int>(p.names.size()) ? p.names[i] : ""}), ++k;
   size_t at = 0;
   for (const auto& o : p.outputs) {
     Tensor t;

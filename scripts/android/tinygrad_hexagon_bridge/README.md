@@ -421,7 +421,14 @@ blocked, so it keeps the vector-style upcast. The driving stem's MAC loop is now
 packets. What remains is around that loop: with a 3-tap inner trip count, the padding-masked input loads and address math
 (about 100 packets, with spills) run once per 48 MACs. Pre-padded inputs are the next lever.
 
-### Through the compiler/runner RPC
+### Through the compiler/runner RPC (the way models run)
+
+ONNX models are compiled and run only through the RPC: `openpilot_v65/run.sh compiler [KEY=VAL...]` starts the compiler service
+(the fork's commit is its `--compiler-id`, and `KEY=VAL` extras such as `ONNX_QDQ_INT_CONV=1 ONNX_QDQ_LUT=1 TC_OPT=1` go into its
+command and therefore its cache key). `run.sh rpc model.onnx --input-raw ... --iters 5 --profile` then compiles, loads and runs on
+the phone. Per-call profiling comes back through the RPC too: each artifact's `program.txt` names its calls' kernels, the worker
+labels its per-call events with them, and the client prints the slowest (`PROF_TOP`). `run.sh phone` (a standalone client over
+adb) remains only for the camera warps, which are tinygrad programs with no ONNX form for the compiler contract.
 
 The same programs go through onnxsim's native remote executor (`tools/onnx-remote`). `openpilot_v65/compile_v65.sh` is an
 `onnx-remote-compiler --command`: it captures, emits, checks the program under qemu, builds the skel and packs a `tghx-v65`

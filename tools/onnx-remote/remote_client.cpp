@@ -341,8 +341,23 @@ static int compile_run(int argc, char** argv) {
   }
   std::cout << "run_compiled: " << result.outputs.size() << " outputs, best " << best << " ms of " << std::max(iters, 1)
             << " (RPC-inclusive)\n";
-  for (const auto& e : result.profile)
-    if (e.category != "hexagon_call" || profiling) std::cout << "  " << e.name << ' ' << e.duration_us << " us " << e.detail << '\n';
+  std::vector<const ProfileEvent*> calls;
+  for (const auto& e : result.profile) {
+    if (e.category == "hexagon_call") calls.push_back(&e);
+    else std::cout << "  " << e.name << ' ' << e.duration_us << " us " << e.detail << '\n';
+  }
+  if (profiling && !calls.empty()) {
+    // per-kernel device time of the last run, slowest first (PROF_TOP, default 15)
+    uint64_t total = 0;
+    for (const auto* e : calls) total += e->duration_us;
+    std::sort(calls.begin(), calls.end(), [](const ProfileEvent* a, const ProfileEvent* b) { return a->duration_us > b->duration_us; });
+    const char* top_env = std::getenv("PROF_TOP");
+    const size_t top = std::min(calls.size(), static_cast<size_t>(top_env ? std::atoi(top_env) : 15));
+    std::cout << "  " << calls.size() << " profiled calls, " << total << " us:\n";
+    for (size_t i = 0; i < top; ++i)
+      std::cout << "    " << calls[i]->name << ' ' << calls[i]->duration_us << " us " << (100.0 * calls[i]->duration_us / total)
+                << "% " << calls[i]->detail << '\n';
+  }
   if (!dump_path.empty()) {
     std::ofstream f(dump_path, std::ios::binary | std::ios::trunc);
     for (const auto& t : result.outputs) f.write(reinterpret_cast<const char*>(t.data.data()), t.data.size() * 4);
