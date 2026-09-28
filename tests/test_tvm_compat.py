@@ -95,7 +95,10 @@ def test_loaded_tvm_ffi_module_functions_are_forwarded_unchanged(monkeypatch):
     monkeypatch.setitem(sys.modules, "tvm", types.SimpleNamespace(rpc=Rpc))
     wrapped = tvm_compat.connect("runner", 9090)
     assert wrapped.load_module("kernel.so") is module
-    assert wrapped.load_module("kernel.so").get_function("add_one")(ffi_tensor) is ffi_tensor
+    assert (
+        wrapped.load_module("kernel.so").get_function("add_one")(ffi_tensor)
+        is ffi_tensor
+    )
 
 
 def test_session_forwards_time_evaluator_and_closes_on_context_exit(monkeypatch):

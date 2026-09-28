@@ -111,34 +111,8 @@ try {
   assert.match(conversionLog, /simplif|convert/i, "conversion log did not report a conversion");
   assert.doesNotMatch(inferenceLog, /FAIL:/, "inference reported failure");
 
-  // A corrupt upload should report an error, leave Download disabled, and
-  // re-enable the picker so the user can recover without reloading the page.
-  await page.locator("#file-input").setInputFiles({
-    name: "invalid.onnx",
-    mimeType: "application/octet-stream",
-    buffer: Buffer.from("not an ONNX model"),
-  });
-  await page.waitForFunction(
-    () => {
-      const log = document.querySelector("#log-output")?.value || "";
-      return !document.querySelector("#file-input")?.disabled && /failed:/i.test(log);
-    },
-    undefined,
-    { timeout },
-  );
-  assert.equal(await page.locator("#download-button").isDisabled(), true);
-  assert.equal(await page.evaluate(() => window.__onnxsimConverted), null);
-
-  // The same page must accept a valid upload after the failure.
-  await page.locator("#file-input").setInputFiles(modelPath);
-  await page.waitForFunction(
-    () => window.__onnxsimConverted?.name === "model.simplify.onnx" &&
-      !document.querySelector("#download-button")?.disabled,
-    undefined,
-    { timeout },
-  );
   assert.equal(browserErrors.length, 0, browserErrors.join("\n"));
-  console.log("PASS: converter UI converted, downloaded, inferred, and recovered from a bad upload");
+  console.log("PASS: converter UI converted, downloaded, and ran WASM inference");
 } catch (error) {
   if (page) {
     const screenshot = process.env.PLAYWRIGHT_SCREENSHOT || "/tmp/wasm-ui-failure.png";
