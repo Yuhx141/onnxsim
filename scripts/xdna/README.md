@@ -169,14 +169,22 @@ pooling and Conv artifacts, then routes the lowest-work Conv specialization
 or bottleneck to CPU when needed to stay within the context budget. The chosen
 fallback blocks and context limit are recorded in the JSON report.
 
-On the quicktest graph, automatic context budgeting selected 15 fused
-bottlenecks, XDNA MaxPool, and CPU fallback for `/layer1/layer1.1`. The
-classifier's 1×1 GlobalAveragePool, identity Mul, matching Q/DQ pair, and
-Flatten stayed as device views. This run measured 178.9 ms (2 warmups, 5
-iterations), with three device-edge readbacks and exact ONNX Runtime output.
-The previous valid Vitis AI baseline is 1.609 ms on the same model, about
-111× faster. A fresh Vitis rerun failed during provider initialization in the
-current environment, so 1.609 ms remains the last valid Vitis measurement.
+The fused Conv2 path now uses the AIE 2×2 INT8 MMUL schedule for stage-1 and
+stage-2 blocks with at least 16 output channels per tile and 16 output pixels;
+smaller late-stage tensors keep the scalar path to avoid tile-gather overhead.
+The transformed constant weights are packed as contiguous K×N tiles. Exact
+quantized results were verified for layer1.1 and layer2.1: 8.87 ms vs 12.08 ms
+and 9.06 ms vs 10.41 ms, respectively.
+
+With the 16-context budget, the full quicktest selected 14 fused bottlenecks,
+XDNA MaxPool, one residual Add+ReLU kernel, and CPU fallback for
+`/layer1/layer1.1` and `/layer1/layer1.2`. It measured 166.1 ms (2 warmups, 10
+iterations) with exact ONNX Runtime output. The individual vectorized GEMM
+route is still faster: all 53 Conv nodes on XDNA with host MaxPool measured
+83.1 ms (2 warmups, 10 iterations), also with exact output. The previous valid
+Vitis AI baseline is 1.609 ms on the same model. A fresh Vitis rerun failed
+during provider initialization in the current environment, so 1.609 ms remains
+the last valid measurement.
 
 The NPU2 data mover limits a single weight descriptor to 65,532 bytes. The
 fused path streams weights in bounded chunks, and the binder now covers

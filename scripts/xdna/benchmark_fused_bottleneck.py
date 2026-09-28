@@ -296,7 +296,12 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         for index in range(c2_chunks):
             start = worker * c2_worker_outputs + index * c2_rows
             sl = slice(start, start + c2_rows)
-            chunks.append((w2[sl], b2[sl]))
+            # The vectorized AIE MMUL consumes B as contiguous KxN tiles.
+            packed_w2 = (
+                np.ascontiguousarray(w2[sl].transpose(2, 3, 1, 0))
+                if c2_rows >= 16 and output_height * output_width >= 16 else w2[sl]
+            )
+            chunks.append((packed_w2, b2[sl]))
     for index in range(c3_chunks):
         sl = slice(index * c3_rows, (index + 1) * c3_rows)
         chunks.append((w3[sl], b3[sl]))

@@ -1,4 +1,6 @@
 // Chunked full-tensor kernels for a fused INT8 identity ResNet bottleneck.
+#define NOCPP
+#include <aie_api/aie.hpp>
 #include <stdint.h>
 #ifndef FUSED_W
 #error "FUSED_W must be defined"
@@ -73,29 +75,102 @@ extern "C" void fused_bottleneck_conv2_chunk(const uint8_t *bundle, const uint8_
   const int outputs = (FUSED_MID / 2) / FUSED_C2_CHUNKS;
   const int pixels = FUSED_OUT_W * FUSED_OUT_H;
   const uint8_t *q1 = bundle;
-  for (int y = 0; y < FUSED_OUT_H; ++y) for (int x = 0; x < FUSED_OUT_W; ++x) {
-    int p = y * FUSED_OUT_W + x;
-    for (int oc = 0; oc < outputs; ++oc) {
-      int full_oc = channel_offset + chunk * outputs + oc;
-      int32_t acc = bias[oc];
-      for (int ky = 0; ky < 3; ++ky) {
-        int iy = y * FUSED_CONV2_STRIDE + ky - 1;
-        if (iy < 0 || iy >= FUSED_H) continue;
-        for (int kx = 0; kx < 3; ++kx) {
-          int ix = x * FUSED_CONV2_STRIDE + kx - 1;
-          if (ix < 0 || ix >= FUSED_W) continue;
-          int ip = iy * FUSED_W + ix;
-          for (int ic = 0; ic < FUSED_MID; ++ic) {
-            int wi = ((oc * FUSED_MID + ic) * 3 + ky) * 3 + kx;
-            acc += ((int32_t)q1[ip * FUSED_MID + ic] - 128) * (int32_t)weights[wi];
+  using MMUL = aie::mmul<8, 8, 8, int8, int8>;
+  alignas(32) int8_t a0_tile[64], a1_tile[64];
+  alignas(32) int8_t b0_tile[64], b1_tile[64];
+  // The 2x2 MMUL schedule raises utilization when both the pixel and output
+  // tiles are large enough. Small late-stage tensors use the scalar path below
+  // to avoid spending more time gathering padded tiles than doing MACs.
+  if (outputs >= 16 && (outputs % 16) == 0 && pixels >= 16) {
+  for (int p0 = 0; p0 < pixels; p0 += 16) {
+    const int valid0 = pixels - p0 < 8 ? pixels - p0 : 8;
+    const int valid1 = pixels - (p0 + 8) < 8 ? pixels - (p0 + 8) : 8;
+    for (int oc0 = 0; oc0 < outputs; oc0 += 16) {
+      MMUL c00 = aie::zeros<acc32, 64>();
+      MMUL c01 = aie::zeros<acc32, 64>();
+      MMUL c10 = aie::zeros<acc32, 64>();
+      MMUL c11 = aie::zeros<acc32, 64>();
+      for (int ky = 0; ky < 3; ++ky) for (int kx = 0; kx < 3; ++kx) {
+        for (int ic0 = 0; ic0 < FUSED_MID; ic0 += 8) {
+          for (int m = 0; m < 16; ++m) {
+            const int p = p0 + m;
+            const int y = p / FUSED_OUT_W;
+            const int x = p - y * FUSED_OUT_W;
+            const int iy = y * FUSED_CONV2_STRIDE + ky - 1;
+            const int ix = x * FUSED_CONV2_STRIDE + kx - 1;
+            const bool valid = (m < 8) ? (m < valid0) : ((m - 8) < valid1);
+            for (int k = 0; k < 8; ++k) {
+              int8_t value = 0;
+              if (valid && iy >= 0 && iy < FUSED_H && ix >= 0 && ix < FUSED_W) {
+                const int ip = iy * FUSED_W + ix;
+                value = (int8_t)((int32_t)q1[ip * FUSED_MID + ic0 + k] - 128);
+              }
+              if (m < 8) a0_tile[m * 8 + k] = value;
+              else a1_tile[(m - 8) * 8 + k] = value;
+            }
           }
+          const int weight_offset = ((ky * 3 + kx) * FUSED_MID + ic0) * outputs + oc0;
+          for (int k = 0; k < 8; ++k) for (int n = 0; n < 8; ++n) {
+            b0_tile[k * 8 + n] = weights[weight_offset + k * outputs + n];
+            b1_tile[k * 8 + n] = weights[weight_offset + k * outputs + 8 + n];
+          }
+          auto av0 = aie::load_v<64>(a0_tile);
+          auto av1 = aie::load_v<64>(a1_tile);
+          auto bv0 = aie::load_v<64>(b0_tile);
+          auto bv1 = aie::load_v<64>(b1_tile);
+          c00.mac(av0, bv0);
+          c01.mac(av0, bv1);
+          c10.mac(av1, bv0);
+          c11.mac(av1, bv1);
         }
       }
-      int32_t q = 128 + round_shift_even(acc, FUSED_SHIFT2);
-      if (q < 128) q = 128; else if (q > 255) q = 255;
-      output[p * (FUSED_MID / 2) + chunk * outputs + oc] = (uint8_t)q;
+      auto s00 = c00.to_vector<int32>();
+      auto s01 = c01.to_vector<int32>();
+      auto s10 = c10.to_vector<int32>();
+      auto s11 = c11.to_vector<int32>();
+      for (int m = 0; m < valid0; ++m) for (int n = 0; n < 8; ++n) {
+        int32_t q0 = 128 + round_shift_even(s00[m * 8 + n] + bias[oc0 + n], FUSED_SHIFT2);
+        int32_t q1v = 128 + round_shift_even(s01[m * 8 + n] + bias[oc0 + 8 + n], FUSED_SHIFT2);
+        if (q0 < 128) q0 = 128; else if (q0 > 255) q0 = 255;
+        if (q1v < 128) q1v = 128; else if (q1v > 255) q1v = 255;
+        output[(p0 + m) * (FUSED_MID / 2) + chunk * outputs + oc0 + n] = (uint8_t)q0;
+        output[(p0 + m) * (FUSED_MID / 2) + chunk * outputs + oc0 + 8 + n] = (uint8_t)q1v;
+      }
+      for (int m = 0; m < valid1; ++m) for (int n = 0; n < 8; ++n) {
+        int32_t q0 = 128 + round_shift_even(s10[m * 8 + n] + bias[oc0 + n], FUSED_SHIFT2);
+        int32_t q1v = 128 + round_shift_even(s11[m * 8 + n] + bias[oc0 + 8 + n], FUSED_SHIFT2);
+        if (q0 < 128) q0 = 128; else if (q0 > 255) q0 = 255;
+        if (q1v < 128) q1v = 128; else if (q1v > 255) q1v = 255;
+        output[(p0 + 8 + m) * (FUSED_MID / 2) + chunk * outputs + oc0 + n] = (uint8_t)q0;
+        output[(p0 + 8 + m) * (FUSED_MID / 2) + chunk * outputs + oc0 + 8 + n] = (uint8_t)q1v;
+      }
     }
   }
+  } else {
+    for (int y = 0; y < FUSED_OUT_H; ++y) for (int x = 0; x < FUSED_OUT_W; ++x) {
+      int p = y * FUSED_OUT_W + x;
+      for (int oc = 0; oc < outputs; ++oc) {
+        int32_t acc = bias[oc];
+        for (int ky = 0; ky < 3; ++ky) {
+          int iy = y * FUSED_CONV2_STRIDE + ky - 1;
+          if (iy < 0 || iy >= FUSED_H) continue;
+          for (int kx = 0; kx < 3; ++kx) {
+            int ix = x * FUSED_CONV2_STRIDE + kx - 1;
+            if (ix < 0 || ix >= FUSED_W) continue;
+            int ip = iy * FUSED_W + ix;
+            for (int ic = 0; ic < FUSED_MID; ++ic) {
+              int wi = ((oc * FUSED_MID + ic) * 3 + ky) * 3 + kx;
+              acc += ((int32_t)q1[ip * FUSED_MID + ic] - 128) * (int32_t)weights[wi];
+            }
+          }
+        }
+        int32_t q = 128 + round_shift_even(acc, FUSED_SHIFT2);
+        if (q < 128) q = 128; else if (q > 255) q = 255;
+        output[p * (FUSED_MID / 2) + chunk * outputs + oc] = (uint8_t)q;
+      }
+    }
+  }
+  (void)channel_offset;
   (void)pixels;
 }
 
