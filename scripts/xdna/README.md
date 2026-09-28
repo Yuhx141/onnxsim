@@ -234,13 +234,39 @@ python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
 
 The manifest records the graph dispatch schedule, Conv GEMM dimensions, and
 which Conv shapes exceed the whole-array GEMM padding budget. XDNA profiling
-reports per-host-op totals, Conv preparation/upload/launch/readback totals, and
-the slowest individual Conv nodes. Vitis profiling is available through
+reports per-host-op time, Conv preparation/upload/launch/readback time, and
+all Conv-node timings averaged across measured iterations. `profile_ms` and
+`conv_timings[*].elapsed_ms` are per-inference means; `profile_samples` records
+the number of measured runs. Vitis profiling is available through
 ONNX Runtime and reports its provider subgraph as a fused node, plus CPU-side
 input quantization and output dequantization; it does not expose timings for
 individual Conv nodes inside that fused Vitis subgraph. Enable it with
 `--profile-json` on `benchmark_vitis_resnet.py`. Profiling adds some overhead,
 so use a separate unprofiled run for the headline latency.
+
+### Conv placement profile (2026-09-28)
+
+On the 32x32 ResNet quicktest, the best measured Conv schedule places all 53
+Conv nodes on Torch CPU with two threads (`--cpu-small-m 256`). With 20 warmups
+and 100 measured runs it averaged 21.37 ms and matched the ONNX Runtime CPU
+output exactly. The same run settings with `--cpu-small-m 64` averaged 25.87 ms;
+that schedule placed one Conv on XDNA and 52 on CPU. A 10-warmup/30-run sweep
+at threshold 32 placed 12 Conv nodes on XDNA and averaged 40.64 ms. The Vitis
+AI EP reference averaged 1.68 ms over 100 runs.
+
+Per-node profiling explains the schedule: the stem Conv averaged 1.89 ms on
+XDNA versus 0.25 ms on CPU; the 11 shared stage-1 Conv nodes averaged roughly
+1.5-1.7 ms each on XDNA versus 0.07-0.15 ms each on CPU. Keeping these small-M
+Conv nodes on XDNA adds launch cost without enough compute to amortize it. The
+all-XDNA Conv run averaged 104.0 ms with 51 XDNA Conv calls. These results
+recommend CPU Conv placement for this small input shape; they do not predict
+the best schedule for larger spatial dimensions.
+
+Vitis' ONNX Runtime trace reports a single fused provider node, so it cannot
+show internal Conv timings. Ryzen AI 1.8 documents AI Analyzer's inference
+timeline, but currently does not support INT8 model analysis. Enabling its
+profiling and visualization provider flags for this INT8 model produced no
+additional Analyzer artifacts. See AMD's [AI Analyzer documentation](https://ryzenai.docs.amd.com/en/main/ai_analyzer.html).
 
 The same manifest now includes `graph_programs`: maximal connected semantic
 regions across QDQ edges, graph input/output boundaries, static constant

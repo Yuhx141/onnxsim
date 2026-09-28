@@ -990,11 +990,44 @@ def main() -> int:
     cold_ms = (time.perf_counter() - start) * 1000.0
     for _ in range(args.warmup):
         runner.run(feed)
+    # Runner-local timers reset per graph execution; aggregate the timed runs
+    # here so JSON profiles report steady-state per-inference means.
+    profile_totals: dict[str, float] = {}
+    conv_elapsed_totals: dict[int, float] = {}
+    conv_records: dict[int, dict[str, Any]] = {}
+    fused_elapsed_totals: dict[str, float] = {}
+    fused_records: dict[str, dict[str, Any]] = {}
     start = time.perf_counter()
     for _ in range(args.iters):
         outputs = runner.run(feed)
+        for name, elapsed in runner._profile.items():
+            profile_totals[name] = profile_totals.get(name, 0.0) + elapsed
+        for item in runner._conv_times:
+            index = int(item["node_index"])
+            conv_records[index] = {
+                key: value for key, value in item.items() if key != "elapsed_ms"
+            }
+            conv_elapsed_totals[index] = conv_elapsed_totals.get(index, 0.0) + float(
+                item["elapsed_ms"]
+            )
+        for item in runner._fused_times:
+            key = str(item.get("prefix", item.get("node_name", len(fused_records))))
+            fused_records[key] = {
+                name: value for name, value in item.items() if name != "elapsed_ms"
+            }
+            fused_elapsed_totals[key] = fused_elapsed_totals.get(key, 0.0) + float(
+                item.get("elapsed_ms", 0.0)
+            )
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     avg_ms = elapsed_ms / args.iters
+    conv_timings = [
+        {**conv_records[index], "elapsed_ms": elapsed / args.iters}
+        for index, elapsed in conv_elapsed_totals.items()
+    ]
+    fused_timings = [
+        {**fused_records[key], "elapsed_ms": elapsed / args.iters}
+        for key, elapsed in fused_elapsed_totals.items()
+    ]
     result = {
         "backend": "amd_xdna_iron_xrt_resnet_graph",
         "execution": "full_graph_with_fused_bottleneck" if (args.fused_block_prefix or args.fused_block) else (
@@ -1011,12 +1044,14 @@ def main() -> int:
         "graph_dispatches": runner.codegen.estimated_dispatches,
         "execution_counts": runner._executed,
         "unique_fused_xclbins_used": len({item["xclbin"] for item in runner._fused_blocks.values()}),
-        "fused_block_timings": runner._fused_times,
-        "profile_ms": runner._profile,
+        "fused_block_timings": fused_timings,
+        "profile_samples": args.iters,
+        "profile_ms": {key: value / args.iters for key, value in profile_totals.items()},
+        "conv_timings": conv_timings,
         "slowest_conv_nodes": sorted(
-            runner._conv_times, key=lambda item: item["elapsed_ms"], reverse=True
+            conv_timings, key=lambda item: item["elapsed_ms"], reverse=True
         )[:8],
-        "unique_xclbins_used": len({item["artifact"] for item in runner._conv_times if "artifact" in item}),
+        "unique_xclbins_used": len({item["artifact"] for item in conv_timings if "artifact" in item}),
         "warmup": args.warmup,
         "iters": args.iters,
         "cold_ms": cold_ms,
