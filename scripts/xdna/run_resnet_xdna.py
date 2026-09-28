@@ -205,6 +205,7 @@ class XDNAResNetRunner:
         self._packed_weight_cache: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
         self._cpu_weight_cache: dict[int, np.ndarray] = {}
         self._torch_weight_cache: dict[int, Any] = {}
+        self._torch_int8_weight_cache: dict[int, tuple[Any, ...]] = {}
         fused_specs = list(fused_blocks or ())
         parallel_specs = list(parallel_projection_blocks or ())
         if any((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
@@ -703,14 +704,15 @@ class XDNAResNetRunner:
         if weights is None:
             weights = _centered_int8(wt_raw, wt_zero, f"Conv {plan.node_name} weights")
             self._cpu_weight_cache[index] = weights
-        panels = im2col_nchw(x, plan) if self.cpu_backend == "numpy" else None
+        panels = im2col_nchw(x, plan) if self.cpu_backend in {"numpy", "torch-int8"} else None
         bias = values[node.input[2]].astype(np.float32).reshape(-1) if len(node.input) > 2 else None
         self._profile["cpu_conv_prepare_ms"] = self._profile.get("cpu_conv_prepare_ms", 0.0) + (time.perf_counter() - stage_start) * 1000.0
+        execute_start = time.perf_counter()
         # The configured threshold is intended for batch-1 tiny feature maps,
         # where NumPy's integer GEMM avoids a device launch per Conv.
         batch, out_channels, out_h, out_w = plan.output_shape
         out_per_group = out_channels // plan.groups
-        if self.cpu_backend == "torch":
+        if self.cpu_backend in {"torch", "torch-int8"}:
             # oneDNN's CPU convolution avoids materializing and multiplying a
             # large int32 im2col matrix. Each centered int8 value is exactly
             # representable in float32; keep this experimental backend
@@ -718,33 +720,56 @@ class XDNAResNetRunner:
             import torch
             import torch.nn.functional as torch_f
 
+            if self.cpu_backend == "torch-int8" and not hasattr(torch, "_int_mm"):
+                raise RuntimeError("--cpu-backend torch-int8 requires PyTorch with torch._int_mm support")
             if not self._torch_initialized:
                 torch.set_num_threads(self.cpu_threads)
                 self._torch_initialized = True
 
-            attrs = _attrs(node)
-            pads = tuple(int(v) for v in attrs.get("pads", (0, 0, 0, 0)))
-            strides = tuple(int(v) for v in attrs.get("strides", (1, 1)))
-            dilations = tuple(int(v) for v in attrs.get("dilations", (1, 1)))
-            tx = torch.from_numpy(np.array(x, dtype=np.float32, copy=True, order="C"))
-            tw = self._torch_weight_cache.get(index)
-            if tw is None:
-                tw = torch.from_numpy(np.array(weights, dtype=np.float32, copy=True, order="C"))
-                self._torch_weight_cache[index] = tw
-            conv_padding = (0, 0)
-            if pads[0] == pads[2] and pads[1] == pads[3]:
-                conv_padding = (pads[0], pads[1])
-            elif any(pads):
-                tx = torch_f.pad(tx, (pads[1], pads[3], pads[0], pads[2]))
-            raw = torch_f.conv2d(
-                tx,
-                tw,
-                bias=None,
-                stride=strides,
-                padding=conv_padding,
-                dilation=dilations,
-                groups=plan.groups,
-            ).numpy()
+            if self.cpu_backend == "torch-int8":
+                # CPU int8 GEMM keeps the quantized Conv accumulator exact and
+                # avoids float conversion and oneDNN Conv setup on tiny maps.
+                tw_groups = self._torch_int8_weight_cache.get(index)
+                if tw_groups is None:
+                    tw_groups = tuple(
+                        torch.from_numpy(np.ascontiguousarray(
+                            weights[g * out_per_group : (g + 1) * out_per_group]
+                            .reshape(out_per_group, -1).T
+                        ))
+                        for g in range(plan.groups)
+                    )
+                    self._torch_int8_weight_cache[index] = tw_groups
+                raw = np.empty(plan.output_shape, dtype=np.float32)
+                for group in range(plan.groups):
+                    panel = torch.from_numpy(panels[group])
+                    acc = torch._int_mm(panel, tw_groups[group]).numpy()
+                    raw[:, group * out_per_group : (group + 1) * out_per_group] = acc.reshape(
+                        batch, out_h, out_w, out_per_group
+                    ).transpose(0, 3, 1, 2)
+            else:
+                attrs = _attrs(node)
+                pads = tuple(int(v) for v in attrs.get("pads", (0, 0, 0, 0)))
+                strides = tuple(int(v) for v in attrs.get("strides", (1, 1)))
+                dilations = tuple(int(v) for v in attrs.get("dilations", (1, 1)))
+                tx = torch.from_numpy(np.array(x, dtype=np.float32, copy=True, order="C"))
+                tw = self._torch_weight_cache.get(index)
+                if tw is None:
+                    tw = torch.from_numpy(np.array(weights, dtype=np.float32, copy=True, order="C"))
+                    self._torch_weight_cache[index] = tw
+                conv_padding = (0, 0)
+                if pads[0] == pads[2] and pads[1] == pads[3]:
+                    conv_padding = (pads[0], pads[1])
+                elif any(pads):
+                    tx = torch_f.pad(tx, (pads[1], pads[3], pads[0], pads[2]))
+                raw = torch_f.conv2d(
+                    tx,
+                    tw,
+                    bias=None,
+                    stride=strides,
+                    padding=conv_padding,
+                    dilation=dilations,
+                    groups=plan.groups,
+                ).numpy()
         else:
             raw = np.empty(plan.output_shape, dtype=np.float32)
             for group in range(plan.groups):
@@ -754,13 +779,14 @@ class XDNAResNetRunner:
                 raw[:, group * out_per_group : (group + 1) * out_per_group] = acc.reshape(
                     batch, out_h, out_w, out_per_group
                 ).transpose(0, 3, 1, 2)
+        execute_ms = (time.perf_counter() - execute_start) * 1000.0
         raw = raw.astype(np.float32)
         raw *= in_scale * wt_scale
         if bias is not None:
             raw += bias.reshape(1, -1, 1, 1)
         output = np.maximum(raw, 0) if plan.fused_relu else raw
         elapsed = (time.perf_counter() - total_start) * 1000.0
-        self._profile["cpu_conv_execute_ms"] = self._profile.get("cpu_conv_execute_ms", 0.0) + elapsed
+        self._profile["cpu_conv_execute_ms"] = self._profile.get("cpu_conv_execute_ms", 0.0) + execute_ms
         self._executed["cpu_conv"] += 1
         self._conv_times.append({
             "node_index": index,
@@ -973,8 +999,8 @@ def main() -> int:
         help="run batch-1 Conv layers with at most this many output pixels on CPU",
     )
     parser.add_argument(
-        "--cpu-backend", choices=("numpy", "torch"), default="numpy",
-        help="CPU implementation for --cpu-small-m (torch uses optimized float32 Conv2d)",
+        "--cpu-backend", choices=("numpy", "torch", "torch-int8"), default="numpy",
+        help="CPU implementation for --cpu-small-m (torch-int8 uses exact integer GEMM)",
     )
     parser.add_argument(
         "--cpu-threads", type=int, default=2,
@@ -1067,7 +1093,7 @@ def main() -> int:
         "context_budget_fallback_blocks": runner.context_budget_fallback_blocks,
         "cpu_small_m_threshold": args.cpu_small_m,
         "cpu_backend": args.cpu_backend,
-        "cpu_threads": args.cpu_threads if args.cpu_backend == "torch" else None,
+        "cpu_threads": args.cpu_threads if args.cpu_backend.startswith("torch") else None,
         "model": str(args.model),
         "graph_dispatches": runner.codegen.estimated_dispatches,
         "execution_counts": runner._executed,
