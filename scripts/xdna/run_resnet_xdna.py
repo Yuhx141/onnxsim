@@ -123,6 +123,7 @@ class XDNAResNetRunner:
         fused_block_xclbin: str | None = None,
         fused_block_insts: str | None = None,
         fused_blocks: list[tuple[str, str, str]] | None = None,
+        parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
     ):
         self.model = model
         self.nodes = list(model.graph.node)
@@ -205,13 +206,15 @@ class XDNAResNetRunner:
         self._cpu_weight_cache: dict[int, np.ndarray] = {}
         self._torch_weight_cache: dict[int, Any] = {}
         fused_specs = list(fused_blocks or ())
+        parallel_specs = list(parallel_projection_blocks or ())
         if any((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
             if not all((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
                 raise ValueError("fused block requires its node prefix, xclbin, and instruction stream")
             fused_specs.append((fused_block_prefix, fused_block_xclbin, fused_block_insts))
         bottleneck_plans = {block.prefix: block for block in plan_bottleneck_blocks(model)}
         prepared_blocks: dict[str, tuple[Any, dict[str, Any], set[int], str, str]] = {}
-        for prefix, xclbin, insts in fused_specs:
+        parallel_prefixes = {prefix for prefix, _xclbin, _insts in parallel_specs}
+        for prefix, xclbin, insts in [*fused_specs, *parallel_specs]:
             if prefix in prepared_blocks:
                 raise ValueError(f"fused block {prefix!r} was specified more than once")
             block = bottleneck_plans.get(prefix)
@@ -318,15 +321,22 @@ class XDNAResNetRunner:
             block_input = iron.tensor(
                 np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu"
             )
-            block_parameters = iron.tensor(
-                binding["params"], dtype=np.uint8, device="npu"
-            )
+            block_parameters = None
+            main_parameters = skip_parameters = None
+            if prefix in parallel_prefixes:
+                main_parameters = iron.tensor(binding["main_params"], dtype=np.uint8, device="npu")
+                skip_parameters = iron.tensor(binding["skip_params"], dtype=np.uint8, device="npu")
+            else:
+                block_parameters = iron.tensor(binding["params"], dtype=np.uint8, device="npu")
             block_output = iron.zeros(output_count, dtype=np.int8, device="npu")
             self._fused_blocks[prefix] = {
                 "binding": binding,
                 "start": start_index,
                 "input": block_input,
                 "parameters": block_parameters,
+                "main_parameters": main_parameters,
+                "skip_parameters": skip_parameters,
+                "parallel_projection": prefix in parallel_prefixes,
                 "output": block_output,
                 "kernel": self._kernel(str(xclbin), str(insts)),
                 "xclbin": str(xclbin),
@@ -779,7 +789,12 @@ class XDNAResNetRunner:
             )
 
         launch_start = time.perf_counter()
-        block["kernel"](block_input, block["parameters"], block["output"])
+        if block["parallel_projection"]:
+            block["kernel"](
+                block_input, block["main_parameters"], block["skip_parameters"], block["output"]
+            )
+        else:
+            block["kernel"](block_input, block["parameters"], block["output"])
         kernel_ms = (time.perf_counter() - launch_start) * 1000.0
         self._profile["fused_bottleneck_kernel_call_ms"] = (
             self._profile.get("fused_bottleneck_kernel_call_ms", 0.0)
@@ -966,6 +981,10 @@ def main() -> int:
         "--fused-block", nargs=3, action="append", metavar=("PREFIX", "XCLBIN", "INSTS"),
         help="add a fused bottleneck specialization; repeat to fuse multiple blocks",
     )
+    parser.add_argument(
+        "--parallel-projection-block", nargs=3, action="append", metavar=("PREFIX", "XCLBIN", "INSTS"),
+        help="run a projection bottleneck with main and skip branches on separate NPU columns",
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     model = onnx.load(args.model)
@@ -980,6 +999,9 @@ def main() -> int:
         fused_block_xclbin=str(args.fused_block_xclbin) if args.fused_block_xclbin else None,
         fused_block_insts=str(args.fused_block_insts) if args.fused_block_insts else None,
         fused_blocks=[(prefix, xclbin, insts) for prefix, xclbin, insts in (args.fused_block or [])],
+        parallel_projection_blocks=[
+            (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
+        ],
     )
     input_info = model.graph.input[0]
     shape = [int(dim.dim_value) or 1 for dim in input_info.type.tensor_type.shape.dim]
@@ -1030,7 +1052,7 @@ def main() -> int:
     ]
     result = {
         "backend": "amd_xdna_iron_xrt_resnet_graph",
-        "execution": "full_graph_with_fused_bottleneck" if (args.fused_block_prefix or args.fused_block) else (
+        "execution": "full_graph_with_fused_bottleneck" if (args.fused_block_prefix or args.fused_block or args.parallel_projection_block) else (
             "full_graph_xdna_conv_host_ops" if not args.cpu_small_m else "full_graph_hybrid_conv_host_ops"
         ),
         "fused_block_prefix": args.fused_block_prefix,

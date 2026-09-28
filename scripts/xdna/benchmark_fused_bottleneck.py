@@ -332,6 +332,15 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
         offset = index * slot_bytes
         offsets.append(offset)
         params[offset : offset + packed.size] = packed
+    skip_indices = set(range(skip_chunk_start, skip_chunk_start + skip_chunks))
+    main_params = np.concatenate([
+        params[index * slot_bytes : (index + 1) * slot_bytes]
+        for index in range(len(packed_chunks)) if index not in skip_indices
+    ])
+    skip_params = np.concatenate([
+        params[index * slot_bytes : (index + 1) * slot_bytes]
+        for index in range(skip_chunk_start, skip_chunk_start + skip_chunks)
+    ]) if skip_chunks else np.empty(0, dtype=np.uint8)
 
     q_type = "u8"
     q_nodes = [edges[edge.output_name] for edge in (*quantizers, final_quantizer)]
@@ -346,6 +355,8 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     return {
         "block": block,
         "params": params,
+        "main_params": main_params,
+        "skip_params": skip_params,
         "shifts": tuple(shifts),
         "input_raw_name": input_raw_name,
         "input_zero_point": input_zero,
