@@ -127,6 +127,7 @@ class XDNAResNetRunner:
         fused_block_insts: str | None = None,
         fused_blocks: list[tuple[str, str, str]] | None = None,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
+        maxpool_uint8_artifact: tuple[str, str] | None = None,
     ):
         self.model = model
         self.nodes = list(model.graph.node)
@@ -214,6 +215,58 @@ class XDNAResNetRunner:
                 return None
             return float(scale[0]), int(zero[0])
 
+        self._maxpool_qdq_fusions: dict[int, dict[str, Any]] = {}
+        self._maxpool_input_dqs: set[int] = set()
+        if maxpool_uint8_artifact is not None:
+            xclbin, insts = maxpool_uint8_artifact
+            if not Path(xclbin).is_file() or not Path(insts).is_file():
+                raise ValueError("uint8 MaxPool xclbin and instruction stream must both exist")
+            for pool_index, pool_node in enumerate(self.nodes):
+                if pool_node.op_type != "MaxPool" or pool_index not in self.operation_specs:
+                    continue
+                input_dq = self.nodes_by_output.get(str(pool_node.input[0]))
+                if input_dq is None or input_dq.op_type != "DequantizeLinear":
+                    continue
+                input_q = self.nodes_by_output.get(str(input_dq.input[0]))
+                if input_q is None or input_q.op_type != "QuantizeLinear":
+                    continue
+                relu = self.nodes_by_output.get(str(input_q.input[0]))
+                if relu is None or relu.op_type != "Relu":
+                    continue
+                input_qparams = scalar_qparams(input_q)
+                input_dqparams = scalar_qparams(input_dq)
+                if (input_qparams is None or input_qparams != input_dqparams
+                        or np.asarray(self.arrays[input_q.input[2]]).dtype != np.uint8
+                        or input_qparams[1] <= 0
+                        or single_consumer(str(input_q.output[0]), "DequantizeLinear") is None
+                        or single_consumer(str(input_dq.output[0]), "MaxPool") != pool_index):
+                    continue
+                output_q_index = single_consumer(str(pool_node.output[0]), "QuantizeLinear")
+                if output_q_index is None:
+                    continue
+                output_q = self.nodes[output_q_index]
+                output_dq_index = single_consumer(str(output_q.output[0]), "DequantizeLinear")
+                if (output_dq_index is None or scalar_qparams(output_q) != input_qparams
+                        or np.asarray(self.arrays[output_q.input[2]]).dtype != np.uint8):
+                    continue
+                output_dq = self.nodes[output_dq_index]
+                if scalar_qparams(output_dq) != input_qparams:
+                    continue
+                self._maxpool_qdq_fusions[pool_index] = {
+                    "input_raw": str(input_q.output[0]),
+                    "input_dq_index": self.nodes.index(input_dq),
+                    "output_q_index": output_q_index,
+                    "output_dq_index": output_dq_index,
+                    "scale": input_qparams[0],
+                    "zero_point": input_qparams[1],
+                }
+                self._maxpool_input_dqs.add(self.nodes.index(input_dq))
+                self.operation_specs[pool_index]["compiled_artifact"] = {
+                    "xclbin": str(xclbin), "insts": str(insts),
+                }
+            if not self._maxpool_qdq_fusions:
+                raise ValueError("uint8 MaxPool fusion requires a Relu->Q->DQ input and matching pool Q->DQ output")
+
         # Fold the common quantized residual sequence into one host executor
         # step when no native quantized Add artifact is available.
         for add_index, add_node in enumerate(self.nodes):
@@ -285,7 +338,7 @@ class XDNAResNetRunner:
                 "dequantize_params": dequantize_params,
             }
             self._host_qadd_input_dqs.update(input_dq_indices)
-        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "xdna_quantized_add_relu": 0, "device_resident_pool_outputs": 0, "device_view_ops": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
+        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "qdq_maxpool_fusions": 0, "xdna_quantized_add_relu": 0, "device_resident_pool_outputs": 0, "device_view_ops": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
         self._profile: dict[str, float] = {}
         self._device_readback_cache: dict[tuple[Any, ...], np.ndarray] = {}
         self._conv_times: list[dict[str, Any]] = []
@@ -649,6 +702,51 @@ class XDNAResNetRunner:
         self._executed["xdna_maxpool"] += 1
         self._executed["device_resident_pool_outputs"] += 1
         return _DeviceValue(output_tensor, output_shape, 1.0, 0, producer=f"maxpool:{index}", layout="nchw")
+
+    def _run_quantized_maxpool_kernel(self, index: int, raw: np.ndarray) -> _DeviceValue:
+        """Pool the uint8 Relu-Q tensor directly and preserve its QDQ edge on-device."""
+        import aie.iron as iron
+        from aie.iron.device import from_name
+
+        iron.set_current_device(from_name("npu2", n_cols=None))
+        spec = self.operation_specs[index]
+        params = spec["parameters"]
+        artifact = spec["compiled_artifact"]
+        raw_shape = tuple(int(value) for value in spec["input_shapes"][0])
+        x = np.asarray(raw, dtype=np.uint8).reshape(raw_shape)
+        pads = tuple(int(value) for value in params["pads"])
+        pt, pl, pb, pr = pads
+        transfer_width = (int(raw_shape[3]) + pl + pr + 3) & ~3
+        transfer_right_pad = transfer_width - int(raw_shape[3]) - pl
+        padded = np.pad(x, ((0, 0), (0, 0), (pt, pb), (pl, transfer_right_pad)), constant_values=0)
+        expected = (1, int(params["channels"]), int(params["input_height"]), transfer_width)
+        if padded.shape != expected:
+            raise ValueError(f"uint8 MaxPool node {index} expects padded input {expected}, got {padded.shape}")
+        output_shape = (1, int(params["channels"]), int(params["output_height"]), int(params["output_width"]))
+        workspace_key = (str(artifact["xclbin"]), str(artifact["insts"]), expected, output_shape, "u8")
+        workspaces = self._maxpool_workspace_cache.get(workspace_key)
+        if workspaces is None:
+            workspaces = (
+                iron.tensor((math.prod(expected),), dtype=np.uint8, device="npu"),
+                iron.tensor(np.zeros(math.prod(output_shape), dtype=np.uint8), dtype=np.uint8, device="npu"),
+            )
+            self._maxpool_workspace_cache[workspace_key] = workspaces
+        input_tensor, output_tensor = workspaces
+        started = time.perf_counter()
+        with input_tensor.overwrite() as host_input:
+            np.copyto(host_input, padded.reshape(-1))
+        self._profile["maxpool_pad_upload_ms"] = self._profile.get("maxpool_pad_upload_ms", 0.0) + (time.perf_counter() - started) * 1000.0
+        launch_start = time.perf_counter()
+        self._kernel(str(artifact["xclbin"]), str(artifact["insts"]))(input_tensor, output_tensor)
+        self._profile["maxpool_kernel_ms"] = self._profile.get("maxpool_kernel_ms", 0.0) + (time.perf_counter() - launch_start) * 1000.0
+        self._executed["xdna_maxpool"] += 1
+        self._executed["qdq_maxpool_fusions"] += 1
+        self._executed["device_resident_pool_outputs"] += 1
+        fusion = self._maxpool_qdq_fusions[index]
+        return _DeviceValue(
+            output_tensor, output_shape, float(fusion["scale"]), int(fusion["zero_point"]),
+            as_real=True, producer=f"maxpool:{index}", layout="nchw",
+        )
 
     def _run_quantized_add_relu(self, index: int, values: dict[str, Any]) -> _DeviceValue:
         """Run the compiled residual Add+ReLU+Quantize kernel on XDNA."""
@@ -1026,6 +1124,7 @@ class XDNAResNetRunner:
         self._executed = {
             "xdna_conv": 0,
             "xdna_maxpool": 0,
+            "qdq_maxpool_fusions": 0,
             "xdna_quantized_add_relu": 0,
             "device_resident_pool_outputs": 0,
             "device_view_ops": 0,
@@ -1059,6 +1158,8 @@ class XDNAResNetRunner:
                 continue
             if index in self._precomputed_host_nodes or index in self._host_qadd_input_dqs:
                 continue
+            if index in self._maxpool_input_dqs:
+                continue
             if index in self._fused_input_handoffs:
                 raw = values.get(str(node.input[0]))
                 if (not isinstance(raw, _DeviceValue)
@@ -1086,6 +1187,8 @@ class XDNAResNetRunner:
             if result is not None:
                 offloaded = True
                 self._executed["device_view_ops"] += 1
+                args = []
+            elif op == "MaxPool" and index in self._maxpool_qdq_fusions:
                 args = []
             else:
                 args = [] if op == "Conv" or native_qadd else [
@@ -1116,7 +1219,11 @@ class XDNAResNetRunner:
                 result = args[0] * args[1]
             elif op == "MaxPool":
                 if index in self.operation_specs:
-                    result = self._run_maxpool_kernel(index, args[0])
+                    if index in self._maxpool_qdq_fusions:
+                        raw = values[self._maxpool_qdq_fusions[index]["input_raw"]]
+                        result = self._run_quantized_maxpool_kernel(index, raw)
+                    else:
+                        result = self._run_maxpool_kernel(index, args[0])
                     offloaded = True
                 else:
                     result = _max_pool(args[0], attrs)
@@ -1187,10 +1294,14 @@ def main() -> int:
         "--parallel-projection-block", nargs=3, action="append", metavar=("PREFIX", "XCLBIN", "INSTS"),
         help="run a projection bottleneck with main and skip branches on separate NPU columns",
     )
+    parser.add_argument("--maxpool-uint8-xclbin", type=Path, help="use a uint8 MaxPool artifact to fuse matching QDQ edges")
+    parser.add_argument("--maxpool-uint8-insts", type=Path)
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     model = onnx.load(args.model)
     manifest = json.loads(args.manifest.read_text())
+    if bool(args.maxpool_uint8_xclbin) != bool(args.maxpool_uint8_insts):
+        raise ValueError("--maxpool-uint8-xclbin and --maxpool-uint8-insts must be supplied together")
     runner = XDNAResNetRunner(
         model,
         manifest,
@@ -1204,6 +1315,8 @@ def main() -> int:
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
         ],
+        maxpool_uint8_artifact=(str(args.maxpool_uint8_xclbin), str(args.maxpool_uint8_insts))
+        if args.maxpool_uint8_xclbin else None,
     )
     input_info = model.graph.input[0]
     shape = [int(dim.dim_value) or 1 for dim in input_info.type.tensor_type.shape.dim]

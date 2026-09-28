@@ -17,6 +17,7 @@ from aie.utils.hostruntime.argparse import add_compile_args
 from aie.utils.hostruntime.cli import run_design_cli
 
 _KERNEL = Path(__file__).with_name("kernels") / "maxpool2d_nchw_f32.cc"
+_U8_KERNEL = Path(__file__).with_name("kernels") / "maxpool2d_nchw_u8.cc"
 
 
 @iron.jit
@@ -35,6 +36,7 @@ def maxpool2d(
     stride_width: CompileTime[int] = 2,
     tile_output_rows: CompileTime[int] = 8,
     tile_channels: CompileTime[int] = 1,
+    uint8: CompileTime[bool] = False,
 ):
     if output_height % tile_output_rows:
         raise ValueError("output height must be divisible by tile_output_rows")
@@ -46,13 +48,14 @@ def maxpool2d(
     input_rows_per_tile = (tile_output_rows - 1) * stride_height + kernel_height
     channel_groups = channels // tile_channels
     chunks = channel_groups * output_row_groups
-    input_type = np.ndarray[(channels * input_height * input_width,), np.dtype[np.float32]]
-    output_type = np.ndarray[(channels * output_height * output_width,), np.dtype[np.float32]]
-    input_tile = np.ndarray[(tile_channels * input_rows_per_tile * input_width,), np.dtype[np.float32]]
-    output_tile = np.ndarray[(tile_channels * tile_output_rows * output_width,), np.dtype[np.float32]]
+    data_dtype = np.uint8 if uint8 else np.float32
+    input_type = np.ndarray[(channels * input_height * input_width,), np.dtype[data_dtype]]
+    output_type = np.ndarray[(channels * output_height * output_width,), np.dtype[data_dtype]]
+    input_tile = np.ndarray[(tile_channels * input_rows_per_tile * input_width,), np.dtype[data_dtype]]
+    output_tile = np.ndarray[(tile_channels * tile_output_rows * output_width,), np.dtype[data_dtype]]
     kernel = ExternalFunction(
-        "maxpool2d_nchw_f32",
-        source_file=str(_KERNEL),
+        "maxpool2d_nchw_u8" if uint8 else "maxpool2d_nchw_f32",
+        source_file=str(_U8_KERNEL if uint8 else _KERNEL),
         arg_types=[input_tile, output_tile, np.int32, np.int32, np.int32, np.int32,
                    np.int32, np.int32, np.int32, np.int32],
     )
@@ -142,6 +145,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--stride-width", type=int, default=2)
     parser.add_argument("--tile-output-rows", type=int, default=8)
     parser.add_argument("--tile-channels", type=int, default=1)
+    parser.add_argument("--uint8", action="store_true", help="compile a quantized uint8 MaxPool kernel")
     parser.add_argument("--pad-top", type=int, default=1)
     parser.add_argument("--pad-left", type=int, default=1)
     parser.add_argument("--pad-bottom", type=int, default=1)
@@ -165,27 +169,38 @@ def main(argv: list[str] | None = None) -> int:
         "output_width": opts.output_width, "kernel_height": opts.kernel_height,
         "kernel_width": opts.kernel_width, "stride_height": opts.stride_height,
         "stride_width": opts.stride_width, "tile_output_rows": opts.tile_output_rows,
-        "tile_channels": opts.tile_channels,
+        "tile_channels": opts.tile_channels, "uint8": opts.uint8,
     }
 
     def verify(run_opts: Any) -> None:
         iron.set_current_device(from_name(run_opts.dev, n_cols=None))
-        in_h = run_opts.input_height - run_opts.pad_top - run_opts.pad_bottom
-        in_w = run_opts.input_width - run_opts.pad_left - run_opts.pad_right
-        values = np.arange(run_opts.channels * in_h * in_w, dtype=np.float32)
-        source = (values % 997).reshape(run_opts.channels, in_h, in_w) / np.float32(997)
+        in_h = ((run_opts.output_height - 1) * run_opts.stride_height
+                + run_opts.kernel_height - run_opts.pad_top)
+        in_w = ((run_opts.output_width - 1) * run_opts.stride_width
+                + run_opts.kernel_width - run_opts.pad_left)
+        semantic_height = in_h + run_opts.pad_top + run_opts.pad_bottom
+        semantic_width = in_w + run_opts.pad_left + run_opts.pad_right
+        extra_bottom = run_opts.input_height - semantic_height
+        extra_right = run_opts.input_width - semantic_width
+        if extra_bottom < 0 or extra_right < 0:
+            raise ValueError("compiled input storage is too small for the pooling shape and padding")
+        dtype = np.uint8 if run_opts.uint8 else np.float32
+        values = np.arange(run_opts.channels * in_h * in_w, dtype=np.int32)
+        source = ((values % 251) if run_opts.uint8 else (values % 997) / 997.0)
+        source = source.reshape(run_opts.channels, in_h, in_w).astype(dtype)
         padded = np.pad(
             source,
-            ((0, 0), (run_opts.pad_top, run_opts.pad_bottom), (run_opts.pad_left, run_opts.pad_right)),
-            constant_values=-np.inf,
-        ).astype(np.float32)
-        output = np.zeros((run_opts.channels * run_opts.output_height * run_opts.output_width,), dtype=np.float32)
-        input_tensor = iron.tensor(padded.reshape(-1), dtype=np.float32, device="npu")
-        output_tensor = iron.tensor(output, dtype=np.float32, device="npu")
+            ((0, 0), (run_opts.pad_top, run_opts.pad_bottom + extra_bottom),
+             (run_opts.pad_left, run_opts.pad_right + extra_right)),
+            constant_values=0 if run_opts.uint8 else -np.inf,
+        ).astype(dtype)
+        output = np.zeros((run_opts.channels * run_opts.output_height * run_opts.output_width,), dtype=dtype)
+        input_tensor = iron.tensor(padded.reshape(-1), dtype=dtype, device="npu")
+        output_tensor = iron.tensor(output, dtype=dtype, device="npu")
         maxpool2d(input_tensor, output_tensor, **kwargs)
         actual = output_tensor.numpy().reshape(run_opts.channels, run_opts.output_height, run_opts.output_width)
         expected = _pool_reference(
-            source,
+            source.astype(np.float32),
             kernel=(run_opts.kernel_height, run_opts.kernel_width),
             stride=(run_opts.stride_height, run_opts.stride_width),
             pads=(run_opts.pad_top, run_opts.pad_left, run_opts.pad_bottom, run_opts.pad_right),
