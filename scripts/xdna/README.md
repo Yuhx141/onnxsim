@@ -104,13 +104,13 @@ python3 scripts/xdna/run_resnet_xdna.py resnet.onnx resnet-xdna-all.json \
   --warmup 1 --iters 5 --json resnet-xdna-fullgraph.json
 ```
 
-The graph runner supports an all-XDNA Conv mode and a hybrid mode that runs
-small Conv layers as CPU integer GEMMs to avoid launch overhead. In both modes,
-unsupported QDQ, activation, residual, dense, and uncompiled pooling nodes run on
-the host. Reports
-distinguish `full_graph_xdna_conv_host_ops` from
-`full_graph_hybrid_conv_host_ops`; neither means all graph operators execute on
-the NPU. The quicktest ResNet-50 graph has 53 Conv nodes and 91 planned
+The graph runner supports XDNA Conv execution and a hybrid mode that runs
+small Conv layers as CPU integer GEMMs to avoid launch overhead. Fused
+bottlenecks, compiled MaxPool, and compiled residual Add+ReLU+Quantize kernels
+can execute on XDNA; remaining QDQ, activation, dense, and uncompiled pooling
+nodes run on the host. Reports distinguish
+`full_graph_xdna_conv_host_ops` from `full_graph_hybrid_conv_host_ops`; neither
+means all graph operators execute on the NPU. The quicktest ResNet-50 graph has 53 Conv nodes and 91 planned
 dispatch groups. The runner compares its output with ONNX Runtime's CPU result.
 Large padded GEMM specs can take time to compile and add substantial compute
 that the logical Conv does not need.
@@ -249,10 +249,12 @@ parameters and power-of-two input/output scale ratios now lower to one native
 fixed-point kernel. It consumes the two raw quantized activation edges, applies
 the two scale ratios and zero points, clamps ReLU values, rounds ties to even,
 and emits the quantized output edge. The manifest compiler specializes these
-artifacts by tensor size and quantization parameters. A 16,384-element kernel
-was compiled and matched the NumPy quantization reference on the NPU. Other
-scale ratios and per-channel quantization stay descriptor-only; runtime graph
-dispatch is still pending.
+artifacts by tensor size and quantization parameters. The runner dispatches
+compiled kernels for residual blocks outside the fused bottleneck set, retains
+their output in device memory, and includes those XCLBINs in its 16-context
+budget. A 16,384-element kernel was compiled and matched the NumPy
+quantization reference on the NPU. Other scale ratios and per-channel
+quantization stay descriptor-only.
 
 Scalar float32 `Mul` nodes now lower to a shape-specialized AIE kernel when one
 operand is a static scalar and the tensor shape is preserved. The quicktest
@@ -292,8 +294,9 @@ XDNA kernel can execute every listed operator. A graph runner must separately
 bind each planned instruction to a supported device kernel and retain each
 internal tensor in an XRT allocation until its final consumer. Adjacent fused
 blocks can now pass their raw quantized activation buffers directly on device
-when shape and QDQ scale match. Unfused operations and incompatible boundaries
-still materialize values on the host.
+when shape and QDQ scale match. Compiled residual Add+ReLU kernels also retain
+their output on device. Conv blocks outside fused kernels, the stem, classifier
+Gemm, and unsupported graph operators still use host execution.
 
 A practical implementation sequence is:
 

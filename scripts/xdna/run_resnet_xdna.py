@@ -191,13 +191,14 @@ class XDNAResNetRunner:
             if entry.get("compiled_artifact")
             or entry.get("status") == "zero_copy_device_view"
         }
-        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "device_resident_pool_outputs": 0, "device_view_ops": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
+        self._executed = {"xdna_conv": 0, "xdna_maxpool": 0, "xdna_quantized_add_relu": 0, "device_resident_pool_outputs": 0, "device_view_ops": 0, "cpu_conv": 0, "host_ops": 0, "skipped_conv_dq": 0, "fused_relu": 0, "fused_bottleneck": 0, "device_resident_handoffs": 0, "device_edge_readbacks": 0}
         self._profile: dict[str, float] = {}
         self._device_readback_cache: dict[tuple[Any, ...], np.ndarray] = {}
         self._conv_times: list[dict[str, Any]] = []
         self._fused_times: list[dict[str, Any]] = []
         self._workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
         self._maxpool_workspace_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+        self._qadd_workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
         # ONNX weights are constants. Keep their padded GEMM layout so steady
         # state inference only packs the changing activation matrix.
         self._packed_weight_cache: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
@@ -249,12 +250,19 @@ class XDNAResNetRunner:
                 index
                 for prefix in active_prefixes
                 for index in prepared_blocks[prefix][2]
-                if self.nodes[index].op_type == "Conv"
             }
             remaining_conv_contexts = conv_contexts(covered)
+            remaining_qadd_contexts = {
+                str(item["compiled_artifact"]["xclbin"])
+                for index, item in self.operation_specs.items()
+                if item.get("op_type") == "Add"
+                and item.get("quantization")
+                and item.get("compiled_artifact")
+                and not set(item["quantization"].get("fused_node_indices") or (index,)).issubset(covered)
+            }
             active_contexts = pool_contexts | {
                 prepared_blocks[prefix][3] for prefix in active_prefixes
-            } | set(remaining_conv_contexts)
+            } | set(remaining_conv_contexts) | remaining_qadd_contexts
             if len(active_contexts) <= self.context_cache_limit:
                 break
 
@@ -532,6 +540,49 @@ class XDNAResNetRunner:
         self._executed["device_resident_pool_outputs"] += 1
         return _DeviceValue(output_tensor, output_shape, 1.0, 0, producer=f"maxpool:{index}", layout="nchw")
 
+    def _run_quantized_add_relu(self, index: int, values: dict[str, Any]) -> _DeviceValue:
+        """Run the compiled residual Add+ReLU+Quantize kernel on XDNA."""
+        import aie.iron as iron
+        from aie.iron.device import from_name
+
+        iron.set_current_device(from_name("npu2", n_cols=None))
+        spec = self.operation_specs[index]
+        quant = spec["quantization"]
+        artifact = spec["compiled_artifact"]
+        shape = tuple(int(v) for v in spec["output_shapes"][0])
+        if len(shape) != 4 or shape[0] != 1:
+            raise ValueError(f"quantized Add node {index} requires batch-one NCHW tensors")
+        elements = math.prod(shape)
+        key = (str(artifact["xclbin"]), elements)
+        cached = self._qadd_workspace_cache.get(key)
+        if cached is None:
+            cached = tuple(
+                iron.tensor(np.zeros(elements, dtype=np.uint8), dtype=np.uint8, device="npu")
+                for _ in range(3)
+            )
+            self._qadd_workspace_cache[key] = cached
+        lhs_workspace, rhs_workspace, output_tensor = cached
+
+        def input_tensor(name: str, workspace: Any) -> Any:
+            value = values.get(name)
+            if isinstance(value, _DeviceValue) and value.layout == "nhwc" and value.shape == shape:
+                # XRT buffers are byte-compatible; the kernel consumes uint8 bit patterns.
+                return value.tensor
+            raw = self._host_value(value) if isinstance(value, _DeviceValue) else np.asarray(value)
+            nhwc = np.asarray(raw, dtype=np.uint8).reshape(shape).transpose(0, 2, 3, 1).copy()
+            with workspace.overwrite() as host:
+                np.copyto(host, nhwc.reshape(-1))
+            return workspace
+
+        lhs = input_tensor(str(quant["raw_inputs"][0]), lhs_workspace)
+        rhs = input_tensor(str(quant["raw_inputs"][1]), rhs_workspace)
+        self._kernel(str(artifact["xclbin"]), str(artifact["insts"]))(lhs, rhs, output_tensor)
+        self._executed["xdna_quantized_add_relu"] += 1
+        return _DeviceValue(
+            output_tensor, shape, float(quant["output_scale"]),
+            int(quant["output_zero_point"]), producer=f"qadd:{index}", layout="nhwc",
+        )
+
     def _run_conv(self, index: int, node: Any, values: dict[str, np.ndarray]) -> np.ndarray:
         total_start = time.perf_counter()
         plan = self.conv_plans[index]
@@ -765,6 +816,7 @@ class XDNAResNetRunner:
         self._executed = {
             "xdna_conv": 0,
             "xdna_maxpool": 0,
+            "xdna_quantized_add_relu": 0,
             "device_resident_pool_outputs": 0,
             "device_view_ops": 0,
             "cpu_conv": 0,
@@ -780,6 +832,7 @@ class XDNAResNetRunner:
         self._conv_times = []
         self._fused_times = []
         self._precomputed_relu_nodes: set[int] = set()
+        self._precomputed_native_nodes: set[int] = set()
         values = dict(self.arrays)
         values.update(inputs)
         for index, node in enumerate(self.nodes):
@@ -789,6 +842,8 @@ class XDNAResNetRunner:
                     self._run_fused_bottleneck(values, self._fused_blocks[prefix])
                 continue
             if index in self._precomputed_relu_nodes:
+                continue
+            if index in self._precomputed_native_nodes:
                 continue
             if index in self._fused_input_handoffs:
                 raw = values.get(str(node.input[0]))
@@ -815,6 +870,15 @@ class XDNAResNetRunner:
                 pass
             elif op == "Constant":
                 result = numpy_helper.to_array(attrs["value"])
+            elif (op == "Add" and index in self.operation_specs
+                  and self.operation_specs[index].get("compiled_artifact")
+                  and self.operation_specs[index].get("quantization")):
+                result = self._run_quantized_add_relu(index, values)
+                quant = self.operation_specs[index]["quantization"]
+                values[str(quant["raw_output"])] = result
+                for fused_index in quant.get("fused_node_indices", ())[1:]:
+                    self._precomputed_native_nodes.add(int(fused_index))
+                offloaded = True
             elif op == "QuantizeLinear":
                 result = _quantize(args[0], args[1], args[2], int(attrs.get("axis", 1)))
             elif op == "DequantizeLinear":
