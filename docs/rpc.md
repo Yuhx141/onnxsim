@@ -83,6 +83,8 @@ remote.upload("model.onnx")                              # copy into the server'
 model = remote.load_model("model.onnx")                  # keeps an onnxruntime session alive
 out = model.run({"x": np.zeros((1, 3, 224, 224), "float32")})
 t = model.time_evaluator({"x": x}, number=5, repeat=3)   # device-side timing only
+# Or send only shape/dtype metadata; the server generates and reuses random inputs.
+t = model.time_evaluator({"x": x}, number=5, repeat=3, random_inputs=True, seed=7)
 print(f"{t.median * 1e3:.2f} ms", t.results)
 
 with rpc.remote_executor(remote):                        # constant folding runs on the device
@@ -120,7 +122,7 @@ python -m onnxsim.rpc server --port 9090 --key pixel --tracker host:9190     # r
 | `Session.upload(path_or_bytes, name=None)` | store a file in the server workspace (name sanitised) |
 | `Session.load_model(name/path/bytes/ModelProto, providers=None)` | returns a `RemoteModel` |
 | `RemoteModel.run(inputs)` | outputs by name as NumPy arrays |
-| `RemoteModel.time_evaluator(inputs, number, repeat)` | `ProfileResult` (`results`, `mean`, `median`, `min`, `max`, `std`), seconds per call |
+| `RemoteModel.time_evaluator(inputs, number, repeat, random_inputs=False, seed=None)` | `ProfileResult` (`results`, `mean`, `median`, `min`, `max`, `std`), seconds per call; random mode sends shape/dtype metadata only and generates inputs on the server |
 | `Session.run(model, inputs)` | one-shot run without keeping a handle |
 | `rpc.remote_executor(session)` | context manager: `onnxsim.simplify` folds constants remotely |
 

@@ -86,20 +86,35 @@ class RemoteModel:
         return proto.decode_tensors(reply["tensors"], out)
 
     def time_evaluator(
-        self, inputs: Dict[str, np.ndarray], number: int = 1, repeat: int = 3
+        self,
+        inputs: Dict[str, np.ndarray],
+        number: int = 1,
+        repeat: int = 3,
+        random_inputs: bool = False,
+        seed: Optional[int] = None,
     ) -> ProfileResult:
-        """Time ``session.run`` on the device only: transfers and session creation are excluded."""
-        specs, blobs = proto.encode_tensors(inputs)
-        reply, _ = self._session._call(
-            {
-                "op": "time",
-                "handle": self.handle,
-                "tensors": specs,
-                "number": number,
-                "repeat": repeat,
-            },
-            blobs,
+        """Time server-side calls, optionally generating input values on the server.
+
+        In random mode, ``inputs`` supplies only input names, shapes and dtypes. The
+        server generates one seeded random set and reuses it for this timing request.
+        """
+        specs, blobs = (
+            (proto.encode_tensor_specs(inputs), [])
+            if random_inputs
+            else proto.encode_tensors(inputs)
         )
+        header: Dict[str, Any] = {
+            "op": "time",
+            "handle": self.handle,
+            "tensors": specs,
+            "number": number,
+            "repeat": repeat,
+        }
+        if random_inputs:
+            header["random_inputs"] = True
+            if seed is not None:
+                header["seed"] = int(seed)
+        reply, _ = self._session._call(header, blobs)
         return ProfileResult(list(reply["results"]), reply.get("stats"))
 
     def close(self) -> None:

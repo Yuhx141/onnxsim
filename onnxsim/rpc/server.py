@@ -13,6 +13,7 @@ onnxruntime custom-op libraries are never loaded. Expose it only on a trusted li
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import re
@@ -38,6 +39,49 @@ def _sanitize(name: str) -> str:
     if not base:
         raise proto.RPCError(f"invalid file name {name!r}")
     return base
+
+
+def _random_tensors(specs, seed: Optional[int]) -> Dict[str, np.ndarray]:
+    """Generate bounded random arrays from tensor metadata without receiving tensor blobs."""
+    rng = np.random.default_rng(seed)
+    tensors = {}
+    seen = set()
+    for spec in specs:
+        name, dtype = spec["name"], spec["dtype"]
+        if name in seen:
+            raise proto.RPCError(f"duplicate tensor name {name!r}")
+        seen.add(name)
+        if dtype not in proto.DTYPES:
+            raise proto.RPCError(f"unsupported tensor dtype {dtype!r}")
+        try:
+            shape = tuple(int(dim) for dim in spec["shape"])
+        except (KeyError, TypeError, ValueError):
+            raise proto.RPCError(f"invalid shape for tensor {name!r}") from None
+        if any(dim < 0 for dim in shape):
+            raise proto.RPCError(f"invalid shape for tensor {name!r}")
+        np_dtype = np.dtype(dtype)
+        byte_count = math.prod(shape) * np_dtype.itemsize
+        if byte_count > proto.DEFAULT_MAX_BLOB_BYTES:
+            raise proto.RPCError(
+                f"random tensor {name!r} exceeds the tensor size limit"
+            )
+        if dtype == "bool":
+            value = rng.integers(0, 2, size=shape, dtype=np.uint8).astype(np.bool_)
+        elif dtype.startswith("float"):
+            value = rng.standard_normal(size=shape).astype(np_dtype)
+        else:
+            limits = np.iinfo(np_dtype)
+            value = rng.integers(
+                limits.min,
+                limits.max,
+                size=shape,
+                dtype=np_dtype,
+                endpoint=True,
+            )
+        tensors[name] = value
+    if not tensors:
+        raise proto.RPCError("random inputs require at least one tensor")
+    return tensors
 
 
 class _Runner:
@@ -414,7 +458,12 @@ class _Handler(socketserver.BaseRequestHandler):
             return {"tensors": specs}, out_blobs
         if op == "time":
             runner = self._model(models, header)
-            inputs = proto.decode_tensors(header["tensors"], blobs)
+            if header.get("random_inputs"):
+                if blobs:
+                    raise proto.RPCError("random inputs must not include tensor blobs")
+                inputs = _random_tensors(header["tensors"], header.get("seed"))
+            else:
+                inputs = proto.decode_tensors(header["tensors"], blobs)
             number, repeat = (
                 max(int(header.get("number", 1)), 1),
                 max(int(header.get("repeat", 1)), 1),
