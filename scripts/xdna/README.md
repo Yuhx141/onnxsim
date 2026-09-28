@@ -268,9 +268,12 @@ averaged 13.18 ms over 20 measured runs with exact ONNX CPU output; the
 float32 Torch path measured 14.82 ms over 10 runs in the same setup. Replacing
 the float32 `unfold` conversion with an int8 view-based spatial pack reduced
 the hybrid run to 11.17 ms over 20 measured runs, still with exact output. The
-runner also fuses each scalar-quantized residual `Dequantize → Add → Relu →
-Quantize → Dequantize` chain into one host step when no native Add artifact is
-selected. That covers 16 residuals here and reduces interpreted host nodes from
+uint8 zero-point-128 path now centers activations and weights with a single
+signed-byte transform; a 30-run follow-up measured 12.18 ms with exact output
+and 3.09 ms in CPU Conv preparation. The runner also fuses each
+scalar-quantized residual `Dequantize → Add → Relu → Quantize → Dequantize`
+chain into one host step when no native Add artifact is selected. That covers
+16 residuals here and reduces interpreted host nodes from
 209 to 128. Interleaved fused/unfused runs had indistinguishable full-graph
 latency, so this fusion reduces graph-walk work but has not yet narrowed the
 device-performance gap. Vitis still measures about 1.63 ms on this model.

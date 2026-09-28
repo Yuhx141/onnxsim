@@ -81,6 +81,9 @@ def _centered_int8(raw: np.ndarray, zero: int, label: str) -> np.ndarray:
     raw = np.asarray(raw)
     if raw.dtype == np.int8 and zero == 0:
         return raw
+    if raw.dtype == np.uint8 and zero == 128:
+        # Rotate the unsigned range around 128 with one signed-byte copy.
+        return np.bitwise_xor(raw.view(np.int8), np.int8(-128))
     centered = raw.astype(np.int16) - zero
     if np.any((centered < -128) | (centered > 127)):
         raise ValueError(f"{label} cannot be represented as signed int8")
