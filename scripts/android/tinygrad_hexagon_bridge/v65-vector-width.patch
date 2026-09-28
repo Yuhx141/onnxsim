@@ -1,0 +1,178 @@
+diff --git a/test/unit/test_dsp_render.py b/test/unit/test_dsp_render.py
+index df9922ca2..72295b2d6 100644
+--- a/test/unit/test_dsp_render.py
++++ b/test/unit/test_dsp_render.py
+@@ -1,6 +1,7 @@
+ import unittest
++import numpy as np
+ from tinygrad import Tensor, dtypes
+-from tinygrad.helpers import Target, Context
++from tinygrad.helpers import Target, Context, getenv
+ from tinygrad.codegen import to_program
+ from tinygrad.runtime import ops_dsp
+ from tinygrad.runtime.ops_dsp import MockDSPRenderer
+@@ -34,6 +35,40 @@ class TestDSPRender(unittest.TestCase):
+     self.assertIn("(val0+val1)", src)
+     self.assertNotIn("val0[1]", src)  # no per-lane constructor
+ 
++  def test_float_depthwise_conv_upcast_fits_hvx_vector(self):
++    # v65 has 128-byte HVX vectors. A 64-lane f32 upcast creates an invalid 256-byte vector and
++    # miscomputes depthwise Conv; the heuristic must cap this reduction at 32 f32 lanes.
++    x = Tensor.empty(1, 64, 64, 128)
++    w = Tensor.empty(64, 1, 3, 3, dtype=dtypes.float16)
++    b = Tensor.empty(64, dtype=dtypes.float16)
++    src = dsp_source(x.conv2d(w, b, stride=2, groups=64, padding=1))
++    self.assertNotIn("float64", src)
++    self.assertIn("float32", src)
++
++  @unittest.skipUnless(getenv("MOCKDSP"), "requires MOCKDSP=1")
++  def test_float_depthwise_conv_matches_cpu(self):
++    rng = np.random.default_rng(7)
++    x = rng.normal(0, 2, (1, 64, 64, 128)).astype(np.float32)
++    w = rng.normal(0, 0.15, (64, 1, 3, 3)).astype(np.float16)
++    b = rng.normal(0, 0.15, (64,)).astype(np.float16)
++    with Context(PARALLEL=0):
++      dsp = Tensor(x, device="DSP").conv2d(Tensor(w, device="DSP"), Tensor(b, device="DSP"),
++                                             stride=2, groups=64, padding=1).numpy()
++      cpu = Tensor(x, device="CPU").conv2d(Tensor(w, device="CPU"), Tensor(b, device="CPU"),
++                                             stride=2, groups=64, padding=1).numpy()
++    np.testing.assert_allclose(dsp, cpu, atol=1e-4, rtol=1e-4)
++
++  @unittest.skipUnless(getenv("MOCKDSP"), "requires MOCKDSP=1")
++  def test_float_1x1_conv_matches_cpu(self):
++    rng = np.random.default_rng(123)
++    x = rng.normal(size=(1, 64, 32, 64)).astype(np.float32)
++    w = rng.normal(size=(64, 64, 1, 1)).astype(np.float16)
++    b = rng.normal(size=(64,)).astype(np.float16)
++    with Context(PARALLEL=0):
++      dsp = Tensor(x, device="DSP").conv2d(Tensor(w, device="DSP"), Tensor(b, device="DSP")).numpy()
++      cpu = Tensor(x, device="CPU").conv2d(Tensor(w, device="CPU"), Tensor(b, device="CPU")).numpy()
++    np.testing.assert_allclose(dsp, cpu, atol=1e-4, rtol=1e-4)
++
+ class TestDSPQfloat(unittest.TestCase):
+   # HVX_ARCH>=v68 turns on qfloat lowering; flip the module flag directly so this runs without a v68 toolchain
+   def setUp(self): self.prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True
+diff --git a/tinygrad/codegen/opt/heuristic.py b/tinygrad/codegen/opt/heuristic.py
+index 3405d882c..4fdd41184 100644
+--- a/tinygrad/codegen/opt/heuristic.py
++++ b/tinygrad/codegen/opt/heuristic.py
+@@ -49,6 +49,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
+ 
+   # make a copy so it does not mutate the input
+   k = k.copy()
++  is_dsp = k.ren is not None and k.ren.target.device == "DSP"
++  # HVX vectors are 128 bytes. The DSP path also handles byte tensors, so the lane cap must
++  # account for the reduction dtype (e.g. 32 f32 lanes or 128 byte lanes).
++  dsp_vector_lanes = 128 // k.reduceop.dtype.itemsize if is_dsp and k.reduceop is not None else 128
+ 
+   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
+   if IMAGE:
+@@ -104,7 +108,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
+   for axis in k.upcastable_dims:
+     # for Schedule, we check if the range is used in INDEX gates or WHERE gates
+     is_masked = k.rngs[axis] in where_gate_rngs
+-    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= 7 * 7:
++    max_masked_upcast = min(7 * 7, dsp_vector_lanes // k.upcast_size()) if is_dsp else 7 * 7
++    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= max_masked_upcast:
+       # upcasting a masked global axis moves that range out of the launch grid into each work-item
+       # under IMAGE, skip the upcast unless enough global work-items remain after it to hide memory latency
+       if IMAGE and k.axis_types[axis] is AxisType.GLOBAL:
+@@ -116,13 +121,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
+   for axis in to_upcast[::-1]: k.apply_opt(Opt(OptOps.UPCAST, axis, 0))
+ 
+   # potentially do more upcasts of non reduce axes based on a heuristic
+-  is_dsp = k.ren is not None and k.ren.target.device == "DSP"
+   upcasted_axis: set[int] = set()
+   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
+     xb_choices = []
+-    # consider all upcastable axes with 3 or 4 upcast (on the DSP, one HVX-register-sized or larger vector: 128/64/32 lanes,
+-    # since real shapes like ...x272 aren't multiples of 128 and would otherwise fall back to a 4-wide upcast)
+-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128,64,32] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
++    # consider upcasts up to one HVX vector (the lane count depends on the reduction dtype); real shapes like ...x272
++    # aren't multiples of 128 and would otherwise fall back to a 4-wide upcast for byte-sized reductions
++    dsp_upcast_sizes = [s for s in [128,64,32,16,8,4] if s * k.upcast_size() <= dsp_vector_lanes]
++    for axis, upcast_amount in itertools.product(k.upcastable_dims,
++        (dsp_upcast_sizes if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
+       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
+       rng = k.rngs[axis]
+@@ -161,8 +167,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
+             break
+   except KernelOptError: pass
+ 
+-  # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, as wide as the innermost dim allows, up to 128 lanes)
+-  for splits in ([128,64,32,16,8,4] if is_dsp else [4]):
++  # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, up to one HVX vector)
++  for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp else [4]):
+     if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
+       k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+       break
+--- a/tinygrad/runtime/ops_dsp.py
++++ b/tinygrad/runtime/ops_dsp.py
+@@ -117,6 +117,9 @@
+ def hvx_revectorize(x:UOp) -> UOp|None:
+   srcs, n = x.src, len(x.src)
+   if n < 2 or x.dtype == dtypes.void: return None
++  # v65 has integer HVX only. Keeping float lanes in an ext_vector_type makes LLVM lower unsupported vector-float
++  # arithmetic incorrectly (e.g. the openpilot stem 1x1 convolution); let it render scalar lane expressions instead.
++  if not HVX_QFLOAT and dtypes.is_float(x.dtype): return None
+   s0 = srcs[0]
+   # STACK(v[0], v[1], ..., v[n-1]) of a length-n vector is v itself
+   if s0.op is Ops.INDEX and len(s0.src) == 2 and s0.src[0]._shape == (n,) and \
+@@ -230,27 +233,29 @@
+ 
+     pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8)), off_mv:=memoryview(bytearray(len(bufs)*4))],
+                                        outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
+-    for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.size)
++    for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.alloc_size)
+     for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)): struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v)
+     off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))
+     self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
+     return timer[0] / 1e6
+ 
+ class DSPBuffer:
+-  def __init__(self, va_addr:int, size:int, share_info, offset:int=0):
++  def __init__(self, va_addr:int, size:int, share_info, offset:int=0, alloc_size:int|None=None):
+     self.va_addr, self.size, self.share_info, self.offset = va_addr, size, share_info, offset
++    self.alloc_size = alloc_size if alloc_size is not None else size
+ 
+ class DSPAllocator(Allocator['DSPDevice']):
+   def _alloc(self, size:int, options:BufferSpec):
++    alloc_size = round_up(size+128, 0x1000)
+     if getenv("MOCKDSP") or getenv("HEXSIM"): fd, share_info, flags = -1, None, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS
+     else:
+-      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
++      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=alloc_size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
+       fd, flags = (share_info:=qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)).fd, mmap.MAP_SHARED
+-    return DSPBuffer(libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0), size, share_info, offset=0)
++    return DSPBuffer(libc.mmap(0, alloc_size, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0), size, share_info, offset=0, alloc_size=alloc_size)
+ 
+   @suppress_finalizing
+   def _free(self, opaque:DSPBuffer, options:BufferSpec):
+-    libc.munmap(opaque.va_addr, opaque.size)
++    libc.munmap(opaque.va_addr, opaque.alloc_size)
+     if opaque.share_info is not None:
+       os.close(opaque.share_info.fd)
+       qcom_dsp.ION_IOC_FREE(self.dev.ion_fd, handle=opaque.share_info.handle)
+@@ -258,7 +263,7 @@
+   def _as_buffer(self, src:DSPBuffer) -> memoryview: return to_mv(src.va_addr, src.size)
+   def _copyin(self, dest:DSPBuffer, src:memoryview): ctypes.memmove(dest.va_addr, mv_address(src), src.nbytes)
+   def _copyout(self, dest:memoryview, src:DSPBuffer): ctypes.memmove(mv_address(dest), src.va_addr, dest.nbytes)
+-  def _offset(self, buf, size:int, offset:int): return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset)
++  def _offset(self, buf, size:int, offset:int): return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset, max(size, buf.alloc_size-offset))
+ 
+ def _find_libgcc() -> str:
+   # Every kernel this backend has ever compiled before HEXSIM/float32 support (uint8/int8/int32
+@@ -452,8 +457,11 @@
+     for i,b in enumerate(bufs):
+       if b[1][0].addrspace == AddrSpace.GLOBAL:
+         sz = b[1][0].max_numel()*b[1][0].dtype.itemsize
++        # LLVM can issue a full 128-byte HVX load for a 64-byte half vector. Keep the
++        # logical input size unchanged, but map a guarded tail so final vector loads stay valid.
++        map_sz = round_up(sz+128, 4096)
+         # for loop for big reads
+-        msrc.append(f"void *buf{i} = mmap2(0, {sz}, 3, 0x21, -1, 0); for(int rd = 0; rd < {sz}; rd += read(0, buf{i}+rd, {sz}-rd));")
++        msrc.append(f"void *buf{i} = mmap2(0, {map_sz}, 3, 0x21, -1, 0); for(int rd = 0; rd < {sz}; rd += read(0, buf{i}+rd, {sz}-rd));")
+       else:
+         msrc.append(f"{self._render_dtype(b[1][0].dtype)} val{i}; read(0, &val{i}, {b[1][0].dtype.itemsize});")
+     msrc.append("unsigned int st = inscount();")

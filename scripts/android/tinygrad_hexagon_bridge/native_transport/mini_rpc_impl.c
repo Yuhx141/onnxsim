@@ -12,6 +12,23 @@
 #include "block1_kernels.c"
 #include "block1_glue.c"
 
+#ifdef TG_OPENPILOT_PROBE
+#ifndef TG_PROBE_INPUT_BYTES
+#error "TG_PROBE_INPUT_BYTES must be set for the openpilot model-kernel probe"
+#endif
+#ifndef TG_PROBE_OUTPUT_BYTES
+#error "TG_PROBE_OUTPUT_BYTES must be set for the openpilot model-kernel probe"
+#endif
+void tinygrad_openpilot_probe(const unsigned char* input, unsigned char* output);
+#endif
+
+#ifdef TG_OPENPILOT_GRAPH
+int tg_openpilot_load_weights(int offset, const unsigned char* data, int size);
+int tg_openpilot_begin(const unsigned char* input, int input_bytes);
+int tg_openpilot_step(int start, int count);
+int tg_openpilot_finish(unsigned char* output, int output_capacity);
+#endif
+
 int mini_rpc_open(const char* uri, remote_handle64* h) {
   *h = (remote_handle64)(uintptr_t)malloc(1);
   return *h ? 0 : -1;
@@ -151,6 +168,34 @@ __attribute__((noinline)) void hex_boxhead_gemm(float* restrict __attribute__((a
 
 int mini_rpc_run_kernel(remote_handle64 h, const unsigned char* a, int aLen,
                          const unsigned char* b, int bLen, unsigned char* c, int cLen) {
+#ifdef TG_OPENPILOT_GRAPH
+  /* Reuse the existing three-sequence method: b carries a 32-bit weight offset, an 8-byte
+   * {start,count} graph batch, or is empty for begin/finalize. Small graph batches keep each
+   * cDSP invocation under its FastRPC watchdog window. */
+  if (bLen == (int)sizeof(int32_t) && cLen == 0) {
+    int32_t offset;
+    memcpy(&offset, b, sizeof(offset));
+    return tg_openpilot_load_weights(offset, a, aLen);
+  }
+  if (aLen == TG_GRAPH_INPUT_BYTES && bLen == 0 && cLen == 0)
+    return tg_openpilot_begin(a, aLen);
+  if (aLen == 0 && bLen == 2 * (int)sizeof(int32_t) && cLen == 0) {
+    int32_t batch[2]; memcpy(batch, b, sizeof(batch));
+    return tg_openpilot_step(batch[0], batch[1]);
+  }
+  if (aLen == 0 && bLen == 0 && cLen == TG_GRAPH_OUTPUT_BYTES)
+    return tg_openpilot_finish(c, cLen);
+#endif
+#ifdef TG_OPENPILOT_PROBE
+  if (aLen == TG_PROBE_INPUT_BYTES && bLen == 0 && cLen == TG_PROBE_OUTPUT_BYTES) {
+#ifdef TG_PROBE_TRANSPORT_ONLY
+    memset(c, 0x5a, cLen);
+#else
+    tinygrad_openpilot_probe(a, c);
+#endif
+    return 0;
+  }
+#endif
   /* Dispatch by buffer size: the original transport-PoC test (8/8/8-byte buffers, see
    * ../README.md) still gets the placeholder byte-add below; a call sized for the real
    * cin=64,cout=256,m=54400 GEMM (hex_gemm_kernel.py's own default shape) runs the real kernel,

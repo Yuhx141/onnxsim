@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 #include "mini_rpc.h"
+#include <remote.h>
 
 #define GEMM_A_LEN 3481600
 #define GEMM_B_LEN 16384
@@ -56,6 +57,16 @@ static unsigned char* read_file_exact(const char* path, int expect_len) {
 int main(int argc, char** argv) {
   const char* uri = argv[1];  /* e.g. "file:///data/local/tmp/native_transport/mini_rpc.so?mini_rpc_skel_handle_invoke&_dom=cdsp" */
 
+  /* SDK default is only 16 KiB per FastRPC DSP thread. Generated call 61 needs a 0x5798-byte
+   * frame by itself, so configure the cDSP worker stack before making any other RPC call. */
+  struct remote_rpc_thread_params thread_params;
+  thread_params.domain = CDSP_DOMAIN_ID;
+  thread_params.prio = -1;
+  thread_params.stack_size = 64 * 1024;
+  int trc = remote_session_control(FASTRPC_THREAD_PARAMS, &thread_params, sizeof(thread_params));
+  printf("set cDSP FastRPC stack=65536 rc=%d\n", trc);
+  if (trc != 0) return 2;
+
   /* The missing piece: unsigned .so loading on the CDSP is refused (AEE_ECONNREFUSED) unless
    * this process explicitly opts in per-session first. TVM's own launcher/session code
    * (apps/hexagon_launcher/launcher_android.cc, src/runtime/hexagon/rpc/android/session.cc)
@@ -85,6 +96,142 @@ int main(int argc, char** argv) {
   printf("run_kernel (placeholder byte-add) rc=%d out=", rc);
   for (int i = 0; i < 8; i++) printf("%d ", c[i]);
   printf("\n");
+
+#ifdef TG_OPENPILOT_PROBE
+  #ifndef TG_PROBE_INPUT_BYTES
+  #error "TG_PROBE_INPUT_BYTES must be set for the openpilot model-kernel probe"
+  #endif
+  #ifndef TG_PROBE_OUTPUT_BYTES
+  #error "TG_PROBE_OUTPUT_BYTES must be set for the openpilot model-kernel probe"
+  #endif
+  #ifndef TG_PROBE_REPEATS
+  #define TG_PROBE_REPEATS 5
+  #endif
+  const char* probe_input_path = "/data/local/tmp/native_transport/openpilot_probe_input.bin";
+  const char* probe_output_path = "/data/local/tmp/native_transport/openpilot_probe_output.bin";
+  unsigned char* probe_input = read_file_exact(probe_input_path, TG_PROBE_INPUT_BYTES);
+  if (!probe_input) {
+    fprintf(stderr, "probe input missing or wrong size: %s\n", probe_input_path);
+    mini_rpc_close(h);
+    return 3;
+  }
+  unsigned char* probe_output = malloc(TG_PROBE_OUTPUT_BYTES);
+  if (!probe_output) { free(probe_input); mini_rpc_close(h); return 4; }
+  double probe_times[TG_PROBE_REPEATS];
+  int probe_rc = 0, probe_count = 0;
+  for (int probe_i = 0; probe_i < TG_PROBE_REPEATS; probe_i++) {
+    struct timespec probe_t0, probe_t1;
+    clock_gettime(CLOCK_MONOTONIC, &probe_t0);
+    probe_rc = mini_rpc_run_kernel(h, probe_input, TG_PROBE_INPUT_BYTES, probe_input, 0,
+                                   probe_output, TG_PROBE_OUTPUT_BYTES);
+    clock_gettime(CLOCK_MONOTONIC, &probe_t1);
+    probe_times[probe_i] = (probe_t1.tv_sec - probe_t0.tv_sec) * 1000.0 +
+                           (probe_t1.tv_nsec - probe_t0.tv_nsec) / 1e6;
+    probe_count++;
+    if (probe_rc != 0) break;
+  }
+  for (int i = 1; i < probe_count; i++) {
+    double value = probe_times[i]; int j = i - 1;
+    while (j >= 0 && probe_times[j] > value) { probe_times[j + 1] = probe_times[j]; j--; }
+    probe_times[j + 1] = value;
+  }
+  printf("openpilot kernel probe rc=%d repeats=%d median_wall_ms=%.3f\n", probe_rc,
+         probe_count, probe_times[probe_count / 2]);
+  FILE* probe_file = fopen(probe_output_path, "wb");
+  if (!probe_file) { free(probe_input); free(probe_output); mini_rpc_close(h); return 5; }
+  fwrite(probe_output, 1, TG_PROBE_OUTPUT_BYTES, probe_file);
+  fclose(probe_file);
+  printf("wrote %s (%d bytes)\n", probe_output_path, TG_PROBE_OUTPUT_BYTES);
+  free(probe_input);
+  free(probe_output);
+  mini_rpc_close(h);
+  return probe_rc;
+#endif
+
+#ifdef TG_OPENPILOT_GRAPH
+  #ifndef TG_GRAPH_INPUT_BYTES
+  #error "TG_GRAPH_INPUT_BYTES must be set for the openpilot graph runner"
+  #endif
+  #ifndef TG_GRAPH_OUTPUT_BYTES
+  #error "TG_GRAPH_OUTPUT_BYTES must be set for the openpilot graph runner"
+  #endif
+  #ifndef TG_GRAPH_WEIGHT_BYTES
+  #error "TG_GRAPH_WEIGHT_BYTES must be set for the openpilot graph runner"
+  #endif
+  #ifndef TG_GRAPH_WEIGHT_CHUNK
+  #define TG_GRAPH_WEIGHT_CHUNK 8388608
+  #endif
+  const char* graph_weights_path = "/data/local/tmp/native_transport/openpilot_graph_weights.bin";
+  const char* graph_input_path = "/data/local/tmp/native_transport/openpilot_graph_input.bin";
+  const char* graph_expected_path = "/data/local/tmp/native_transport/openpilot_graph_expected.bin";
+  const char* graph_output_path = "/data/local/tmp/native_transport/openpilot_graph_output.bin";
+  unsigned char* graph_weights = read_file_exact(graph_weights_path, TG_GRAPH_WEIGHT_BYTES);
+  unsigned char* graph_input = read_file_exact(graph_input_path, TG_GRAPH_INPUT_BYTES);
+  unsigned char* graph_expected = read_file_exact(graph_expected_path, TG_GRAPH_OUTPUT_BYTES);
+  unsigned char* graph_output = malloc(TG_GRAPH_OUTPUT_BYTES);
+  if (!graph_weights || !graph_input || !graph_expected || !graph_output) {
+    fprintf(stderr, "openpilot graph files missing or have wrong sizes\n");
+    free(graph_weights); free(graph_input); free(graph_expected); free(graph_output);
+    mini_rpc_close(h);
+    return 6;
+  }
+  printf("loading %d openpilot weight bytes in %d-byte FastRPC chunks...\n",
+         TG_GRAPH_WEIGHT_BYTES, TG_GRAPH_WEIGHT_CHUNK);
+  int graph_rc = 0;
+  unsigned char graph_empty[1] = {0};
+  for (int offset = 0; offset < TG_GRAPH_WEIGHT_BYTES; offset += TG_GRAPH_WEIGHT_CHUNK) {
+    int chunk = TG_GRAPH_WEIGHT_BYTES - offset;
+    if (chunk > TG_GRAPH_WEIGHT_CHUNK) chunk = TG_GRAPH_WEIGHT_CHUNK;
+    graph_rc = mini_rpc_run_kernel(h, graph_weights + offset, chunk,
+                                   (const unsigned char*)&offset, sizeof(offset), graph_empty, 0);
+    if (graph_rc != 0) {
+      fprintf(stderr, "load weights failed at offset %d size %d rc=%d\n", offset, chunk, graph_rc);
+      break;
+    }
+  }
+  if (graph_rc == 0) {
+    struct timespec graph_t0, graph_t1;
+    clock_gettime(CLOCK_MONOTONIC, &graph_t0);
+    graph_rc = mini_rpc_run_kernel(h, graph_input, TG_GRAPH_INPUT_BYTES, graph_empty, 0, graph_empty, 0);
+    int32_t batch[2];
+    const int batch_calls = TG_GRAPH_BATCH_CALLS;
+    for (int start = 0; graph_rc == 0 && start < TG_GRAPH_CALLS; start += batch_calls) {
+      batch[0] = start;
+      batch[1] = (start + batch_calls <= TG_GRAPH_CALLS) ? batch_calls : TG_GRAPH_CALLS - start;
+      struct timespec batch_t0, batch_t1;
+      clock_gettime(CLOCK_MONOTONIC, &batch_t0);
+      graph_rc = mini_rpc_run_kernel(h, graph_empty, 0, (const unsigned char*)batch,
+                                     sizeof(batch), graph_empty, 0);
+      clock_gettime(CLOCK_MONOTONIC, &batch_t1);
+      double batch_ms = (batch_t1.tv_sec - batch_t0.tv_sec) * 1000.0 +
+                        (batch_t1.tv_nsec - batch_t0.tv_nsec) / 1e6;
+      printf("openpilot batch start=%d count=%d rc=%d wall_ms=%.3f\n",
+             start, batch[1], graph_rc, batch_ms);
+      if (graph_rc != 0) fprintf(stderr, "openpilot graph batch %d rc=%d\n", start, graph_rc);
+    }
+    if (graph_rc == 0)
+      graph_rc = mini_rpc_run_kernel(h, graph_empty, 0, graph_empty, 0,
+                                     graph_output, TG_GRAPH_OUTPUT_BYTES);
+    clock_gettime(CLOCK_MONOTONIC, &graph_t1);
+    double graph_ms = (graph_t1.tv_sec - graph_t0.tv_sec) * 1000.0 +
+                      (graph_t1.tv_nsec - graph_t0.tv_nsec) / 1e6;
+    printf("openpilot graph rc=%d wall_ms=%.3f\n", graph_rc, graph_ms);
+  }
+  if (graph_rc == 0) {
+    FILE* graph_file = fopen(graph_output_path, "wb");
+    if (!graph_file || fwrite(graph_output, 1, TG_GRAPH_OUTPUT_BYTES, graph_file) != TG_GRAPH_OUTPUT_BYTES) {
+      if (graph_file) fclose(graph_file);
+      fprintf(stderr, "could not write graph output\n");
+      graph_rc = -1;
+    } else fclose(graph_file);
+    int graph_match = memcmp(graph_output, graph_expected, TG_GRAPH_OUTPUT_BYTES) == 0;
+    printf("full graph bit-exact to QEMU zero-input reference: %s\n", graph_match ? "yes" : "no");
+    if (!graph_match) graph_rc = -1;
+  }
+  free(graph_weights); free(graph_input); free(graph_expected); free(graph_output);
+  mini_rpc_close(h);
+  return graph_rc == 0 ? 0 : 7;
+#endif
 
   /* Real hex_gemm_kernel.py-generated vrmpy GEMM at the flagship Mask R-CNN backbone shape
    * (cin=64,cout=256,m=54400) -- only runs if gen_gemm_test_data.py's output files were pushed

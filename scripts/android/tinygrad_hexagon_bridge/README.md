@@ -58,6 +58,404 @@ Verified end-to-end, real hardware, `cin=64, cout=256, hw=512` (the pathological
 | tinygrad, vrmpy TensorCore (see below) | 29.9 ms | 0.28 GMAC/s | yes |
 | stock TVM (hand-tuned `vrmpy` schedule) | 3.8 ms | 2.18 GMAC/s | yes |
 
+### v65 code generation check
+
+The installed Hexagon SDK 6.4 compiler rejects `-mcpu=hexagonv65`, so the bridge accepts a
+compiler override. System clang 19 can emit v65 objects; TVM's SDK linker still links the support
+libraries for v68. This compiled and ran the generated kernel on the attached v69 phone, with
+bit-exact output (53.8 ms for the 512x64x256 generic kernel):
+
+```sh
+bridge_and_test.py --kernel kernel.c --hexagon-toolchain "$HEXAGON_TOOLCHAIN" \
+  --hexagon-clang /usr/bin/clang-19 --hex-arch v65 --link-arch v68 \
+  --tvm-root <tvm source root> --hw 512 --cin 64 --cout 256
+```
+
+This validates v65-targeted generic code on newer hardware. The captured default kernel did not
+select `vrmpy`. Full-model QEMU execution of openpilot v0.9.7 `supercombo.onnx` now completes with
+148 captured kernels and a `(1, 6504)` output. Against ONNX Runtime CPU on the same seeded inputs,
+the maximum absolute output difference is `2.48` (mean `0.069`); the largest output magnitude is
+`8618`, and the 99th-percentile relative error is `0.084%` for outputs whose reference magnitude
+exceeds `0.01`. This is close numerical agreement, not bit-exact equivalence.
+
+### Exporting the captured model code
+
+`examples/openpilot/compile3.py` captures and validates tinygrad's graph, but its pickle keeps the
+generated programs embedded in the JIT object. Export those programs into reviewable per-kernel
+sources and compile v65-targeted ELF objects with:
+
+```sh
+export TINYGRAD_ROOT=/path/to/tinygrad
+export PYTHONPATH="$TINYGRAD_ROOT/examples/openpilot:$TINYGRAD_ROOT"
+export HEXAGON_TOOLCHAIN=/path/to/Hexagon_SDK/6.4.0.2/tools/HEXAGON_Tools/19.0.04/Tools
+MOCKDSP=1 DEV=DSP FLOAT16=1 NOLOCALS=1 BEAM=0 CC=/usr/bin/clang-19 \
+  python3 "$TINYGRAD_ROOT/examples/openpilot/compile3.py" \
+    /path/to/supercombo.onnx /tmp/supercombo_v65.pkl
+MOCKDSP=1 DEV=DSP FLOAT16=1 NOLOCALS=1 BEAM=0 CC=/usr/bin/clang-19 \
+  python3 scripts/android/tinygrad_hexagon_bridge/export_openpilot_kernels.py \
+    /tmp/supercombo_v65.pkl --tinygrad-root "$TINYGRAD_ROOT" \
+    --out /tmp/supercombo_v65_codegen --hexagon-clang /usr/bin/clang-19 --hex-arch v65 \
+    --onnx /path/to/supercombo.onnx
+```
+
+The exporter preserves capture order and call signatures in `manifest.json`, including each
+argument's backing storage slot and byte offset through `BITCAST`/`SHRINK` views. This identifies
+the shared 2.5 MiB scratch arena used by this capture, rather than incorrectly treating every
+intermediate as a separate allocation. It writes the full QEMU source and ELF for each unique
+program, and emits kernel-only C with a unique symbol plus a v65 ELF object when `--hexagon-clang`
+is supplied. Identical generated sources share one code artifact.
+With `--onnx`, it also packs initializer tensors into 128-byte-aligned `weights.bin` and records
+names, shapes, dtypes, offsets, and hashes in the manifest. For the current v0.9.7 capture this
+exports 148 calls backed by 65 unique program sources. The captured ELF files are QEMU executables;
+the `.o` files are v65 objects for composing a phone-side runtime. The original capture used NPY
+inputs for five non-image values, which baked their sample data into the graph. `compile3.py` now
+supports `DSP_ALL_INPUTS=1` to realize all seven ONNX inputs on DSP before capture. The regenerated
+`/tmp/supercombo_v65_dynamic.pkl` has 148 calls, 65 unique sources, all seven inputs on DSP, and
+seven PARAM slots (0 through 6) whose shapes match the seven model inputs. Its shared scratch arena
+is 2.62 MiB. The exported manifest is `/tmp/supercombo_v65_dynamic_codegen`.
+
+`capture_openpilot_buffer_bindings.py` replays this capture under QEMU and hashes the actual bytes
+passed to every kernel. It verified all 313 ONNX initializer-to-BUFFER slots with no conflicts, and
+saved the sole extra constant buffer (`BUFFER:435`, the ONNX constant `[0.010002136, 1.0]`) plus a
+zero-input reference output. `generate_openpilot_graph_driver.py` consumes those bindings and emits
+a C dispatcher for all 148 calls. The generated driver holds a 2.5 MiB aligned arena, accepts the
+seven packed float32 inputs, and loads the 51.3 MB aligned weight blob in chunks. The native client
+reuses the existing `run_kernel` FastRPC method: each 8 MiB weight chunk carries its byte offset in
+the second sequence, and an empty second sequence selects graph execution.
+
+### Running one captured model kernel on the phone
+
+The native FastRPC transport can run a selected captured call as a probe. For example, call 93 is
+a small `E_10_4_128` program. Prepare deterministic synthetic activations and a QEMU reference, then
+build and run its kernel-only C on the phone's v69 DSP with a v65 target:
+
+```sh
+python3 scripts/android/tinygrad_hexagon_bridge/prepare_openpilot_kernel_probe.py \
+  /tmp/supercombo_v65_codegen --call 93 --synthetic-weights \
+  --out /tmp/supercombo_v65_phone_probe
+HEXAGON_SDK_ROOT=/path/to/Hexagon_SDK/6.4.0.2 \
+HEXAGON_TOOLCHAIN=/path/to/Hexagon_SDK/6.4.0.2/tools/HEXAGON_Tools/19.0.04/Tools \
+HEX_ARCH=v68 LINK_ARCH=v68 MODEL_ARCH=v65 MODEL_CLANG=/usr/bin/clang-19 \
+OPENPILOT_PROBE_DIR=/tmp/supercombo_v65_phone_probe \
+  bash scripts/android/tinygrad_hexagon_bridge/native_transport/build.sh
+```
+
+On the attached v69 phone this returned output bit-exact to QEMU across 5 calls; median RPC-inclusive
+time was `0.646 ms` for the 20 KiB output kernel, with a 22 KiB packed input. Activations and weights
+are synthetic, so this validates the generated v65 function's phone execution and transport ABI,
+not the actual layer result from a real model frame. The 3x3 stem probes initially returned FastRPC
+error `78`. DSP crash logs showed
+an access fault at `data2 + 18`: an eight-half vector load began on an odd row of a 9-half filter,
+while the generated C type promised 16-byte alignment. QEMU tolerated the unaligned access; the
+phone did not. `DSPRenderer` now gives FP16 vector types their natural 2-byte alignment, which
+lowers those loads safely. Calls 0 and 1 then matched QEMU bit-for-bit on the phone using their
+actual ONNX initializer weights and synthetic activations. Call 0 took `3371 ms` median; call 1
+took `15.91 ms`. These are single-kernel RPC timings, not full-model latency.
+
+Additional exact phone probes cover call 2 (`48.34 ms`), call 4 (7x7 conv, `18.04 ms`), call 93
+(`0.645 ms`), call 133 (`0.172 ms`), and the final 46-argument call 147 (`142.35 ms`, 26 KiB
+output). The captured graph has 148 ordered DSP calls, 65 unique programs, and covers all 595 nodes
+/ 26 operator types in the ONNX model; the captured QEMU run still produces `(1, 6504)`. These
+probes give representative early, middle, and final-kernel coverage. The seven model inputs are
+dynamic in the regenerated capture, with verified weight binding, persistent phone-side arena
+allocation, and successful dispatch across all 148 calls.
+
+The host `clang-19` accepts `-mcpu=hexagonv65`; the installed Qualcomm SDK compiler accepts only
+v68 and newer. A v65 syntax-only pass succeeded for all 65 unique generated kernel sources. A full
+capture-time execution of the new seven-input graph completed in QEMU with 148 calls; the optimized
+capture build took about four minutes because one fused kernel is large. The generated dispatcher
+and all 65 kernel objects were linked into a standalone QEMU executable; its full 148-call zero-input
+result matched the capture reference bit-for-bit. The graph runner sends the generated graph in
+eight-kernel FastRPC batches. The phone build with Hexagon SDK 6.4.0.2 succeeds, uploads all model
+weights, and runs the graph in `9.23 s`; its output matches the QEMU zero-input reference bit for
+bit. The SDK's default FastRPC DSP stack is 16 KiB, but call 61 (`tg_call_61_r_32_32_32`) needs a
+`0x5798`-byte frame. Configuring a 64 KiB cDSP FastRPC stack before the first RPC fixes the TLBMISS
+that previously occurred in this call.
+
+A one-kernel-per-RPC profile measured `9.23 s` end-to-end on the attached phone; measured kernel
+RPCs account for `9.21 s`, so transport overhead is small relative to execution. The slowest calls
+were call 0 at `3.94 s` (42.7%), call 109 at `461 ms`, calls 6 and 10 at `402 ms` and `397 ms`,
+call 108 at `342 ms`, and call 99 at `211 ms`. Those six calls account for 62.4% of measured kernel
+time. Per-batch timing is printed by the native client; one-call batches were used for this profile
+to isolate individual kernels.
+Changing only call 0's compiler target to v68 left its generated arithmetic scalar and did not
+improve performance. A gather-only qfloat experiment did vectorize the arithmetic and remained
+bit-exact, but regressed call 0 to `6.79 s`: assembling vectors from scattered loads cost more
+than the saved arithmetic. The useful change was to pack stem.0 weights from OIHW to `[input,
+kernel_y, kernel_x, output]` order and load each 32-output-channel slice contiguously. Call 0 then
+fell from `3.94 s` to `0.76 s`; the complete graph fell from `9.23 s` to `6.02 s` (about `1.53x`
+faster) and remained bit-exact to the QEMU zero-input reference. All other kernels remain the
+validated v65 objects. The qfloat-capable v68 call 0 is compiled from the packed source; the
+`OPENPILOT_GRAPH_PREBUILT=1` option prevents unvalidated kernels from being recompiled for v68.
+The small renderer extension used during v68 capture is recorded in
+[`v68-stem0-vectorization.patch`](v68-stem0-vectorization.patch); the exporter performs the
+contiguous weight load rewrite and initializer packing.
+
+Further profiling confirmed calls 6 and 10 share one generated source and object. Retargeting that
+shared kernel to v68 reduced each call from about `395 ms` to `81 ms`, but changed 6,284 of 6,504
+output values (maximum absolute difference `2.67e-5` on the zero-input reference). Since this
+path is not bit-exact, it is excluded from the validated graph. The graph-preparation helper now
+updates every call that shares a selected source, so experimental selections link one object
+without duplicate symbols. The phone is left on the bit-exact build with calls 0, 6, 10, 109, and
+147 on v68; the latest run measured `4.62 s` end-to-end and matched all 6,504 values exactly.
+
+Testing call 108 (`r_10_64_32_128_4`) as a v68 kernel cut its isolated time from `342.6 ms` to
+`29.8 ms`, but the end-to-end output failed bit-exact comparison. Disabling FP contraction reduced
+the speedup (`42.2 ms`) and still failed exact comparison. Both variants are excluded. Restoring the
+validated graph produced `5.96 s` end-to-end and matched the zero-input reference exactly; call 108
+remains on v65.
+
+The mismatch is in the vectorized arithmetic path: compiling the original per-lane scalar source for
+v68 remained exact but took `360 ms`, while an explicit vector accumulation sequence took `49 ms`
+and still differed. The current restored v65 call 108 measured `341 ms`; the packed-call-0 graph
+measured `5.96 s` and was bit-exact. Until the vector operations can reproduce scalar rounding,
+call 108 stays on v65.
+
+Call 109 (`r_512_2048_10`) was optimized by tiling 32 adjacent positions. This reuses each loaded
+weight across 32 positions while keeping the original 2,048-term reduction order for each one. The
+[`optimize_openpilot_call109.py`](optimize_openpilot_call109.py) reproduces the kernel rewrite.
+The two phone runs measured `62.2 ms` and `64.3 ms`, down from about `461 ms`, and both remained
+bit-exact. Tile 64 was also exact but slightly slower at `64.9 ms`. The combined graph with calls
+0, 109, and 147 on v68 measured `5.35 s` and `5.38 s` on two tile-32 runs, matching the reference.
+
+Calls 6 and 10 share the same convolution source. The raw v68 vector kernel was fast but inexact;
+tiling 32 output-channel groups lets the kernel reuse each activation tile across groups while
+keeping every output's original reduction order. [`optimize_openpilot_calls610.py`](optimize_openpilot_calls610.py)
+generates this scalar-accumulation kernel. Each call dropped from about `338 ms` to `72 ms` on two
+phone runs. With calls 0, 6, 10, 109, and 147 selected for v68, the graph measured `4.63 s` and
+`4.62 s` and remained bit-exact.
+
+The same v68 retargeting on call 99 (`r_10_48_32_128_4`) reduced its phone time from `210 ms` to
+`21.9 ms`, but also failed the full-graph exact comparison. The conversion-materialized and explicit
+vector-accumulation call 108 variants likewise remained inexact (`47.9 ms` and `49.4 ms`). The final
+graph with only packed stem.0 on v68 measured `6.01 s` and matched the reference exactly.
+
+Call 147 (`r_813_8_256_64_16_32_64_16_32_64_32_32_32_32_32_32_4`) proved safe to retarget:
+its v68 kernel ran in `49.8 ms` and `49.6 ms` on the tile-32 graph runs, down from about `143 ms`,
+with the full graph bit-exact both times.
+
+To regenerate the optimized v68 capture without asking the old QEMU to execute v68 instructions,
+use the capture-only hook (its output values are placeholders; only the captured graph/code is
+used):
+
+```sh
+TINYGRAD_ROOT=/home/takecheeze/.cache/tg-vrmpy
+OPENPILOT_ONNX=/tmp/openpilot_supercombo.onnx
+PYTHONPATH="$PWD/scripts/android/tinygrad_hexagon_bridge/capture_only_sitecustomize:$TINYGRAD_ROOT/examples/openpilot:$TINYGRAD_ROOT" \\
+MOCKDSP_CAPTURE_ONLY=1 MOCKDSP=1 DEV=DSP FLOAT16=1 NOLOCALS=1 BEAM=0 CACHELEVEL=0 CC=/usr/bin/clang-19 \\
+DSP_ALL_INPUTS=1 HVX_ARCH=v68 HEXAGON_TOOLCHAIN=/mnt/data/cache/tvm-hexagon/qualcomm/Hexagon_SDK/6.4.0.2/tools/HEXAGON_Tools/19.0.04/Tools \\
+  python3 "$TINYGRAD_ROOT/examples/openpilot/compile3.py" "$OPENPILOT_ONNX" /tmp/supercombo_v68_dynamic.pkl
+PYTHONPATH="$TINYGRAD_ROOT" HVX_ARCH=v68 MOCKDSP=1 \\
+  python3 scripts/android/tinygrad_hexagon_bridge/export_openpilot_kernels.py /tmp/supercombo_v68_dynamic.pkl \\
+    --tinygrad-root "$TINYGRAD_ROOT" --out /tmp/supercombo_v68_stem0_export --hex-arch v68 \\
+    --onnx "$OPENPILOT_ONNX" --optimize-openpilot-stem0
+python3 scripts/android/tinygrad_hexagon_bridge/optimize_openpilot_call109.py /tmp/supercombo_v68_stem0_export --tile 32
+python3 scripts/android/tinygrad_hexagon_bridge/optimize_openpilot_calls610.py /tmp/supercombo_v68_stem0_export --tile 32
+python3 scripts/android/tinygrad_hexagon_bridge/prepare_openpilot_stem0_graph.py \\
+  /tmp/supercombo_v65_dynamic_codegen /tmp/supercombo_v68_stem0_export \\
+  /tmp/supercombo_v65_bindings/buffer_bindings.json /tmp/supercombo_v65_phone_graph \\
+  --out-bundle /tmp/supercombo_v65_calls610_109_147_bundle --out-graph /tmp/supercombo_v65_calls610_109_147_graph \\
+  --hexagon-clang /mnt/data/cache/tvm-hexagon/qualcomm/Hexagon_SDK/6.4.0.2/tools/HEXAGON_Tools/19.0.04/Tools/bin/hexagon-clang \\
+  --v68-call 6 --v68-call 109 --v68-call 147
+```
+
+Build and run that mixed graph with the same SDK environment as the v65 graph above, replacing
+the graph directories and adding `MODEL_ARCH=v68 OPENPILOT_GRAPH_PREBUILT=1`:
+
+```sh
+HEXAGON_SDK_ROOT=/mnt/data/cache/tvm-hexagon/qualcomm/Hexagon_SDK/6.4.0.2 \\
+HEXAGON_TOOLCHAIN=/mnt/data/cache/tvm-hexagon/qualcomm/Hexagon_SDK/6.4.0.2/tools/HEXAGON_Tools/19.0.04/Tools \\
+HEX_ARCH=v68 LINK_ARCH=v68 MODEL_ARCH=v68 \\
+OPENPILOT_GRAPH_DIR=/tmp/supercombo_v65_calls610_109_147_graph \\
+OPENPILOT_GRAPH_BUNDLE_DIR=/tmp/supercombo_v65_calls610_109_147_bundle \\
+OPENPILOT_GRAPH_BINDINGS_DIR=/tmp/supercombo_v65_bindings \\
+OPENPILOT_GRAPH_PREBUILT=1 \\
+  bash scripts/android/tinygrad_hexagon_bridge/native_transport/build.sh
+```
+
+Hexagon SDK 6.4.0.2 is available in the shared cache at
+`/mnt/data/cache/tvm-hexagon/qualcomm/Hexagon_SDK/6.4.0.2`, including `qaic`, FastRPC IDL headers,
+and Android `libcdsprpc.so`. Its bundled Hexagon compiler still cannot target v65, so the graph
+kernels must use host `clang-19` as above; the transport support objects can use v68 as shown below.
+
+With the SDK installed, build and run the phone graph against that same QEMU reference using:
+
+```sh
+python3 scripts/android/tinygrad_hexagon_bridge/capture_openpilot_buffer_bindings.py \
+  /tmp/supercombo_v65_dynamic.pkl /tmp/supercombo_v65_dynamic_codegen \
+  --tinygrad-root /path/to/tinygrad --out /tmp/supercombo_v65_bindings
+python3 scripts/android/tinygrad_hexagon_bridge/generate_openpilot_graph_driver.py \
+  /tmp/supercombo_v65_dynamic_codegen /tmp/supercombo_v65_bindings/buffer_bindings.json \
+  --out /tmp/supercombo_v65_phone_graph
+HEXAGON_SDK_ROOT=/mnt/data/cache/tvm-hexagon/qualcomm/Hexagon_SDK/6.4.0.2 \
+HEXAGON_TOOLCHAIN=/mnt/data/cache/tvm-hexagon/qualcomm/Hexagon_SDK/6.4.0.2/tools/HEXAGON_Tools/19.0.04/Tools \
+HEX_ARCH=v68 LINK_ARCH=v68 MODEL_ARCH=v65 MODEL_CLANG=/usr/bin/clang-19 \
+OPENPILOT_GRAPH_DIR=/tmp/supercombo_v65_phone_graph \
+OPENPILOT_GRAPH_BUNDLE_DIR=/tmp/supercombo_v65_dynamic_codegen \
+OPENPILOT_GRAPH_BINDINGS_DIR=/tmp/supercombo_v65_bindings \
+  bash scripts/android/tinygrad_hexagon_bridge/native_transport/build.sh
+```
+
+Four v65-specific issues were fixed to get that result:
+
+1. The DSP heuristic selected 64 float32 lanes (a 256-byte vector) on 128-byte HVX, which broke
+   depthwise Conv node 15. The heuristic now caps vector lanes by the reduction dtype's byte width.
+2. The renderer's float re-vectorization emitted 32-lane float vector arithmetic for the following
+   1x1 Conv. v65 has integer HVX but no floating-point HVX; LLVM's lowering returned values around
+   `4.2e6` where CPU returned `43.4`. The renderer now keeps float lanes scalar when qfloat support
+   is unavailable, while retaining integer vectorization. A QEMU 1x1 Conv regression test matches
+   the CPU result.
+3. A final half-vector load at the end of a 1.5 MiB buffer faulted in QEMU because LLVM issued a
+   full 128-byte HVX load for a logical 64-byte half vector. DSP allocations and mock mappings now
+   include a guarded tail; logical buffer and transfer sizes stay unchanged.
+4. Odd-row FP16 vector loads in 3x3 convolutions faulted on the phone due to an overstrong vector
+   alignment promise. The DSP renderer now uses natural half alignment for FP16 vectors.
+
+The heuristic and Conv changes, with source and numerical regressions, are recorded in
+`v65-vector-width.patch`. This completes full-model generated-code and simulator validation.
+Representative early, middle, and final `supercombo` kernels now execute through the FastRPC bridge
+on the phone, but there is not yet a phone-side runner for the full graph and Adreno has not yet
+been replaced.
+
+### Correction: the "v68-selected" graphs above do not run on a Snapdragon 845
+
+Calls 0, 6, 10, 109 and 147 in the 4.6-6.0 s graphs above were compiled for v68 (qfloat), which the 845's v65 cDSP does not
+have. Built for v65 instead with `prepare_openpilot_stem0_graph.py --opt-arch v65 --opt-call 6 --opt-call 109` (the tiled
+rewrites of calls 6/10/109 are scalar C), the whole graph is **8.26 s, bit-exact** to the QEMU reference on the phone; call 0,
+the stem, is 3.9 s of that. The reason is fp16: v65 has no fp16 arithmetic or conversion, so each fp16 weight use in the stem's
+inner loop was an `__extendhfsf2` call (320 call sites in that one kernel). The next section removes both problems at the
+source instead of per call.
+
+## openpilot on v65: every modeld program generated by tinygrad, one standalone DSP program each
+
+openpilot master (checked at 027770d) builds six tinygrad programs in `selfdrive/modeld/SConscript`: `driving_supercombo.onnx`,
+`dmonitoring_model.onnx`, and the camera warps (driving yuv420 512x256, two frames; DM luma 1440x960) for each of the two
+camera configurations. All six are generated by the tinygrad fork (`onnxsim/tinygrad`, branch `openpilot-v65-graph`, on top of
+`dsp-consolidated`) as standalone v65 programs, checked bit for bit under QEMU, and run on the phone (V69, which executes the
+v65 code) bit-exact to that reference:
+
+```sh
+export TINYGRAD_ROOT=/path/to/tinygrad-fork HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... CC=clang-19
+M=/path/to/openpilot/selfdrive/modeld/models
+openpilot_v65/run.sh model driving $M/driving_supercombo.onnx
+openpilot_v65/run.sh model dm $M/dmonitoring_model.onnx
+openpilot_v65/run.sh warp warp_drive_1928 --camera 1928x1208 --warp-to 512x256 --layout yuv420 --frames 2
+openpilot_v65/run.sh warp warp_drive_1344 --camera 1344x760 --warp-to 512x256 --layout yuv420 --frames 2
+openpilot_v65/run.sh warp warp_dm_1928 --camera 1928x1208 --warp-to 1440x960 --layout luma --border-fill 16
+openpilot_v65/run.sh warp warp_dm_1344 --camera 1344x760 --warp-to 1440x960 --layout luma --border-fill 16
+openpilot_v65/run.sh phone dm 5 4          # iters, threads [, batch, prof]
+```
+
+`driving_supercombo` is 156 calls (107 threaded, 73 distinct kernels), 120 MB of fp32 weights uploaded in 0.2 s, 15.9 MB of
+activations; its `action_t` input is not read by any kernel and is left out of the program. The QEMU reference for it takes
+65 s per inference, and one of its fused kernels takes over five minutes to compile.
+
+What the fork does, all in tinygrad rather than in per-call rewrites of exported C:
+
+- **`DSP_V65_HW=1`**: the real v65 constraints. HVX there is integer-only, so no float vectors (LLVM miscompiled them into
+  values around 4e6), upcasts of at most one 128-byte register, and half emulated as fp16 bits with float32 math. The
+  emulation's generic decomposition used to flush fp16 subnormals to zero, which zeroed every weight below 6.1e-5; widening now
+  keeps them exactly.
+- **`ONNX_FP16_AS_FP32=1`** (with `FLOAT16=0`): fp16 initializers become fp32 on the host at load, so no kernel converts a
+  weight. fp16 storage only costs conversions on hardware without fp16.
+- **`DSP_THREADS=4`**: tinygrad's CPU `core_id` split, enabled for the DSP. A kernel's outer global loop is split across the
+  cDSP's hardware threads (four on the 845); each output keeps its reduction order, so results are unchanged. The thread
+  heuristic's 128K-elements-per-thread floor is a renderer property, 16K on the DSP, where one element can cost hundreds of
+  cycles.
+- **`runtime/support/dsp_graph_v65.py`**: `dsp_graph.capture` of a TinyJit replay (nothing runs), emitted as one program. Views
+  into the JIT's memory-planned arena stay (region, offset), so kernels that alias an arena through a BITCAST still share memory.
+  Never-written regions are the weight blob, uploaded once in 8 MB chunks and read in place. `core_id` kernels run on a qurt
+  thread pool (from v65 QuRT context-switches HVX, so pool threads can't deadlock on the two HVX contexts). `run_qemu` runs the
+  whole emitted program under qemu-hexagon for an exactness check without a phone.
+- `examples/openpilot/compile3.py`: numpy-generated inputs (uint8 camera frames; `Tensor.randn` needs 64-bit division on the
+  DSP), `ALL_OUTPUTS=1` keeps the recurrent-state outputs (`next_state_*`) as part of the graph, `BENCH_RUNS`.
+  `examples/openpilot/compile_warp.py` is upstream's warp math, pickled like compile3 and saving realistic transforms (a random
+  matrix gives NaN coordinates, whose float-to-int casts are undefined in C).
+
+Phone results (Xiaomi 12S V69 running v65 code; RPC-inclusive, best of N; every output bit-exact to the QEMU reference):
+
+| program | 1 thread | 4 threads |
+|---|---:|---:|
+| `driving_supercombo` (all four outputs, recurrent state included) | 2057 ms | 768 ms |
+| `dmonitoring_model` | 893 ms | 342 ms |
+| driving warp, 1928x1208 | 87.9 ms | 50.3 ms |
+| driving warp, 1344x760 | 75.2 ms | 43.0 ms |
+| DM warp, 1928x1208 | 238.9 ms | 78.3 ms |
+| DM warp, 1344x760 | 225.3 ms | 70.1 ms |
+
+The model rows include every codegen change below. Each step, as 1 / 4 threads:
+
+| step | driving | DM |
+|---|---:|---:|
+| fp32 weights, `DSP_THREADS` | 3831 / 1702 ms | 1623 / 620 ms |
+| + scalar register blocking | 3796 / 1493 | 1094 / 419 |
+| + materialized conv padding | 2991 / 1234 | 1044 / 388 |
+| + strided sub-line prefetch | 2156 / 1089 | 1024 / 370 |
+| + scalar GEMV upcast | 2057 / 768 | 893 / 342 |
+
+**Strided sub-line prefetch (`HVX_PREFETCH_SUBLINE`, default on).** Scalar float code loads a float4 per reduction step. A 1x1
+conv over NCHW channels, or a GEMM over weight rows, walks those loads at a multi-KB stride and missed on every step, because
+the existing vector-load prefetch skips anything under a line. One `dcfetch` `HVX_PREFETCH_STRIDES` steps ahead on such loads
+took driving's 192->64 1x1 conv from 371 to 105 ms single-threaded (102 -> 30 ms with 4 threads).
+
+**Scalar GEMV (`DSP_SCALAR_GEMV`, default on).** A reduction that nothing broadcasts into used to get the HVX rule, which
+upcasts the innermost output axis to 128. On v65 float that is a 128-float accumulator in memory, and for the policy head's
+`[out, in]` Gemm weights it reads 128 rows per step. With threads it got slower (59.7 ms with 4 threads vs 20.3 with 1). A
+4-wide upcast plus reduce unroll gives 12.4 / 3.8 ms; `[in, out]` GEMVs are unchanged.
+
+**Materialized conv padding (`CONV_PAD_MATERIALIZE=1`).** tinygrad pads a conv input lazily, so the zero padding becomes a
+mask on every input load inside the conv. On scalar v65 the masked loads and their address math cost more than the MACs. With
+the flag the conv reads a padded copy made by its own small kernel. Fusing that copy into the producer was worse (DM
+419 -> 547 ms): the producer then computes, masked, over the padded grid and loses its register blocking. As a separate kernel
+the strided 3x3 benchmark stem went 330 -> 89 ms (+5 ms for the copy). Outputs are unchanged in value, and DM's differ from the
+unpadded capture only at rounding level (6e-5 on values up to 862) because fusion changed.
+
+A cheaper exact trunc (the one-instruction truncating convert plus copysign, in place of the bit-mask emulation) left the
+warps' output unchanged but measured no faster, so it was dropped.
+
+**Scalar register blocking.** Under `DSP_V65_HW`, a float reduction with reuse along two axes (a conv) takes tinygrad's CPU
+upcast rules, small upcasts on the reused axes, instead of one vector-wide axis. Accumulators × unrolled taps are capped near
+the 32-register file (`DSP_SCALAR_UNROLL`, default 16). On openpilot-shaped layers (phone, 4 threads) the 1x1 convs went
+22.4 -> 9.2 ms and 43.0 -> 15.7 ms, and a strided 3x3 stem 465 -> 332 ms. A GEMV has one reuse axis and measured 10x slower
+blocked, so it keeps the vector-style upcast. The driving stem's MAC loop is now 16 register accumulators, 16 MACs in 10
+packets. What remains is around that loop: with a 3-tap inner trip count, the padding-masked input loads and address math
+(about 100 packets, with spills) run once per 48 MACs. Pre-padded inputs are the next lever.
+
+### Through the compiler/runner RPC
+
+The same programs go through onnxsim's native remote executor (`tools/onnx-remote`). `openpilot_v65/compile_v65.sh` is an
+`onnx-remote-compiler --command`: it captures, emits, checks the program under qemu, builds the skel and packs a `tghx-v65`
+artifact. `onnx-remote-hexagon-worker` (`build_worker.sh`, Android) is the runner, with `load_compiled` once and
+`run_compiled` per inference. `e2e.sh` drives `onnx-remote-client --compile-run` against both on an attached phone:
+
+```sh
+onnx-remote-compiler --port 39502 --cache-dir ~/.cache/onnxsim-v65 --target hexagon-v65 --compiler-id "tinygrad-$(git -C "$TINYGRAD_ROOT" rev-parse --short HEAD)" \
+  --command "$PWD/openpilot_v65/compile_v65.sh {input} {output} {manifest}" &
+openpilot_v65/build_worker.sh worker/
+CLIENT=.../onnx-remote-client openpilot_v65/e2e.sh worker/onnx-remote-hexagon-worker dmonitoring_model.onnx \
+  --input-raw 2:1,1382400:img.bin --input-raw 1:1,3:calib.bin --expect ref.bin --iters 5
+```
+
+| model | compile (cache miss) | artifact | `load_compiled` | `run_compiled` (RPC-inclusive / DSP) | vs capture reference |
+|---|---:|---:|---:|---:|---|
+| tiny conv (uint8 + float in, 2 outputs) | seconds | 14 KB | 72 ms | 9.6 / 1.3 ms | 4.8e-7 from ORT |
+| `dmonitoring_model` | ~20 min | 14.7 MB | 474 ms | 479 / 437 ms | bit-exact |
+| `driving_supercombo` (4 outputs) | ~45 min | 121 MB | 3580 ms | 1740 / 1494 ms | bit-exact |
+
+The compiler's cache key is the target, `--compiler-id`, command string and model bytes. It does not include the tinygrad
+checkout the command runs, so put the fork's commit in `--compiler-id` (for example `tinygrad-$(git -C "$TINYGRAD_ROOT"
+rev-parse --short HEAD)`); otherwise a codegen change keeps serving old artifacts. The compiler service is one request at a
+time, so a long compile blocks cache hits behind it. A second instance on the same
+`--cache-dir` (its publication is multi-process safe) serves those. The runner is reached through `adb forward`; a
+`run_compiled` round trip adds about 8 ms of TCP over USB to the DSP time. For driving it adds about 250 ms, mostly from moving
+its 2.4 MB of inputs and 8 MB of outputs, which are mostly the recurrent state.
+
+This makes all of them generatable and correct on v65. They are not fast: openpilot runs at 20 Hz, and these are one to two
+orders of magnitude away. v65 float is scalar. DM's stem converts each uint8 input pixel again for every output-channel group
+and accumulates four outputs at a time, and the warps spend about 180 cycles per pixel on a float divide plus a trunc emulation
+per coordinate. The next lever is scalar register blocking over output channels, the tiling that made calls 6/10 5x faster by
+hand, chosen by the heuristic. After that comes the integer path (`scripts/openpilot_dsp/hvx65`) for the convolutions.
+
 BEAM search gave a genuine 2.37x improvement over naive codegen, confirmed on real hardware (not
 just qemu's instruction-count proxy) -- real signal. But even BEAM=2's best kernel is ~2.2x
 *slower* than TVM's hand-tuned schedule: tinygrad's Hexagon renderer had (before this session)
