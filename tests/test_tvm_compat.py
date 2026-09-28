@@ -24,6 +24,9 @@ class _Session:
     def load_module(self, path):
         return ("module", path)
 
+    def get_function(self, name):
+        return lambda *args: (name, args)
+
 
 def test_connect_falls_back_for_old_tvm_signature(monkeypatch):
     session = _Session()
@@ -58,3 +61,28 @@ def test_tracker_falls_back_for_old_request_signature(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "tvm", types.SimpleNamespace(rpc=Rpc))
     assert tvm_compat.connect_tracker("tracker", 9190, "hexagon").raw is session
+
+
+def test_loaded_tvm_ffi_module_functions_are_forwarded_unchanged(monkeypatch):
+    ffi_tensor = object()
+
+    class Module:
+        def get_function(self, name):
+            return lambda value: (name, value)
+
+    class Session(_Session):
+        def load_module(self, path):
+            assert path == "kernel.so"
+            return Module()
+
+    session = Session()
+
+    class Rpc:
+        @staticmethod
+        def connect(host, port, **kwargs):
+            return session
+
+    monkeypatch.setitem(sys.modules, "tvm", types.SimpleNamespace(rpc=Rpc))
+    wrapped = tvm_compat.connect("runner", 9090)
+    module = wrapped.load_module("kernel.so")
+    assert module.get_function("add_one")(ffi_tensor) == ("add_one", ffi_tensor)

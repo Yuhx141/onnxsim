@@ -183,8 +183,12 @@ two are independent.
 
 For applications that already compile a TVM module, `onnxsim.rpc.tvm_compat`
 provides a small version-tolerant wrapper around the installed TVM Python
-client. It delegates the native handshake, tracker allocation, and PackedFunc
-marshalling to TVM itself:
+client. It also works with TVM FFI-enabled builds: the session still comes
+from `tvm.rpc`, and uploaded FFI-compatible modules and their exported
+functions are loaded and called through TVM's remote module interface. The
+adapter returns the TVM module and function objects unchanged, so FFI tensor
+and object arguments are marshalled by the installed TVM client rather than
+converted by onnxsim.
 
 ```python
 from onnxsim.rpc import tvm_compat
@@ -192,12 +196,16 @@ from onnxsim.rpc import tvm_compat
 with tvm_compat.connect_tracker("tracker", 9190, "hexagon") as session:
     session.upload("model.so")
     module = session.load_module("model.so")
-    module.get_function("run")(...)
+    run = module.get_function("run")
+    run(...)
 ```
 
-This supports the TVM version installed by the application, but does not make
-a TVM RPC server an ONNX executor. The binary onnxsim-v5 transport remains the
-portable protocol for the remote EP and compiler/runner services.
+For an FFI-enabled TVM application, import and use `tvm_ffi` as that module's
+API requires; `tvm_compat` does not need to import or wrap FFI values. The
+native TVM RPC server must have a compatible TVM runtime and any target-side
+runtime libraries available. This does not make a TVM RPC server an ONNX
+executor. The binary onnxsim-v5 transport remains the portable protocol for
+the remote EP and compiler/runner services.
 
 ## Security
 
