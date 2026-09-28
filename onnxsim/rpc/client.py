@@ -131,6 +131,8 @@ class RemoteModel:
         In random mode, ``inputs`` supplies only input names, shapes and dtypes. The
         server generates one seeded random set and reuses it for this timing request.
         """
+        specs: List[Dict[str, Any]]
+        blobs: List[bytes]
         if random_inputs:
             specs, blobs = _random_input_specs(inputs), []
         else:
