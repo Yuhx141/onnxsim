@@ -1892,7 +1892,6 @@ def test_coverage_report_on_the_resnet18_step():
     assert report["per_op"]["Div"] == {"conditional": 51, "refused": 1}
     # Live-operand MatMul/Gemm/Conv nodes with a step template move from
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
-    live = len(axb.mre.step_manifest()["nodes"])
     rs = _step_reshape_templated()
     want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
     assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
@@ -2135,7 +2134,6 @@ def test_coverage_report_weight_dtypes_on_the_resnet18_step():
     report = axb.coverage_report(_step_records(), policy)
     # Live-operand MatMul/Gemm/Conv nodes with a step template move from
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
-    live = len(axb.mre.step_manifest()["nodes"])
     rs = _step_reshape_templated()
     want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
     assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}

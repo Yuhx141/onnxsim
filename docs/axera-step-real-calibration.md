@@ -1,6 +1,6 @@
 # ResNet18 step coverage at a real calibration
 
-The coverage report marked 562 of the step's 1,104 nodes as "conditional":
+The initial coverage report marked 562 of the step's 1,104 nodes as "conditional":
 a template exists, but it only works if the node's calibrated zero points are
 in the template's class (for example `x128,y128`). This work predicts
 Pulsar2's actual quantization of the step and settles every one of those
@@ -74,36 +74,22 @@ are elided (`axera-zp-register-write-elision`).
 
 ## Coverage at the predicted calibration
 
-The current Pulsar-free UOp-to-mcode planner covers **570 of 1,104 nodes**
-at this calibration and refuses 534. This includes 42 live broadcast binary
-nodes (all `Mul` nodes in this step), which are emitted with a validated
-full-shape binary template and expanded at the segment boundary. The
-regression test in `tests/test_axera_step_calibration.py` pins this report.
+The generic calibration coverage report now covers **887 of 1,104 nodes**;
+the remaining 217 refusals are binary ops only. Exact per-op counts are pinned
+by `tests/test_axera_step_calibration.py`:
 
-Master reported 120 covered / 562 conditional / 422 refused. Settling the
-conditionals against the predicted calibration:
+| Binary op | Covered | Refused |
+| --- | ---: | ---: |
+| Add | 144 | 0 |
+| Mul | 231 | 166 |
+| Div | 5 | 47 |
+| Sub | 42 | 4 |
 
-| | covered | conditional | refused |
-| --- | ---: | ---: | ---: |
-| master's templates, conditionals settled | 395 | 18 | 691 |
-| + nodes computed inside covered MatMul chains | 426 | 18 | 660 |
-| + the zero-point work above | 446 | 18 | 640 |
-| + #1892's Neg and same-bytes ReduceSum templates, settled here | 449 | 18 | 637 |
-| + bias-flatten Reshapes as fused ReduceSum chains (below) | **467** | 0 | 637 |
-
-Per op, covered at the predicted calibration, before (master's templates) ->
-after:
-
-- Relu 0 -> 17
-- MaxPool 0 -> 1
-- ReduceSum 42 -> 44 (one via #1892's same-bytes `[16,64,112,112]` equivalent)
-- Neg 0 -> 2 (#1892's large-program template, zero points x255,y0)
-- Reshape 118 -> 153 (18 via the fused ReduceSum chains below)
-- Mul 0 -> 14 (inside MatMul chains)
-- Squeeze 0 -> 1 (inside a MatMul chain)
-
-Already at their final counts: Sqrt 42/42, Softmax 3/3, Log 2/2, Cast,
-Greater, Less, Gather and Transpose all, and MatMul 24/41.
+All non-binary ops are covered in this report. The step runner additionally
+uses exact-shape FP32 captures and exact-calibration templates for the refused
+binary signatures in this ResNet18 graph; its current plan has zero ONNX
+Runtime fallback nodes. The report describes generic calibrated emitter
+coverage, not the runner's extra graph-specific routes.
 
 ### The 18 bias-flatten Reshapes
 
@@ -138,29 +124,13 @@ And the flatten's rank-1 consumers can't compile as written: `Reshape -> Mul`
 at `[C]` fails Pulsar2's Mul tiler (`TileFailException ... tuple index out of
 range`), as #1869 found for rank-1 binary ops; those Muls run at `[1,C]`.
 
-## What is still refused, and why
+## Remaining generic binary coverage gaps
 
-- **Binary ops with two live same-shape inputs:** 63 Mul, 42 Sub, 43 Div
-  and 101 Add. Their real zero points are spread (for example
-  `x142,y155,z130`), but the templates only exist at `{0, 128}` classes.
-  #1869 found that asymmetric zero points compile Add to a different
-  program, so this needs the binary-op emitter to move zero points, the way
-  Relu's now can.
-- **Constant or broadcast operands:** 330 Mul, and some Add/Sub/Div.
-- **Conv:** 8 were conditional and now fail
-  `recalibrate`: `zero point goes between zero and nonzero`. The templates
-  were built with a nonnegative input (zero point 0), but in the step the
-  input is a Relu output that shares its pre-activation's nonzero zero
-  point. They need templates built with a signed input range. The other 12
-  Conv have no template yet.
-- **Gemm:** two zero-point roles tie at the predicted scales, so
-  `recalibrate` refuses rather than guess.
-- **17 Reshapes whose output feeds only a MatMul:** they are int8 in the
-  real compile, while every Reshape template is uint8. These are the inputs
-  of the MatMul chains, so the cleaner fix is to extend those chains by one
-  Reshape.
-- **ReduceMean:** its output (`pool1_fwd`) feeds only MatMuls, so it is
-  int8.
+The 217 generic refusals are 166 Mul, 47 Div, and 4 Sub nodes. Add has no
+remaining refusals at this calibration. The ResNet18 step runner covers these
+graph-specific signatures with validated FP32 or exact-calibration templates;
+other models and calibrations still need generic native templates before they
+can use the same fallback-free path.
 
 Reproduce: `tests/test_axera_step_calibration.py` (no device, no Pulsar2; the
 rule checks run on committed probe graphs, their ranges and their

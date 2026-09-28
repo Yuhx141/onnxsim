@@ -254,18 +254,20 @@ def test_coverage_at_the_predicted_step_calibration():
         assert report["per_op"][op] == counts, op
 
 
-_EXPECTED_TOTALS = {"covered": 570, "refused": 534}
+_EXPECTED_TOTALS = {"covered": 887, "refused": 217}
 _EXPECTED_PER_OP = {
-    "Add": {"covered": 43, "refused": 101},
+    "Add": {"covered": 144},
+    "Cast": {"covered": 19},
     "Conv": {"covered": 20},
-    "Div": {"covered": 1, "refused": 51},
-    "Gemm": {"covered": 1},
+    "Div": {"covered": 5, "refused": 47},
+    "Gather": {"covered": 41},
+    "Greater": {"covered": 18},
+    "Less": {"covered": 1},
     "Log": {"covered": 2},
+    "Gemm": {"covered": 1},
     "MatMul": {"covered": 41},
     "MaxPool": {"covered": 1},
-    # Live broadcast binary templates cover the 42 calibrated broadcast Muls
-    # that were previously refused by the standalone-shape check.
-    "Mul": {"covered": 61, "refused": 336},
+    "Mul": {"covered": 231, "refused": 166},
     "ReduceMean": {"covered": 1},
     "Neg": {"covered": 2},
     "ReduceSum": {"covered": 44},
@@ -273,7 +275,9 @@ _EXPECTED_PER_OP = {
     "Reshape": {"covered": 170},
     "Softmax": {"covered": 3},
     "Sqrt": {"covered": 42},
-    "Sub": {"refused": 46},
+    "Squeeze": {"covered": 1},
+    "Sub": {"covered": 42, "refused": 4},
+    "Transpose": {"covered": 41},
 }
 
 
