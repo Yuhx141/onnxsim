@@ -149,6 +149,11 @@ class RemoteEp;
 
 struct RemoteProfiler final : OrtEpProfilerImpl {
   explicit RemoteProfiler(const OrtEpApi* api) : ep_api(api) {
+    // OrtEpProfilerImpl is a C struct of version + function pointers. Zero
+    // the whole base so unimplemented optional callbacks are null rather
+    // than uninitialized garbage that ORT may indirect-call through.
+    std::memset(static_cast<OrtEpProfilerImpl*>(this), 0,
+                sizeof(OrtEpProfilerImpl));
     ort_version_supported = ORT_API_VERSION;
     Release = ReleaseImpl;
     StartProfiling = StartProfilingImpl;
@@ -268,9 +273,14 @@ struct RemoteNodeComputeInfo final : OrtNodeComputeInfo {
 };
 
 class RemoteEp final : public OrtEp {
- public:
+  public:
   RemoteEp(const OrtApi* api, const OrtEpApi* ep_api, RemoteOptions options)
       : api_(api), ep_api_(ep_api), options_(std::move(options)) {
+    // Same zeroing rationale as RemoteProfiler: ORT null-checks optional
+    // callbacks such as GetKernelRegistry (added in 1.24), so every member
+    // we don't implement must be null. Uninitialized garbage reads as
+    // non-null and ORT indirect-calls through it inside CreateSession.
+    std::memset(static_cast<OrtEp*>(this), 0, sizeof(OrtEp));
     ort_version_supported = ORT_API_VERSION;
     GetName = [](const OrtEp* value) noexcept -> const char* {
       return static_cast<const RemoteEp*>(value)->Name();
@@ -360,6 +370,8 @@ class RemoteEp final : public OrtEp {
 
 RemoteNodeComputeInfo::RemoteNodeComputeInfo(RemoteEp& owner, std::string operation)
     : ep(owner), op(std::move(operation)) {
+  std::memset(static_cast<OrtNodeComputeInfo*>(this), 0,
+              sizeof(OrtNodeComputeInfo));
   ort_version_supported = ORT_API_VERSION;
   CreateState = CreateStateImpl;
   Compute = ComputeImpl;
@@ -553,6 +565,10 @@ class RemoteFactory final : public OrtEpFactory {
   RemoteFactory(const OrtApi* api, const OrtEpApi* ep_api,
                 RemoteOptions options)
       : api_(api), ep_api_(ep_api), options_(std::move(options)) {
+    // Zero the base for the same reason: ORT probes optional factory
+    // callbacks for null (e.g. CreateSyncStreamForDevice), and garbage
+    // would read as implemented.
+    std::memset(static_cast<OrtEpFactory*>(this), 0, sizeof(OrtEpFactory));
     ort_version_supported = ORT_API_VERSION;
     GetName = [](const OrtEpFactory*) noexcept -> const char* { return kName; };
     GetVendor = [](const OrtEpFactory*) noexcept -> const char* { return kVendor; };

@@ -51,29 +51,22 @@ int main(int argc, char** argv) {
     Step("env");
     env.RegisterExecutionProviderLibrary("onnxsim_remote", argv[1]);
     Step("register");
-    // Append the plugin's EP device, falling back to ORT's own CPU device
-    // when the plugin device would trigger a use-after-free inside
-    // CreateSession's plugin-EP resolution path on 1.29. Frame 0
-    // dereferences recycled heap bytes through what the disassembly shows
-    // is a virtual dispatch on a released object, while the CPU device path
-    // completes cleanly. ONNXSIM_REMOTE_EP_TEST_APPEND selects the device
-    // by name (default onnxsim_remote); the remote execution path is
-    // covered by the ORT graph worker integration test.
+    // Enumerate exactly once and append immediately. GetEpDevices results
+    // alias ORT-owned storage; the create-session path issues its own
+    // device query internally, so hold no assumptions across calls.
     const auto devices = env.GetEpDevices();
     Step("devices");
     if (verbose != nullptr && std::string(verbose) != "0") {
       for (const auto& value : devices)
         std::cerr << "[devices] ep=" << value.EpName() << '\n';
     }
-    const char* append_name = std::getenv("ONNXSIM_REMOTE_EP_TEST_APPEND");
-    const std::string target = append_name != nullptr ? append_name
-                                                      : "onnxsim_remote";
     auto device = std::find_if(devices.begin(), devices.end(),
-                               [&target](const auto& value) {
-                                 return std::string(value.EpName()) == target;
+                               [](const auto& value) {
+                                 return std::string(value.EpName()) ==
+                                        "onnxsim_remote";
                                });
     if (device == devices.end()) {
-      std::cerr << target << " device was not discovered\n";
+      std::cerr << "onnxsim_remote device was not discovered\n";
       return 1;
     }
     Ort::SessionOptions options;
