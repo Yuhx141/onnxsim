@@ -214,6 +214,17 @@ classifier Gemm layers run on the host, and pooling padding is prepared on the
 host before upload. The 91-dispatch graph schedule remains planning metadata
 rather than one executable XDNA program.
 
+The fused bottleneck Conv1 now uses an AIE2P 2×2 INT8 MMUL schedule when the
+spatial tile has at least 16 pixels, output chunks are multiples of 16, and
+input channels are divisible by 8. This replaces the scalar reduction for
+eligible 1×1 convolutions while preserving int32 accumulation and the existing
+round-to-even requantization. Smaller or irregular shapes retain the scalar
+kernel. On device, exact-output A/B runs with 2 warmups and 20 iterations
+reduced `/layer1/layer1.1` from 7.00 ms to 4.60 ms (34%) and
+`/layer2/layer2.1` from 7.13 ms to 4.75 ms (33%). `benchmark_fused_bottleneck.py`
+and `fused_bottleneck_design.py` accept `--scalar-conv1` to reproduce the
+scalar baseline; omit it for the MMUL path.
+
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
 hybrid Conv layers and skips their unused im2col staging. Converted constant
 weights are cached and symmetric padding is passed directly to Conv2d. Two

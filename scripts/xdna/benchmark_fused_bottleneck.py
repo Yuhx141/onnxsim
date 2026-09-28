@@ -61,7 +61,9 @@ def _quantizer_after(value: str, nodes: list[Any], consumers: dict[str, list[int
     raise ValueError(f"no QuantizeLinear follows {value!r} through Relu")
 
 
-def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, Any]:
+def bind_fused_bottleneck(
+    model: Any, block: BottleneckBlockPlan, *, conv1_mmul: bool = True
+) -> dict[str, Any]:
     nodes = list(model.graph.node)
     edges = dict(qdq_edge_map(model))
     initializers = {str(item.name): numpy_helper.to_array(item) for item in model.graph.initializer}
@@ -283,7 +285,14 @@ def bind_fused_bottleneck(model: Any, block: BottleneckBlockPlan) -> dict[str, A
     chunks: list[tuple[np.ndarray, np.ndarray]] = []
     for index in range(c1_chunks):
         sl = slice(index * c1_rows, (index + 1) * c1_rows)
-        chunks.append((w1[sl], b1[sl]))
+        # The Conv1 MMUL kernel consumes B as contiguous KxN tiles, matching
+        # the layout already used by the Conv3 1x1 matrix-multiply path.
+        packed_w1 = (
+            np.ascontiguousarray(w1[sl].reshape(c1_rows, -1).transpose(1, 0))
+            if conv1_mmul and c1_rows >= 16 and c1_rows % 16 == 0 and channels % 8 == 0 and height * width >= 16
+            else w1[sl]
+        )
+        chunks.append((packed_w1, b1[sl]))
     skip_chunk_start = len(chunks)
     if projection:
         skip_rows = skip_weight.shape[0] // skip_chunks
@@ -411,13 +420,14 @@ def main() -> int:
     parser.add_argument("insts", type=Path)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--scalar-conv1", action="store_true", help="benchmark scalar Conv1 with OI weight layout")
     args = parser.parse_args()
 
     model = onnx.load(args.model)
     block = next((item for item in plan_bottleneck_blocks(model) if item.prefix == args.block), None)
     if block is None:
         parser.error(f"no ResNet bottleneck found for prefix {args.block!r}")
-    binding = bind_fused_bottleneck(model, block)
+    binding = bind_fused_bottleneck(model, block, conv1_mmul=not args.scalar_conv1)
     if not args.xclbin.is_file() or not args.insts.is_file():
         parser.error("compiled xclbin and instruction stream must both exist")
 

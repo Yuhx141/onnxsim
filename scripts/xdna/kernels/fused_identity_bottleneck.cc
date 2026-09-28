@@ -32,6 +32,9 @@
 #ifndef FUSED_PROJECTION
 #define FUSED_PROJECTION 0
 #endif
+#ifndef FUSED_C1_MMUL
+#define FUSED_C1_MMUL 0
+#endif
 
 static int32_t round_shift_even(int32_t value, int shift) {
   if (shift <= 0) return value;
@@ -59,6 +62,60 @@ extern "C" void fused_bottleneck_conv1_chunk(const int8_t *input, const uint8_t 
   const int32_t *bias = (const int32_t *)(params + FUSED_BIAS1_OFFSET);
   const int outputs = FUSED_MID / FUSED_C1_CHUNKS;
   const int pixels = FUSED_W * FUSED_H;
+#if FUSED_C1_MMUL
+  using MMUL1 = aie::mmul<8, 8, 8, int8, int8>;
+  alignas(32) int8_t a10_tile[64], a11_tile[64];
+  alignas(32) int8_t b10_tile[64], b11_tile[64];
+  // Two spatial and two output-channel MMULs reuse each gathered activation
+  // tile. We keep accumulation in int32 and apply bias/requantization once,
+  // preserving the scalar reference's integer result exactly.
+  for (int p0 = 0; p0 < pixels; p0 += 16) {
+    const int valid0 = pixels - p0 < 8 ? pixels - p0 : 8;
+    const int valid1 = pixels - (p0 + 8) < 8 ? pixels - (p0 + 8) : 8;
+    for (int oc0 = 0; oc0 < outputs; oc0 += 16) {
+      MMUL1 c100 = aie::zeros<acc32, 64>();
+      MMUL1 c101 = aie::zeros<acc32, 64>();
+      MMUL1 c110 = aie::zeros<acc32, 64>();
+      MMUL1 c111 = aie::zeros<acc32, 64>();
+      for (int ic0 = 0; ic0 < FUSED_C; ic0 += 8) {
+        for (int m = 0; m < 16; ++m) for (int k = 0; k < 8; ++k) {
+          const int p = p0 + m;
+          const bool valid = (m < 8) ? (m < valid0) : ((m - 8) < valid1);
+          const int8_t value = valid
+              ? (int8_t)((int32_t)((const uint8_t *)input)[p * FUSED_C + ic0 + k] - 128)
+              : 0;
+          if (m < 8) a10_tile[m * 8 + k] = value;
+          else a11_tile[(m - 8) * 8 + k] = value;
+        }
+        const int weight_offset = ic0 * outputs + oc0;
+        for (int k = 0; k < 8; ++k) for (int n = 0; n < 8; ++n) {
+          b10_tile[k * 8 + n] = weights[weight_offset + k * outputs + n];
+          b11_tile[k * 8 + n] = weights[weight_offset + k * outputs + 8 + n];
+        }
+        auto av0 = aie::load_v<64>(a10_tile);
+        auto av1 = aie::load_v<64>(a11_tile);
+        auto bv0 = aie::load_v<64>(b10_tile);
+        auto bv1 = aie::load_v<64>(b11_tile);
+        c100.mac(av0, bv0); c101.mac(av0, bv1);
+        c110.mac(av1, bv0); c111.mac(av1, bv1);
+      }
+      auto s100 = c100.to_vector<int32>(); auto s101 = c101.to_vector<int32>();
+      auto s110 = c110.to_vector<int32>(); auto s111 = c111.to_vector<int32>();
+      for (int m = 0; m < valid0; ++m) for (int n = 0; n < 16; ++n) {
+        const int32_t dot = n < 8 ? s100[m * 8 + n] : s101[m * 8 + n - 8];
+        int32_t q = 128 + round_shift_even(dot + bias[oc0 + n], FUSED_SHIFT1);
+        if (q < 128) q = 128; else if (q > 255) q = 255;
+        bundle[(p0 + m) * FUSED_MID + chunk * outputs + oc0 + n] = (uint8_t)q;
+      }
+      for (int m = 0; m < valid1; ++m) for (int n = 0; n < 16; ++n) {
+        const int32_t dot = n < 8 ? s110[m * 8 + n] : s111[m * 8 + n - 8];
+        int32_t q = 128 + round_shift_even(dot + bias[oc0 + n], FUSED_SHIFT1);
+        if (q < 128) q = 128; else if (q > 255) q = 255;
+        bundle[(p0 + 8 + m) * FUSED_MID + chunk * outputs + oc0 + n] = (uint8_t)q;
+      }
+    }
+  }
+#else
   for (int p = 0; p < pixels; ++p) for (int oc = 0; oc < outputs; ++oc) {
     int32_t acc = bias[oc];
     for (int ic = 0; ic < FUSED_C; ++ic)
@@ -67,6 +124,7 @@ extern "C" void fused_bottleneck_conv1_chunk(const int8_t *input, const uint8_t 
     if (q < 128) q = 128; else if (q > 255) q = 255;
     bundle[p * FUSED_MID + chunk * outputs + oc] = (uint8_t)q;
   }
+#endif
 }
 
 extern "C" void fused_bottleneck_conv2_chunk(const uint8_t *bundle, const uint8_t *params, uint8_t *output, int32_t chunk, int32_t channel_offset) {

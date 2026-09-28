@@ -51,6 +51,7 @@ def fused_identity_bottleneck(
     skip_shift: CompileTime[int] = 0,
     residual_main_shift: CompileTime[int] = 2,
     residual_skip_shift: CompileTime[int] = 0,
+    conv1_mmul: CompileTime[bool] = True,
 ):
     pixels = width * height
     output_pixels = output_width * output_height
@@ -91,6 +92,7 @@ def fused_identity_bottleneck(
         f"-DFUSED_BIAS1_OFFSET={_align4(outputs1 * channels)}",
         f"-DFUSED_BIAS2_OFFSET={_align4(outputs2 * mid_channels * 9)}",
         f"-DFUSED_BIAS3_OFFSET={_align4(outputs3 * mid_channels)}",
+        f"-DFUSED_C1_MMUL={1 if conv1_mmul and width * height >= 16 and outputs1 >= 16 and outputs1 % 16 == 0 and channels % 8 == 0 else 0}",
         f"-DFUSED_MAIN_RESIDUAL_SHIFT={residual_main_shift}", f"-DFUSED_SKIP_RESIDUAL_SHIFT={residual_skip_shift}",
     ]
     k1 = ExternalFunction("fused_bottleneck_conv1_chunk", source_file=str(_KERNEL), arg_types=[activation_ty, weight_ty, stage1_ty, np.int32], compile_flags=flags)
@@ -205,6 +207,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-stride", type=int, default=1)
     parser.add_argument("--skip-chunks", type=int, default=0)
     parser.add_argument("--skip-shift", type=int, default=0)
+    parser.add_argument("--scalar-conv1", action="store_true", help="disable Conv1 MMUL for A/B benchmarking")
     parser.add_argument("--chunks1", type=int, default=1)
     parser.add_argument("--chunks2", type=int, default=1)
     parser.add_argument("--chunks3", type=int, default=1)
@@ -238,7 +241,8 @@ def _compile_kwargs(opts):
                 "conv2_stride": binding["conv2_stride"][0], "skip_stride": binding["conv2_stride"][0],
                 "skip_chunks": binding["skip_chunk_count"], "skip_shift": binding["skip_output_shift"] or 0,
                 "residual_main_shift": binding["main_residual_shift"],
-                "residual_skip_shift": binding["skip_residual_shift"]}
+                "residual_skip_shift": binding["skip_residual_shift"],
+                "conv1_mmul": not opts.scalar_conv1}
     return {"width": opts.width, "height": opts.height, "channels": opts.channels, "mid_channels": opts.mid_channels,
             "shift1": opts.shift1, "shift2": opts.shift2, "shift3": opts.shift3,
             "residual_shift": opts.residual_shift, "input_shift": opts.input_shift,
@@ -246,7 +250,8 @@ def _compile_kwargs(opts):
             "output_width": opts.output_width, "output_height": opts.output_height, "output_channels": opts.output_channels,
             "conv2_stride": opts.conv2_stride, "skip_stride": opts.skip_stride, "skip_chunks": opts.skip_chunks,
             "skip_shift": opts.skip_shift,
-            "residual_main_shift": opts.residual_shift, "residual_skip_shift": opts.input_shift}
+            "residual_main_shift": opts.residual_shift, "residual_skip_shift": opts.input_shift,
+            "conv1_mmul": not opts.scalar_conv1}
 
 
 def main() -> None:
