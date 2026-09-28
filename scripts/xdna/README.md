@@ -225,6 +225,13 @@ reduced `/layer1/layer1.1` from 7.00 ms to 4.60 ms (34%) and
 and `fused_bottleneck_design.py` accept `--scalar-conv1` to reproduce the
 scalar baseline; omit it for the MMUL path.
 
+The existing two-column projection schedule now uses the same Conv1 packing
+and MMUL eligibility rule. On `/layer1/layer1.0`, it runs Conv1 and the skip
+projection concurrently and measures 4.69 ms with exact output, compared with
+7.56 ms for the single-column fused block (2 warmups, 20 iterations). The
+parallel design remains limited to projection blocks with one weight chunk per
+Conv; larger projections need independent per-column weight streaming.
+
 An optional `--cpu-backend torch` uses PyTorch CPU Conv2d for the small-spatial
 hybrid Conv layers and skips their unused im2col staging. Converted constant
 weights are cached and symmetric padding is passed directly to Conv2d. Two

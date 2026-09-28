@@ -24,6 +24,7 @@ def main() -> int:
     parser.add_argument("insts", type=Path)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument("--scalar-conv1", action="store_true", help="benchmark scalar Conv1 with OI weight layout")
     args = parser.parse_args()
 
     model = onnx.load(args.model)
@@ -32,7 +33,7 @@ def main() -> int:
         parser.error(f"{args.block!r} is not a supported projection bottleneck")
     if not args.xclbin.is_file() or not args.insts.is_file():
         parser.error("compiled xclbin and instruction stream must both exist")
-    binding = bind_fused_bottleneck(model, block)
+    binding = bind_fused_bottleneck(model, block, conv1_mmul=not args.scalar_conv1)
     if (*binding["chunk_counts"], binding["skip_chunk_count"]) != (1, 1, 1, 1):
         parser.error(
             "this schedule requires one weight chunk per Conv; "

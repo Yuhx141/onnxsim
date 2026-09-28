@@ -50,6 +50,7 @@ def parallel_projection_bottleneck(
     skip_stride: CompileTime[int] = 1,
     residual_main_shift: CompileTime[int] = 0,
     residual_skip_shift: CompileTime[int] = 0,
+    conv1_mmul: CompileTime[bool] = True,
 ):
     """Fork the input DMA and execute the projection on a second NPU column."""
     pixels = width * height
@@ -92,6 +93,7 @@ def parallel_projection_bottleneck(
         f"-DFUSED_BIAS1_OFFSET={_align4(outputs1 * channels)}",
         f"-DFUSED_BIAS2_OFFSET={_align4(outputs2 * mid_channels * 9)}",
         f"-DFUSED_BIAS3_OFFSET={_align4(outputs3 * mid_channels)}",
+        f"-DFUSED_C1_MMUL={1 if conv1_mmul and width * height >= 16 and outputs1 >= 16 and outputs1 % 16 == 0 and channels % 8 == 0 else 0}",
         f"-DFUSED_MAIN_RESIDUAL_SHIFT={residual_main_shift}",
         f"-DFUSED_SKIP_RESIDUAL_SHIFT={residual_skip_shift}",
     ]
@@ -242,6 +244,7 @@ def main() -> None:
     add_compile_args(parser)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--block", required=True)
+    parser.add_argument("--scalar-conv1", action="store_true", help="disable Conv1 MMUL for A/B benchmarking")
     run_design_cli(
         parallel_projection_bottleneck,
         parser.parse_args(),
