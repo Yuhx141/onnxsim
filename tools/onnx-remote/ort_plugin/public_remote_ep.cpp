@@ -273,7 +273,7 @@ struct RemoteNodeComputeInfo final : OrtNodeComputeInfo {
 };
 
 class RemoteEp final : public OrtEp {
-  public:
+ public:
   RemoteEp(const OrtApi* api, const OrtEpApi* ep_api, RemoteOptions options)
       : api_(api), ep_api_(ep_api), options_(std::move(options)) {
     // Same zeroing rationale as RemoteProfiler: ORT null-checks optional

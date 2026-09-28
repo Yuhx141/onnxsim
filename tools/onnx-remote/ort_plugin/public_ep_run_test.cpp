@@ -2,14 +2,12 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 static size_t ElementBytes(ONNXTensorElementDataType type) {
@@ -51,9 +49,6 @@ int main(int argc, char** argv) {
     Step("env");
     env.RegisterExecutionProviderLibrary("onnxsim_remote", argv[1]);
     Step("register");
-    // Enumerate exactly once and append immediately. GetEpDevices results
-    // alias ORT-owned storage; the create-session path issues its own
-    // device query internally, so hold no assumptions across calls.
     const auto devices = env.GetEpDevices();
     Step("devices");
     if (verbose != nullptr && std::string(verbose) != "0") {
