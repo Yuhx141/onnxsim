@@ -332,6 +332,32 @@ round-trip through DDR between layers. Device time is ~98% of wall, and even Vit
 ~17 GB/s effective (2x its own cost model). This is the architecture that removes our floor:
 21 MB over 8 streams is ~0.4 ms versus ~3 ms over the one active stream per block kind.
 
+### Layer-engine feasibility probe (Vitis-style, all 8 columns per layer)
+
+`scripts/xdna/layer_engine_probe.py` spreads one 1x1 conv layer's output channels over all 32
+cores (8 columns x 4), one shim weight stream per column (broadcast to its four cores, each
+keeps its slice), and repeats it for N layers with fresh weights. Verified bit-exact against
+numpy. Measured (isolated runs; NOTE: never time two different xclbins alternately in one
+loop -- every call then pays a ~1.8 ms context switch, which produced bogus numbers at first):
+
+- Streaming: 8 layers of 1 MB (K=512, N=2048, P=1) take 0.53 ms with compute (0.48 ms
+  streaming-only) including ~0.15-0.2 ms launch, i.e. roughly 25-30 GB/s of weight streaming
+  versus ~7-8 GB/s for the one-active-stream-per-block-kind body. This confirms the Vitis AI
+  inspection: all-column layers remove the weight-bandwidth floor (21 MB would take ~0.75 ms).
+- Per-layer synchronization is the new cost: marginal per layer (tiny layers, nocompute) is
+  2.3 / 4.4 / 20 / 36 us for 1 / 2 / 4 / 8 columns, i.e. ~1.2-1.5 us per DMA task issued
+  serially by the single control processor (Vitis runs one control stream per column and pays
+  ~10-15 us per layer). Issuing each column's weights once for all layers (`--once`) cuts 8
+  columns to ~19 us/layer; one broadcast activation stream (`--bcast`) gives ~16 us/layer;
+  joining outputs across columns is not possible (an objectfifo cannot sit in two links and a
+  memtile has ~6 input channels), so one drain per column remains.
+
+Projection for a full layer-sequential ResNet-50 engine: 55 conv layers x ~16 us sync (~0.9 ms)
++ streaming (~0.75 ms, partly overlapped) + compute + launch, roughly 2-2.5 ms versus ~3.5 ms
+now, i.e. a ~1.5x gain that still trails Vitis' 1.55 ms. It needs runtime-shaped kernels (per-
+shape code does not fit 16 KB of program memory across all block kinds), a generic 3x3/1x1/skip/
+residual engine and a per-layer parameter header, so it is a substantial rewrite; not started.
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is
