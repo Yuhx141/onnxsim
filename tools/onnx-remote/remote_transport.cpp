@@ -83,8 +83,9 @@ bool checked_tensor(const Tensor& t, std::string& error) {
   if (element_bytes == 0) { error = "unsupported tensor dtype"; return false; }
   uint64_t elements = 1;
   for (int64_t d : t.shape) {
-    if (d <= 0 || static_cast<uint64_t>(d) > kMaxTensorBytes ||
-        elements > kMaxTensorBytes / static_cast<uint64_t>(d)) {
+    // a zero dimension is an empty tensor (ONNX allows them; runners use one as "no data sent")
+    if (d < 0 || static_cast<uint64_t>(d) > kMaxTensorBytes ||
+        (d > 0 && elements > kMaxTensorBytes / static_cast<uint64_t>(d))) {
       error = "invalid tensor shape"; return false;
     }
     elements *= static_cast<uint64_t>(d);
@@ -136,7 +137,7 @@ bool decode_tensors(const std::vector<char>& b, size_t& at, std::vector<Tensor>&
     t.shape.resize(rank); uint64_t elements = 1;
     for (auto& d : t.shape) {
       uint64_t ud;
-      if (!take_u64(b, at, ud) || ud == 0 || ud > kMaxTensorBytes || elements > kMaxTensorBytes / ud) {
+      if (!take_u64(b, at, ud) || ud > kMaxTensorBytes || (ud > 0 && elements > kMaxTensorBytes / ud)) {
         error = "invalid tensor dimension"; return false;
       }
       d = static_cast<int64_t>(ud); elements *= ud;

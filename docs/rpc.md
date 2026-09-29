@@ -74,6 +74,13 @@ Compiled execution can optionally use a load/attach handshake: the host sends
 native executor keeps this disabled by default for stateless compatibility; set
 `attach_compiled_artifact=true` for a runner with persistent artifact storage.
 
+A runner may also keep a model's recurrent state resident (the Hexagon v65 runner does, for artifacts whose manifest pairs an
+output with the input it feeds, e.g. openpilot's `next_state_img_q` -> `state_img_q`). After one call that sends the state,
+a client sends that input as an empty tensor (a zero dimension) to mean "the previous call's output", and the matching output
+comes back empty. `onnx-remote-client --compile-run ... --resident IN:OUT,...` does this and checks the result bit for bit
+against sending the state back explicitly. For openpilot's driving model this is 4.4 MB less per call: 470 -> 356 ms
+RPC-inclusive for 340 ms of runner time.
+
 ```python
 import numpy as np
 import onnxsim

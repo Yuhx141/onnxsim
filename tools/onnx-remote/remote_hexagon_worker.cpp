@@ -5,6 +5,8 @@
 //   capabilities                     the runner manifest
 //   load_compiled(id, artifact)      unpack, cache tg_graph_<id>.so, open it on the cDSP and upload the weights once
 //   run_compiled(id, tensors)        ONNX inputs in graph order -> ONNX outputs in graph order (in their program.txt dtypes)
+//                                    a recurrent-state input (program.txt "state") sent empty takes the previous run's output,
+//                                    and that output comes back empty: after the first call the state stays on the phone
 // An artifact is TGHXV65\0, u32 file count, then per file u32 name length, name, u64 size, bytes: tg_graph.so (the skel),
 // blob.bin (weights) and program.txt (the I/O contract; see tinygrad's examples/openpilot/dsp_graph_v65.py).
 #include "remote_transport.h"
@@ -39,6 +41,11 @@ struct Program {
   std::vector<InputSpec> inputs;  // ONNX graph order
   std::vector<OutputSpec> outputs;
   std::vector<std::string> names;  // kernel name per call (program.txt "name"), for per-call profile events
+  // recurrent state (program.txt "state <output> <input>": the output is the input's next value, e.g. next_state_img_q ->
+  // state_img_q). The last run's state outputs stay here, so a client can send such an input empty to mean "the resident
+  // value" and then gets that output back empty: the state never crosses the transport after the first call
+  std::vector<std::pair<int, int>> states;  // (output index, input ONNX index)
+  std::map<int, std::vector<uint8_t>> resident;  // input ONNX index -> bytes
   remote_handle64 handle = 0;
 };
 
@@ -111,6 +118,10 @@ bool parse_program(const std::string& text, Program& p, std::string& error) {
       if (dtype > 255 || dtype_bytes(static_cast<uint8_t>(dtype)) == 0) { error = "unsupported program output dtype"; return false; }
       o.dtype = static_cast<uint8_t>(dtype);
       p.outputs.push_back(o);
+    } else if (key == "state") {
+      int o = -1, i = -1;
+      f >> o >> i;
+      p.states.emplace_back(o, i);
     } else if (key == "name") {
       size_t i = 0;
       std::string name;
@@ -122,6 +133,12 @@ bool parse_program(const std::string& text, Program& p, std::string& error) {
   if (p.output_align == 0) { error = "inconsistent program.txt"; return false; }
   for (const auto& o : p.outputs) total = (total + o.elements * dtype_bytes(o.dtype) + p.output_align - 1) / p.output_align * p.output_align;
   if (p.ncalls <= 0 || p.outputs.empty() || total != p.output_bytes) { error = "inconsistent program.txt"; return false; }
+  for (const auto& [o, idx] : p.states) {
+    const int i = idx;  // (a structured binding can't be captured in C++17)
+    const auto in = std::find_if(p.inputs.begin(), p.inputs.end(), [&](const InputSpec& s) { return s.onnx_index == i; });
+    if (o < 0 || o >= static_cast<int>(p.outputs.size()) || in == p.inputs.end() || in->dtype != p.outputs[o].dtype ||
+        in->bytes != p.outputs[o].elements * dtype_bytes(p.outputs[o].dtype)) { error = "inconsistent program.txt state"; return false; }
+  }
   return true;
 }
 
@@ -195,11 +212,23 @@ Response execute(const Request& request) {
   for (const auto& s : p.inputs) if (s.slot >= 0) by_slot.push_back(&s);
   std::sort(by_slot.begin(), by_slot.end(), [](const InputSpec* a, const InputSpec* b) { return a->slot < b->slot; });
   std::vector<uint8_t> packed;
+  std::vector<bool> from_resident(request.inputs.size(), false);
+  for (const auto& [o, i] : p.states) {
+    const Tensor& t = request.inputs[static_cast<size_t>(i)];
+    if (!t.data.empty() || !t.raw_data.empty()) continue;
+    if (!p.resident.count(i)) {
+      response.error = "state input " + std::to_string(i) + " sent empty but has no resident value: send it in full first";
+      return response;
+    }
+    from_resident[static_cast<size_t>(i)] = true;
+  }
   for (const InputSpec* s : by_slot) {
     const Tensor& t = request.inputs[static_cast<size_t>(s->onnx_index)];
-    const uint8_t* data = t.dtype == 1 ? reinterpret_cast<const uint8_t*>(t.data.data()) : t.raw_data.data();
-    const size_t n = t.dtype == 1 ? t.data.size() * 4 : t.raw_data.size();
-    if (t.dtype != s->dtype || n != s->bytes) {
+    const bool res = from_resident[static_cast<size_t>(s->onnx_index)];
+    const uint8_t* data = res ? p.resident[s->onnx_index].data()
+                              : t.dtype == 1 ? reinterpret_cast<const uint8_t*>(t.data.data()) : t.raw_data.data();
+    const size_t n = res ? p.resident[s->onnx_index].size() : t.dtype == 1 ? t.data.size() * 4 : t.raw_data.size();
+    if ((!res && t.dtype != s->dtype) || n != s->bytes) {
       response.error = "input " + std::to_string(s->onnx_index) + " dtype/size differs from the compiled model";
       return response;
     }
@@ -230,19 +259,31 @@ Response execute(const Request& request) {
     }
   }
   size_t at = 0;
+  std::vector<size_t> offsets;  // the program's output is the ONNX outputs' bytes back to back, each in its own dtype
   for (const auto& o : p.outputs) {
-    // the program's output is the ONNX outputs' bytes back to back, each in its own dtype
+    offsets.push_back(at);
+    at = (at + o.elements * dtype_bytes(o.dtype) + p.output_align - 1) / p.output_align * p.output_align;
+  }
+  std::vector<bool> omit(p.outputs.size(), false);  // state outputs of inputs that came from the resident values
+  for (const auto& [o, i] : p.states) {
+    const size_t n = p.outputs[o].elements * dtype_bytes(p.outputs[o].dtype);
+    p.resident[i].assign(out.data() + offsets[o], out.data() + offsets[o] + n);
+    omit[o] = from_resident[static_cast<size_t>(i)];
+  }
+  for (size_t k = 0; k < p.outputs.size(); ++k) {
+    const auto& o = p.outputs[k];
     Tensor t;
     t.shape = o.shape;
     t.dtype = o.dtype;
     const size_t n = o.elements * dtype_bytes(o.dtype);
-    if (o.dtype == 1) {
+    if (omit[k]) {
+      t.shape = {0};
+    } else if (o.dtype == 1) {
       t.data.resize(o.elements);
-      std::memcpy(t.data.data(), out.data() + at, n);
+      std::memcpy(t.data.data(), out.data() + offsets[k], n);
     } else {
-      t.raw_data.assign(out.data() + at, out.data() + at + n);
+      t.raw_data.assign(out.data() + offsets[k], out.data() + offsets[k] + n);
     }
-    at = (at + n + p.output_align - 1) / p.output_align * p.output_align;
     response.outputs.push_back(std::move(t));
   }
   response.ok = true;

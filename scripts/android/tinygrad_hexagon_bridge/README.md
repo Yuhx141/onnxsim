@@ -449,6 +449,23 @@ CLIENT=.../onnx-remote-client openpilot_v65/e2e.sh worker/onnx-remote-hexagon-wo
 | `dmonitoring_model` | ~20 min | 14.7 MB | 474 ms | 479 / 437 ms | bit-exact |
 | `driving_supercombo` (4 outputs) | ~45 min | 121 MB | 3580 ms | 1740 / 1494 ms | bit-exact |
 
+**Quantized models and the transport.** With the integer path (W8/W16 A16 QDQ models, `ONNX_QDQ_INT_CONV=1 ONNX_QDQ_LUT=1
+TC_OPT=1`), 4 threads on the V69 phone, all bit-exact to the capture:
+
+| step | driving: DSP / RPC-inclusive | DM: DSP |
+|---|---:|---:|
+| integer path, u8 x u8 tensor cores | 394 / 631 ms | 99.8 ms |
+| integer reductions skip gather-making upcasts | 398 / 673 | 93.6 |
+| the vector upcast takes the axis at unit stride in the most buffers (a W16 7x7 depthwise vectorized its NCHW output width, gathering its input: 26.6 ms -> off the top list) | 347 / 631 | 93.6 |
+| outputs in their own dtypes (`ALL_OUTPUTS=2`): the 2 MB uint8 frame queue stays uint8, each output its own aligned slice | 337 / 470 | 94 |
+| recurrent state resident on the runner (`--resident 4:1,5:2,6:3`) | 340 / 356 | |
+
+The last two are transport: casting the frame queue to float made an 8 MB output (and a 15 ms scalar cast kernel), and
+sending `state_*_q` in and `next_state_*_q` back every call moved 4.4 MB over `adb forward`. The runner now keeps each
+`next_X` output (program.txt `state` records) as the next call's `X` when the client sends `X` empty; the client's
+`--resident` checks that against sending it back explicitly. What is left per call is `new_img` (393 KB) and the FastRPC
+copies (about 6 ms between `hexagon_run` and the DSP time).
+
 **Compile time.** One compiler service handles requests concurrently: cache hits are served while models compile, `--jobs`
 (`COMPILE_JOBS`, default 2) bounds concurrent cold compiles, and a second request for a model already compiling waits for it
 and reuses the artifact. Each kernel is compiled once and cached by source across compiles (the mock-DSP capture build through
