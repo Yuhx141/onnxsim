@@ -281,6 +281,15 @@ add a ~0.75 ms+ switch. Measured 7.0-8.4 ms end to end on a host under heavy unr
 load (body 4.9-5.8 ms in-runner vs 3.7 ms in isolation), logits identical to ORT CPU.
 Before this schedule: 13.6 ms (best hybrid) and 76 ms (all per-op XRT).
 
+Double-buffering the weight FIFO (`--weight-depths`, with a smaller per-group
+`--chunk-caps`) overlaps weight DMA with compute where tile memory allows: on the
+layer4 groups (small activations, ~16.5 KB slots after tap pruning) it gave ~17% on a
+layer4-only body (1.79 -> 1.49 ms, depth 3 no better than 2) and ~5% on the whole body;
+layers 1-3 have 18-37 KB slots plus large activations/static buffers and cannot hold two
+slots. Weight-chunk caps and depths must match between compile and run (they change the
+packed layout); the runner reads them from `--fused-body`'s group JSON
+(`{"blocks": [...], "chunk_cap": N, "depth": D}` entries).
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is
