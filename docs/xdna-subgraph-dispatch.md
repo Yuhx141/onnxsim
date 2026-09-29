@@ -310,6 +310,17 @@ block is a strict conv1 -> conv2 -> conv3 pipeline, so at any moment only one st
 weights are needed and depth-1/2 FIFOs cannot run ahead; more channels do not help, only
 staging larger runs of weights ahead of compute (memtile FIFOs) or fewer bytes could.
 
+Memtile weight staging (`--l2-depths`: shim fills a deep memtile FIFO ahead of compute, the
+memtile forwards to the cores; BD limits cap it near depth ~8-12) is exact and gives nothing
+(layer4-only body 1.80 vs 1.84 ms). The NPU itself is not DDR-limited: the reference
+`memcpy` microbenchmark (8 columns x 2 channels) reaches 76 GB/s in+out. So the ~8 GB/s
+"weight-stream floor" is a property of this dataflow, not of the memory system: prefetching,
+more shim channels (`--split-weights`) and staging all leave it unchanged, consistent with
+per-core input-DMA ingress on the phase that is currently active (conv1, the projection skip
+and conv3 each run on a single core; only conv2 uses two). Spreading every conv across all
+four cores of a column (data-parallel over output channels, with memtile join/broadcast between
+phases) is the change that would raise the ingress rate.
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is
