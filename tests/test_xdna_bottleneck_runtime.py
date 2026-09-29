@@ -1,0 +1,37 @@
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "xdna"))
+
+onnx = pytest.importorskip("onnx")
+
+from bottleneck_runtime import bind_bottleneck_block  # noqa: E402
+from resnet_bottleneck import plan_bottleneck_blocks  # noqa: E402
+
+QUICKTEST_MODEL = Path("/home/takecheeze/ryzen_ai-1.8.0/venv/quicktest/test_model.onnx")
+
+
+def _quicktest_model() -> str:
+    """The Ryzen AI quicktest ResNet-50 (only present on the XDNA development host)."""
+    if not QUICKTEST_MODEL.is_file():
+        pytest.skip(f"quicktest model not available: {QUICKTEST_MODEL}")
+    return str(QUICKTEST_MODEL)
+
+
+def test_quicktest_bottleneck_bindings_reject_bias_or_downsample():
+    model = onnx.load(_quicktest_model())
+    bindings = [
+        bind_bottleneck_block(model, block) for block in plan_bottleneck_blocks(model)
+    ]
+    assert len(bindings) == 16
+    assert all(binding.has_bias for binding in bindings)
+    assert not any(binding.executable_with_existing_primitive for binding in bindings)
+    assert all(binding.weights.size > 0 for binding in bindings)
+    assert all(
+        binding.biases and all(bias.size > 0 for bias in binding.biases)
+        for binding in bindings
+    )
+    assert sum(binding.skip_weight is not None for binding in bindings) == 4
+    assert "bias_requantize" in bindings[0].required_postops

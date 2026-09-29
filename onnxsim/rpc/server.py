@@ -523,6 +523,31 @@ class _Handler(socketserver.BaseRequestHandler):
                 _close(runner)
             specs, out_blobs = proto.encode_tensors(outputs)
             return {"tensors": specs}, out_blobs
+        if op == "xdna_compile_resnet":
+            from .xdna import compile_resnet
+
+            header = dict(header, _xdna_python=server.xdna_python)
+            with server.xdna_lock:
+                result, out_blobs = compile_resnet(header, blobs, server.work_dir)
+            return {"result": result}, out_blobs
+        if op == "xdna_run_resnet":
+            from .xdna import run_resnet
+
+            header = dict(header, _xdna_python=server.xdna_python)
+            with server.xdna_lock:
+                result, out_blobs = run_resnet(header, blobs, server.work_dir)
+            return {"result": result}, out_blobs
+        if op == "xdna_compare_vitis_resnet":
+            from .xdna import compare_resnet
+
+            header = dict(
+                header,
+                _xdna_python=server.xdna_python,
+                _vitis_python=server.vitis_python,
+            )
+            with server.xdna_lock:
+                result, out_blobs = compare_resnet(header, blobs, server.work_dir)
+            return {"result": result}, out_blobs
         raise proto.RPCError(f"unknown operation {op!r}")
 
     @staticmethod
@@ -547,6 +572,8 @@ class RPCServer(socketserver.ThreadingTCPServer):
         work_dir: Optional[str] = None,
         max_blob_bytes: int = proto.DEFAULT_MAX_BLOB_BYTES,
         verbose: bool = False,
+        xdna_python: Optional[str] = None,
+        vitis_python: Optional[str] = None,
     ):
         super().__init__((host, port), _Handler)
         self.key = key
@@ -554,6 +581,9 @@ class RPCServer(socketserver.ThreadingTCPServer):
         os.makedirs(self.work_dir, exist_ok=True)
         self.max_blob_bytes = max_blob_bytes
         self.verbose = verbose
+        self.xdna_python = xdna_python or sys.executable
+        self.vitis_python = vitis_python or self.xdna_python
+        self.xdna_lock = threading.Lock()
         self.stats: Dict[str, int] = {}
         self._thread: Optional[threading.Thread] = None
 
@@ -569,6 +599,8 @@ class RPCServer(socketserver.ThreadingTCPServer):
             "platform": platform.platform(),
             "machine": platform.machine(),
             "python": sys.version.split()[0],
+            "xdna_python": self.xdna_python,
+            "vitis_python": self.vitis_python,
             "onnx": onnx.__version__,
         }
         try:

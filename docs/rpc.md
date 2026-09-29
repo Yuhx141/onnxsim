@@ -156,6 +156,155 @@ caches Python constants between calls, so this suits static-shape models. `scrip
 has a benchmark built on this; a server started with `MOCKDSP=1` also exposes tinygrad's Hexagon
 renderer (kernels executed under `qemu-hexagon-static`, where "time" is an instruction count).
 
+## XDNA ResNet compilation and execution
+
+Run the RPC server on the machine with IRON, XRT, and the XDNA device. Start it
+with that machine's Python environment so compiler subprocesses inherit the
+same toolchain:
+
+```bash
+export XILINX_XRT=/path/to/xrt
+PYTHONPATH=/path/to/onnx-simplifier:$PYTHONPATH \
+  python -m onnxsim.rpc server --host 127.0.0.1 --port 9192 --key xdna \
+  --xdna-python /path/to/iron-python \
+  --vitis-python /path/to/vitis-ai-python
+```
+
+The RPC process uses this source checkout for the XDNA scripts.
+`--xdna-python` selects the subprocess environment with IRON/XRT, and
+`--vitis-python` selects the one with `VitisAIExecutionProvider`. This supports
+installations where the two providers are available in separate environments.
+For a Ryzen AI venv, the server also sets `RYZEN_AI_INSTALLATION_PATH` and adds
+its VOE runtime libraries to the Vitis child's library path, keeping system XRT
+libraries first to avoid mixing incompatible XRT versions.
+
+The client can compile a fused bottleneck and quantized MaxPool remotely, then
+pass their server-side artifact paths to a graph run:
+
+```python
+import onnxsim.rpc as rpc
+
+remote = rpc.connect("127.0.0.1", 9192, key="xdna")
+model = "/client/path/resnet.onnx"
+build = remote.xdna_compile_resnet(model, "resnet", {
+    "example": "/server/path/whole_array.py", "device": "npu2",
+    "optimize_small_m": True,
+})
+block = remote.xdna_compile_resnet(
+    model, "fused_bottleneck", {"block": "/layer1/layer1.0", "device": "npu2"}
+)
+pool = remote.xdna_compile_resnet(model, "maxpool_u8", {
+    "channels": 64, "input_height": 18, "input_width": 20,
+    "output_height": 8, "output_width": 8,
+    "kernel_height": 3, "kernel_width": 3,
+    "stride_height": 2, "stride_width": 2,
+    "tile_output_rows": 8, "tile_channels": 4,
+})
+report = remote.xdna_run_resnet(model, build["manifest"], {
+    "cpu_small_m": 64, "cpu_backend": "torch", "cpu_threads": 2,
+    "warmup": 2, "iters": 10,
+    "fused_blocks": [{"prefix": "/layer1/layer1.0",
+                      "xclbin": block["xclbin"], "insts": block["insts"]}],
+    "maxpool_uint8": {"xclbin": pool["xclbin"], "insts": pool["insts"]},
+})
+print(report["avg_ms"], report["cpu_reference"])
+remote.close()
+```
+
+For the best measured schedule, compile the whole bottleneck body as **one** xclbin
+(`kind="resnet_body"`; one core column per block kind, so ResNet-50's 16 blocks use 8
+columns) and run it with the stem Conv and MaxPool on the host, which avoids every
+xclbin switch:
+
+```python
+groups = [["/layer1/layer1.0"], ["/layer1/layer1.1", "/layer1/layer1.2"],
+          ["/layer2/layer2.0"], ["/layer2/layer2.1", "/layer2/layer2.2", "/layer2/layer2.3"],
+          ["/layer3/layer3.0"], [f"/layer3/layer3.{i}" for i in range(1, 6)],
+          # layer4 groups: smaller weight chunks + a double-buffered weight FIFO (~-9% on the body)
+          {"blocks": ["/layer4/layer4.0"], "chunk_cap": 17000, "depth": 2},
+          {"blocks": ["/layer4/layer4.1", "/layer4/layer4.2"], "chunk_cap": 17000, "depth": 2}]
+body = remote.xdna_compile_resnet(model, "resnet_body", {"groups": groups})
+report = remote.xdna_run_resnet(model, build["manifest"], {
+    "cpu_small_m": 256, "cpu_backend": "numpy", "host_maxpool": True,
+    "fused_body": {"xclbin": body["xclbin"], "insts": body["insts"], "groups": groups},
+    "warmup": 5, "iters": 30,
+})
+```
+
+The whole network, including the stem Conv and MaxPool, can run on the device as one xclbin with one
+core column per bottleneck stage (`kind="resnet_network"`; runtime-shaped kernels; the host only
+quantizes the image and runs the classifier tail):
+
+```python
+stages = [[f"/layer1/layer1.{i}" for i in range(3)], [f"/layer2/layer2.{i}" for i in range(4)],
+          [f"/layer3/layer3.{i}" for i in range(6)], [f"/layer4/layer4.{i}" for i in range(3)]]
+net = remote.xdna_compile_resnet(model, "resnet_network", {"stages": stages})
+report = remote.xdna_run_resnet(model, build["manifest"], {
+    "device_network": {"xclbin": net["xclbin"], "insts": net["insts"], "stages": stages},
+    "warmup": 5, "iters": 30,
+})   # ~5.2 ms end to end on the quicktest ResNet, logits identical to ONNX Runtime CPU
+```
+
+All blocks of a group must share shapes and weight chunking (they differ only in
+weights and requantization scales). `fused_stage` compiles also accept
+`options["blocked"]` (1-8 blocks, vectorized kernels; pass `"blocked": True` on the
+matching `fused_stages` run entry).
+
+`xdna_compile_resnet` also supports `kind="resnet"`; provide the server-side
+IRON `whole_array.py` path as `options["example"]`. Compiled paths remain on the
+server, so compile and run calls must use the same server. Compiler failures
+are returned with the subprocess log tail for diagnosis.
+
+### XDNA compile cache
+
+Compiles take 40 s to a few minutes and are usually repeated with identical inputs, so
+`xdna_compile_resnet` caches artifacts on the server, content-addressed. The reply has the same
+shape as a fresh compile plus `"cache": "hit" | "miss" | "bypass"` and `"cache_key"`; artifact
+paths point into the cache entry (`<cache>/<key>/artifacts/...`) and stay valid until the entry is
+evicted.
+
+The key is a SHA-256 over: the compile kind; the model bytes; the exact compiler command
+(device, columns, `compile_all`, `optimize_small_m`, block(s), groups/chunk caps/depths, `blocked`,
+pool geometry, ... -- only options that reach the compiler count, so e.g. `no_cache` does not);
+the content hash of the `resnet` `example` file; every `.py`/`.cc`/`.h` file under
+`scripts/xdna` (excluding `__pycache__`) plus `onnxsim/rpc/xdna.py`; the IRON python identity
+(path, Python version, mlir_aie/aie version, Peano `clang` stat, XRT `version.info`, probed once
+per process); and the compile-relevant environment (`XDNA_*` such as `XDNA_BLOCKED_MAX_CHUNK`,
+`AIE_*`, `IRON_*`, `PEANO*`, `MLIR_AIE*`, `XILINX_XRT`, `PYTHONPATH`, `PATH`,
+`LD_LIBRARY_PATH`). Any change to these misses; nothing else needs manual invalidation.
+
+Entries are built in a temp directory and published by atomic rename under a per-key `flock`, so
+concurrent identical requests compile once and a crash never leaves a partial entry. On a hit
+every recorded file must still exist with its recorded non-zero size, otherwise the entry is
+discarded and rebuilt. The cache keeps the newest entries by last use (LRU by mtime).
+
+| Setting | Meaning |
+| --- | --- |
+| `options["no_cache"]=True` | skip the cache; compile into a fresh `<work_dir>/xdna-rpc/<uuid>` (`"cache": "bypass"`) |
+| `ONNXSIM_XDNA_CACHE=0` | disable the cache server-wide |
+| `ONNXSIM_XDNA_CACHE_DIR` / `options["cache_dir"]` | cache root (default `<work_dir>/xdna-cache`) |
+| `ONNXSIM_XDNA_CACHE_MAX_ENTRIES` / `options["cache_max_entries"]` | entries kept (default 20) |
+
+For an apples-to-apples full-graph comparison, use
+`Session.xdna_compare_vitis_resnet(model, manifest, options)`. It runs the XDNA
+graph and then Vitis AI sequentially on the same server, with identical input
+seed, warmup count, and measured iteration count. The response includes both
+full reports, XDNA per-op timings, summarized Vitis provider events, CPU
+reference errors, and a latency ratio only when both backends report real NPU
+execution. Both reports must have matching input shape and seed, and the Vitis
+trace must contain NPU-assigned nodes for the comparison to be marked valid.
+Vitis profiling is performed in a separate untimed pass by default; set
+`profile_vitis=False` to skip the trace, in which case NPU node placement and
+the latency ratio cannot be verified.
+
+```python
+comparison = remote.xdna_compare_vitis_resnet(model, build["manifest"], {
+    "warmup": 20, "iters": 200, "seed": 0,
+    "cpu_small_m": 64, "cpu_backend": "torch", "cpu_threads": 2,
+})
+print(comparison["comparison_valid"], comparison.get("xdna_vs_vitis_latency_ratio"))
+```
+
 ## Remote constant folding
 
 onnxsim's folder builds a throwaway sub-model per fold group and hands it to a `ModelExecutor`

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import statistics
@@ -232,6 +233,94 @@ class Session:
             header.update(runtime=runtime, device=device, options=options or {})
         reply, out = self._call(header, [_model_bytes(model), *blobs])
         return proto.decode_tensors(reply["tensors"], out)
+
+    def xdna_compile_resnet(
+        self,
+        model: ModelLike,
+        kind: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Compile a supported XDNA ResNet artifact on the RPC server.
+
+        ``kind`` is ``"resnet"`` (needs a server-side IRON example path in options),
+        ``"fused_bottleneck"`` (needs ``options["block"]``), ``"fused_stage"`` (1-3 blocks, or
+        1-8 with ``options["blocked"]``), ``"resnet_body"`` (the whole bottleneck body as ONE
+        xclbin; needs ``options["groups"]``, block-prefix groups with one core column each), or
+        ``"resnet_network"`` (stem Conv + MaxPool + all four bottleneck stages on the device as ONE
+        xclbin, one core column per stage; needs ``options["stages"]``: block-prefix lists, projection
+        block first), or ``"maxpool_u8"``.
+        Returned artifact paths are on the RPC server and can be passed to
+        :meth:`xdna_run_resnet` on the same server.
+
+        Compiles are cached on the server, content-addressed by the model bytes, the compiler
+        command (device, columns, blocks/groups, ...), the ``scripts/xdna`` sources, the IRON
+        toolchain identity and compile-relevant environment variables. The reply carries
+        ``"cache": "hit" | "miss" | "bypass"`` and ``"cache_key"``; pass
+        ``options["no_cache"] = True`` to force a fresh compile. See ``docs/rpc.md``.
+        """
+        if kind not in (
+            "resnet",
+            "fused_bottleneck",
+            "fused_stage",
+            "resnet_body",
+            "resnet_network",
+            "maxpool_u8",
+        ):
+            raise ValueError(f"unsupported XDNA compile kind {kind!r}")
+        reply, _ = self._call(
+            {"op": "xdna_compile_resnet", "kind": kind, "options": options or {}},
+            [_model_bytes(model)],
+        )
+        return reply["result"]
+
+    def xdna_run_resnet(
+        self,
+        model: ModelLike,
+        manifest: Union[str, os.PathLike, bytes, Dict[str, Any]],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Run and profile the XDNA ResNet graph on the RPC server.
+
+        Manifest artifact paths and any fused-kernel paths must be valid on the
+        server. The result contains the graph runner's profile and correctness report.
+        """
+        if isinstance(manifest, bytes):
+            manifest_bytes = manifest
+        elif isinstance(manifest, dict):
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+        else:
+            with open(manifest, "rb") as stream:
+                manifest_bytes = stream.read()
+        reply, _ = self._call(
+            {"op": "xdna_run_resnet", "options": options or {}},
+            [_model_bytes(model), manifest_bytes],
+        )
+        return reply["result"]["report"]
+
+    def xdna_compare_vitis_resnet(
+        self,
+        model: ModelLike,
+        manifest: Union[str, os.PathLike, bytes, Dict[str, Any]],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Compare full-graph XDNA and Vitis AI runs on the RPC server.
+
+        Both runs use the same model, input seed, warmup count, and iteration count.
+        Vitis AI profiling runs separately from its timed loop. Use the same server
+        for XDNA, Vitis AI, and all artifact paths referenced by the manifest.
+        """
+        if isinstance(manifest, bytes):
+            manifest_bytes = manifest
+        elif isinstance(manifest, dict):
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+        else:
+            with open(manifest, "rb") as stream:
+                manifest_bytes = stream.read()
+        reply, _ = self._call(
+            {"op": "xdna_compare_vitis_resnet", "options": options or {}},
+            [_model_bytes(model), manifest_bytes],
+        )
+        return reply["result"]
 
     def executor(self, providers: Optional[Sequence[str]] = None):
         from .executor import RemoteModelExecutor
