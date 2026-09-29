@@ -490,6 +490,27 @@ Lossy options measured against the "plan error no worse than today" budget (`w16
 | depthwise convs as sliding-window vrmpy over each channel's flat padded image (`nn/dw_v65.py`; all 29 driving layers, 7x7/3x3/5x5, stride 2 and channel multipliers) | 163 / 185 | 79.5 |
 | u16 table lookups through VTCM `vgather` (`DSP_V65_VGATHER=1`, on by default in `compile_v65.sh`) | 154 / 178 | 75.0 |
 
+| vrmpy tensor core: accumulator folded into the WMMA's C, 4 output-channel vectors x 2 pixels per weight/activation load (`DSP_TC_MUPCAST=4`, `DSP_TC_PUPCAST=2`) | 144 / 165 | 72.1 |
+
+**Tensor-core convs.** The loop accumulator was added outside the vrmpy op (`pm_wmma_add` never fires here: the WMMA sits behind a
+reshape), so each K step zeroed a register, ran the vrmpy from zero and added the result back; a pattern now folds a reshaped WMMA
+plus the accumulator into the WMMA's own accumulator input (restricted to the vrmpy shape (32, 1, 4): without the restriction six HMX
+i8 tests fail). That alone cut 18% of the instructions under qemu and was neutral on the phone. The gain is the blocking, again
+opposite to qemu's count. Driving DSP ms (all byte-identical): 8 x 1 blocking 153.6, 8 x 2 143.8, 4 x 2 142.3 (the qemu count says
+4 x 2 is slower than 8 x 1: 1949 vs 1355 us); 4 x 4, 2 x 4 and 2 x 8 stalled the compiler in qemu (not excluded on performance).
+Tensor-core kernels in driving: 51.2 -> 39.1 ms. Not tried: weight-prefetch tuning, the thread-axis choice, sharing the weight load
+between the two byte planes of an A16 activation. The compiler cache key is the fork commit: an uncommitted change re-serves the
+cached artifact, so commit before measuring.
+
+**A cost per distinct kernel, not explained.** Kernel bodies that repeat are cheap; each distinct kernel costs 100-200 us more, at
+any size. Measured on the phone with synthetic graphs of tiny (512-element) kernels: 300 calls of 3 distinct kernels 8.4 ms (28 us
+per call); 100 softmax + mul pairs with a different constant each (distinct source, identical structure and buffers) 29.0 ms;
+191 calls of distinct-size kernels 26.9 ms (141 us per call). The driving graph has 218 distinct kernels among 371 calls, so this
+may be a large part of its run (up to ~25-40 ms). Ruled out: the per-call timer, the thread pool (same with 1 thread), cold caches
+between runs, code size, software prefetch on/off, prefetching every kernel's code lines (`dcfetch` over the code, before the
+first call: 27.1 -> 27.0 ms), reading one byte of every code page first (24.1 -> 24.1 ms). Next probe: the DSP PMU counters
+(`libs/itrace/inc/itrace_dsp_events_pmu.h`), or an unsigned-PD-independent rebuild of the skel with the kernels in one section.
+
 **Depthwise (sliding-window vrmpy).** Each channel's padded image is one flat byte signal. A 128-lane vrmpy takes one unaligned
 128-byte load at offset `128b + s + ky*Wp + 4g` and a splat of 4 weights; four shifts s = 0..3 give 128 outputs, re-ordered with
 `vshuff` -4 then -8 (the negative forms are the full-interleave constants). 56 vrmpys per 128 outputs for 7x7 and 12 for 3x3,
@@ -497,6 +518,12 @@ instead of about three loads per output. The idea is the SDK's `qhdsp_hvx_conv7x
 Qualcomm Proprietary). The old depthwise bucket was 40 ms; the new kernels are 0.03-0.3 ms each. The input planes come from a small
 custom prep kernel; the tinygrad-generated pad/flatten/plane-split version made DM slower (93.8 -> 101.9 ms). Not tried: the
 `valign` variant (aligned loads and register shifts).
+
+**Lane join.** A 128-lane u16 -> u8 plane split built its vector from 256 scalar loads plus `vinsert` chains: a wide load split
+into two 64-lane halves fell through to a per-lane constructor. `_lane_join` in `ops_dsp.py` turns a STACK of consecutive elements
+from several narrower loads of one buffer into one unaligned wide load: 680 -> 20 us for the standalone kernel under qemu; no
+change on the phone's total (the plane-split kernels are small). The 19 `E_128_2_128` calls (8.0 ms) that looked like lookups are
+requantization epilogues; `vgather` already converts every real lookup in the driving capture (10 sources, 22 calls).
 
 **Table lookups through `vgather`.** An unsigned PD gets VTCM with `HAP_compute_res_acquire` and a VTCM parameter (no HMX vote;
 2, 4 and 8 MB were all granted). The 128 KB tables need the word-offset gather (`Q6_vgather_ARMWw`, 64 halfwords per instruction,
