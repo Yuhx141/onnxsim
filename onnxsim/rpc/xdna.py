@@ -196,11 +196,26 @@ def _compile_command(
         ]
         if options.get("stem", True):
             command.append("--stem")
+        if options.get("cols"):
+            command += ["--cols", str(int(options["cols"]))]
         for stage in stages:
             command += [
                 "--stage",
                 *(stage["blocks"] if isinstance(stage, dict) else stage),
             ]
+        # Per-stage tuning (lists with one entry per stage): per-core weight streams and weight
+        # FIFO depths. Weight layout does not depend on either, so a run needs no matching options.
+        for option, flag in (
+            ("split_weights", "--split-weights"),
+            ("weight_depths", "--weight-depths"),
+        ):
+            values = options.get(option)
+            if values is not None:
+                if not isinstance(values, list) or len(values) != len(stages):
+                    raise proto.RPCError(
+                        f"{option} needs one entry per stage ({len(stages)})"
+                    )
+                command += [flag, ",".join(str(int(v)) for v in values)]
     elif kind == "resnet_body":
         groups = _body_groups(options.get("groups"))
         command = [

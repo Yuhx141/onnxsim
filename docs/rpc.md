@@ -238,11 +238,16 @@ quantizes the image and runs the classifier tail):
 ```python
 stages = [[f"/layer1/layer1.{i}" for i in range(3)], [f"/layer2/layer2.{i}" for i in range(4)],
           [f"/layer3/layer3.{i}" for i in range(6)], [f"/layer4/layer4.{i}" for i in range(3)]]
-net = remote.xdna_compile_resnet(model, "resnet_network", {"stages": stages})
+net = remote.xdna_compile_resnet(model, "resnet_network", {
+    "stages": stages,
+    "cols": 8,                       # reach every shim DMA channel
+    "split_weights": [0, 0, 1, 1],   # per-core weight streams for the two heavy stages
+    "weight_depths": [1, 1, 1, 2],   # double-buffer layer4's weight FIFOs
+})
 report = remote.xdna_run_resnet(model, build["manifest"], {
     "device_network": {"xclbin": net["xclbin"], "insts": net["insts"], "stages": stages},
     "warmup": 5, "iters": 30,
-})   # ~5.2 ms end to end on the quicktest ResNet, logits identical to ONNX Runtime CPU
+})   # ~3.6-3.8 ms end to end on the quicktest ResNet, logits identical to ONNX Runtime CPU
 ```
 
 All blocks of a group must share shapes and weight chunking (they differ only in
