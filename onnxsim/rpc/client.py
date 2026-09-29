@@ -243,11 +243,20 @@ class Session:
         """Compile a supported XDNA ResNet artifact on the RPC server.
 
         ``kind`` is ``"resnet"`` (needs a server-side IRON example path in options),
-        ``"fused_bottleneck"`` (needs ``options["block"]``), or ``"maxpool_u8"``.
+        ``"fused_bottleneck"`` (needs ``options["block"]``), ``"fused_stage"`` (1-3 blocks, or
+        1-8 with ``options["blocked"]``), ``"resnet_body"`` (the whole bottleneck body as ONE
+        xclbin; needs ``options["groups"]``, block-prefix groups with one core column each), or
+        ``"maxpool_u8"``.
         Returned artifact paths are on the RPC server and can be passed to
         :meth:`xdna_run_resnet` on the same server.
         """
-        if kind not in ("resnet", "fused_bottleneck", "fused_stage", "maxpool_u8"):
+        if kind not in (
+            "resnet",
+            "fused_bottleneck",
+            "fused_stage",
+            "resnet_body",
+            "maxpool_u8",
+        ):
             raise ValueError(f"unsupported XDNA compile kind {kind!r}")
         reply, _ = self._call(
             {"op": "xdna_compile_resnet", "kind": kind, "options": options or {}},

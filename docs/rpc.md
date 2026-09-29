@@ -211,6 +211,29 @@ print(report["avg_ms"], report["cpu_reference"])
 remote.close()
 ```
 
+For the best measured schedule, compile the whole bottleneck body as **one** xclbin
+(`kind="resnet_body"`; one core column per block kind, so ResNet-50's 16 blocks use 8
+columns) and run it with the stem Conv and MaxPool on the host, which avoids every
+xclbin switch:
+
+```python
+groups = [["/layer1/layer1.0"], ["/layer1/layer1.1", "/layer1/layer1.2"],
+          ["/layer2/layer2.0"], ["/layer2/layer2.1", "/layer2/layer2.2", "/layer2/layer2.3"],
+          ["/layer3/layer3.0"], [f"/layer3/layer3.{i}" for i in range(1, 6)],
+          ["/layer4/layer4.0"], ["/layer4/layer4.1", "/layer4/layer4.2"]]
+body = remote.xdna_compile_resnet(model, "resnet_body", {"groups": groups})
+report = remote.xdna_run_resnet(model, build["manifest"], {
+    "cpu_small_m": 256, "cpu_backend": "numpy", "host_maxpool": True,
+    "fused_body": {"xclbin": body["xclbin"], "insts": body["insts"], "groups": groups},
+    "warmup": 5, "iters": 30,
+})
+```
+
+All blocks of a group must share shapes and weight chunking (they differ only in
+weights and requantization scales). `fused_stage` compiles also accept
+`options["blocked"]` (1-8 blocks, vectorized kernels; pass `"blocked": True` on the
+matching `fused_stages` run entry).
+
 `xdna_compile_resnet` also supports `kind="resnet"`; provide the server-side
 IRON `whole_array.py` path as `options["example"]`. Compiled paths remain on the
 server, so compile and run calls must use the same server. Compiler failures

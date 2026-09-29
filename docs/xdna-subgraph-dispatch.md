@@ -245,10 +245,49 @@ Of that, ~8.3 ms is the four stage launches as seen by the runner (host load and
 per-launch setup included), ~1.3 ms MaxPool, ~1.9 ms stem Conv dispatch+post and
 host QDQ. Vitis AI runs the same graph in ~1.6 ms as one fused provider node.
 
-Note: the `numpy` CPU-conv fallback is not bit-exact for the large layers (it fed
-layer3 blocks a slightly different input than ORT and looked like a kernel bug);
-validate blocks with `--capture`/reference boundary tensors rather than through that
-fallback.
+Note: validate blocks with `--capture`/reference boundary tensors rather than
+through the CPU-conv fallback; an early layer3 mismatch that looked like a kernel bug
+was traced to that fallback path, not the kernels.
+
+### The remaining cost was context switching, not compute
+
+Running the four stages back to back in one process took 8.3 ms although each stage
+alone (same hardware context, repeated) took 3.8 ms in total. Every switch between
+xclbins costs ~0.75 ms fixed plus a part that grows with the PDI (w1 +0.8, w2 +1.1,
+w3 +1.6, w4 +0.8 ms), even when the two designs use disjoint columns. A multi-device
+**full ELF** (`compose_full_elf.py`: four devices, one `@main` sequence with
+`aiex.configure`/`aiex.run`, one host launch) is exact but takes the same 8.0-8.3 ms:
+a PDI load inside the ELF costs as much as a context switch.
+
+The fix is not to reconfigure at all. ResNet-50's 16 bottlenecks are only 8 *kinds*
+(one projection block plus a run of identical identity blocks per stage), and 8 kinds
+x 4 cores = the whole 32-core NPU2 array. `resnet_body_design.py` maps each kind to one
+column and iterates same-shaped blocks on it:
+
+- requantization shifts are runtime values read from a 64-byte header appended to every
+  weight slot (`FUSED_RT_SHIFTS`, `blocked_stage.pack_blocked_params(header=True)`),
+  so one compiled block serves blocks with different scales and weights;
+- each group's weight streams are concatenated into one transfer; iterations chain
+  through a DDR scratch buffer via the shim DMAs (which also do the NHWC <-> blocked
+  layout conversion), issued in order by the runtime sequence.
+
+Result: the **whole bottleneck body in one xclbin launch, bit-exact, 3.7 ms** (vs 8.3 ms
+chained, 16.7 ms for layer1 alone at the start of this work).
+
+Graph-level (`run_resnet_xdna.py ... --fused-body XCLBIN INSTS GROUPS_JSON
+--cpu-small-m 256 --host-maxpool`): the stem Conv (2.4 M MACs; exact float32 BLAS GEMM,
+1.2 -> 0.2 ms) and the 16x16 MaxPool run on the host because each extra xclbin would
+add a ~0.75 ms+ switch. Measured 7.0-8.4 ms end to end on a host under heavy unrelated
+load (body 4.9-5.8 ms in-runner vs 3.7 ms in isolation), logits identical to ORT CPU.
+Before this schedule: 13.6 ms (best hybrid) and 76 ms (all per-op XRT).
+
+What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
+(~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
+rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is
+active at a time and each kind has a single shim MM2S stream (the 16 shim MM2S
+channels are all taken by 8 input + 8 weight streams), so a faster body needs either
+more concurrent weight streams for the active group (e.g. memtile staging that
+prefetches ahead of compute, or sharing input channels) or fewer weight bytes.
 
 The Vitis capture adds selected quantized tensors as ONNX graph outputs and
 runs them through a separate Vitis AI session. RPC XDNA capture saves linked
