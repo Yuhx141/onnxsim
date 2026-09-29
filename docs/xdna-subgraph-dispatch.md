@@ -290,6 +290,17 @@ slots. Weight-chunk caps and depths must match between compile and run (they cha
 packed layout); the runner reads them from `--fused-body`'s group JSON
 (`{"blocks": [...], "chunk_cap": N, "depth": D}` entries).
 
+Further tuning (interleaved, same window; the host was loaded and the body is DRAM-bandwidth
+bound, so absolute times swing 3.5 -> 8 ms with other jobs' memory traffic, ratios hold):
+building conv2's small-map 3x3 tiles from a few contiguous row segments instead of a
+static im2col buffer (`--seg-gather`, stride-1 maps of width 1/2/4) frees ~18 KB of tile
+memory for deeper weight FIFOs and smaller chunks, but the extra loads per MMUL cost
+more than the overlap gives (all-groups segments: +13% at depth 1; with depths 3/2/2/2
+and smaller chunk caps it only breaks even with the baseline). The best measured
+configuration is the plain body with double-buffered layer4 groups (about -6%);
+mixed segment/im2col was -2%. Weight prefetch depth is not the lever; per-stream weight
+bandwidth is.
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is

@@ -113,6 +113,13 @@ constexpr TapTable TAPS = make_tap_table();  // evaluated at compile time; runti
 
 constexpr bool ROW_TILES1 = (W % 8 == 0);  // conv1 output tile = 8 pixels of one row
 constexpr bool ROW_TILES2 = (S == 1 && W % 8 == 0 && OW == W);
+// Stride-1 maps narrower than a tile: an A tile is 8/OW row segments of OW pixels, each one
+// contiguous in the padded buffer, so it is assembled from a few vector loads and needs no
+// static im2col buffer (leaves tile memory for a deeper weight FIFO).
+#ifndef FUSED_SEG_GATHER
+#define FUSED_SEG_GATHER 0
+#endif
+constexpr bool SEG_GATHER = (FUSED_SEG_GATHER && S == 1 && !ROW_TILES2 && (OW == 2 || OW == 4 || (OW == 1 && OH == 1)));
 
 using MMUL = aie::mmul<8, 8, 8, int8, int8>;
 using v64 = aie::vector<int8, 64>;
@@ -217,7 +224,7 @@ extern "C" void fused_bottleneck_conv1_chunk(const int8_t *input, const uint8_t 
 // Non-row-tiled maps: the 3x3 windows are gathered once per block (chunk 0) into a
 // persistent im2col buffer of aligned A tiles, so every chunk's inner loop is a plain
 // 64-byte load instead of eight scalar copies per MMUL.
-alignas(64) static int8_t col_tiles[ROW_TILES2 ? 64 : NTAPS * MB * TO * 64];
+alignas(64) static int8_t col_tiles[(ROW_TILES2 || SEG_GATHER) ? 64 : NTAPS * MB * TO * 64];
 
 static void conv2_impl(const uint8_t *bundle, const uint8_t *params, uint8_t *output, int32_t chunk) {
   set_modes();
@@ -226,7 +233,7 @@ static void conv2_impl(const uint8_t *bundle, const uint8_t *params, uint8_t *ou
   const int32_t *bias = (const int32_t *)(params + FUSED_BIAS2_OFFSET);
   int8_t *out = (int8_t *)output;
   const v64 zero = aie::zeros<int8, 64>();
-  if constexpr (!ROW_TILES2) {
+  if constexpr (!ROW_TILES2 && !SEG_GATHER) {
     if (chunk == 0) {
       for (int vt = 0; vt < NTAPS; ++vt) {
         const int tap = TAPS.tap[vt], ky = tap / 3, kx = tap % 3;
@@ -244,6 +251,24 @@ static void conv2_impl(const uint8_t *bundle, const uint8_t *params, uint8_t *ou
       const int ky = tap / 3, kx = tap % 3;
       const int y = (t * 8) / OW, x0 = (t * 8) % OW;
       return load_tile(in + (icb * PADP + (y + ky) * PW + x0 + kx) * 8);
+    } else if constexpr (SEG_GATHER) {
+      const int tap = TAPS.tap[kk / MB], icb = kk % MB;
+      const int ky = tap / 3, kx = tap % 3;
+      constexpr int rows = 8 / OW;  // output rows per tile (OW == 1 uses row 0 only)
+      const int8_t *base = in + icb * PADP * 8 + kx * 8;
+      auto seg = [&](int r) { return base + ((t * rows + r + ky) * PW) * 8; };
+      if constexpr (OW == 4) {
+        return aie::concat(aie::load_unaligned_v<32>(seg(0)), aie::load_unaligned_v<32>(seg(1)));
+      } else if constexpr (OW == 2) {
+        auto a = aie::concat(aie::load_unaligned_v<16>(seg(0)), aie::load_unaligned_v<16>(seg(1)));
+        auto b = aie::concat(aie::load_unaligned_v<16>(seg(2)), aie::load_unaligned_v<16>(seg(3)));
+        return aie::concat(a, b);
+      } else {
+        // 1x1 map: only row 0 is a real pixel; the other rows are ignored garbage.
+        auto a = aie::load_unaligned_v<16>(seg(0));
+        auto b = aie::concat(a, a);
+        return aie::concat(b, b);
+      }
     } else {
       return aie::load_v<64>(col_tiles + (kk * TO + t) * 64);
     }

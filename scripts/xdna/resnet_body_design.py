@@ -47,13 +47,16 @@ def resnet_body(
     *,
     body_specs: CompileTime[str],
     weight_depths: CompileTime[str] = "",
+    nocompute: CompileTime[int] = 0,
+    seg_gather: CompileTime[str] = "",
 ):
     groups = json.loads(body_specs)
     if not 1 <= len(groups) <= 8:
         raise ValueError("the body needs one to eight block-kind groups")
     input_fifos, weight_fifos, output_fifos, workers = [], [], [], []
     depths = [int(v) for v in weight_depths.split(",")] if weight_depths else [1] * len(groups)
-    if len(depths) != len(groups):
+    seg_modes = [int(v) for v in seg_gather.split(",")] if seg_gather else [0] * len(groups)
+    if len(depths) != len(groups) or len(seg_modes) != len(groups):
         raise ValueError("weight_depths needs one entry per group")
 
     for index, spec in enumerate(groups):
@@ -96,7 +99,7 @@ def resnet_body(
             f"-DFUSED_BIAS1_OFFSET={_align4(outputs1 * channels)}",
             f"-DFUSED_BIAS2_OFFSET={_align4(outputs2 * mid_channels * taps)}",
             f"-DFUSED_BIAS3_OFFSET={_align4(outputs3 * mid_channels)}",
-            "-DFUSED_RT_SHIFTS", f"-DFUSED_HDR_OFFSET={payload}",
+            "-DFUSED_RT_SHIFTS", f"-DFUSED_HDR_OFFSET={payload}", f"-DFUSED_SEG_GATHER={seg_modes[index]}",
         ]
         prefix = f"g{index}"
         src = str(_BLOCKED_KERNEL)
@@ -115,11 +118,12 @@ def resnet_body(
         stage2b_fifo = ObjectFifo(stage2h_ty, depth=1, name=f"g{index}_conv2b")
         stage2_fifo = ObjectFifo(stage2_ty, depth=1, name=f"g{index}_residual_join")
         output_fifo = ObjectFifo(output_ty, depth=1, name=f"g{index}_output")
-        conv1_worker, conv2_worker, conv3_worker = _block_workers(chunks1, skip_chunks, chunks2, chunks3, 0)
+        conv1_worker, conv2_worker, conv3_worker = _block_workers(chunks1, skip_chunks, chunks2, chunks3, int(nocompute))
 
         out_tiles = (output_pixels + 7) // 8
         row_tiles2 = width % 8 == 0 and conv2_stride == 1 and output_width == width
-        conv2_data = None if row_tiles2 else taps * (mid_channels // 8) * out_tiles * 64 + 256
+        use_seg = seg_modes[index] and conv2_stride == 1 and not row_tiles2 and (output_width in (2, 4) or (output_width == 1 and output_height == 1))
+        conv2_data = None if (row_tiles2 or use_seg) else taps * (mid_channels // 8) * out_tiles * 64 + 256
         conv1_data = (channels // 8) * out_tiles * 64 + 256 if skip_chunks and not (conv2_stride == 1 and output_pixels == pixels) else None
         column = index
         workers.extend([
@@ -192,6 +196,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     add_compile_args(parser)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--nocompute", type=int, default=0, help="debug: bitmask of kernels to skip (1 conv1, 2 skip, 4 conv2, 8 conv3) to measure the streaming floor")
+    parser.add_argument("--seg-gather", default="", help="comma-separated 0/1 per group: build small-map 3x3 tiles from row segments (no static im2col, frees tile memory) instead of a static im2col buffer (default 0: the static buffer is faster where it fits)")
     parser.add_argument("--chunk-caps", default="", help="comma-separated weight-chunk byte cap per group (0 = default); smaller chunks leave room for deeper weight FIFOs")
     parser.add_argument("--weight-depths", default="", help="comma-separated weight FIFO depth per group (2 double-buffers the weight DMA where tile memory allows; layer4 groups fit)")
     parser.add_argument("--group", nargs="+", action="append", required=True,
@@ -264,7 +270,7 @@ def _compile_kwargs(opts):
     import onnx
     caps = [int(v) for v in opts.chunk_caps.split(",")] if opts.chunk_caps else None
     specs, _ = group_specs(onnx.load(opts.model), opts.group, caps)
-    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths}
+    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "seg_gather": opts.seg_gather}
 
 
 def main() -> None:
