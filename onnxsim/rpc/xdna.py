@@ -282,9 +282,8 @@ def _compile_command(
         }
         for key, cli_name in cli_names.items():
             if key in options or key in defaults:
-                command.extend(
-                    [f"--{cli_name}", str(int(options.get(key, defaults.get(key))))]
-                )
+                value = options[key] if key in options else defaults[key]
+                command.extend([f"--{cli_name}", str(int(value))])
         command += ["--uint8", "--xclbin-path", str(xclbin), "--insts-path", str(insts)]
 
     return command, xclbin, insts, None
