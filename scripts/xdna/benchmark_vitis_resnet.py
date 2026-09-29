@@ -25,6 +25,8 @@ def main() -> int:
         type=Path,
         help="enable ONNX Runtime profiling and write a compact event summary",
     )
+    parser.add_argument("--capture-npz", type=Path, help="save selected ONNX intermediate outputs")
+    parser.add_argument("--capture-output-name", action="append", default=[], help="ONNX value name to expose and capture")
     args = parser.parse_args()
     if args.iters < 1 or args.warmup < 0:
         parser.error("--iters must be positive and --warmup must be nonnegative")
@@ -114,6 +116,40 @@ def main() -> int:
         result["vitis_npu_node_count"] = vitis_node_count
     if profile_trace is not None:
         result["profile_trace"] = str(profile_trace)
+    if args.capture_output_name:
+        import onnx
+
+        tapped = onnx.load(args.model)
+        inferred = onnx.shape_inference.infer_shapes(tapped)
+        value_info = {
+            item.name: item
+            for item in (*inferred.graph.input, *inferred.graph.value_info, *inferred.graph.output)
+        }
+        existing = {item.name for item in tapped.graph.output}
+        for name in args.capture_output_name:
+            if name not in value_info:
+                raise ValueError(f"cannot find inferred type/shape for capture value {name!r}")
+            if name not in existing:
+                tapped.graph.output.append(value_info[name])
+                existing.add(name)
+        capture_model = args.model.with_name(args.model.stem + "-capture.onnx")
+        onnx.save(tapped, capture_model)
+        capture_session = ort.InferenceSession(
+            str(capture_model), providers=["VitisAIExecutionProvider"], provider_options=[{}],
+        )
+        captured_values = capture_session.run(list(args.capture_output_name), feeds)
+        capture_arrays = {
+            name: np.asarray(value) for name, value in zip(args.capture_output_name, captured_values)
+        }
+        if args.capture_npz:
+            args.capture_npz.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(args.capture_npz, **capture_arrays)
+            result["capture_npz"] = str(args.capture_npz)
+        result["capture_outputs"] = {
+            name: {"shape": list(array.shape), "dtype": str(array.dtype)}
+            for name, array in capture_arrays.items()
+        }
+        result["capture_providers"] = capture_session.get_providers()
     if result["execution"] != "real_npu":
         result["execution_note"] = "VitisAIExecutionProvider did not load; these timings are not NPU measurements."
     encoded = json.dumps(result, indent=2)

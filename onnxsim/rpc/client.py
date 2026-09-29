@@ -247,7 +247,7 @@ class Session:
         Returned artifact paths are on the RPC server and can be passed to
         :meth:`xdna_run_resnet` on the same server.
         """
-        if kind not in ("resnet", "fused_bottleneck", "maxpool_u8"):
+        if kind not in ("resnet", "fused_bottleneck", "fused_stage", "maxpool_u8"):
             raise ValueError(f"unsupported XDNA compile kind {kind!r}")
         reply, _ = self._call(
             {"op": "xdna_compile_resnet", "kind": kind, "options": options or {}},

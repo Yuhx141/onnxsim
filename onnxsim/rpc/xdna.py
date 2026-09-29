@@ -37,10 +37,24 @@ def _run(command: list[str], env: dict[str, str] | None = None) -> subprocess.Co
     return result
 
 
+def _run_inprocess(command: list[str]) -> None:
+    """Run an XRT graph request in the RPC host so contexts survive requests."""
+    import runpy
+
+    script = Path(command[1]).resolve()
+    script_dir = str(script.parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    namespace = runpy.run_path(str(script), run_name="onnxsim_rpc_xdna_runner")
+    status = namespace["main"](command[2:], emit_json=False)
+    if status:
+        raise proto.RPCError(f"XDNA runner returned status {status}")
+
+
 def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
     """Compile the supported ResNet artifacts on the RPC server's XDNA toolchain."""
     kind = header.get("kind")
-    if kind not in ("resnet", "fused_bottleneck", "maxpool_u8"):
+    if kind not in ("resnet", "fused_bottleneck", "fused_stage", "maxpool_u8"):
         raise proto.RPCError(f"unsupported XDNA compile kind {kind!r}")
     if not blobs:
         raise proto.RPCError("XDNA compile requires an ONNX model blob")
@@ -81,6 +95,15 @@ def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
         command = [
             _xdna_python(header), str(_script("fused_bottleneck_design.py")), "--dev",
             str(options.get("device", "npu2")), "--model", str(model_path), "--block", block,
+            "--xclbin-path", str(xclbin), "--insts-path", str(insts),
+        ]
+    elif kind == "fused_stage":
+        blocks = options.get("blocks")
+        if not isinstance(blocks, list) or len(blocks) != 3 or not all(isinstance(value, str) for value in blocks):
+            raise proto.RPCError("fused_stage compile requires options.blocks with exactly three block prefixes")
+        command = [
+            _xdna_python(header), str(_script("linked_bottleneck_stage_design.py")), "--dev",
+            str(options.get("device", "npu2")), "--model", str(model_path), "--blocks", *blocks,
             "--xclbin-path", str(xclbin), "--insts-path", str(insts),
         ]
     else:
@@ -142,22 +165,47 @@ def run_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
         "--cpu-threads", str(max(int(options.get("cpu_threads", 2)), 1)),
         "--json", str(report_path),
     ]
+    capture_path = None
+    if options.get("capture_outputs"):
+        capture_path = root / "xdna-captures.npz"
+        command += ["--capture-npz", str(capture_path)]
     if options.get("cpu_small_m") is not None:
         command += ["--cpu-small-m", str(max(int(options["cpu_small_m"]), 0))]
     for block in options.get("fused_blocks", []):
         if not isinstance(block, dict) or not all(key in block for key in ("prefix", "xclbin", "insts")):
             raise proto.RPCError("each fused_blocks entry needs prefix, xclbin, and insts")
         command += ["--fused-block", str(block["prefix"]), str(block["xclbin"]), str(block["insts"])]
+    for stage in options.get("fused_stages", []):
+        if not isinstance(stage, dict) or not all(key in stage for key in ("blocks", "xclbin", "insts")):
+            raise proto.RPCError("each fused_stages entry needs blocks, xclbin, and insts")
+        blocks = stage["blocks"]
+        if not isinstance(blocks, list) or len(blocks) != 3 or not all(isinstance(value, str) for value in blocks):
+            raise proto.RPCError("each fused stage needs exactly three block prefixes")
+        command += ["--fused-stage", *blocks, str(stage["xclbin"]), str(stage["insts"])]
     pool = options.get("maxpool_uint8")
+    runtime_backend = options.get("runtime_backend", options.get("maxpool_runtime", "iron"))
+    if runtime_backend not in ("iron", "xrt"):
+        raise proto.RPCError("runtime_backend must be 'iron' or 'xrt'")
+    if runtime_backend == "xrt":
+        command += ["--runtime-backend", "xrt"]
     if pool is not None:
         if not isinstance(pool, dict) or not all(key in pool for key in ("xclbin", "insts")):
             raise proto.RPCError("maxpool_uint8 needs xclbin and insts")
         command += ["--maxpool-uint8-xclbin", str(pool["xclbin"]), "--maxpool-uint8-insts", str(pool["insts"])]
-    _run(command)
+    runtime_backend = str(options.get("runtime_backend", options.get("maxpool_runtime", "iron")))
+    if runtime_backend == "xrt" and Path(_xdna_python(header)).resolve() == Path(sys.executable).resolve():
+        _run_inprocess(command)
+    else:
+        _run(command)
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise proto.RPCError(f"XDNA runner did not produce a valid JSON report: {error}") from error
+    if capture_path is not None and capture_path.is_file():
+        report["capture_npz"] = str(capture_path)
+    if runtime_backend == "xrt" and "xdna_xrt_runtime" in sys.modules:
+        runtime_module = sys.modules["xdna_xrt_runtime"]
+        report["xrt_kernel_cache"] = runtime_module.load_kernel.cache_info()._asdict()
     return {"report": report}, []
 
 
@@ -187,6 +235,15 @@ def compare_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
     if options.get("profile_vitis", True):
         profile_path = root / "vitis-profile.json"
         command += ["--profile-json", str(profile_path)]
+    capture_vitis_path = None
+    capture_names = options.get("capture_vitis_outputs", [])
+    if capture_names:
+        if not isinstance(capture_names, list) or not all(isinstance(name, str) for name in capture_names):
+            raise proto.RPCError("capture_vitis_outputs must be a list of ONNX value names")
+        capture_vitis_path = root / "vitis-captures.npz"
+        command += ["--capture-npz", str(capture_vitis_path)]
+        for name in capture_names:
+            command += ["--capture-output-name", name]
     vitis_env = os.environ.copy()
     venv_root = Path(vitis_python).expanduser().resolve().parent.parent
     inferred_installation = venv_root if (venv_root / "quicktest").is_dir() else None
@@ -212,6 +269,8 @@ def compare_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
         vitis = json.loads(report_path.read_text(encoding="utf-8"))
         if profile_path is not None:
             vitis["profile"] = json.loads(profile_path.read_text(encoding="utf-8"))
+        if capture_vitis_path is not None and capture_vitis_path.is_file():
+            vitis["capture_npz"] = str(capture_vitis_path)
     except (OSError, json.JSONDecodeError) as error:
         raise proto.RPCError(f"Vitis AI benchmark did not produce valid reports: {error}") from error
     if vitis.get("execution") != "real_npu":

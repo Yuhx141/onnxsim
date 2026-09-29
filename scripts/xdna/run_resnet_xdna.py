@@ -126,8 +126,12 @@ class XDNAResNetRunner:
         fused_block_xclbin: str | None = None,
         fused_block_insts: str | None = None,
         fused_blocks: list[tuple[str, str, str]] | None = None,
+        fused_stages: list[tuple[tuple[str, str, str], str, str]] | None = None,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
         maxpool_uint8_artifact: tuple[str, str] | None = None,
+        maxpool_runtime: str = "iron",
+        runtime_backend: str | None = None,
+        capture_outputs: bool = False,
     ):
         self.model = model
         self.nodes = list(model.graph.node)
@@ -136,6 +140,12 @@ class XDNAResNetRunner:
         self.cpu_small_m = max(0, int(cpu_small_m))
         self.cpu_backend = cpu_backend
         self.cpu_threads = max(1, int(cpu_threads))
+        if runtime_backend is not None:
+            maxpool_runtime = runtime_backend
+        if maxpool_runtime not in {"iron", "xrt"}:
+            raise ValueError("runtime backend must be 'iron' or 'xrt'")
+        self.runtime_backend = maxpool_runtime
+        self.maxpool_runtime = maxpool_runtime
         self._torch_initialized = False
         self.codegen = build_codegen_plan(
             model, strict=True, optimize_small_m=self.optimize_small_m
@@ -343,6 +353,8 @@ class XDNAResNetRunner:
         self._device_readback_cache: dict[tuple[Any, ...], np.ndarray] = {}
         self._conv_times: list[dict[str, Any]] = []
         self._fused_times: list[dict[str, Any]] = []
+        self._capture_outputs: dict[str, np.ndarray] = {}
+        self._capture_enabled = capture_outputs
         self._workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
         self._maxpool_workspace_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
         self._qadd_workspace_cache: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
@@ -353,6 +365,7 @@ class XDNAResNetRunner:
         self._torch_weight_cache: dict[int, Any] = {}
         self._torch_int8_weight_cache: dict[int, tuple[Any, ...]] = {}
         fused_specs = list(fused_blocks or ())
+        stage_specs = list(fused_stages or ())
         parallel_specs = list(parallel_projection_blocks or ())
         if any((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
             if not all((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
@@ -360,6 +373,7 @@ class XDNAResNetRunner:
             fused_specs.append((fused_block_prefix, fused_block_xclbin, fused_block_insts))
         bottleneck_plans = {block.prefix: block for block in plan_bottleneck_blocks(model)}
         prepared_blocks: dict[str, tuple[Any, dict[str, Any], set[int], str, str]] = {}
+        prepared_stages: dict[str, tuple[list[tuple[Any, dict[str, Any]]], set[int], str, str]] = {}
         parallel_prefixes = {prefix for prefix, _xclbin, _insts in parallel_specs}
         for prefix, xclbin, insts in [*fused_specs, *parallel_specs]:
             if prefix in prepared_blocks:
@@ -378,12 +392,43 @@ class XDNAResNetRunner:
                 )
             prepared_blocks[prefix] = (block, binding, set(binding["covered_nodes"]), str(xclbin), str(insts))
 
+        for prefixes, xclbin, insts in stage_specs:
+            if len(prefixes) != 3:
+                raise ValueError("linked fused stage requires exactly three block prefixes")
+            if not Path(xclbin).is_file() or not Path(insts).is_file():
+                raise ValueError("fused stage xclbin and instruction stream must exist")
+            stage_blocks = []
+            covered: set[int] = set()
+            previous_binding = None
+            for prefix in prefixes:
+                if prefix in prepared_blocks or any(
+                    prefix == block.prefix
+                    for items, _covered, _stage_xclbin, _stage_insts in prepared_stages.values()
+                    for block, _binding in items
+                ):
+                    raise ValueError(f"fused stage block {prefix!r} overlaps another fused artifact")
+                block = bottleneck_plans.get(prefix)
+                if block is None:
+                    raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
+                binding = bind_fused_bottleneck(model, block)
+                if previous_binding is not None and (
+                    previous_binding["output_shape"] != binding["input_shape"]
+                    or previous_binding["output_raw_name"] != binding["input_raw_name"]
+                ):
+                    raise ValueError(f"linked stage boundary before {prefix!r} is not a direct compatible QDQ edge")
+                previous_binding = binding
+                stage_blocks.append((block, binding))
+                covered.update(binding["covered_nodes"])
+            first_prefix = prefixes[0]
+            prepared_stages[first_prefix] = (stage_blocks, covered, str(xclbin), str(insts))
+
         # Strix Halo supports 16 simultaneous hardware contexts. Reserve those
         # slots across pooling, fused blocks, and any remaining XDNA Conv shapes.
         self.context_cache_limit = min(16, max(1, int(os.environ.get("XRT_CONTEXT_CACHE_SIZE", "16"))))
         self.context_budget_fallback_blocks: list[str] = []
         self._forced_cpu_convs: set[int] = set()
         active_prefixes = set(prepared_blocks)
+        active_stages = set(prepared_stages)
         pool_contexts = {
             str(item["compiled_artifact"]["xclbin"])
             for item in self.operation_specs.values()
@@ -407,6 +452,9 @@ class XDNAResNetRunner:
                 for prefix in active_prefixes
                 for index in prepared_blocks[prefix][2]
             }
+            covered.update(
+                index for key in active_stages for index in prepared_stages[key][1]
+            )
             remaining_conv_contexts = conv_contexts(covered)
             remaining_qadd_contexts = {
                 str(item["compiled_artifact"]["xclbin"])
@@ -418,7 +466,7 @@ class XDNAResNetRunner:
             }
             active_contexts = pool_contexts | {
                 prepared_blocks[prefix][3] for prefix in active_prefixes
-            } | set(remaining_conv_contexts) | remaining_qadd_contexts
+            } | {prepared_stages[key][2] for key in active_stages} | set(remaining_conv_contexts) | remaining_qadd_contexts
             if len(active_contexts) <= self.context_cache_limit:
                 break
 
@@ -434,7 +482,19 @@ class XDNAResNetRunner:
                 continue
 
             if not active_prefixes:
-                raise RuntimeError("compiled operator kernels exceed the XRT context limit")
+                if not active_stages:
+                    raise RuntimeError("compiled operator kernels exceed the XRT context limit")
+                demote_stage = min(
+                    active_stages,
+                    key=lambda key: (
+                        sum(math.prod(self.conv_plans[index].gemm_shape) for index in prepared_stages[key][1] if index in self.conv_plans),
+                        key,
+                    ),
+                )
+                self._forced_cpu_convs.update(index for index in prepared_stages[demote_stage][1] if index in self.conv_plans)
+                active_stages.remove(demote_stage)
+                self.context_budget_fallback_blocks.extend(item[0].prefix for item in prepared_stages[demote_stage][0])
+                continue
             demote = min(
                 active_prefixes,
                 key=lambda prefix: (
@@ -457,9 +517,14 @@ class XDNAResNetRunner:
             for prefix in prepared_blocks if prefix in active_prefixes
         ]
         self._fused_blocks: dict[str, dict[str, Any]] = {}
+        self._fused_stages: dict[str, dict[str, Any]] = {}
         self._fused_nodes: dict[int, tuple[str, bool]] = {}
+        self._fused_stage_nodes: dict[int, tuple[str, bool]] = {}
         self._fused_input_handoffs: dict[int, str] = {}
-        if fused_specs:
+        if fused_specs and self.runtime_backend == "iron":
+            import aie.iron as iron
+
+        if active_stages:
             import aie.iron as iron
 
         for prefix, xclbin, insts in fused_specs:
@@ -471,17 +536,40 @@ class XDNAResNetRunner:
             output_shape = binding["output_shape"]
             input_count = int(np.prod(input_shape))
             output_count = int(np.prod(output_shape))
-            block_input = iron.tensor(
-                np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu"
-            )
+            if self.runtime_backend == "xrt":
+                try:
+                    from xdna_xrt_runtime import load_kernel
+                except ImportError:
+                    from .xdna_xrt_runtime import load_kernel
+                block_kernel = load_kernel(str(xclbin), str(insts))
+                block_input = block_kernel.tensor((input_count,), np.int8, 3)
+            else:
+                block_kernel = self._kernel(str(xclbin), str(insts))
+                block_input = iron.tensor(
+                    np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu"
+                )
             block_parameters = None
             main_parameters = skip_parameters = None
             if prefix in parallel_prefixes:
-                main_parameters = iron.tensor(binding["main_params"], dtype=np.uint8, device="npu")
-                skip_parameters = iron.tensor(binding["skip_params"], dtype=np.uint8, device="npu")
+                if self.runtime_backend == "xrt":
+                    main_parameters = block_kernel.tensor((binding["main_params"].size,), np.uint8, 4)
+                    skip_parameters = block_kernel.tensor((binding["skip_params"].size,), np.uint8, 5)
+                    main_parameters.load_constant(binding["main_params"].reshape(-1))
+                    skip_parameters.load_constant(binding["skip_params"].reshape(-1))
+                else:
+                    main_parameters = iron.tensor(binding["main_params"], dtype=np.uint8, device="npu")
+                    skip_parameters = iron.tensor(binding["skip_params"], dtype=np.uint8, device="npu")
             else:
-                block_parameters = iron.tensor(binding["params"], dtype=np.uint8, device="npu")
-            block_output = iron.zeros(output_count, dtype=np.int8, device="npu")
+                if self.runtime_backend == "xrt":
+                    block_parameters = block_kernel.tensor((binding["params"].size,), np.uint8, 4)
+                    block_parameters.load_constant(binding["params"].reshape(-1))
+                else:
+                    block_parameters = iron.tensor(binding["params"], dtype=np.uint8, device="npu")
+            if self.runtime_backend == "xrt":
+                output_index = 6 if prefix in parallel_prefixes else 5
+                block_output = block_kernel.tensor((output_count,), np.int8, output_index)
+            else:
+                block_output = iron.zeros(output_count, dtype=np.int8, device="npu")
             self._fused_blocks[prefix] = {
                 "binding": binding,
                 "start": start_index,
@@ -491,12 +579,149 @@ class XDNAResNetRunner:
                 "skip_parameters": skip_parameters,
                 "parallel_projection": prefix in parallel_prefixes,
                 "output": block_output,
-                "kernel": self._kernel(str(xclbin), str(insts)),
+                "kernel": block_kernel,
+                "direct_xrt": self.runtime_backend == "xrt",
                 "xclbin": str(xclbin),
             }
             for index in covered:
                 self._fused_nodes[index] = (prefix, index == start_index)
+        for first_prefix in active_stages:
+            blocks, covered, xclbin, insts = prepared_stages[first_prefix]
+            if any(index in self._fused_nodes or index in self._fused_stage_nodes for index in covered):
+                raise ValueError(f"linked fused stage {first_prefix!r} overlaps another fused region")
+            bindings = [binding for _block, binding in blocks]
+            input_count = int(np.prod(bindings[0]["input_shape"]))
+            output_count = int(np.prod(bindings[-1]["output_shape"]))
+            input_tensor = iron.tensor(np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu")
+            parameter_tensor = iron.tensor(
+                np.concatenate([binding["params"] for binding in bindings]), dtype=np.uint8, device="npu"
+            )
+            output_tensor = iron.zeros(output_count, dtype=np.int8, device="npu")
+            self._fused_stages[first_prefix] = {
+                "blocks": blocks, "bindings": bindings, "input": input_tensor,
+                "parameters": parameter_tensor, "output": output_tensor,
+                "kernel": self._kernel(xclbin, insts), "xclbin": xclbin,
+            }
+            first_index = min(covered)
+            for index in covered:
+                self._fused_stage_nodes[index] = (first_prefix, index == first_index)
         self._plan_fused_input_handoffs()
+
+    def runtime_subgraph_report(self) -> list[dict[str, Any]]:
+        """Describe actual executor assignment over each planned graph region."""
+        node_executor: dict[int, str] = {}
+        node_dispatch: dict[int, str] = {}
+        for index, node in enumerate(self.nodes):
+            if node.op_type == "Constant":
+                node_executor[index] = "constant_data"
+        for index, (prefix, _is_start) in self._fused_stage_nodes.items():
+            node_executor[index] = f"fused_stage:{prefix}"
+            node_dispatch[index] = f"stage:{prefix}"
+        for index, (prefix, _is_start) in self._fused_nodes.items():
+            node_executor[index] = f"fused_bottleneck:{prefix}"
+            node_dispatch[index] = f"bottleneck:{prefix}"
+        for index, spec in self.operation_specs.items():
+            artifact = spec.get("compiled_artifact")
+            quant = spec.get("quantization") or {}
+            if artifact:
+                executor = f"native_{spec.get('op_type', self.nodes[index].op_type)}:{artifact.get('key', artifact.get('xclbin', 'artifact'))}"
+                for fused_index in quant.get("fused_node_indices", (index,)):
+                    fused_index = int(fused_index)
+                    if fused_index not in node_executor:
+                        node_executor[fused_index] = executor
+                        node_dispatch[fused_index] = f"operation:{index}"
+            elif spec.get("status") == "zero_copy_device_view":
+                node_executor.setdefault(index, "device_view_if_resident")
+        for index, plan in self.conv_plans.items():
+            if index in node_executor:
+                continue
+            if index in self._forced_cpu_convs or (self.cpu_small_m and plan.gemm_shape[0] <= self.cpu_small_m):
+                node_executor[index] = "host_small_conv"
+                continue
+            try:
+                artifact = self._artifact(plan)
+                node_executor[index] = f"native_conv:{artifact['key']}"
+                node_dispatch[index] = f"conv:{index}"
+            except (KeyError, RuntimeError):
+                node_executor[index] = "host_conv_missing_artifact"
+        for conv_index, (relu_index, _output) in self._fused_relu_for_conv.items():
+            if conv_index in self.conv_plans and node_executor.get(conv_index, "").startswith("native_conv:"):
+                node_executor.setdefault(relu_index, node_executor[conv_index])
+
+        producer_by_value = {
+            str(output): index
+            for index, node in enumerate(self.nodes)
+            for output in node.output if output
+        }
+        reports: list[dict[str, Any]] = []
+        for region in self.codegen.graph_regions:
+            instruction_records = []
+            segments: list[dict[str, Any]] = []
+            for instruction in region.instructions:
+                index = int(instruction["node_index"])
+                executor = node_executor.get(index, "host")
+                record = {
+                    "node_index": index,
+                    "op_type": str(instruction["op_type"]),
+                    "executor": executor,
+                    "dispatch_unit": node_dispatch.get(index),
+                }
+                instruction_records.append(record)
+                if segments and segments[-1]["executor"] == executor:
+                    segments[-1]["node_indices"].append(index)
+                    segments[-1]["op_types"].append(str(instruction["op_type"]))
+                else:
+                    segments.append({
+                        "executor": executor,
+                        "node_indices": [index],
+                        "op_types": [str(instruction["op_type"])],
+                    })
+            native = {
+                record["dispatch_unit"] for record in instruction_records
+                if record["dispatch_unit"] is not None
+            }
+            has_host = any(record["executor"].startswith("host") for record in instruction_records)
+            if not native:
+                status = "host_only"
+            elif has_host:
+                status = "hybrid_region"
+            elif len(native) == 1:
+                status = "single_device_dispatch"
+            else:
+                status = "multi_dispatch_device_region"
+            region_indices = {int(item["node_index"]) for item in region.instructions}
+            runtime_boundaries: dict[str, set[tuple[int, int, str, str]]] = {}
+            for instruction in region.instructions:
+                target = int(instruction["node_index"])
+                target_executor = node_executor.get(target, "host")
+                target_is_device = target_executor.startswith(("native_", "fused_stage:", "fused_bottleneck:"))
+                for value in instruction["inputs"]:
+                    source = producer_by_value.get(str(value))
+                    if source is None or source not in region_indices:
+                        continue
+                    source_executor = node_executor.get(source, "host")
+                    source_is_device = source_executor.startswith(("native_", "fused_stage:", "fused_bottleneck:"))
+                    if source_is_device != target_is_device:
+                        runtime_boundaries.setdefault(str(value), set()).add(
+                            (source, target, source_executor, target_executor)
+                        )
+            reports.append({
+                "region_id": region.region_id,
+                "planned_nodes": list(region.node_indices),
+                "planned_op_types": list(region.op_types),
+                "input_values": list(region.input_values),
+                "constant_values": list(region.constant_values),
+                "output_values": list(region.output_values),
+                "peak_live_bytes_known": region.peak_live_bytes,
+                "device_lowering_gaps": list(region.device_lowering_gaps),
+                "status": status,
+                "native_dispatch_count": len(native),
+                "internal_device_host_boundary_values": sorted(runtime_boundaries),
+                "internal_device_host_boundary_count": sum(len(edges) for edges in runtime_boundaries.values()),
+                "instruction_assignment": instruction_records,
+                "executor_segments": segments,
+            })
+        return reports
 
     def _plan_fused_input_handoffs(self) -> None:
         """Find adjacent fused blocks whose raw QDQ edge can stay on device."""
@@ -664,12 +889,30 @@ class XDNAResNetRunner:
         from aie.utils import NPUKernel
         return NPUKernel(xclbin, insts)
 
+    def _pool_kernel(self, xclbin: str, insts: str) -> Any:
+        return self._artifact_kernel(xclbin, insts)
+
+    def _artifact_kernel(self, xclbin: str, insts: str) -> Any:
+        if self.maxpool_runtime == "xrt":
+            try:
+                from xdna_xrt_runtime import load_kernel
+            except ImportError:
+                from .xdna_xrt_runtime import load_kernel
+            return load_kernel(xclbin, insts)
+        return self._kernel(xclbin, insts)
+
+    def _pool_tensor(self, xclbin: str, insts: str, shape: tuple[int, ...], dtype: Any, argument_index: int) -> Any:
+        if self.maxpool_runtime == "xrt":
+            return self._pool_kernel(xclbin, insts).tensor(shape, dtype, argument_index)
+        import aie.iron as iron
+        return iron.tensor(shape, dtype=dtype, device="npu")
+
     def _run_maxpool_kernel(self, index: int, x: np.ndarray) -> _DeviceValue:
         """Upload padded NCHW input and retain the pooling result in XRT memory."""
-        import aie.iron as iron
-        from aie.iron.device import from_name
-
-        iron.set_current_device(from_name("npu2", n_cols=None))
+        if self.maxpool_runtime == "iron":
+            import aie.iron as iron
+            from aie.iron.device import from_name
+            iron.set_current_device(from_name("npu2", n_cols=None))
         spec = self.operation_specs[index]
         params = spec["parameters"]
         artifact = spec["compiled_artifact"]
@@ -688,8 +931,8 @@ class XDNAResNetRunner:
         workspaces = self._maxpool_workspace_cache.get(workspace_key)
         if workspaces is None:
             workspaces = (
-                iron.tensor((math.prod(expected),), dtype=np.float32, device="npu"),
-                iron.tensor(np.zeros(math.prod(output_shape), dtype=np.float32), dtype=np.float32, device="npu"),
+                self._pool_tensor(str(artifact["xclbin"]), str(artifact["insts"]), (math.prod(expected),), np.float32, 3),
+                self._pool_tensor(str(artifact["xclbin"]), str(artifact["insts"]), (math.prod(output_shape),), np.float32, 4),
             )
             self._maxpool_workspace_cache[workspace_key] = workspaces
         input_tensor, output_tensor = workspaces
@@ -697,7 +940,7 @@ class XDNAResNetRunner:
             np.copyto(host_input, padded.reshape(-1))
         self._profile["maxpool_pad_upload_ms"] = self._profile.get("maxpool_pad_upload_ms", 0.0) + (time.perf_counter() - started) * 1000.0
         launch_start = time.perf_counter()
-        self._kernel(str(artifact["xclbin"]), str(artifact["insts"]))(input_tensor, output_tensor)
+        self._pool_kernel(str(artifact["xclbin"]), str(artifact["insts"]))(input_tensor, output_tensor)
         self._profile["maxpool_kernel_ms"] = self._profile.get("maxpool_kernel_ms", 0.0) + (time.perf_counter() - launch_start) * 1000.0
         self._executed["xdna_maxpool"] += 1
         self._executed["device_resident_pool_outputs"] += 1
@@ -705,10 +948,10 @@ class XDNAResNetRunner:
 
     def _run_quantized_maxpool_kernel(self, index: int, raw: np.ndarray) -> _DeviceValue:
         """Pool the uint8 Relu-Q tensor directly and preserve its QDQ edge on-device."""
-        import aie.iron as iron
-        from aie.iron.device import from_name
-
-        iron.set_current_device(from_name("npu2", n_cols=None))
+        if self.maxpool_runtime == "iron":
+            import aie.iron as iron
+            from aie.iron.device import from_name
+            iron.set_current_device(from_name("npu2", n_cols=None))
         spec = self.operation_specs[index]
         params = spec["parameters"]
         artifact = spec["compiled_artifact"]
@@ -727,8 +970,8 @@ class XDNAResNetRunner:
         workspaces = self._maxpool_workspace_cache.get(workspace_key)
         if workspaces is None:
             workspaces = (
-                iron.tensor((math.prod(expected),), dtype=np.uint8, device="npu"),
-                iron.tensor(np.zeros(math.prod(output_shape), dtype=np.uint8), dtype=np.uint8, device="npu"),
+                self._pool_tensor(str(artifact["xclbin"]), str(artifact["insts"]), (math.prod(expected),), np.uint8, 3),
+                self._pool_tensor(str(artifact["xclbin"]), str(artifact["insts"]), (math.prod(output_shape),), np.uint8, 4),
             )
             self._maxpool_workspace_cache[workspace_key] = workspaces
         input_tensor, output_tensor = workspaces
@@ -737,7 +980,7 @@ class XDNAResNetRunner:
             np.copyto(host_input, padded.reshape(-1))
         self._profile["maxpool_pad_upload_ms"] = self._profile.get("maxpool_pad_upload_ms", 0.0) + (time.perf_counter() - started) * 1000.0
         launch_start = time.perf_counter()
-        self._kernel(str(artifact["xclbin"]), str(artifact["insts"]))(input_tensor, output_tensor)
+        self._pool_kernel(str(artifact["xclbin"]), str(artifact["insts"]))(input_tensor, output_tensor)
         self._profile["maxpool_kernel_ms"] = self._profile.get("maxpool_kernel_ms", 0.0) + (time.perf_counter() - launch_start) * 1000.0
         self._executed["xdna_maxpool"] += 1
         self._executed["qdq_maxpool_fusions"] += 1
@@ -750,10 +993,6 @@ class XDNAResNetRunner:
 
     def _run_quantized_add_relu(self, index: int, values: dict[str, Any]) -> _DeviceValue:
         """Run the compiled residual Add+ReLU+Quantize kernel on XDNA."""
-        import aie.iron as iron
-        from aie.iron.device import from_name
-
-        iron.set_current_device(from_name("npu2", n_cols=None))
         spec = self.operation_specs[index]
         quant = spec["quantization"]
         artifact = spec["compiled_artifact"]
@@ -761,19 +1000,39 @@ class XDNAResNetRunner:
         if len(shape) != 4 or shape[0] != 1:
             raise ValueError(f"quantized Add node {index} requires batch-one NCHW tensors")
         elements = math.prod(shape)
-        key = (str(artifact["xclbin"]), elements)
+        key = (str(artifact["xclbin"]), str(artifact["insts"]), elements)
         cached = self._qadd_workspace_cache.get(key)
         if cached is None:
-            cached = tuple(
-                iron.tensor(np.zeros(elements, dtype=np.uint8), dtype=np.uint8, device="npu")
-                for _ in range(3)
-            )
+            if self.runtime_backend == "xrt":
+                kernel = self._artifact_kernel(str(artifact["xclbin"]), str(artifact["insts"]))
+                cached = (
+                    kernel.tensor((elements,), np.uint8, 3),
+                    kernel.tensor((elements,), np.uint8, 4),
+                    kernel.tensor((elements,), np.uint8, 5),
+                )
+            else:
+                import aie.iron as iron
+                from aie.iron.device import from_name
+                iron.set_current_device(from_name("npu2", n_cols=None))
+                cached = tuple(
+                    iron.tensor(np.zeros(elements, dtype=np.uint8), dtype=np.uint8, device="npu")
+                    for _ in range(3)
+                )
             self._qadd_workspace_cache[key] = cached
         lhs_workspace, rhs_workspace, output_tensor = cached
 
-        def input_tensor(name: str, workspace: Any) -> Any:
+        qadd_kernel = self._artifact_kernel(str(artifact["xclbin"]), str(artifact["insts"]))
+
+        def input_tensor(name: str, workspace: Any, argument_index: int) -> Any:
             value = values.get(name)
-            if isinstance(value, _DeviceValue) and value.layout == "nhwc" and value.shape == shape:
+            if (
+                isinstance(value, _DeviceValue)
+                and value.layout == "nhwc"
+                and value.shape == shape
+                and hasattr(value.tensor, "bo")
+                and value.tensor._device is qadd_kernel.device
+                and value.tensor.group == qadd_kernel.kernel.group_id(argument_index)
+            ):
                 # XRT buffers are byte-compatible; the kernel consumes uint8 bit patterns.
                 return value.tensor
             raw = self._host_value(value) if isinstance(value, _DeviceValue) else np.asarray(value)
@@ -782,9 +1041,9 @@ class XDNAResNetRunner:
                 np.copyto(host, nhwc.reshape(-1))
             return workspace
 
-        lhs = input_tensor(str(quant["raw_inputs"][0]), lhs_workspace)
-        rhs = input_tensor(str(quant["raw_inputs"][1]), rhs_workspace)
-        self._kernel(str(artifact["xclbin"]), str(artifact["insts"]))(lhs, rhs, output_tensor)
+        lhs = input_tensor(str(quant["raw_inputs"][0]), lhs_workspace, 3)
+        rhs = input_tensor(str(quant["raw_inputs"][1]), rhs_workspace, 4)
+        qadd_kernel(lhs, rhs, output_tensor)
         self._executed["xdna_quantized_add_relu"] += 1
         return _DeviceValue(
             output_tensor, shape, float(quant["output_scale"]),
@@ -824,8 +1083,7 @@ class XDNAResNetRunner:
             self._profile["conv_static_weight_pack_ms"] = self._profile.get("conv_static_weight_pack_ms", 0.0) + (time.perf_counter() - weight_start) * 1000.0
         bias = values[node.input[2]].astype(np.float32).reshape(-1) if len(node.input) > 2 else None
         kernel_info = spec["compiled_artifact"]
-        kernel = self._kernel(kernel_info["xclbin"], kernel_info["insts"])
-        import aie.iron as iron
+        kernel = self._artifact_kernel(kernel_info["xclbin"], kernel_info["insts"])
 
         launch_start = time.perf_counter()
         for group in range(plan.groups):
@@ -835,15 +1093,27 @@ class XDNAResNetRunner:
             b = packed_weights[group]
             matrix_ms = (time.perf_counter() - matrix_start) * 1000.0
             self._profile["conv_matrix_padding_ms"] = self._profile.get("conv_matrix_padding_ms", 0.0) + matrix_ms
-            workspace_key = (kernel_info["xclbin"], cm, ck, cn)
+            # Use the loaded kernel identity as well as artifact paths.  Some
+            # compiler outputs reuse paths while reloading artifacts during a
+            # long-lived RPC process; only BOs allocated from this exact XRT
+            # kernel/context are safe to pass to it.
+            workspace_key = (id(kernel), kernel_info["xclbin"], kernel_info["insts"], cm, ck, cn)
             workspaces = self._workspace_cache.get(workspace_key)
             if workspaces is None:
                 alloc_start = time.perf_counter()
-                workspaces = (
-                    iron.tensor((cm, ck), dtype=np.int8, device="npu"),
-                    iron.tensor((ck, cn), dtype=np.int8, device="npu"),
-                    iron.tensor((cm, cn), dtype=np.int32, device="npu"),
-                )
+                if self.runtime_backend == "xrt":
+                    workspaces = (
+                        kernel.tensor((cm, ck), np.int8, 3),
+                        kernel.tensor((ck, cn), np.int8, 4),
+                        kernel.tensor((cm, cn), np.int32, 5),
+                    )
+                else:
+                    import aie.iron as iron
+                    workspaces = (
+                        iron.tensor((cm, ck), dtype=np.int8, device="npu"),
+                        iron.tensor((ck, cn), dtype=np.int8, device="npu"),
+                        iron.tensor((cm, cn), dtype=np.int32, device="npu"),
+                    )
                 self._workspace_cache[workspace_key] = workspaces
                 self._profile["conv_buffer_alloc_ms"] = self._profile.get("conv_buffer_alloc_ms", 0.0) + (time.perf_counter() - alloc_start) * 1000.0
             at, bt, ct = workspaces
@@ -1024,6 +1294,91 @@ class XDNAResNetRunner:
     def _run_fused_bottleneck(self, values: dict[str, np.ndarray], block: dict[str, Any]) -> None:
         binding = block["binding"]
         total_start = time.perf_counter()
+        if block.get("direct_xrt"):
+            activation = values[binding["input_raw_name"]]
+            handoff_reason = "resident"
+            source_group = None
+            target_group = int(block["kernel"].kernel.group_id(3))
+            if not isinstance(activation, _DeviceValue):
+                handoff_reason = "host_value"
+            elif activation.as_real:
+                handoff_reason = "dequantized_value"
+            elif activation.layout != "nhwc":
+                handoff_reason = "layout_mismatch"
+            elif tuple(activation.shape) != tuple(binding["input_shape"]):
+                handoff_reason = "shape_mismatch"
+            elif not hasattr(activation.tensor, "bo"):
+                handoff_reason = "non_xrt_buffer"
+            else:
+                source_group = activation.tensor.group
+                if activation.tensor._device is not block["kernel"].device:
+                    handoff_reason = "device_mismatch"
+                elif source_group != target_group:
+                    handoff_reason = "group_mismatch"
+            can_handoff = (
+                isinstance(activation, _DeviceValue)
+                and not activation.as_real
+                and activation.layout == "nhwc"
+                and tuple(activation.shape) == tuple(binding["input_shape"])
+                and hasattr(activation.tensor, "bo")
+                and activation.tensor._device is block["kernel"].device
+                and activation.tensor.group == block["kernel"].kernel.group_id(3)
+            )
+            if can_handoff:
+                block_input = activation.tensor
+                self._executed["device_resident_handoffs"] += 1
+            else:
+                raw = self._host_value(activation).reshape(binding["input_shape"])
+                channel_last = raw.transpose(0, 2, 3, 1).copy().view(np.int8).reshape(-1)
+                with block["input"].overwrite() as host_input:
+                    np.copyto(host_input, channel_last)
+                block_input = block["input"]
+            launch_start = time.perf_counter()
+            if block["parallel_projection"]:
+                block["kernel"](
+                    block_input, block["main_parameters"], block["skip_parameters"],
+                    block["output"], output_indices=(3,),
+                )
+            else:
+                block["kernel"](
+                    block_input, block["parameters"], block["output"], output_indices=(2,),
+                )
+            elapsed_ms = (time.perf_counter() - launch_start) * 1000.0
+            output_shape = tuple(int(value) for value in binding["output_shape"])
+            if self._capture_enabled:
+                output_raw = block["output"].numpy().view(np.uint8).reshape(
+                    output_shape[0], output_shape[2], output_shape[3], output_shape[1]
+                ).transpose(0, 3, 1, 2).copy()
+                self._capture_outputs[f"fused_block:{binding['block'].prefix}"] = output_raw
+            output_value = _DeviceValue(
+                block["output"], output_shape, float(binding["output_scale"]),
+                int(binding["output_zero_point"]), producer=binding["block"].prefix,
+                layout="nhwc",
+            )
+            values[binding["output_raw_name"]] = output_value
+            values[binding["output_dequant_name"]] = _DeviceValue(
+                block["output"], output_shape, output_value.scale, output_value.zero_point,
+                as_real=True, producer=output_value.producer, layout="nhwc",
+            )
+            self._fused_times.append({
+                "prefix": binding["block"].prefix,
+                "input_shape": list(binding["input_shape"]),
+                "output_shape": list(output_shape),
+                "device_resident_input": bool(can_handoff),
+                "runtime": "xrt",
+                "input_handoff_reason": handoff_reason,
+                "input_bo_group": source_group,
+                "input_kernel_group": target_group,
+                "elapsed_ms": elapsed_ms,
+            })
+            self._profile["fused_bottleneck_kernel_call_ms"] = self._profile.get(
+                "fused_bottleneck_kernel_call_ms", 0.0
+            ) + elapsed_ms
+            self._profile["fused_bottleneck_total_ms"] = self._profile.get(
+                "fused_bottleneck_total_ms", 0.0
+            ) + (time.perf_counter() - total_start) * 1000.0
+            self._executed["fused_bottleneck"] += 1
+            return
         activation = values[binding["input_raw_name"]]
         if isinstance(activation, _DeviceValue):
             if tuple(activation.shape) != tuple(binding["input_shape"]):
@@ -1049,6 +1404,13 @@ class XDNAResNetRunner:
             )
         else:
             block["kernel"](block_input, block["parameters"], block["output"])
+        if self._capture_enabled:
+            self._capture_outputs[f"fused_block:{binding['block'].prefix}"] = (
+                block["output"].numpy().view(np.uint8).reshape(
+                    binding["output_shape"][0], binding["output_shape"][2],
+                    binding["output_shape"][3], binding["output_shape"][1],
+                ).transpose(0, 3, 1, 2).copy()
+            )
         kernel_ms = (time.perf_counter() - launch_start) * 1000.0
         self._profile["fused_bottleneck_kernel_call_ms"] = (
             self._profile.get("fused_bottleneck_kernel_call_ms", 0.0)
@@ -1080,6 +1442,57 @@ class XDNAResNetRunner:
             + (time.perf_counter() - total_start) * 1000.0
         )
         self._executed["fused_bottleneck"] += 1
+
+    def _run_fused_stage(self, values: dict[str, np.ndarray], stage: dict[str, Any]) -> None:
+        """Launch a linked multi-block stage once and expose only its final edge."""
+        bindings = stage["bindings"]
+        first, last = bindings[0], bindings[-1]
+        activation = values[first["input_raw_name"]]
+        if isinstance(activation, _DeviceValue):
+            if tuple(activation.shape) != tuple(first["input_shape"]):
+                raise ValueError("linked stage input shape does not match its first block")
+            stage_input = activation.tensor
+            resident_input = True
+            self._executed["device_resident_handoffs"] += 1
+        else:
+            raw = np.asarray(activation).reshape(first["input_shape"])
+            channel_last = raw.transpose(0, 2, 3, 1).copy().view(np.int8).reshape(-1)
+            with stage["input"].overwrite() as host_input:
+                np.copyto(host_input, channel_last)
+            stage_input = stage["input"]
+            resident_input = False
+
+        started = time.perf_counter()
+        stage["kernel"](stage_input, stage["parameters"], stage["output"])
+        producer = "+".join(binding["block"].prefix for binding in bindings)
+        if self._capture_enabled:
+            self._capture_outputs[f"fused_stage:{producer}"] = (
+                stage["output"].numpy().view(np.uint8).reshape(
+                    last["output_shape"][0], last["output_shape"][2],
+                    last["output_shape"][3], last["output_shape"][1],
+                ).transpose(0, 3, 1, 2).copy()
+            )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._profile["fused_stage_kernel_call_ms"] = (
+            self._profile.get("fused_stage_kernel_call_ms", 0.0) + elapsed_ms
+        )
+        output_shape = tuple(last["output_shape"])
+        device_output = _DeviceValue(
+            stage["output"], output_shape, float(last["output_scale"]),
+            int(last["output_zero_point"]), producer=producer,
+        )
+        values[last["output_raw_name"]] = device_output
+        values[last["output_dequant_name"]] = _DeviceValue(
+            stage["output"], output_shape, device_output.scale, device_output.zero_point,
+            as_real=True, producer=producer,
+        )
+        self._fused_times.append({
+            "prefix": producer, "input_shape": list(first["input_shape"]),
+            "output_shape": list(output_shape), "device_resident_input": resident_input,
+            "linked_blocks": len(bindings), "elapsed_ms": elapsed_ms,
+        })
+        self._executed["fused_stage"] = self._executed.get("fused_stage", 0) + 1
+        self._executed["fused_bottleneck"] += len(bindings)
 
     def _run_host_qadd_fusion(self, add_index: int, values: dict[str, Any]) -> None:
         """Execute DQ+Add+Relu+Q+DQ as one host-side graph step."""
@@ -1147,6 +1560,11 @@ class XDNAResNetRunner:
         values = dict(self.arrays)
         values.update(inputs)
         for index, node in enumerate(self.nodes):
+            if index in self._fused_stage_nodes:
+                stage_prefix, is_start = self._fused_stage_nodes[index]
+                if is_start:
+                    self._run_fused_stage(values, self._fused_stages[stage_prefix])
+                continue
             if index in self._fused_nodes:
                 prefix, is_start = self._fused_nodes[index]
                 if is_start:
@@ -1264,7 +1682,7 @@ class XDNAResNetRunner:
             self._executed["fused_relu"] += 1
 
 
-def main() -> int:
+def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
     parser.add_argument("manifest", type=Path)
@@ -1291,13 +1709,21 @@ def main() -> int:
         help="add a fused bottleneck specialization; repeat to fuse multiple blocks",
     )
     parser.add_argument(
+        "--fused-stage", nargs=5, action="append",
+        metavar=("BLOCK0", "BLOCK1", "BLOCK2", "XCLBIN", "INSTS"),
+        help="run three adjacent bottlenecks as one device-linked IRON stage",
+    )
+    parser.add_argument(
         "--parallel-projection-block", nargs=3, action="append", metavar=("PREFIX", "XCLBIN", "INSTS"),
         help="run a projection bottleneck with main and skip branches on separate NPU columns",
     )
     parser.add_argument("--maxpool-uint8-xclbin", type=Path, help="use a uint8 MaxPool artifact to fuse matching QDQ edges")
     parser.add_argument("--maxpool-uint8-insts", type=Path)
+    parser.add_argument("--maxpool-runtime", choices=("iron", "xrt"), default="iron", help="runtime used for MaxPool artifacts")
+    parser.add_argument("--runtime-backend", choices=("iron", "xrt"), help="runtime for fused bottleneck and MaxPool artifacts")
     parser.add_argument("--json", type=Path)
-    args = parser.parse_args()
+    parser.add_argument("--capture-npz", type=Path, help="save fused-block/stage device outputs for debugging")
+    args = parser.parse_args(argv)
     model = onnx.load(args.model)
     manifest = json.loads(args.manifest.read_text())
     if bool(args.maxpool_uint8_xclbin) != bool(args.maxpool_uint8_insts):
@@ -1312,11 +1738,18 @@ def main() -> int:
         fused_block_xclbin=str(args.fused_block_xclbin) if args.fused_block_xclbin else None,
         fused_block_insts=str(args.fused_block_insts) if args.fused_block_insts else None,
         fused_blocks=[(prefix, xclbin, insts) for prefix, xclbin, insts in (args.fused_block or [])],
+        fused_stages=[
+            ((block0, block1, block2), xclbin, insts)
+            for block0, block1, block2, xclbin, insts in (args.fused_stage or [])
+        ],
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
         ],
         maxpool_uint8_artifact=(str(args.maxpool_uint8_xclbin), str(args.maxpool_uint8_insts))
         if args.maxpool_uint8_xclbin else None,
+        maxpool_runtime=args.maxpool_runtime,
+        runtime_backend=args.runtime_backend,
+        capture_outputs=bool(args.capture_npz),
     )
     input_info = model.graph.input[0]
     shape = [int(dim.dim_value) or 1 for dim in input_info.type.tensor_type.shape.dim]
@@ -1357,6 +1790,11 @@ def main() -> int:
             )
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     avg_ms = elapsed_ms / args.iters
+    if args.capture_npz:
+        captured = dict(runner._capture_outputs)
+        captured.update({f"graph_output:{name}": value for name, value in outputs.items()})
+        args.capture_npz.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.capture_npz, **captured)
     conv_timings = [
         {**conv_records[index], "elapsed_ms": elapsed / args.iters}
         for index, elapsed in conv_elapsed_totals.items()
@@ -1365,13 +1803,26 @@ def main() -> int:
         {**fused_records[key], "elapsed_ms": elapsed / args.iters}
         for key, elapsed in fused_elapsed_totals.items()
     ]
+    runtime_subgraphs = runner.runtime_subgraph_report()
+    runtime_subgraph_summary: dict[str, int] = {"total": len(runtime_subgraphs)}
+    for item in runtime_subgraphs:
+        status = str(item["status"])
+        runtime_subgraph_summary[status] = runtime_subgraph_summary.get(status, 0) + 1
+    runtime_subgraph_summary["native_dispatches"] = sum(
+        int(item["native_dispatch_count"]) for item in runtime_subgraphs
+    )
     result = {
         "backend": "amd_xdna_iron_xrt_resnet_graph",
-        "execution": "full_graph_with_fused_bottleneck" if (args.fused_block_prefix or args.fused_block or args.parallel_projection_block) else (
+        "runtime_backend": args.runtime_backend or args.maxpool_runtime,
+        "execution": "full_graph_with_fused_bottleneck" if (args.fused_block_prefix or args.fused_block or args.parallel_projection_block or args.fused_stage) else (
             "full_graph_xdna_conv_host_ops" if not args.cpu_small_m else "full_graph_hybrid_conv_host_ops"
         ),
         "fused_block_prefix": args.fused_block_prefix,
         "fused_blocks": list(runner._fused_blocks),
+        "fused_stages": [
+            {"blocks": [block.prefix for block, _binding in stage["blocks"]], "xclbin": stage["xclbin"]}
+            for stage in runner._fused_stages.values()
+        ],
         "context_cache_limit": runner.context_cache_limit,
         "context_budget_fallback_blocks": runner.context_budget_fallback_blocks,
         "cpu_small_m_threshold": args.cpu_small_m,
@@ -1381,6 +1832,8 @@ def main() -> int:
         "input_seed": args.seed,
         "input_shape": list(shape),
         "graph_dispatches": runner.codegen.estimated_dispatches,
+        "runtime_subgraph_summary": runtime_subgraph_summary,
+        "runtime_subgraphs": runtime_subgraphs,
         "execution_counts": runner._executed,
         "unique_fused_xclbins_used": len({item["xclbin"] for item in runner._fused_blocks.values()}),
         "fused_block_timings": fused_timings,
@@ -1398,6 +1851,8 @@ def main() -> int:
         "fps": 1000.0 / avg_ms,
         "output_shapes": {name: list(value.shape) for name, value in outputs.items()},
     }
+    if args.capture_npz:
+        result["capture_npz"] = str(args.capture_npz)
     try:
         import onnxruntime as ort
 
@@ -1413,7 +1868,8 @@ def main() -> int:
     except Exception as exc:
         result["cpu_reference"] = {"available": False, "reason": str(exc)}
     encoded = json.dumps(result, indent=2)
-    print(encoded)
+    if emit_json:
+        print(encoded)
     if args.json:
         args.json.write_text(encoded + "\n", encoding="utf-8")
     return 0
