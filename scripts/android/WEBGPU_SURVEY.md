@@ -96,7 +96,7 @@ Conv variants and ConvTranspose. Each runs on the phone and is compared to host 
 - **Confirmed two ways.** (1) With `preferredLayout=NCHW` (provider option key `preferredLayout`,
   not the `ep.webgpuexecutionprovider.` config name) the layout-inserted failures go away, except
   `Conv` with 1 output channel. (2) With the tiled path disabled
-  (`webgpu_ops/ort_transpose_no_shared.patch`, env `ORT_WGPU_NO_SHARED_TRANSPOSE=1`) **all 40
+  (an experiment; that env-var patch has since been replaced, see the fix below) **all 40
   Transpose/Conv/Pool/BN/S2D failures pass in the default NHWC layout, including that 1-channel Conv.**
 - The remaining 5 mismatches (Equal, Greater, LessOrEqual, And, Cast-to-int) are a test artifact:
   the phone CPU EP shows the identical 1-ulp input difference at the exact thresholds.
@@ -106,8 +106,21 @@ Conv variants and ConvTranspose. Each runs on the phone and is compared to host 
   it, is correct on three other Vulkan implementations, including Tint's output on them. The
   fault is specific to the Adreno 730 Vulkan stack (its driver/shader compiler) rather than ORT's
   kernel logic. Driver selected per run with `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/<x>_icd.json`.
-- Not yet known: which construct trips the Adreno compiler (2-D `local_invocation_id`
-  indexing, the `tile_size + 1` padded stride, or barrier placement). A reduced standalone WGSL
-  kernel run through Dawn on the phone would narrow it. Interim workaround: the patch above; a
-  real fix would be a plain-kernel fallback selected for Adreno adapters.
+- **Construct isolated** (`webgpu_ops/dawn_repro/`, a standalone Dawn harness plus WGSL kernels
+  using the same Dawn/Tint as ORT): the tile's odd row stride. ORT declares
+  `tile: array<array<f32, tile_size + 1>, tile_size>` (stride 17) and the guarded store/barrier
+  pattern around it miscompiles on the Adreno 730 (Qualcomm Vulkan 512.615.0, compiler
+  EV031.36.08.11). ORT's kernel is wrong even at 1x16 (50%) and 256x256 (26%); the same kernel
+  with stride 16 is correct on 8 shapes; a flat stride-17 array is still wrong; the same WGSL is
+  correct on the RTX 5050, RADV and lavapipe. Dropping the bounds guards also "fixes" it but is
+  not general; adding `storageBarrier()` leaves 2.4% wrong (a race-like symptom).
+- Tint/Dawn have Qualcomm-gated workarounds (matrix pass-by-pointer, std140 column vectors,
+  `NClamp` scalarization, uniform vector component loads, command-buffer splits) but none for
+  workgroup memory or barriers, so this kernel gets Tint's normal output.
+- **Fix, verified through ORT:** `webgpu_ops/ort_transpose_qualcomm_unpadded_tile.patch` uses an
+  unpadded tile when `adapter_info.vendor == "qualcomm"` (Dawn reports `qualcomm` / `adreno-7xx`
+  here). With it the full sweep passes **230/235 on the phone at default settings**; the other 5
+  are the tie artifacts. The padded tile is kept for other vendors (avoids bank conflicts).
+- Not yet known: whether other Adreno generations (6xx, 8xx) share it, and the kernel-speed cost
+  of the unpadded tile on Adreno.
 - Timing is not yet measured; only correctness was checked.

@@ -1,0 +1,49 @@
+diff --git a/onnxruntime/core/providers/webgpu/tensor/transpose.cc b/onnxruntime/core/providers/webgpu/tensor/transpose.cc
+index 4f45305..8c00b63 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/transpose.cc
++++ b/onnxruntime/core/providers/webgpu/tensor/transpose.cc
+@@ -95,7 +95,8 @@ Status TransposeProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   const auto& output = shader.AddOutput("output", ShaderUsage::UseUniform | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseValueTypeAlias);
+ 
+   if (use_shared_) {
+-    shader.AdditionalImplementation() << "var<workgroup> tile : array<array<output_value_t, tile_size + 1>, tile_size>;\n";
++    shader.AdditionalImplementation() << (pad_tile_ ? "var<workgroup> tile : array<array<output_value_t, tile_size + 1>, tile_size>;\n"
++                                                              : "var<workgroup> tile : array<array<output_value_t, tile_size>, tile_size>;\n");
+     shader.MainFunctionBody() << "  let stride = (uniforms.output_shape[1] - 1) / tile_size + 1;\n"
+                                  "  let workgroup_id_x = workgroup_idx % stride;\n"
+                                  "  let workgroup_id_y = workgroup_idx / stride;\n"
+@@ -200,7 +201,10 @@ Status Transpose::DoTranspose(onnxruntime::webgpu::ComputeContextBase& context,
+   }
+ 
+   uint32_t output_size = onnxruntime::narrow<uint32_t>(input_shape.Size());
+-  TransposeProgram program{permutations, use_shared};
++  // Qualcomm Adreno (observed on Adreno 730, driver 512.615.0, Vulkan) miscomputes this kernel when the
++  // shared tile has the odd +1 row padding: use an unpadded tile there.
++  const bool pad_tile = context.AdapterInfo().vendor != std::string_view{"qualcomm"};
++  TransposeProgram program{permutations, use_shared, pad_tile};
+ 
+   program
+       .CacheHint(absl::StrJoin(permutations, "-"))
+diff --git a/onnxruntime/core/providers/webgpu/tensor/transpose.h b/onnxruntime/core/providers/webgpu/tensor/transpose.h
+index abd3b2b..50fa5ea 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/transpose.h
++++ b/onnxruntime/core/providers/webgpu/tensor/transpose.h
+@@ -39,8 +39,8 @@ class Transpose final : public WebGpuKernel, public TransposeBase {
+ 
+ class TransposeProgram final : public Program<TransposeProgram> {
+  public:
+-  TransposeProgram(const gsl::span<const size_t>& permutations, bool use_shared)
+-      : Program{"Transpose"}, perm_(permutations.begin(), permutations.end()), use_shared_(use_shared) {
++  TransposeProgram(const gsl::span<const size_t>& permutations, bool use_shared, bool pad_tile = true)
++      : Program{"Transpose"}, perm_(permutations.begin(), permutations.end()), use_shared_(use_shared), pad_tile_(pad_tile) {
+   }
+ 
+   Status GenerateShaderCode(ShaderHelper& sh) const override;
+@@ -51,6 +51,7 @@ class TransposeProgram final : public Program<TransposeProgram> {
+  private:
+   InlinedVector<int64_t> perm_;
+   const bool use_shared_;
++  const bool pad_tile_;
+ };
+ 
+ }  // namespace webgpu
