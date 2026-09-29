@@ -270,15 +270,46 @@ Measured ceilings (`dawn_repro/peak.cc`, `bw.cc`, `chain.cc`), all in Dawn direc
    (about 165 on short-K layers, 230-276 on long-K ones). Summed over ResNet-50's 20 distinct conv shapes the best
    variant per shape projects to 54 ms against ORT's 37.7 ms. Dawn's robustness / Vulkan-memory-model toggles (as ORT
    sets them) change nothing beyond noise (126-168 GFLOPS).
-4. **Small grids are the real inefficiency.** A batch-1 layer with a 14x14 or 7x7 output has only ~100 workgroups
-   and a long serial K-loop: a single dispatch of a late-stage GEMM runs at 50-63 GFLOPS where the same GEMM in
-   throughput mode reaches 137-183. Layers with <=196 output pixels are 46% of ResNet-50's conv GPU time (14x14 stage 14.1 ms,
-   7x7 stage 3.2 ms of 37.8 ms). Split-K or smaller tiles for those layers is the lever; ORT's Conv2dMM has none
-   (its MatMul has split-K for small M).
+4. **Small grids are *not* the inefficiency (corrected).** My first reading was that batch-1 layers with a 14x14 or 7x7
+   output leave the GPU under-occupied: a single dispatch of a toy shared-memory GEMM ran at 50-63 GFLOPS against 137-183 in
+   throughput mode, and layers with <=196 output pixels are 46% of ResNet-50's conv time in the profile. The split-K
+   experiment below disproves it: multiplying the workgroup count by 4-16 barely changes the kernel time, so ORT's real
+   kernel is throughput-bound (workgroup-memory loads), not occupancy-bound. The toy GEMM's single-dispatch figure is a
+   property of that toy kernel, not of ORT's.
 5. **A fixed per-node cost remains** (~0.1 ms CPU removed by graph capture, ~0.19 ms GPU-side that is not): ResNet-50
    never goes below ~17-26 ms however small the input, so many-node models pay it in full (fusing nodes would help).
 6. **Per-kernel timings need care**: the profiler's `Api` events are GPU timestamps, but in profile mode every dispatch
-   is its own pass and they sum to 42.5 of ResNet's 69 ms; use them for per-layer comparison, not as a total.
+   is its own pass and they sum to 42.5 of ResNet's 69 ms, and some dispatches report an impossible ~5 us (a 231-MFLOP
+   convolution cannot take that), so per-layer profile numbers are only indicative; wall-clock medians are the reliable ones.
 
-Not done: an implicit-GEMM split-K Conv kernel inside ORT, fp16 storage with fp32 accumulation, and operator fusion
-(Conv+Add+Relu, SiLU) to cut the node count.
+### Split-K for Conv2dMM (tried, no gain)
+
+`ort_conv2d_splitk_experiment.patch` (on top of the Transpose and missing-ops patches; off unless
+`ORT_WGPU_CONV_SPLITK=auto|N`) adds a deterministic two-stage split-K to the channels-last vec4 Conv2dMM:
+
+1. a partial stage: the existing shader with the shared generator's split-K mode (`dispatch_z = S`, each z-slice covers
+   `ceil(K/S)` rounded up to the tile size) writing raw partial sums to slice `z` of a temporary
+   `[S, out_h, out_w, C/4]` buffer, with no bias or activation;
+2. a reduce kernel that sums the S slices, adds the bias and applies the fused activation (ReLU/Clip/...).
+
+Unlike ORT's own MatMul split-K (Intel-only, atomic compare-exchange adds, needs no fused activation) it needs no atomics and
+keeps the fused activation. One bug worth knowing: `mm_readA` derives the output width from `uniforms.result_shape[2]`, so the
+temporary buffer must be declared `[S, H, W, C/4]`, not `[S, M, 1, C/4]` (that version got only the first image row right).
+
+Results (fp32, 224x224 ResNet-50; outputs verified against the CPU, relative error <= 8.1e-7 for all settings; single-conv
+models with/without bias, ReLU and stride 2 match to <= 7.8e-7):
+
+| ORT_WGPU_CONV_SPLITK | median | change |
+|---|---|---|
+| off | 66.3 ms | |
+| auto (only layers with < 256 workgroups and K >= 512, up to 16 slices) | 66.7 ms | +0.6% |
+| 2 | 67.8 ms | +2% |
+| 4 | 68.6 ms | +3% |
+| 8 | 69.1 ms | +4% |
+| 16 | 71.1 ms | +7% |
+
+Individual layers do get 10-20% faster (e.g. the 14x14 256-channel 3x3 conv 1.86 -> 1.49 ms with 4 slices, the 28x28 128-channel
+one 1.71 -> 1.44 ms), but the extra partial-sum traffic and reduce dispatch cancel it across the network, and forcing splits
+on large-grid layers makes it worse. Since 4-16x more workgroups barely speeds a layer up, ORT's Conv is bound by its
+workgroup-memory load throughput, as computed above, and only a design with a higher FMA-per-load ratio (or fewer loads per FMA,
+e.g. fp16 storage with fp32 accumulation) can beat it. Not done: fusing Conv+Add+Relu / SiLU to cut the node count.
