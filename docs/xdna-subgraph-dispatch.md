@@ -404,6 +404,16 @@ the stem/pool on the host. Two host-side fixes were needed to see that gain: con
 What remains on the host: image quantize + im2col (~0.2 ms), GlobalAveragePool/Q/DQ/two Gemms (~0.4 ms)
 and Python overhead; the device call is ~4.3 ms.
 
+Per-worker weight streams in the stage-column design (`resnet_stage_design.py --split-weights 0,0,1,1
+--cols 8`): now affordable because the stage columns freed shim channels (4 activation + 3 stem + the
+weight streams; `--cols 8` is needed so all shim tiles are reachable). Each core of a split stage gets its
+own weight FIFO/shim stream: its slice of the projection block once, then its slice of every identity block
+at the block stride, and nothing is discarded. Exact everywhere. Measured one artifact per process:
+layer4 stage alone 2.22-2.28 -> 1.98-2.04 ms (-10%); image -> layer4 with layer3 and layer4 split
+4.17-4.24 -> 3.55 ms (-15%; layer4 only: ~4.0 ms). Through the graph runner the split artifact was faster
+than the baseline in every same-window comparison (5.4-5.9 vs 6.4-7.9 ms device call on a host at load
+12-19, so absolute times there are inflated).
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is
