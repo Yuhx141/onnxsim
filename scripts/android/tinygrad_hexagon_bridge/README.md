@@ -511,6 +511,14 @@ between runs, code size, software prefetch on/off, prefetching every kernel's co
 first call: 27.1 -> 27.0 ms), reading one byte of every code page first (24.1 -> 24.1 ms). Next probe: the DSP PMU counters
 (`libs/itrace/inc/itrace_dsp_events_pmu.h`), or an unsigned-PD-independent rebuild of the skel with the kernels in one section.
 
+PMU probe (inconclusive). `qurt_pmu_enable/set/get` works from the unsigned PD (`process_class` includes `unsigned`); a skel build
+that stores four counter deltas per call (event bytes 0x10 I$ miss, 0x11 D$ miss, 0x5b ITLB miss, 0x8f DTLB miss; second set 0x02
+packets, 0x33 cycles with one thread running, 0x82 DU stall, 0x54 I$ access) gave, per call with the worker on one thread: D$ demand
+misses median 1942 for the graph of distinct tiny kernels against 521 for the repeated-kernel graph, I$ misses about 0 and TLB
+misses 0. Treat those as suggestive only: the counters are global unless matched to a hardware thread id
+(`QURT_PMUSTID0/1`, `QURT_PMUCNTSTID*`), which I did not set up, other clients' threads count too, and the packet and stall events
+read 0. The instrumentation is not in the tree (a small `#ifdef` in the skel's per-call loop and a `#define` from the emitter).
+
 **Depthwise (sliding-window vrmpy).** Each channel's padded image is one flat byte signal. A 128-lane vrmpy takes one unaligned
 128-byte load at offset `128b + s + ky*Wp + 4g` and a splat of 4 weights; four shifts s = 0..3 give 128 outputs, re-ordered with
 `vshuff` -4 then -8 (the negative forms are the full-interleave constants). 56 vrmpys per 128 outputs for 7x7 and 12 for 3x3,
