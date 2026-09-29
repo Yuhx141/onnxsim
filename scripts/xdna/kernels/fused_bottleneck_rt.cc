@@ -144,11 +144,14 @@ inline void fill_coords(int *py, int *px, int n, int w) {
   }
 }
 
-// Copy one A tile (8 pixel rows of 8 bytes) with per-row source pixel offsets `offs` (< 0 = padding
-// row -> zeros). Sources and destination are 8-byte aligned, so each row is one 64-bit access.
+// Copy one A tile (8 pixel rows of 8 bytes) from per-row source pixel offsets `offs`. Every offset is
+// valid (rows past the pixel count point at pixel 0: their MMUL results are never stored), so the
+// copy is straight-line code: a data-dependent branch per row cost ~40 cycles each on this core.
+// Sources and destination are 8-byte aligned, so each row is one 64-bit access.
 inline void gather_rows(int8_t *dst, const int8_t *block_base, const int *offs) {
   uint64_t *d = (uint64_t *)dst;
-  for (int r = 0; r < 8; ++r) d[r] = offs[r] >= 0 ? *(const uint64_t *)(block_base + offs[r] * 8) : 0;
+  _Pragma("clang loop unroll(full)")
+  for (int r = 0; r < 8; ++r) d[r] = *(const uint64_t *)(block_base + offs[r] * 8);
 }
 
 inline void set_modes() {
@@ -233,7 +236,7 @@ static void conv2_impl(const uint8_t *bundle, const uint8_t *params, uint8_t *ou
         int offs[8];
         for (int r = 0; r < 8; ++r) {
           const int o = t * 8 + r;
-          offs[r] = o < d.OP ? (py[o] * d.S + ky) * d.PW + px[o] * d.S + kx : -1;
+          offs[r] = o < d.OP ? (py[o] * d.S + ky) * d.PW + px[o] * d.S + kx : 0;
         }
         for (int icb = 0; icb < d.MB; ++icb)
           gather_rows(col_tiles + ((vt * d.MB + icb) * d.TO + t) * 64, in + (size_t)icb * d.PADP * 8, offs);
@@ -253,8 +256,13 @@ static void conv2_impl(const uint8_t *bundle, const uint8_t *params, uint8_t *ou
     const int gb = chunk * d.NB2 + ocl;
     store_rows(out + (gb * d.OP + t * 8) * 8, v, d.OP - t * 8);
   };
-  if (row_tiles) gemm_rt<false>(d.NB2, d.TO, d.NTAPS, d.MB, d.weights, bias, a_base_row, d.PADP * 8, epi);
-  else gemm_rt<false>(d.NB2, d.TO, d.NTAPS, d.MB, d.weights, bias, a_base_col, d.TO * 64, epi);
+#ifndef RT_REPEAT_GEMM
+#define RT_REPEAT_GEMM 1
+#endif
+  for (int rep = 0; rep < RT_REPEAT_GEMM; ++rep) {  // RT_REPEAT_GEMM > 1 is a profiling aid only
+    if (row_tiles) gemm_rt<false>(d.NB2, d.TO, d.NTAPS, d.MB, d.weights, bias, a_base_row, d.PADP * 8, epi);
+    else gemm_rt<false>(d.NB2, d.TO, d.NTAPS, d.MB, d.weights, bias, a_base_col, d.TO * 64, epi);
+  }
 }
 #endif
 
@@ -285,7 +293,7 @@ extern "C" void fused_bottleneck_skip_chunk(const int8_t *input, const uint8_t *
       int offs[8];
       for (int r = 0; r < 8; ++r) {
         const int o = t * 8 + r;
-        offs[r] = o < d.OP ? py[o] * d.SS * d.W + px[o] * d.SS : -1;
+        offs[r] = o < d.OP ? py[o] * d.SS * d.W + px[o] * d.SS : 0;
       }
       for (int icb = 0; icb < d.CB; ++icb)
         gather_rows(skip_x + (icb * d.TO + t) * 64, input + (size_t)icb * d.P * 8, offs);
