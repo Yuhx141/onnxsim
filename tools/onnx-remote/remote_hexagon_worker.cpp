@@ -4,7 +4,7 @@
 // Runs on the Android side of a Snapdragon (FastRPC to the cDSP, unsigned PD). Operations:
 //   capabilities                     the runner manifest
 //   load_compiled(id, artifact)      unpack, cache tg_graph_<id>.so, open it on the cDSP and upload the weights once
-//   run_compiled(id, tensors)        ONNX inputs in graph order -> ONNX outputs in graph order (float32)
+//   run_compiled(id, tensors)        ONNX inputs in graph order -> ONNX outputs in graph order (in their program.txt dtypes)
 // An artifact is TGHXV65\0, u32 file count, then per file u32 name length, name, u64 size, bytes: tg_graph.so (the skel),
 // blob.bin (weights) and program.txt (the I/O contract; see tinygrad's examples/openpilot/dsp_graph_v65.py).
 #include "remote_transport.h"
@@ -32,10 +32,10 @@ namespace fs = std::filesystem;
 namespace {
 
 struct InputSpec { int onnx_index = 0; uint32_t dtype = 0; uint64_t bytes = 0; int slot = -1; };
-struct OutputSpec { uint64_t elements = 0; std::vector<int64_t> shape; };
+struct OutputSpec { uint8_t dtype = 1; uint64_t elements = 0; std::vector<int64_t> shape; };
 struct Program {
   int ncalls = 0, threads = 1;
-  uint64_t output_bytes = 0;
+  uint64_t output_bytes = 0, output_align = 1;  // each output starts at a multiple of output_align bytes
   std::vector<InputSpec> inputs;  // ONNX graph order
   std::vector<OutputSpec> outputs;
   std::vector<std::string> names;  // kernel name per call (program.txt "name"), for per-call profile events
@@ -98,6 +98,7 @@ bool parse_program(const std::string& text, Program& p, std::string& error) {
     if (key == "ncalls") f >> p.ncalls;
     else if (key == "threads") f >> p.threads;
     else if (key == "output_bytes") f >> p.output_bytes;
+    else if (key == "output_align") f >> p.output_align;
     else if (key == "input") {
       InputSpec s;
       f >> s.onnx_index >> s.dtype >> s.bytes >> s.slot;
@@ -107,7 +108,8 @@ bool parse_program(const std::string& text, Program& p, std::string& error) {
       uint32_t dtype = 0;
       f >> dtype >> o.elements;
       for (int64_t d; f >> d;) o.shape.push_back(d);
-      if (dtype != 1) { error = "only float32 program outputs are supported"; return false; }
+      if (dtype > 255 || dtype_bytes(static_cast<uint8_t>(dtype)) == 0) { error = "unsupported program output dtype"; return false; }
+      o.dtype = static_cast<uint8_t>(dtype);
       p.outputs.push_back(o);
     } else if (key == "name") {
       size_t i = 0;
@@ -117,7 +119,8 @@ bool parse_program(const std::string& text, Program& p, std::string& error) {
     } else if (!key.empty()) { error = "unknown program record: " + key; return false; }
   }
   uint64_t total = 0;
-  for (const auto& o : p.outputs) total += o.elements * 4;
+  if (p.output_align == 0) { error = "inconsistent program.txt"; return false; }
+  for (const auto& o : p.outputs) total = (total + o.elements * dtype_bytes(o.dtype) + p.output_align - 1) / p.output_align * p.output_align;
   if (p.ncalls <= 0 || p.outputs.empty() || total != p.output_bytes) { error = "inconsistent program.txt"; return false; }
   return true;
 }
@@ -228,11 +231,18 @@ Response execute(const Request& request) {
   }
   size_t at = 0;
   for (const auto& o : p.outputs) {
+    // the program's output is the ONNX outputs' bytes back to back, each in its own dtype
     Tensor t;
     t.shape = o.shape;
-    t.data.resize(o.elements);
-    std::memcpy(t.data.data(), out.data() + at, o.elements * 4);
-    at += o.elements * 4;
+    t.dtype = o.dtype;
+    const size_t n = o.elements * dtype_bytes(o.dtype);
+    if (o.dtype == 1) {
+      t.data.resize(o.elements);
+      std::memcpy(t.data.data(), out.data() + at, n);
+    } else {
+      t.raw_data.assign(out.data() + at, out.data() + at + n);
+    }
+    at = (at + n + p.output_align - 1) / p.output_align * p.output_align;
     response.outputs.push_back(std::move(t));
   }
   response.ok = true;

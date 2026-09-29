@@ -76,29 +76,6 @@ bool take_string(const std::vector<char>& b, size_t& at, uint32_t max_bytes,
   at += n;
   return true;
 }
-size_t dtype_bytes(uint8_t dtype) {
-  switch (dtype) {
-    case 1:  // FLOAT
-    case 6:  // INT32
-    case 12: // UINT32
-      return 4;
-    case 2:  // UINT8
-    case 3:  // INT8
-    case 9:  // BOOL
-      return 1;
-    case 4:  // UINT16
-    case 5:  // INT16
-    case 10: // FLOAT16
-    case 16: // BFLOAT16
-      return 2;
-    case 7:  // INT64
-    case 11: // DOUBLE
-    case 13: // UINT64
-      return 8;
-    default:
-      return 0;
-  }
-}
 
 bool checked_tensor(const Tensor& t, std::string& error) {
   if (t.shape.size() > kMaxRank) { error = "tensor rank exceeds limit"; return false; }
@@ -385,6 +362,30 @@ bool send_message(int fd, uint16_t kind, const std::vector<char>& payload, std::
 }
 
 }  // namespace
+
+size_t dtype_bytes(uint8_t dtype) {
+  switch (dtype) {
+    case 1:  // FLOAT
+    case 6:  // INT32
+    case 12: // UINT32
+      return 4;
+    case 2:  // UINT8
+    case 3:  // INT8
+    case 9:  // BOOL
+      return 1;
+    case 4:  // UINT16
+    case 5:  // INT16
+    case 10: // FLOAT16
+    case 16: // BFLOAT16
+      return 2;
+    case 7:  // INT64
+    case 11: // DOUBLE
+    case 13: // UINT64
+      return 8;
+    default:
+      return 0;
+  }
+}
 
 int listen_tcp(uint16_t port, int backlog) {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) return -1;

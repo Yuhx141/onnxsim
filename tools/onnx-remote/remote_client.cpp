@@ -360,13 +360,17 @@ static int compile_run(int argc, char** argv) {
   }
   if (!dump_path.empty()) {
     std::ofstream f(dump_path, std::ios::binary | std::ios::trunc);
-    for (const auto& t : result.outputs) f.write(reinterpret_cast<const char*>(t.data.data()), t.data.size() * 4);
+    for (const auto& t : result.outputs) {
+      if (t.dtype == 1) f.write(reinterpret_cast<const char*>(t.data.data()), t.data.size() * 4);
+      else f.write(reinterpret_cast<const char*>(t.raw_data.data()), t.raw_data.size());
+    }
   }
   if (!expect_path.empty()) {
     std::ifstream f(expect_path, std::ios::binary);
     std::vector<uint8_t> expect((std::istreambuf_iterator<char>(f)), {});
     std::vector<uint8_t> got;
     for (const auto& t : result.outputs) {
+      if (t.dtype != 1) { got.insert(got.end(), t.raw_data.begin(), t.raw_data.end()); continue; }
       const auto* b = reinterpret_cast<const uint8_t*>(t.data.data());
       got.insert(got.end(), b, b + t.data.size() * 4);
     }
