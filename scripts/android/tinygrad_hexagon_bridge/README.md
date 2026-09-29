@@ -492,6 +492,18 @@ a 345x3x64 shape vectorized an axis one of their buffers walks with a stride, so
 driving is now 85.7 ms (98.0 before). What is left there is table lookups (about 20 ms), the stem's plane split + pad + channel-4
 interleave (7 ms: a 4-way transpose, which needs vector shuffles tinygrad cannot express) and many 1-4 ms layout kernels.
 
+**Table lookups (the largest part of what is left in the elementwise bucket, about 40 ms of driving's 86).** Benchmarked on the
+phone as eight chained Gelu lookups over 98304 elements (`lut8.onnx`-style: DQ -> Gelu -> Q with per-tensor u16 parameters), DSP time
+per kernel: 238 us with 64K-entry tables, 110 us with 256-entry (uint8) tables. The upcast width does not matter (128 lanes: 1.91 ms
+for the chain, 8 lanes: 1.91, none: 2.09), so the `vinsert`/`valign` chains that build the 128-lane result vector are not the
+bottleneck: the loop is scalar loads (index, table) and a store at about 4.5 cycles per element even with a table that fits L1
+(the 4 hardware threads share the pipeline), plus about half again from the 128 KB table missing L1. Shrinking the table
+(`ONNX_QDQ_LUT_DROP`, lossy) gave only 2% on the whole model. Only a vector gather would help (V65's `vgather` reads from VTCM), which
+needs the tables in VTCM and a gather op in the DSP renderer; not attempted.
+**Stem plane split + pad + channel-4 interleave (7 ms):** a 4-way byte transpose of u16 activations; fusing the hi and lo plane
+kernels into one would save one read of the u16 tensor (about 1-2 ms of the 7); the transpose itself needs `vshuff`/`vdeal`, which
+tinygrad's expression set does not have.
+
 Tried and dropped: blocking pixels inside the tensor-core construction (`DSP_TC_MBLOCK`): the compiler passes ran out of memory
 (12 GB in 6 s). The same blocking as an ordinary upcast after the tensor core (`DSP_TC_MUPCAST`) works.
 
