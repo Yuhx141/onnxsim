@@ -298,6 +298,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--nocompute", type=int, default=0, help="debug: bitmask of kernels to skip (1 conv1, 2 skip, 4 conv2, 8 conv3)")
     parser.add_argument("--dbg", type=int, default=0, help="debug output mode for blocked conv3 (1 skip, 2 pre-residual main)")
+    parser.add_argument("--cols", type=int, default=0, help="target array width (use 8 for stages merged into one full ELF)")
     parser.add_argument("--blocked", action="store_true", help="vectorized blocked-layout kernels (needs blocked_stage packing)")
     parser.add_argument("--tap", action="store_true", help="debug: also drain block 0 output to a 4th host buffer")
     parser.add_argument("--blocks", nargs="+", required=True)
@@ -354,7 +355,7 @@ def main() -> None:
     opts = _parser().parse_args()
     run_design_cli(
         linked_bottleneck_stage, opts, compile_kwargs=_compile_kwargs,
-        device=lambda value: device_from_args(value, n_cols=max(3, len(value.blocks))),
+        device=lambda value: device_from_args(value, n_cols=value.cols or max(3, len(value.blocks))),
     )
 
 

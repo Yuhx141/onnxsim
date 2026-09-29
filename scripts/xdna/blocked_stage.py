@@ -58,8 +58,25 @@ def _tile_3x3(weight: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(w.transpose(0, 4, 2, 3, 1))  # ocb,tap,icb,k,n
 
 
-def pack_blocked_params(binding: dict[str, Any]) -> np.ndarray:
-    """Return the packed parameter tensor for one block in blocked layout."""
+HEADER_BYTES = 64
+
+
+def runtime_header(binding: dict[str, Any]) -> np.ndarray:
+    """int32 [shift1, shift2, shift3, skip_shift, main_residual_shift, skip_residual_shift]."""
+    shifts = binding["shifts"]
+    return np.array(
+        [shifts[0], shifts[1], shifts[2], binding["skip_output_shift"] or 0,
+         binding["main_residual_shift"], binding["skip_residual_shift"]],
+        dtype=np.int32,
+    )
+
+
+def pack_blocked_params(binding: dict[str, Any], *, header: bool = False) -> np.ndarray:
+    """Return the packed parameter tensor for one block in blocked layout.
+
+    With ``header`` every weight slot grows by ``HEADER_BYTES`` and ends with the block's
+    requantization shifts (see ``FUSED_RT_SHIFTS`` in fused_bottleneck_blocked.cc).
+    """
     raw = binding["raw_weights"]
     mid = raw["w1"].shape[0]
     half = mid // 2
@@ -91,7 +108,11 @@ def pack_blocked_params(binding: dict[str, Any]) -> np.ndarray:
     slot = int(binding["chunk_slot_bytes"])
     if max(blob.size for blob in packed) > slot or len(packed) * slot != binding["params"].size:
         raise ValueError("blocked parameter chunks do not match the compiled weight slot layout")
-    params = np.zeros(len(packed) * slot, dtype=np.uint8)
+    stride = slot + (HEADER_BYTES if header else 0)
+    params = np.zeros(len(packed) * stride, dtype=np.uint8)
+    hdr = runtime_header(binding).view(np.uint8) if header else None
     for index, blob in enumerate(packed):
-        params[index * slot : index * slot + blob.size] = blob
+        params[index * stride : index * stride + blob.size] = blob
+        if header:
+            params[index * stride + slot : index * stride + slot + hdr.size] = hdr
     return params

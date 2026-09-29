@@ -56,6 +56,26 @@
 #define FUSED_SKIP_CHUNKS 1
 #endif
 
+// FUSED_RT_SHIFTS: the requantization shifts are runtime values read from a 6 x int32
+// header stored right after each weight chunk's payload (at FUSED_HDR_OFFSET), so one
+// compiled block can serve several same-shaped blocks with different scales.
+#ifdef FUSED_RT_SHIFTS
+#define RT_HDR(i) (((const int32_t *)(params + FUSED_HDR_OFFSET))[i])
+#define SHIFT1_V pos(RT_HDR(0))
+#define SHIFT2_V pos(RT_HDR(1))
+#define SHIFT3_V pos(RT_HDR(2))
+#define SKIPSHIFT_V pos(RT_HDR(3))
+#define EA_V (RT_HDR(4))
+#define EB_V (RT_HDR(5))
+#else
+#define SHIFT1_V pos(FUSED_SHIFT1)
+#define SHIFT2_V pos(FUSED_SHIFT2)
+#define SHIFT3_V pos(FUSED_SHIFT3)
+#define SKIPSHIFT_V pos(FUSED_SKIP_SHIFT)
+#define EA_V (FUSED_MAIN_RESIDUAL_SHIFT)
+#define EB_V (FUSED_SKIP_RESIDUAL_SHIFT)
+#endif
+
 namespace {
 constexpr int W = FUSED_W, H = FUSED_H, P = W * H;
 constexpr int OW = FUSED_OUT_W, OH = FUSED_OUT_H, OP = OW * OH;
@@ -175,7 +195,7 @@ extern "C" void fused_bottleneck_conv1_chunk(const int8_t *input, const uint8_t 
   // Rows past P (P < 8 or a partial tail) read neighbouring bytes and are ignored.
   auto a_get = [&](int t, int icb) -> v64 { return flip(load_tile(input + (icb * P + t * 8) * 8)); };
   auto epi = [&](int ocl, int t, MMUL &c) {
-    v64 v = aie::max(c.to_vector<int8>(pos(FUSED_SHIFT1)), zero);
+    v64 v = aie::max(c.to_vector<int8>(SHIFT1_V), zero);
     const int gb = chunk * NB1 + ocl;
     if constexpr (ROW_TILES1) {
       const int y = (t * 8) / W, x0 = (t * 8) % W;
@@ -229,7 +249,7 @@ static void conv2_impl(const uint8_t *bundle, const uint8_t *params, uint8_t *ou
     }
   };
   auto epi = [&](int ocl, int t, MMUL &c) {
-    v64 v = aie::max(c.to_vector<int8>(pos(FUSED_SHIFT2)), zero);
+    v64 v = aie::max(c.to_vector<int8>(SHIFT2_V), zero);
     const int gb = chunk * NB2 + ocl;
     store_rows(out + (gb * OP + t * 8) * 8, v, OP - t * 8);
   };
@@ -271,7 +291,7 @@ extern "C" void fused_bottleneck_skip_chunk(const int8_t *input, const uint8_t *
   };
   auto epi = [&](int ocl, int t, MMUL &c) {
     const int gb = chunk * NBS + ocl;
-    store_rows(out + (gb * OP + t * 8) * 8, c.to_vector<int8>(pos(FUSED_SKIP_SHIFT)), OP - t * 8);
+    store_rows(out + (gb * OP + t * 8) * 8, c.to_vector<int8>(SKIPSHIFT_V), OP - t * 8);
   };
   tiled_gemm<pick_group(NBS)>(NBS, TO, CB, weights, bias, a_get, epi);
 }
@@ -293,13 +313,13 @@ extern "C" void fused_bottleneck_conv3_chunk(const uint8_t *bundle, const uint8_
   const int8_t *weights = (const int8_t *)params;
   const int32_t *bias = (const int32_t *)(params + FUSED_BIAS3_OFFSET);
   int8_t *out = (int8_t *)output;
-  constexpr int EA = FUSED_MAIN_RESIDUAL_SHIFT, EB = FUSED_SKIP_RESIDUAL_SHIFT;
-  constexpr int common = (EA < EB) ? pos(-EA) : pos(-EB);
+  const int EA = EA_V, EB = EB_V;
+  const int common = (EA < EB) ? pos(-EA) : pos(-EB);
   const v64 zero = aie::zeros<int8, 64>();
   auto a_get = [&](int t, int icb) -> v64 { return load_tile(in + (icb * OP + t * 8) * 8); };
   auto epi = [&](int ocl, int t, MMUL &c) {
     const int gb = chunk * NB3 + ocl;
-    v64 q3 = c.to_vector<int8>(pos(FUSED_SHIFT3));
+    v64 q3 = c.to_vector<int8>(SHIFT3_V);
     v64 r = load_tile(skip + (gb * OP + t * 8) * 8);
     aie::accum<acc32, 64> a1, a2;
     a1.from_vector(q3, EA + common);
