@@ -24,6 +24,7 @@
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/dynamic_quantize_ternary_matmul.h"
+#include "passes/eliminate_common_subexpression.h"
 #include "passes/eliminate_consecutive_idempotent_ops.h"
 #include "passes/eliminate_loop_with_const_trip_count.h"
 #include "passes/eliminate_nop_dropout.h"
@@ -31,9 +32,11 @@
 #include "passes/eliminate_optional_has_element.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
 #include "passes/eliminate_reshape_family_on_constant.h"
+#include "passes/eliminate_slice_after_shape.h"
 #include "passes/eliminate_sequence_at_construct.h"
 #include "passes/eliminate_sequence_length_construct.h"
 #include "passes/explicit_auto_pad.h"
+#include "passes/extract_constant_to_initializer.h"
 #include "passes/explicit_conv_padding.h"
 #include "passes/float16_to_float32.h"
 #include "passes/fp6_llm.h"
@@ -51,6 +54,7 @@
 #include "passes/fuse_matmul_add_bias_into_gemm_batched.h"
 #include "passes/fuse_matmul_into_conv.h"
 #include "passes/fuse_mul_into_conv.h"
+#include "passes/fuse_pad_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
 #include "passes/fuse_qkv.h"
@@ -297,11 +301,15 @@ void RegisterCustomOptimizerPasses() {
     // opset-12 Dropout, zero-padding MaxPool, ...) apply while the fork itself
     // tracks upstream onnxoptimizer.
     RegisterOrReplace<p::EliminateConsecutiveIdempotentOps>(registry);
+    RegisterOrReplace<p::EliminateCommonSubexpression>(registry);
     RegisterOrReplace<p::EliminateNopDropout>(registry);
+    RegisterOrReplace<p::ExtractConstantToInitializer>(registry);
+    RegisterOrReplace<p::EliminateSliceAfterShape>(registry);
     RegisterOrReplace<p::FuseAddBiasIntoConv>(registry);
     RegisterOrReplace<p::FuseBNIntoConv>(registry);
     RegisterOrReplace<p::FuseConsecutiveUnsqueezes>(registry);
     RegisterOrReplace<p::FuseMatMulAddBiasIntoGemm>(registry);
+    RegisterOrReplace<p::FusePadIntoConv>(registry);
     RegisterOrReplace<p::FusePadIntoPool>(registry);
     RegisterOrReplace<p::FuseQKV>(registry);
   });
