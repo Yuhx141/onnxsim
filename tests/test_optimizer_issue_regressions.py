@@ -1,4 +1,5 @@
-"""Regressions for onnx/optimizer issues #342-#350.
+"""Regressions for onnx/optimizer issues 342-350
+(https://github.com/onnx/optimizer/issues/350 and its siblings).
 
 Each test isolates one optimizer pass (``simplify_isolated``) and checks that it
 either declines an unsound rewrite or produces a valid, equivalent model.
@@ -27,7 +28,8 @@ def _run(model, feeds):
     return sess.run(None, feeds)
 
 
-# --- #345: Slice after Shape(start=...) -------------------------------------
+# Slice after Shape(start=...)
+# https://github.com/onnx/optimizer/issues/345
 
 
 @pytest.mark.parametrize("end, expected", [(1, [3]), (2, [3, 4])])
@@ -49,7 +51,8 @@ def test_slice_after_shape_honours_shape_start(end, expected):
     assert list(_run(model, {"X": x})[0]) == expected
 
 
-# --- #343: CSE across operator domains --------------------------------------
+# CSE across operator domains
+# https://github.com/onnx/optimizer/issues/343
 
 
 def test_cse_keeps_nodes_of_different_domains():
@@ -77,7 +80,9 @@ def test_cse_keeps_nodes_of_different_domains():
     assert domains["custom"] == 1 and domains[""] == 1
 
 
-# --- #344 / #342: covered by onnxsim's own overrides; keep as guards --------
+# covered by onnxsim's own overrides; keep as guards
+# https://github.com/onnx/optimizer/issues/344
+# https://github.com/onnx/optimizer/issues/342
 
 
 def test_consecutive_reshape_declines_ambiguous_zero():
@@ -96,7 +101,10 @@ def test_consecutive_reshape_declines_ambiguous_zero():
     np.testing.assert_array_equal(_run(sim, {"X": x})[0], _run(model, {"X": x})[0])
 
 
-# --- #346 / #347 / #348: Pad into pools -------------------------------------
+# Pad into pools
+# https://github.com/onnx/optimizer/issues/346
+# https://github.com/onnx/optimizer/issues/347
+# https://github.com/onnx/optimizer/issues/348
 
 
 def test_avgpool_existing_pads_without_count_include_pad_not_fused():
@@ -146,7 +154,8 @@ def test_maxpool_used_indices_not_fused():
     assert ops["Pad"] == 1
 
 
-# --- #349: legacy Pad value into Conv ---------------------------------------
+# legacy Pad value into Conv
+# https://github.com/onnx/optimizer/issues/349
 
 
 def test_pad10_nonzero_value_not_fused_into_conv():
@@ -181,7 +190,8 @@ def test_pad10_zero_value_fused_into_conv():
     assert ops["Pad"] == 0
 
 
-# --- #350: duplicate initializer names --------------------------------------
+# duplicate initializer names
+# https://github.com/onnx/optimizer/issues/350
 
 
 def test_extract_constant_gives_unique_initializer_names():
