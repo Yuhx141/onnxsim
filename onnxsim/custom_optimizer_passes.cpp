@@ -50,6 +50,7 @@
 #include "passes/fuse_gelu.h"
 #include "passes/fuse_gqa.h"
 #include "passes/fuse_layer_norm.h"
+#include "passes/fuse_lp_normalization.h"
 #include "passes/fuse_matmul_add_bias_into_gemm.h"
 #include "passes/fuse_matmul_add_bias_into_gemm_batched.h"
 #include "passes/fuse_matmul_into_conv.h"
@@ -218,6 +219,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
     RegisterOrReplace<p::FuseReduceSumIntoConv>(registry);
     RegisterOrReplace<p::FuseReshapeFamily>(registry);
+    RegisterOrReplace<p::FuseLpNormalization>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
     RegisterOrReplace<p::FuseSplitGatherConcat>(registry);
