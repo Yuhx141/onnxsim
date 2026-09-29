@@ -220,7 +220,9 @@ xclbin switch:
 groups = [["/layer1/layer1.0"], ["/layer1/layer1.1", "/layer1/layer1.2"],
           ["/layer2/layer2.0"], ["/layer2/layer2.1", "/layer2/layer2.2", "/layer2/layer2.3"],
           ["/layer3/layer3.0"], [f"/layer3/layer3.{i}" for i in range(1, 6)],
-          ["/layer4/layer4.0"], ["/layer4/layer4.1", "/layer4/layer4.2"]]
+          # layer4 groups: smaller weight chunks + a double-buffered weight FIFO (~-9% on the body)
+          {"blocks": ["/layer4/layer4.0"], "chunk_cap": 17000, "depth": 2},
+          {"blocks": ["/layer4/layer4.1", "/layer4/layer4.2"], "chunk_cap": 17000, "depth": 2}]
 body = remote.xdna_compile_resnet(model, "resnet_body", {"groups": groups})
 report = remote.xdna_run_resnet(model, build["manifest"], {
     "cpu_small_m": 256, "cpu_backend": "numpy", "host_maxpool": True,
