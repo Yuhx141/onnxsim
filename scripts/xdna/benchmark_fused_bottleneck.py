@@ -275,14 +275,22 @@ def bind_fused_bottleneck(
         + int(np.prod(output_shape))
     )
     if blocked:
-        # Blocked kernels keep conv1's output in a zero-padded [C/8][H+2][W+2][8]
-        # buffer and the projection/identity skip in [OUT_C/8][OP][8].
-        live_tensor_bytes = (
-            int(np.prod(input_shape))
-            + (mid_channels // 8) * (height + 2) * (width + 2) * 8
-            + int(np.prod(output_shape))
-            + 1024
-        )
+        try:
+            from .blocked_stage import valid_taps as _valid_taps
+        except ImportError:
+            from blocked_stage import valid_taps as _valid_taps
+        conv2_taps_pre = _valid_taps(height, width, output_height, output_width, conv2_stride[0])
+        # Worst per-tile live bytes of the blocked kernels (weight slot, stack and FIFO
+        # buffers excluded): conv1 tile = input + padded conv1 output + skip (+ strided
+        # skip gather buffer); conv2 tile = padded conv1 output + im2col + output.
+        out_pixels = output_height * output_width
+        out_tiles = (out_pixels + 7) // 8
+        padded1 = (mid_channels // 8) * (height + 2) * (width + 2) * 8
+        conv2_im2col = 0 if width % 8 == 0 and conv2_stride == (1, 1) else len(conv2_taps_pre) * (mid_channels // 8) * out_tiles * 64
+        skip_gather = 0 if (projection and conv2_stride == (1, 1) and out_pixels == height * width) or not projection else (channels // 8) * out_tiles * 64
+        conv1_live = int(np.prod(input_shape)) + padded1 + int(np.prod(output_shape)) + skip_gather
+        conv2_live = padded1 + conv2_im2col + out_pixels * mid_channels // 2
+        live_tensor_bytes = max(conv1_live, conv2_live) + 4096
     max_chunk_bytes = min(int(os.environ.get("XDNA_BLOCKED_MAX_CHUNK", "49152")) if blocked else 36864, tile_memory_bytes - worker_stack_bytes - live_tensor_bytes)
     if max_chunk_bytes <= 0:
         raise ValueError(

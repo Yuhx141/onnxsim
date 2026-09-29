@@ -99,8 +99,8 @@ def linked_bottleneck_stage(
 ):
     """Run a fixed three-block stage with inter-block FIFOs on the device."""
     specs = json.loads(stage_specs)
-    if not 1 <= len(specs) <= 3:
-        raise ValueError("linked stage supports one to three bottleneck blocks")
+    if not 1 <= len(specs) <= 8:
+        raise ValueError("linked stage supports one to eight bottleneck blocks")
 
     input_fifos = []
     weight_fifos = []
@@ -182,11 +182,21 @@ def linked_bottleneck_stage(
 
         conv1_worker, conv2_worker, conv3_worker = _block_workers(chunks1, skip_chunks, chunks2, chunks3, int(nocompute))
 
+        # Persistent static buffers of the blocked kernels must be reserved explicitly
+        # so the buffer allocator leaves room for them (see fused_bottleneck_blocked.cc).
+        conv1_data = conv2_data = None
+        if blocked:
+            out_tiles = (output_pixels + 7) // 8
+            row_tiles2 = width % 8 == 0 and conv2_stride == 1 and output_width == width
+            if not row_tiles2:
+                conv2_data = spec["taps"] * (mid_channels // 8) * out_tiles * 64 + 256
+            if skip_chunks and not (conv2_stride == 1 and output_pixels == pixels):
+                conv1_data = (channels // 8) * out_tiles * 64 + 256
         column = block_index
         workers.extend([
-            Worker(conv1_worker, fn_args=[input_fifo.cons(), weights_fifo.cons(), stage1_fifo.prod(), skip_fifo.prod(), k1, kskip, kidentity], tile=Tile(column, 2), stack_size=0x1000),
-            Worker(conv2_worker, fn_args=[stage1_fifo.cons(), weights_fifo.cons(), stage2a_fifo.prod(), k2a, 0, True], tile=Tile(column, 3), stack_size=0x1000),
-            Worker(conv2_worker, fn_args=[stage1_fifo.cons(), weights_fifo.cons(), stage2b_fifo.prod(), k2b, mid_channels // 2, False], tile=Tile(column, 5), stack_size=0x1000),
+            Worker(conv1_worker, fn_args=[input_fifo.cons(), weights_fifo.cons(), stage1_fifo.prod(), skip_fifo.prod(), k1, kskip, kidentity], tile=Tile(column, 2), stack_size=0x1000, data_size=conv1_data),
+            Worker(conv2_worker, fn_args=[stage1_fifo.cons(), weights_fifo.cons(), stage2a_fifo.prod(), k2a, 0, True], tile=Tile(column, 3), stack_size=0x1000, data_size=conv2_data),
+            Worker(conv2_worker, fn_args=[stage1_fifo.cons(), weights_fifo.cons(), stage2b_fifo.prod(), k2b, mid_channels // 2, False], tile=Tile(column, 5), stack_size=0x1000, data_size=conv2_data),
             Worker(conv3_worker, fn_args=[stage2_fifo.cons(), weights_fifo.cons(), output_fifo.prod(), k3], tile=Tile(column, 4), stack_size=0x1000),
         ])
         ObjectFifoLink(
@@ -344,7 +354,7 @@ def main() -> None:
     opts = _parser().parse_args()
     run_design_cli(
         linked_bottleneck_stage, opts, compile_kwargs=_compile_kwargs,
-        device=lambda value: device_from_args(value, n_cols=3),
+        device=lambda value: device_from_args(value, n_cols=max(3, len(value.blocks))),
     )
 
 

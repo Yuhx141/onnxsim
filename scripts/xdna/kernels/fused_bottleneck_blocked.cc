@@ -128,11 +128,14 @@ inline void tiled_gemm(int nb, int T, int KT, const int8_t *w, const int32_t *bi
   for (int t = 0; t < T; ++t) {
     for (int og = 0; og < nb; og += G) {
       MMUL c[G];
+      _Pragma("clang loop unroll(full)")
       for (int g = 0; g < G; ++g) c[g] = MMUL(bias_tile(bias + (og + g) * 8));
       for (int kk = 0; kk < KT; ++kk) {
         v64 a = a_get(t, kk);
-        for (int g = 0; g < G; ++g) c[g].mac(a, load_tile(w + ((og + g) * KT + kk) * 64));
+        _Pragma("clang loop unroll(full)")
+        for (int g = 0; g < G; ++g) c[g].mac(a, aie::load_v<64>(w + ((og + g) * KT + kk) * 64));
       }
+      _Pragma("clang loop unroll(full)")
       for (int g = 0; g < G; ++g) epi(og + g, t, c[g]);
     }
   }
@@ -191,6 +194,11 @@ extern "C" void fused_bottleneck_conv1_chunk(const int8_t *input, const uint8_t 
 #endif
 
 #if defined(BLK_CONV2A) || defined(BLK_CONV2B)
+// Non-row-tiled maps: the 3x3 windows are gathered once per block (chunk 0) into a
+// persistent im2col buffer of aligned A tiles, so every chunk's inner loop is a plain
+// 64-byte load instead of eight scalar copies per MMUL.
+alignas(64) static int8_t col_tiles[ROW_TILES2 ? 64 : NTAPS * MB * TO * 64];
+
 static void conv2_impl(const uint8_t *bundle, const uint8_t *params, uint8_t *output, int32_t chunk) {
   set_modes();
   const int8_t *in = (const int8_t *)bundle;
@@ -198,14 +206,26 @@ static void conv2_impl(const uint8_t *bundle, const uint8_t *params, uint8_t *ou
   const int32_t *bias = (const int32_t *)(params + FUSED_BIAS2_OFFSET);
   int8_t *out = (int8_t *)output;
   const v64 zero = aie::zeros<int8, 64>();
+  if constexpr (!ROW_TILES2) {
+    if (chunk == 0) {
+      for (int vt = 0; vt < NTAPS; ++vt) {
+        const int tap = TAPS.tap[vt], ky = tap / 3, kx = tap % 3;
+        for (int icb = 0; icb < MB; ++icb)
+          for (int t = 0; t < TO; ++t) {
+            v64 tile = gather_tile(in, PADP, icb, t, OP, [&](int o) { return ((o / OW) * S + ky) * PW + (o % OW) * S + kx; });
+            aie::store_v(col_tiles + ((vt * MB + icb) * TO + t) * 64, tile);
+          }
+      }
+    }
+  }
   auto a_get = [&](int t, int kk) -> v64 {
-    const int tap = TAPS.tap[kk / MB], icb = kk % MB;
-    const int ky = tap / 3, kx = tap % 3;
     if constexpr (ROW_TILES2) {
+      const int tap = TAPS.tap[kk / MB], icb = kk % MB;
+      const int ky = tap / 3, kx = tap % 3;
       const int y = (t * 8) / OW, x0 = (t * 8) % OW;
       return load_tile(in + (icb * PADP + (y + ky) * PW + x0 + kx) * 8);
     } else {
-      return gather_tile(in, PADP, icb, t, OP, [&](int o) { return ((o / OW) * S + ky) * PW + (o % OW) * S + kx; });
+      return aie::load_v<64>(col_tiles + (kk * TO + t) * 64);
     }
   };
   auto epi = [&](int ocl, int t, MMUL &c) {
@@ -229,14 +249,25 @@ extern "C" void fused_bottleneck_conv2_chunk_b(const uint8_t *bundle, const uint
 #endif
 
 #ifdef BLK_SKIP
+constexpr bool SKIP_DIRECT = (SS == 1 && OP == P);
+alignas(64) static int8_t skip_x[SKIP_DIRECT ? 64 : CB * TO * 64];
+
 extern "C" void fused_bottleneck_skip_chunk(const int8_t *input, const uint8_t *params, uint8_t *output, int32_t chunk) {
   set_modes();
   const int8_t *weights = (const int8_t *)params;
   const int32_t *bias = (const int32_t *)(params + FUSED_SKIP_BIAS_OFFSET);
   int8_t *out = (int8_t *)output;
+  if constexpr (!SKIP_DIRECT) {
+    // Strided projection: gather the sampled input pixels once per block.
+    if (chunk == 0)
+      for (int icb = 0; icb < CB; ++icb)
+        for (int t = 0; t < TO; ++t)
+          aie::store_v(skip_x + (icb * TO + t) * 64,
+                       gather_tile(input, P, icb, t, OP, [&](int o) { return (o / OW) * SS * W + (o % OW) * SS; }));
+  }
   auto a_get = [&](int t, int icb) -> v64 {
-    if constexpr (SS == 1 && OP == P) return flip(load_tile(input + (icb * P + t * 8) * 8));
-    else return flip(gather_tile(input, P, icb, t, OP, [&](int o) { return (o / OW) * SS * W + (o % OW) * SS; }));
+    if constexpr (SKIP_DIRECT) return flip(load_tile(input + (icb * P + t * 8) * 8));
+    else return flip(aie::load_v<64>(skip_x + (icb * TO + t) * 64));
   };
   auto epi = [&](int ocl, int t, MMUL &c) {
     const int gb = chunk * NBS + ocl;

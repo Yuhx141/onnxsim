@@ -395,8 +395,8 @@ class XDNAResNetRunner:
             prepared_blocks[prefix] = (block, binding, set(binding["covered_nodes"]), str(xclbin), str(insts))
 
         for prefixes, xclbin, insts in stage_specs:
-            if not 1 <= len(prefixes) <= 3:
-                raise ValueError("linked fused stage requires one to three block prefixes")
+            if not 1 <= len(prefixes) <= 8:
+                raise ValueError("linked fused stage requires one to eight block prefixes")
             if not Path(xclbin).is_file() or not Path(insts).is_file():
                 raise ValueError("fused stage xclbin and instruction stream must exist")
             stage_blocks = []
