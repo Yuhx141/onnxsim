@@ -12,7 +12,6 @@ import math
 from typing import Any
 
 import numpy as np
-from onnx import numpy_helper
 
 try:
     from .blocked_stage import RT_DESC_BYTES, _align4, _tile_1x1
@@ -23,6 +22,10 @@ CHUNK_PIXELS = 64
 
 
 def _values(model) -> dict[str, np.ndarray]:
+    from onnx import (
+        numpy_helper,  # lazy: the numpy-only helpers (im2col, packing) need no onnx
+    )
+
     values = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
     for node in model.graph.node:
         if node.op_type == "Constant":
@@ -95,11 +98,11 @@ def im2col_chunks(image: np.ndarray, stem: dict[str, Any]) -> np.ndarray:
     padded = np.pad(q, ((0, 0), (pt, stem["pads"][2]), (pl, stem["pads"][3])), constant_values=stem["in_zero"])
     sh, sw = stem["strides"]
     kh = kw = stem["weights"].shape[2]
+    # All 7x7 windows at once: [C][OH][OW][kh][kw] -> [OH*OW][C*kh*kw] (K order c, ky, kx).
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (kh, kw), axis=(1, 2))[:, ::sh, ::sw]
+    windows = windows[:, : g["oh"], : g["ow"]]
     cols = np.full((g["pixels"], g["k_pad"]), stem["in_zero"], dtype=np.uint8)
-    for oy in range(g["oh"]):
-        for ox in range(g["ow"]):
-            window = padded[:, oy * sh : oy * sh + kh, ox * sw : ox * sw + kw]  # [C][kh][kw]
-            cols[oy * g["ow"] + ox, : g["k"]] = window.reshape(-1)
+    cols[:, : g["k"]] = windows.transpose(1, 2, 0, 3, 4).reshape(g["pixels"], g["k"])
     chunks = []
     for c in range(g["chunks"]):
         block = cols[c * CHUNK_PIXELS : (c + 1) * CHUNK_PIXELS]                  # [64][k_pad]
@@ -152,9 +155,26 @@ def emulate(image: np.ndarray, stem: dict[str, Any]) -> np.ndarray:
         conv[c * CHUNK_PIXELS : (c + 1) * CHUNK_PIXELS] = (np.maximum(q, 0) + 128).astype(np.uint8)
     fmap = conv.reshape(g["oh"], g["ow"], -1).transpose(2, 0, 1)  # [C][H][W]
     padded = np.pad(fmap, ((0, 0), (1, 1), (1, 1)), constant_values=0)
-    ph, pw = (g["oh"] + 1) // 2 if g["oh"] % 2 else g["oh"] // 2, (g["ow"] + 1) // 2 if g["ow"] % 2 else g["ow"] // 2
     out = np.zeros((fmap.shape[0], g["oh"] // 2, g["ow"] // 2), dtype=np.uint8)
     for oy in range(out.shape[1]):
         for ox in range(out.shape[2]):
             out[:, oy, ox] = padded[:, oy * 2 : oy * 2 + 3, ox * 2 : ox * 2 + 3].reshape(fmap.shape[0], -1).max(axis=1)
     return out[None]
+
+
+def stem_nodes(model, value_name: str) -> set[int]:
+    """Indices of every non-Constant node needed to produce ``value_name`` (its transitive producers).
+
+    For the first bottleneck's input this is the whole stem: input Q, stem weight/bias DQ, Conv,
+    ReLU, Q/DQ, MaxPool, Q (and the DQ after it): the nodes the device stem + pool replace.
+    """
+    producers = {out: index for index, node in enumerate(model.graph.node) for out in node.output}
+    seen: set[int] = set()
+    stack = [value_name]
+    while stack:
+        index = producers.get(stack.pop())
+        if index is None or index in seen:
+            continue
+        seen.add(index)
+        stack.extend(model.graph.node[index].input)
+    return {i for i in seen if model.graph.node[i].op_type != "Constant"}

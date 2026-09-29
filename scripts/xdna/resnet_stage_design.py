@@ -22,7 +22,16 @@ from pathlib import Path
 
 import aie.iron as iron
 import numpy as np
-from aie.iron import CompileTime, ExternalFunction, In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron import (
+    CompileTime,
+    ExternalFunction,
+    In,
+    ObjectFifo,
+    Out,
+    Program,
+    Runtime,
+    Worker,
+)
 from aie.iron.controlflow import range_
 from aie.iron.dataflow import ObjectFifoLink
 from aie.iron.device import Tile
@@ -177,7 +186,7 @@ def resnet_stages(
         stem_handles = [stem_in, stem_w, pool_out]
 
     for index, col in enumerate(cols):
-        mid, act_obj, out_obj = col["mid"], col["act_obj"], col["out_obj"]
+        act_obj, out_obj = col["act_obj"], col["out_obj"]
         slot = col["slot"] + RT_DESC_BYTES
         act_ty = np.ndarray[(act_obj,), np.dtype[np.int8]]
         w_ty = np.ndarray[(slot,), np.dtype[np.uint8]]

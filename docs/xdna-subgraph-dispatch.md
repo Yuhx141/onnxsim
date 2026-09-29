@@ -376,6 +376,34 @@ generated assembly):
 - Descriptor + weights must match: use `--rt` at compile time and `pack_rt_params` (runner:
   `--fused-body-rt`; RPC: `options["rt"]` on compile, `fused_body["rt"]` on run).
 
+### Whole network on the device: stage columns + on-device stem/pool
+
+With runtime-shaped kernels a core column is not tied to a block shape, so `resnet_stage_design.py`
+runs each ResNet stage (projection block + identity blocks) in ONE column: FIFO objects are sized to
+the stage maximum, DDR transfers are always whole (padded) objects, activations between blocks stay in
+the linear 8-channel-blocked layout, and every weight slot is padded to the stage's common slot
+(`pack_rt_params(binding, slot_bytes=...)`). The four stages use 4 columns and 8 shim channels, and the
+body is bit-exact at 4.0 ms (8-column version: 4.16 ms; compile-time kernels: 3.6 ms). This frees 4
+columns and half the shim MM2S channels.
+
+`--stem` adds a fifth column that runs the stem Conv and MaxPool before the stages (`stem_pool.py`
+host side, `BLK_STEM`/`BLK_POOL` in `fused_bottleneck_rt.cc`): the host quantizes the float image
+(scale 2^-7, zero point 128) and builds a blocked im2col (K = 3*7*7 = 147 padded to 152, four chunks of
+64 pixels); core 0 runs the stem as a 1x1 GEMM per chunk with the requantization shift of 9 and ReLU
+(uint8 zero point 128 output, so the MaxPool is a plain byte max: padding 0 never wins because ReLU
+outputs are >= 128, and the pool's Q has the same scale as its input); core 1 assembles the 16x16 map
+and pools it to 8x8, and the result is drained to DDR as the first stage's input. It uses three extra
+shim streams (image, weights, pooled map) and no extra xclbin.
+
+Result (`run_resnet_xdna.py --device-network XCLBIN INSTS STAGES_JSON`): the pooled map equals ONNX
+Runtime's bit for bit, the image -> layer4 pipeline takes 4.18 ms on the device (only 0.18 ms more than
+the body), and the full graph runs in **5.15-5.3 ms** with logits identical to ORT CPU, versus ~7-8 ms with
+the stem/pool on the host. Two host-side fixes were needed to see that gain: constant-only
+`DequantizeLinear` nodes (weights, biases) are now evaluated once at start-up and skipped in the run loop
+(70 -> 14 host node visits per inference, ~0.5 ms), and the im2col is vectorized (0.35 -> 0.2 ms).
+What remains on the host: image quantize + im2col (~0.2 ms), GlobalAveragePool/Q/DQ/two Gemms (~0.4 ms)
+and Python overhead; the device call is ~4.3 ms.
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is

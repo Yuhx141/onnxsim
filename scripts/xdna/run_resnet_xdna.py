@@ -132,6 +132,7 @@ class XDNAResNetRunner:
         fused_body_chunk_caps: dict[str, int | None] | None = None,
         host_maxpool: bool = False,
         fused_body_rt: bool = False,
+        device_network_stages: list[list[str]] | None = None,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
         maxpool_uint8_artifact: tuple[str, str] | None = None,
         maxpool_runtime: str = "iron",
@@ -374,13 +375,15 @@ class XDNAResNetRunner:
         # state inference only packs the changing activation matrix.
         self._packed_weight_cache: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
         self._cpu_weight_cache: dict[int, np.ndarray] = {}
+        self._constant_dequant: dict[int, np.ndarray] = {}
         self._cpu_numpy_matrix_cache: dict[tuple[int, int], tuple[np.ndarray, bool]] = {}
         self._torch_weight_cache: dict[int, Any] = {}
         self._torch_int8_weight_cache: dict[int, tuple[Any, ...]] = {}
         fused_specs = list(fused_blocks or ())
-        self.fused_stage_blocked = fused_stage_blocked or bool(fused_body_groups)
+        self.fused_stage_blocked = fused_stage_blocked or bool(fused_body_groups) or bool(device_network_stages)
         self.fused_body_groups = fused_body_groups
         self.fused_body_rt = fused_body_rt
+        self.device_network_stages = device_network_stages
         self.fused_body_chunk_caps = fused_body_chunk_caps or {}
         stage_specs = list(fused_stages or ())
         parallel_specs = list(parallel_projection_blocks or ())
@@ -613,7 +616,14 @@ class XDNAResNetRunner:
             input_count = int(np.prod(bindings[0]["input_shape"]))
             output_count = int(np.prod(bindings[-1]["output_shape"]))
             input_tensor = iron.tensor(np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu")
-            if self.fused_stage_blocked:
+            network = None
+            if self.device_network_stages:
+                network = self._prepare_device_network(model, first_prefix, covered)
+                covered = network["covered"]
+                input_tensor, output_tensor = network["input"], network["output"]
+                parameter_tensor, extra_tensor = network["parameters"], network["scratch"]
+                tap_tensor = None
+            elif self.fused_stage_blocked:
                 try:
                     from blocked_stage import pack_blocked_params, pack_rt_params
                 except ImportError:
@@ -625,20 +635,22 @@ class XDNAResNetRunner:
                     stage_params = [pack_blocked_params(binding, header=bool(self.fused_body_groups)) for binding in bindings]
             else:
                 stage_params = [binding["params"] for binding in bindings]
-            parameter_tensor = iron.tensor(np.concatenate(stage_params), dtype=np.uint8, device="npu")
-            output_tensor = iron.zeros(output_count, dtype=np.int8, device="npu")
-            tap_tensor = None
-            if os.environ.get("ONNXSIM_XDNA_STAGE_TAP"):
-                # Debug: artifact built with --tap drains block 0's output as a 4th argument.
-                first_out = bindings[0]["output_shape"]
-                tap_tensor = iron.zeros(int(np.prod(first_out)), dtype=np.int8, device="npu")
-            extra_tensor = None
-            if self.fused_body_groups:
-                # Whole-body artifact: the 4th argument is a DDR scratch buffer holding
-                # every intermediate block boundary (all but the last block's output).
-                scratch = sum(int(np.prod(binding["output_shape"])) for binding in bindings[:-1])
-                extra_tensor = iron.zeros(max(scratch, 1), dtype=np.int8, device="npu")
+            if network is None:
+                parameter_tensor = iron.tensor(np.concatenate(stage_params), dtype=np.uint8, device="npu")
+                output_tensor = iron.zeros(output_count, dtype=np.int8, device="npu")
+                tap_tensor = None
+                if os.environ.get("ONNXSIM_XDNA_STAGE_TAP"):
+                    # Debug: artifact built with --tap drains block 0's output as a 4th argument.
+                    first_out = bindings[0]["output_shape"]
+                    tap_tensor = iron.zeros(int(np.prod(first_out)), dtype=np.int8, device="npu")
+                extra_tensor = None
+                if self.fused_body_groups:
+                    # Whole-body artifact: the 4th argument is a DDR scratch buffer holding
+                    # every intermediate block boundary (all but the last block's output).
+                    scratch = sum(int(np.prod(binding["output_shape"])) for binding in bindings[:-1])
+                    extra_tensor = iron.zeros(max(scratch, 1), dtype=np.int8, device="npu")
             self._fused_stages[first_prefix] = {
+                "network": network,
                 "extra": extra_tensor,
                 "tap": tap_tensor,
                 "blocks": blocks, "bindings": bindings, "input": input_tensor,
@@ -649,6 +661,23 @@ class XDNAResNetRunner:
             for index in covered:
                 self._fused_stage_nodes[index] = (first_prefix, index == first_index)
         self._plan_fused_input_handoffs()
+        # Constant-only DequantizeLinear nodes (weights/biases) are evaluated once here and then
+        # skipped in the run loop: visiting ~50 of them per inference cost more than the maths.
+        self._static_nodes: set[int] = set()
+        for index, node in enumerate(self.nodes):
+            if (
+                node.op_type == "DequantizeLinear"
+                and index not in self._fused_stage_nodes
+                and index not in self._fused_nodes
+                and all(name in self.arrays for name in node.input if name)
+                and len(node.input) >= 3
+            ):
+                attrs = _attrs(node)
+                self.arrays[node.output[0]] = _dequantize(
+                    self.arrays[node.input[0]], self.arrays[node.input[1]], self.arrays[node.input[2]],
+                    int(attrs.get("axis", 1)),
+                )
+                self._static_nodes.add(index)
 
     def runtime_subgraph_report(self) -> list[dict[str, Any]]:
         """Describe actual executor assignment over each planned graph region."""
@@ -1499,7 +1528,75 @@ class XDNAResNetRunner:
         )
         self._executed["fused_bottleneck"] += 1
 
+    def _prepare_device_network(self, model: Any, first_prefix: str, covered: set[int]) -> dict[str, Any]:
+        """Tensors + packing for the stem+pool+stage-column artifact (resnet_stage_design.py --stem)."""
+        import aie.iron as iron
+
+        try:
+            import stem_pool
+            from blocked_stage import pack_rt_params
+            from resnet_stage_design import stage_specs, stem_spec
+        except ImportError:
+            from . import stem_pool
+            from .blocked_stage import pack_rt_params
+            from .resnet_stage_design import stage_specs, stem_spec
+        cols, binds = stage_specs(model, self.device_network_stages)
+        stem = stem_pool.extract_stem(model)
+        spec = stem_spec(model, len(cols))
+        params = np.concatenate(
+            [stem_pool.pack_stem_params(stem)]
+            + [pack_rt_params(b, slot_bytes=c["slot"]) for c, bs in zip(cols, binds) for b in bs]
+        )
+        scratch = sum((c["repeat"] + 1) * c["out_obj"] for c in cols) - cols[-1]["out_obj"]
+        scratch += max(c["act_obj"] for c in cols) + cols[0]["act_obj"]
+        pre = stem_pool.stem_nodes(model, binds[0][0]["input_raw_name"])
+        return {
+            "covered": set(covered) | pre, "stem": stem, "cols": cols, "binds": binds,
+            "input": iron.tensor(np.zeros(spec["chunks"] * spec["chunk_in"], dtype=np.int8), dtype=np.int8, device="npu"),
+            "output": iron.zeros(cols[-1]["out_obj"], dtype=np.int8, device="npu"),
+            "parameters": iron.tensor(params, dtype=np.uint8, device="npu"),
+            "scratch": iron.zeros(scratch, dtype=np.int8, device="npu"),
+        }
+
+    def _run_device_network(self, values: dict[str, Any], stage: dict[str, Any]) -> None:
+        """Image in -> (stem Conv, MaxPool, all bottleneck stages) on the NPU -> last block output."""
+        network = stage["network"]
+        try:
+            import stem_pool
+        except ImportError:
+            from . import stem_pool
+        started = time.perf_counter()
+        image = np.asarray(values[network["stem"]["input_name"]], dtype=np.float32)
+        data = stem_pool.im2col_chunks(image, network["stem"])
+        with stage["input"].overwrite() as host_input:
+            np.copyto(host_input, data.view(np.int8))
+        self._profile["device_network_prepare_ms"] = self._profile.get("device_network_prepare_ms", 0.0) + (time.perf_counter() - started) * 1000.0
+        launch = time.perf_counter()
+        stage["kernel"](stage["input"], stage["parameters"], stage["output"], stage["extra"])
+        elapsed_ms = (time.perf_counter() - launch) * 1000.0
+        self._profile["fused_stage_kernel_call_ms"] = self._profile.get("fused_stage_kernel_call_ms", 0.0) + elapsed_ms
+        last = stage["bindings"][-1]
+        _, channels, height, width = last["output_shape"]
+        raw = (
+            stage["output"].numpy().view(np.uint8)[: channels * height * width]
+            .reshape(channels // 8, height * width, 8).transpose(0, 2, 1).reshape(1, channels, height, width).copy()
+        )
+        values[last["output_raw_name"]] = raw
+        values[last["output_dequant_name"]] = (
+            (raw.astype(np.float32) - float(last["output_zero_point"])) * np.float32(last["output_scale"])
+        )
+        self._fused_times.append({
+            "prefix": "device_network", "input_shape": list(image.shape), "output_shape": list(last["output_shape"]),
+            "device_resident_input": False, "linked_blocks": len(stage["bindings"]), "elapsed_ms": elapsed_ms,
+        })
+        self._executed["fused_stage"] = self._executed.get("fused_stage", 0) + 1
+        self._executed["fused_bottleneck"] += len(stage["bindings"])
+        self._executed["device_network"] = self._executed.get("device_network", 0) + 1
+
     def _run_fused_stage(self, values: dict[str, np.ndarray], stage: dict[str, Any]) -> None:
+        if stage.get("network") is not None:
+            self._run_device_network(values, stage)
+            return
         """Launch a linked multi-block stage once and expose only its final edge."""
         bindings = stage["bindings"]
         first, last = bindings[0], bindings[-1]
@@ -1625,6 +1722,8 @@ class XDNAResNetRunner:
         values = dict(self.arrays)
         values.update(inputs)
         for index, node in enumerate(self.nodes):
+            if index in self._static_nodes:
+                continue
             if index in self._fused_stage_nodes:
                 stage_prefix, is_start = self._fused_stage_nodes[index]
                 if is_start:
@@ -1691,7 +1790,14 @@ class XDNAResNetRunner:
             elif op == "QuantizeLinear":
                 result = _quantize(args[0], args[1], args[2], int(attrs.get("axis", 1)))
             elif op == "DequantizeLinear":
-                result = _dequantize(args[0], args[1], args[2], int(attrs.get("axis", 1)))
+                if all(name in self.arrays for name in node.input if name):
+                    # Every input is a constant (weights/bias): dequantize once, not per inference.
+                    result = self._constant_dequant.get(index)
+                    if result is None:
+                        result = _dequantize(args[0], args[1], args[2], int(attrs.get("axis", 1)))
+                        self._constant_dequant[index] = result
+                else:
+                    result = _dequantize(args[0], args[1], args[2], int(attrs.get("axis", 1)))
             elif op == "Conv":
                 result = self._run_conv(index, node, values)
             elif op == "Relu":
@@ -1783,6 +1889,10 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         help="run every bottleneck as ONE resnet_body_design.py artifact; GROUPS_JSON lists the "
              "block-prefix groups in execution order, e.g. '[[\"/layer1/layer1.0\"],[...]]'",
     )
+    parser.add_argument(
+        "--device-network", nargs=3, metavar=("XCLBIN", "INSTS", "STAGES_JSON"),
+        help="run stem Conv + MaxPool + every bottleneck stage as ONE resnet_stage_design.py --stem artifact; STAGES_JSON lists the block prefixes of each stage",
+    )
     parser.add_argument("--fused-body-rt", action="store_true", help="the --fused-body artifact was compiled with resnet_body_design.py --rt (runtime-shaped kernels)")
     parser.add_argument("--host-maxpool", action="store_true", help="run MaxPool on the host instead of an XDNA artifact")
     parser.add_argument("--fused-stage-blocked", action="store_true", help="fused stages were compiled with --blocked (vectorized layout)")
@@ -1804,6 +1914,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
     body_groups = None
     body_caps: dict[str, int | None] = {}
     body_stages = []
+    network_stages = None
     if args.fused_body:
         import json as _json
         raw_groups = _json.loads(args.fused_body[2])
@@ -1814,6 +1925,11 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
             for g in raw_groups if isinstance(g, dict) for prefix in g["blocks"]
         }
         body_stages = [(tuple(prefix for group in body_groups for prefix in group), args.fused_body[0], args.fused_body[1])]
+
+    if args.device_network:
+        import json as _json
+        network_stages = _json.loads(args.device_network[2])
+        body_stages = [(tuple(p for stage in network_stages for p in stage), args.device_network[0], args.device_network[1])]
 
     runner = XDNAResNetRunner(
         model,
@@ -1834,6 +1950,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         fused_body_chunk_caps=body_caps,
         host_maxpool=args.host_maxpool,
         fused_body_rt=args.fused_body_rt,
+        device_network_stages=network_stages,
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
         ],
