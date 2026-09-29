@@ -502,6 +502,15 @@ Tensor-core kernels in driving: 51.2 -> 39.1 ms. Not tried: weight-prefetch tuni
 between the two byte planes of an A16 activation. The compiler cache key is the fork commit: an uncommitted change re-serves the
 cached artifact, so commit before measuring.
 
+**FastRPC calls and data.** An inference is one FastRPC call (`tg_graph_run` runs all 371 kernel calls on the DSP), so there are no
+calls left to fuse. What crosses it is data: the recurrent state (`state_*_q` in, `next_state_*_q` out, 2.2 MB each way for driving)
+used to be copied through FastRPC every call. Now the emitter records which output slices feed which input regions (`G_NSTATE`,
+`G_ST_*` in `graph.h`, `state` records in `program.txt`), the skel loops the slices back on the DSP after every run, and
+`tg_graph_run`'s new `flags` argument leaves resident state out of the input and the output transfer. The gap between the runner's
+call and the DSP loop for driving: 6.2 -> 3.7 ms (RPC-inclusive 161-164 -> 157 ms); DM 2.4 -> 2.0 ms. Outputs are byte-identical
+and `--resident` checks the resident path bit for bit against sending the state back. What is left in the 3.7 ms: the camera frame
+(393 KB in), the DSP-side loop-back copy (2.2 MB), creating the graph and helper threads on every run, and the VTCM setup.
+
 **DSP clock vote (`DSP_V65_PERF_VOTE`, level 3 by default in `compile_v65.sh`).** The skel never voted for DSP power, so the cDSP ran
 at whatever DCVS chose for a light FastRPC client: identical runs of the same artifact ranged from 144 to 192 ms for driving and
 72 to 96 ms for DM, and a PMU probe of the tiny-kernel graphs measured about 360 MHz effective. The skel now takes the HVX power

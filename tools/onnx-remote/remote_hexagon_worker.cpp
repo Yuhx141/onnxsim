@@ -42,10 +42,11 @@ struct Program {
   std::vector<OutputSpec> outputs;
   std::vector<std::string> names;  // kernel name per call (program.txt "name"), for per-call profile events
   // recurrent state (program.txt "state <output> <input>": the output is the input's next value, e.g. next_state_img_q ->
-  // state_img_q). The last run's state outputs stay here, so a client can send such an input empty to mean "the resident
-  // value" and then gets that output back empty: the state never crosses the transport after the first call
+  // state_img_q), in ascending output order: pair k is bit k of tg_graph_run's flags. The program loops each state output back into
+  // its input on the DSP after every run, so a client can send such an input empty to mean "the value the last run produced" and
+  // then gets that output back empty: the state crosses neither the transport nor FastRPC after the first call
   std::vector<std::pair<int, int>> states;  // (output index, input ONNX index)
-  std::map<int, std::vector<uint8_t>> resident;  // input ONNX index -> bytes
+  bool ran = false;  // a run has completed: the state on the DSP is valid
   remote_handle64 handle = 0;
 };
 
@@ -227,36 +228,46 @@ Response execute(const Request& request) {
   std::sort(by_slot.begin(), by_slot.end(), [](const InputSpec* a, const InputSpec* b) { return a->slot < b->slot; });
   std::vector<uint8_t> packed;
   std::vector<bool> from_resident(request.inputs.size(), false);
-  for (const auto& [o, i] : p.states) {
+  int flags = 0;  // bit k: state pair k's input is on the DSP; bit 16+k: its output slice stays there too
+  for (size_t k = 0; k < p.states.size(); ++k) {
+    const int i = p.states[k].second;
     const Tensor& t = request.inputs[static_cast<size_t>(i)];
     if (!t.data.empty() || !t.raw_data.empty()) continue;
-    if (!p.resident.count(i)) {
-      response.error = "state input " + std::to_string(i) + " sent empty but has no resident value: send it in full first";
+    if (!p.ran) {
+      response.error = "state input " + std::to_string(i) + " sent empty but the program has not run yet: send it in full first";
       return response;
     }
     from_resident[static_cast<size_t>(i)] = true;
+    flags |= (1 << k) | (1 << (16 + k));
   }
   for (const InputSpec* s : by_slot) {
+    if (from_resident[static_cast<size_t>(s->onnx_index)]) continue;  // not packed: the skel skips it too
     const Tensor& t = request.inputs[static_cast<size_t>(s->onnx_index)];
-    const bool res = from_resident[static_cast<size_t>(s->onnx_index)];
-    const uint8_t* data = res ? p.resident[s->onnx_index].data()
-                              : t.dtype == 1 ? reinterpret_cast<const uint8_t*>(t.data.data()) : t.raw_data.data();
-    const size_t n = res ? p.resident[s->onnx_index].size() : t.dtype == 1 ? t.data.size() * 4 : t.raw_data.size();
-    if ((!res && t.dtype != s->dtype) || n != s->bytes) {
+    const uint8_t* data = t.dtype == 1 ? reinterpret_cast<const uint8_t*>(t.data.data()) : t.raw_data.data();
+    const size_t n = t.dtype == 1 ? t.data.size() * 4 : t.raw_data.size();
+    if (t.dtype != s->dtype || n != s->bytes) {
       response.error = "input " + std::to_string(s->onnx_index) + " dtype/size differs from the compiled model";
       return response;
     }
     packed.insert(packed.end(), data, data + n);
     packed.resize((packed.size() + 127) / 128 * 128);
   }
-  std::vector<uint8_t> out(p.output_bytes);
+  // the output without the state slices left on the DSP (each output's slot is its bytes rounded up to output_align)
+  auto slot = [&](const OutputSpec& o) { return (o.elements * dtype_bytes(o.dtype) + p.output_align - 1) / p.output_align * p.output_align; };
+  std::vector<bool> omit(p.outputs.size(), false);
+  size_t out_bytes = 0;
+  for (size_t k = 0; k < p.states.size(); ++k)
+    if (from_resident[static_cast<size_t>(p.states[k].second)]) omit[static_cast<size_t>(p.states[k].first)] = true;
+  for (size_t k = 0; k < p.outputs.size(); ++k) if (!omit[k]) out_bytes += slot(p.outputs[k]);
+  std::vector<uint8_t> out(out_bytes);
   const bool detailed = request.profiling == ProfilingLevel::Detailed;
   std::vector<uint64_t> times(detailed ? 1 + static_cast<size_t>(p.ncalls) : 1);
   const int threads = g_threads_override > 0 ? g_threads_override : p.threads;
   const uint64_t run0 = now_us();
-  int rc = tg_graph_run(p.handle, 0, p.ncalls, threads, packed.data(), static_cast<int>(packed.size()), out.data(),
+  int rc = tg_graph_run(p.handle, 0, p.ncalls, threads, flags, packed.data(), static_cast<int>(packed.size()), out.data(),
                         static_cast<int>(out.size()), reinterpret_cast<uint64*>(times.data()), static_cast<int>(times.size()));
   if (rc) { response.error = "tg_graph_run failed: " + std::to_string(rc); return response; }
+  p.ran = true;
   profile(response, request, "hexagon_run", run0 - t0, now_us() - run0,
           "dsp_us=" + std::to_string(times[0]) + " threads=" + std::to_string(threads));
   if (detailed) {
@@ -273,16 +284,11 @@ Response execute(const Request& request) {
     }
   }
   size_t at = 0;
-  std::vector<size_t> offsets;  // the program's output is the ONNX outputs' bytes back to back, each in its own dtype
-  for (const auto& o : p.outputs) {
-    offsets.push_back(at);
-    at = (at + o.elements * dtype_bytes(o.dtype) + p.output_align - 1) / p.output_align * p.output_align;
-  }
-  std::vector<bool> omit(p.outputs.size(), false);  // state outputs of inputs that came from the resident values
-  for (const auto& [o, i] : p.states) {
-    const size_t n = p.outputs[o].elements * dtype_bytes(p.outputs[o].dtype);
-    p.resident[i].assign(out.data() + offsets[o], out.data() + offsets[o] + n);
-    omit[o] = from_resident[static_cast<size_t>(i)];
+  std::vector<size_t> offsets(p.outputs.size(), 0);  // the returned outputs' bytes back to back, each in its own dtype
+  for (size_t k = 0; k < p.outputs.size(); ++k) {
+    if (omit[k]) continue;
+    offsets[k] = at;
+    at += slot(p.outputs[k]);
   }
   for (size_t k = 0; k < p.outputs.size(); ++k) {
     const auto& o = p.outputs[k];

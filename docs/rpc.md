@@ -79,7 +79,9 @@ output with the input it feeds, e.g. openpilot's `next_state_img_q` -> `state_im
 a client sends that input as an empty tensor (a zero dimension) to mean "the previous call's output", and the matching output
 comes back empty. `onnx-remote-client --compile-run ... --resident IN:OUT,...` does this and checks the result bit for bit
 against sending the state back explicitly. For openpilot's driving model this is 4.4 MB less per call: 470 -> 356 ms
-RPC-inclusive for 340 ms of runner time.
+RPC-inclusive for 340 ms of runner time. On the Hexagon runner the state also stays on the DSP: the program loops each state
+output back into its input region after every run and the runner leaves the state out of the FastRPC transfer in both
+directions (`flags` of `tg_graph_run`), which took the runner-side overhead of a driving call from 6.2 to 3.7 ms.
 
 ```python
 import numpy as np
