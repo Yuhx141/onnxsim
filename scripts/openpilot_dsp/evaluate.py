@@ -49,13 +49,23 @@ def run(
     backend="ort",
     device="DSP",
     target="snapdragon845",
+    compiler="127.0.0.1:39502",
+    runner="127.0.0.1:39520",
 ):
     d = np.load(os.path.join(inputs_dir, f"inputs_seg{seg}.npz"))
-    s = (
-        run_models.session(model, threads)
-        if backend == "ort"
-        else run_models.tinygrad_session(model, device, target)
-    )
+    if backend == "ort":
+        s = run_models.session(model, threads)
+    elif backend == "phone":
+        # the phone path: compile on the onnx-remote compiler service, run on the phone's Hexagon runner (phone_session.py)
+        from phone_session import PhoneSession
+
+        def hostport(x):
+            h, p = x.rsplit(":", 1)
+            return h, int(p)
+
+        s = PhoneSession(model, hostport(compiler), hostport(runner))
+    else:
+        s = run_models.tinygrad_session(model, device, target)
     if kind == "driving":
         return run_models.run_driving(s, d["road"], len(d["road"]))
     calib = [float(v) for v in SEG_CALIB[seg].split(",")]
@@ -113,7 +123,17 @@ def main():
     ap.add_argument("--segments", default="8,5")
     ap.add_argument("--inputs-dir", default=".")
     ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--backend", choices=["ort", "tinygrad"], default="ort")
+    ap.add_argument("--backend", choices=["ort", "tinygrad", "phone"], default="ort")
+    ap.add_argument(
+        "--compiler",
+        default="127.0.0.1:39502",
+        help="phone backend: onnx-remote-compiler host:port",
+    )
+    ap.add_argument(
+        "--runner",
+        default="127.0.0.1:39520",
+        help="phone backend: Hexagon runner host:port (adb forward)",
+    )
     ap.add_argument("--device", default="DSP")
     ap.add_argument("--target", default="snapdragon845")
     ap.add_argument("--json", help="append results to this JSON file")
@@ -147,7 +167,7 @@ def main():
                         seg,
                         args.inputs_dir,
                         args.threads,
-                        args.backend,
+                        "ort" if args.backend == "phone" else args.backend,
                         args.device,
                         args.target,
                     ),
@@ -163,6 +183,8 @@ def main():
                     args.backend,
                     args.device,
                     args.target,
+                    args.compiler,
+                    args.runner,
                 ),
                 slices,
             )

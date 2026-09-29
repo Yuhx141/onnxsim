@@ -4,7 +4,9 @@
 // Runs on the Android side of a Snapdragon (FastRPC to the cDSP, unsigned PD). Operations:
 //   capabilities                     the runner manifest
 //   load_compiled(id, artifact)      unpack, cache tg_graph_<id>.so, open it on the cDSP and upload the weights once
-//   run_compiled(id, tensors)        ONNX inputs in graph order -> ONNX outputs in graph order (float32)
+//   run_compiled(id, tensors)        ONNX inputs in graph order -> ONNX outputs in graph order (in their program.txt dtypes)
+//                                    a recurrent-state input (program.txt "state") sent empty takes the previous run's output,
+//                                    and that output comes back empty: after the first call the state stays on the phone
 // An artifact is TGHXV65\0, u32 file count, then per file u32 name length, name, u64 size, bytes: tg_graph.so (the skel),
 // blob.bin (weights) and program.txt (the I/O contract; see tinygrad's examples/openpilot/dsp_graph_v65.py).
 #include "remote_transport.h"
@@ -32,12 +34,19 @@ namespace fs = std::filesystem;
 namespace {
 
 struct InputSpec { int onnx_index = 0; uint32_t dtype = 0; uint64_t bytes = 0; int slot = -1; };
-struct OutputSpec { uint64_t elements = 0; std::vector<int64_t> shape; };
+struct OutputSpec { uint8_t dtype = 1; uint64_t elements = 0; std::vector<int64_t> shape; };
 struct Program {
   int ncalls = 0, threads = 1;
-  uint64_t output_bytes = 0;
+  uint64_t output_bytes = 0, output_align = 1;  // each output starts at a multiple of output_align bytes
   std::vector<InputSpec> inputs;  // ONNX graph order
   std::vector<OutputSpec> outputs;
+  std::vector<std::string> names;  // kernel name per call (program.txt "name"), for per-call profile events
+  // recurrent state (program.txt "state <output> <input>": the output is the input's next value, e.g. next_state_img_q ->
+  // state_img_q), in ascending output order: pair k is bit k of tg_graph_run's flags. The program loops each state output back into
+  // its input on the DSP after every run, so a client can send such an input empty to mean "the value the last run produced" and
+  // then gets that output back empty: the state crosses neither the transport nor FastRPC after the first call
+  std::vector<std::pair<int, int>> states;  // (output index, input ONNX index)
+  bool ran = false;  // a run has completed: the state on the DSP is valid
   remote_handle64 handle = 0;
 };
 
@@ -97,6 +106,7 @@ bool parse_program(const std::string& text, Program& p, std::string& error) {
     if (key == "ncalls") f >> p.ncalls;
     else if (key == "threads") f >> p.threads;
     else if (key == "output_bytes") f >> p.output_bytes;
+    else if (key == "output_align") f >> p.output_align;
     else if (key == "input") {
       InputSpec s;
       f >> s.onnx_index >> s.dtype >> s.bytes >> s.slot;
@@ -106,13 +116,30 @@ bool parse_program(const std::string& text, Program& p, std::string& error) {
       uint32_t dtype = 0;
       f >> dtype >> o.elements;
       for (int64_t d; f >> d;) o.shape.push_back(d);
-      if (dtype != 1) { error = "only float32 program outputs are supported"; return false; }
+      if (dtype > 255 || dtype_bytes(static_cast<uint8_t>(dtype)) == 0) { error = "unsupported program output dtype"; return false; }
+      o.dtype = static_cast<uint8_t>(dtype);
       p.outputs.push_back(o);
+    } else if (key == "state") {
+      int o = -1, i = -1;
+      f >> o >> i;
+      p.states.emplace_back(o, i);
+    } else if (key == "name") {
+      size_t i = 0;
+      std::string name;
+      f >> i >> name;
+      if (i < 100000) { if (p.names.size() <= i) p.names.resize(i + 1); p.names[i] = name; }
     } else if (!key.empty()) { error = "unknown program record: " + key; return false; }
   }
   uint64_t total = 0;
-  for (const auto& o : p.outputs) total += o.elements * 4;
+  if (p.output_align == 0) { error = "inconsistent program.txt"; return false; }
+  for (const auto& o : p.outputs) total = (total + o.elements * dtype_bytes(o.dtype) + p.output_align - 1) / p.output_align * p.output_align;
   if (p.ncalls <= 0 || p.outputs.empty() || total != p.output_bytes) { error = "inconsistent program.txt"; return false; }
+  for (const auto& [o, idx] : p.states) {
+    const int i = idx;  // (a structured binding can't be captured in C++17)
+    const auto in = std::find_if(p.inputs.begin(), p.inputs.end(), [&](const InputSpec& s) { return s.onnx_index == i; });
+    if (o < 0 || o >= static_cast<int>(p.outputs.size()) || in == p.inputs.end() || in->dtype != p.outputs[o].dtype ||
+        in->bytes != p.outputs[o].elements * dtype_bytes(p.outputs[o].dtype)) { error = "inconsistent program.txt state"; return false; }
+  }
   return true;
 }
 
@@ -136,16 +163,30 @@ bool load(const std::string& id, const std::vector<uint8_t>& artifact, Response&
     if (!so) { response.error = "cannot write the skel to the cache dir"; return false; }
   }
   const std::string uri = "file:///" + so_name + "?tg_graph_skel_handle_invoke&_modver=1.0&_dom=cdsp";
-  int rc = tg_graph_open(uri.c_str(), &program->handle);
-  if (rc) { response.error = "FastRPC open of " + so_name + " failed: " + std::to_string(rc); return false; }
-  const auto& [boff, bn] = files["blob.bin"];
+  const size_t boff = files["blob.bin"].first, bn = files["blob.bin"].second;  // (plain locals: the lambda below captures them)
   constexpr size_t kChunk = 8u << 20;  // well under FastRPC's per-buffer limit
-  for (size_t at = 0; at < bn || at == 0; at += kChunk) {
-    const size_t n = std::min(kChunk, bn - at);
-    rc = tg_graph_load(program->handle, static_cast<int>(at), static_cast<int>(bn), artifact.data() + boff + at, static_cast<int>(n));
-    if (rc) { tg_graph_close(program->handle); response.error = "weight upload failed: " + std::to_string(rc); return false; }
-    if (bn == 0) break;
+  // Open the skel and upload the weights. The DSP's unsigned PD has room for a few hundred MB, and every loaded program keeps its
+  // weights there: when a load fails while others are loaded, evict them (they re-attach from the client's artifact on their
+  // next load_compiled) and try once more.
+  auto attempt = [&]() -> int {
+    int rc = tg_graph_open(uri.c_str(), &program->handle);
+    if (rc) { response.error = "FastRPC open of " + so_name + " failed: " + std::to_string(rc); return rc; }
+    for (size_t at = 0; at < bn || at == 0; at += kChunk) {
+      const size_t n = std::min(kChunk, bn - at);
+      rc = tg_graph_load(program->handle, static_cast<int>(at), static_cast<int>(bn), artifact.data() + boff + at, static_cast<int>(n));
+      if (rc) { tg_graph_close(program->handle); response.error = "weight upload failed: " + std::to_string(rc); return rc; }
+      if (bn == 0) break;
+    }
+    return 0;
+  };
+  int rc = attempt();
+  if (rc && !g_programs.empty()) {
+    for (auto& entry : g_programs) tg_graph_close(entry.second->handle);
+    g_programs.clear();
+    rc = attempt();
   }
+  if (rc) return false;
+  response.error.clear();
   g_programs[id] = std::move(program);
   return true;
 }
@@ -186,7 +227,21 @@ Response execute(const Request& request) {
   for (const auto& s : p.inputs) if (s.slot >= 0) by_slot.push_back(&s);
   std::sort(by_slot.begin(), by_slot.end(), [](const InputSpec* a, const InputSpec* b) { return a->slot < b->slot; });
   std::vector<uint8_t> packed;
+  std::vector<bool> from_resident(request.inputs.size(), false);
+  int flags = 0;  // bit k: state pair k's input is on the DSP; bit 16+k: its output slice stays there too
+  for (size_t k = 0; k < p.states.size(); ++k) {
+    const int i = p.states[k].second;
+    const Tensor& t = request.inputs[static_cast<size_t>(i)];
+    if (!t.data.empty() || !t.raw_data.empty()) continue;
+    if (!p.ran) {
+      response.error = "state input " + std::to_string(i) + " sent empty but the program has not run yet: send it in full first";
+      return response;
+    }
+    from_resident[static_cast<size_t>(i)] = true;
+    flags |= (1 << k) | (1 << (16 + k));
+  }
   for (const InputSpec* s : by_slot) {
+    if (from_resident[static_cast<size_t>(s->onnx_index)]) continue;  // not packed: the skel skips it too
     const Tensor& t = request.inputs[static_cast<size_t>(s->onnx_index)];
     const uint8_t* data = t.dtype == 1 ? reinterpret_cast<const uint8_t*>(t.data.data()) : t.raw_data.data();
     const size_t n = t.dtype == 1 ? t.data.size() * 4 : t.raw_data.size();
@@ -197,26 +252,58 @@ Response execute(const Request& request) {
     packed.insert(packed.end(), data, data + n);
     packed.resize((packed.size() + 127) / 128 * 128);
   }
-  std::vector<uint8_t> out(p.output_bytes);
+  // the output without the state slices left on the DSP (each output's slot is its bytes rounded up to output_align)
+  auto slot = [&](const OutputSpec& o) { return (o.elements * dtype_bytes(o.dtype) + p.output_align - 1) / p.output_align * p.output_align; };
+  std::vector<bool> omit(p.outputs.size(), false);
+  size_t out_bytes = 0;
+  for (size_t k = 0; k < p.states.size(); ++k)
+    if (from_resident[static_cast<size_t>(p.states[k].second)]) omit[static_cast<size_t>(p.states[k].first)] = true;
+  for (size_t k = 0; k < p.outputs.size(); ++k) if (!omit[k]) out_bytes += slot(p.outputs[k]);
+  std::vector<uint8_t> out(out_bytes);
   const bool detailed = request.profiling == ProfilingLevel::Detailed;
   std::vector<uint64_t> times(detailed ? 1 + static_cast<size_t>(p.ncalls) : 1);
   const int threads = g_threads_override > 0 ? g_threads_override : p.threads;
   const uint64_t run0 = now_us();
-  int rc = tg_graph_run(p.handle, 0, p.ncalls, threads, packed.data(), static_cast<int>(packed.size()), out.data(),
+  int rc = tg_graph_run(p.handle, 0, p.ncalls, threads, flags, packed.data(), static_cast<int>(packed.size()), out.data(),
                         static_cast<int>(out.size()), reinterpret_cast<uint64*>(times.data()), static_cast<int>(times.size()));
   if (rc) { response.error = "tg_graph_run failed: " + std::to_string(rc); return response; }
+  p.ran = true;
   profile(response, request, "hexagon_run", run0 - t0, now_us() - run0,
           "dsp_us=" + std::to_string(times[0]) + " threads=" + std::to_string(threads));
-  if (detailed)
-    for (int i = 0, k = 0; i < p.ncalls && k < static_cast<int>(kMaxProfileEvents) - 2; ++i)
-      if (times[1 + i] > 0) response.profile.push_back(ProfileEvent{"call_" + std::to_string(i), "hexagon_call", 0, times[1 + i], ""}), ++k;
+  if (detailed) {
+    // the transport carries at most kMaxProfileEvents events: send the slowest calls, not the first ones
+    std::vector<int> order(p.ncalls);
+    for (int i = 0; i < p.ncalls; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return times[1 + a] > times[1 + b]; });
+    const size_t room = kMaxProfileEvents - response.profile.size() - 1;
+    for (size_t k = 0; k < order.size() && k < room; ++k) {
+      const int i = order[k];
+      if (times[1 + i] == 0) break;
+      response.profile.push_back(ProfileEvent{"call_" + std::to_string(i), "hexagon_call", 0, times[1 + i],
+                                              i < static_cast<int>(p.names.size()) ? p.names[i] : ""});
+    }
+  }
   size_t at = 0;
-  for (const auto& o : p.outputs) {
+  std::vector<size_t> offsets(p.outputs.size(), 0);  // the returned outputs' bytes back to back, each in its own dtype
+  for (size_t k = 0; k < p.outputs.size(); ++k) {
+    if (omit[k]) continue;
+    offsets[k] = at;
+    at += slot(p.outputs[k]);
+  }
+  for (size_t k = 0; k < p.outputs.size(); ++k) {
+    const auto& o = p.outputs[k];
     Tensor t;
     t.shape = o.shape;
-    t.data.resize(o.elements);
-    std::memcpy(t.data.data(), out.data() + at, o.elements * 4);
-    at += o.elements * 4;
+    t.dtype = o.dtype;
+    const size_t n = o.elements * dtype_bytes(o.dtype);
+    if (omit[k]) {
+      t.shape = {0};
+    } else if (o.dtype == 1) {
+      t.data.resize(o.elements);
+      std::memcpy(t.data.data(), out.data() + offsets[k], n);
+    } else {
+      t.raw_data.assign(out.data() + offsets[k], out.data() + offsets[k] + n);
+    }
     response.outputs.push_back(std::move(t));
   }
   response.ok = true;

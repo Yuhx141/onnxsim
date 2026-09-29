@@ -51,7 +51,10 @@ The latter is the only component that knows whether an artifact remains valid
 for a particular compiler, SDK, driver, device, and I/O ABI.
 
 `tools/onnx-remote/onnx-remote-compiler` provides a small dependency-free
-compiler endpoint for this split. It accepts `COMPILE` requests, invokes a
+compiler endpoint for this split. It serves each request on its own thread:
+cache hits are answered while other models compile, `--jobs N` (default 2)
+bounds concurrent cold compiles, and a second request for a model already being
+compiled waits for that compile and reuses its artifact. It accepts `COMPILE` requests, invokes a
 trusted command template with `{input}`, `{output}`, `{manifest}`, and
 `{target}` paths, and persists the resulting artifact and manifest. This is a
 convenient SNPE replacement boundary: a QAIRT/QNN wrapper can perform ONNX
@@ -70,6 +73,15 @@ Compiled execution can optionally use a load/attach handshake: the host sends
 `run_compiled(artifact_id, tensors)` without repeating the artifact bytes. The
 native executor keeps this disabled by default for stateless compatibility; set
 `attach_compiled_artifact=true` for a runner with persistent artifact storage.
+
+A runner may also keep a model's recurrent state resident (the Hexagon v65 runner does, for artifacts whose manifest pairs an
+output with the input it feeds, e.g. openpilot's `next_state_img_q` -> `state_img_q`). After one call that sends the state,
+a client sends that input as an empty tensor (a zero dimension) to mean "the previous call's output", and the matching output
+comes back empty. `onnx-remote-client --compile-run ... --resident IN:OUT,...` does this and checks the result bit for bit
+against sending the state back explicitly. For openpilot's driving model this is 4.4 MB less per call: 470 -> 356 ms
+RPC-inclusive for 340 ms of runner time. On the Hexagon runner the state also stays on the DSP: the program loops each state
+output back into its input region after every run and the runner leaves the state out of the FastRPC transfer in both
+directions (`flags` of `tg_graph_run`), which took the runner-side overhead of a driving call from 6.2 to 3.7 ms.
 
 ```python
 import numpy as np

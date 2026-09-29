@@ -76,29 +76,6 @@ bool take_string(const std::vector<char>& b, size_t& at, uint32_t max_bytes,
   at += n;
   return true;
 }
-size_t dtype_bytes(uint8_t dtype) {
-  switch (dtype) {
-    case 1:  // FLOAT
-    case 6:  // INT32
-    case 12: // UINT32
-      return 4;
-    case 2:  // UINT8
-    case 3:  // INT8
-    case 9:  // BOOL
-      return 1;
-    case 4:  // UINT16
-    case 5:  // INT16
-    case 10: // FLOAT16
-    case 16: // BFLOAT16
-      return 2;
-    case 7:  // INT64
-    case 11: // DOUBLE
-    case 13: // UINT64
-      return 8;
-    default:
-      return 0;
-  }
-}
 
 bool checked_tensor(const Tensor& t, std::string& error) {
   if (t.shape.size() > kMaxRank) { error = "tensor rank exceeds limit"; return false; }
@@ -106,8 +83,9 @@ bool checked_tensor(const Tensor& t, std::string& error) {
   if (element_bytes == 0) { error = "unsupported tensor dtype"; return false; }
   uint64_t elements = 1;
   for (int64_t d : t.shape) {
-    if (d <= 0 || static_cast<uint64_t>(d) > kMaxTensorBytes ||
-        elements > kMaxTensorBytes / static_cast<uint64_t>(d)) {
+    // a zero dimension is an empty tensor (ONNX allows them; runners use one as "no data sent")
+    if (d < 0 || static_cast<uint64_t>(d) > kMaxTensorBytes ||
+        (d > 0 && elements > kMaxTensorBytes / static_cast<uint64_t>(d))) {
       error = "invalid tensor shape"; return false;
     }
     elements *= static_cast<uint64_t>(d);
@@ -159,7 +137,7 @@ bool decode_tensors(const std::vector<char>& b, size_t& at, std::vector<Tensor>&
     t.shape.resize(rank); uint64_t elements = 1;
     for (auto& d : t.shape) {
       uint64_t ud;
-      if (!take_u64(b, at, ud) || ud == 0 || ud > kMaxTensorBytes || elements > kMaxTensorBytes / ud) {
+      if (!take_u64(b, at, ud) || ud > kMaxTensorBytes || (ud > 0 && elements > kMaxTensorBytes / ud)) {
         error = "invalid tensor dimension"; return false;
       }
       d = static_cast<int64_t>(ud); elements *= ud;
@@ -385,6 +363,30 @@ bool send_message(int fd, uint16_t kind, const std::vector<char>& payload, std::
 }
 
 }  // namespace
+
+size_t dtype_bytes(uint8_t dtype) {
+  switch (dtype) {
+    case 1:  // FLOAT
+    case 6:  // INT32
+    case 12: // UINT32
+      return 4;
+    case 2:  // UINT8
+    case 3:  // INT8
+    case 9:  // BOOL
+      return 1;
+    case 4:  // UINT16
+    case 5:  // INT16
+    case 10: // FLOAT16
+    case 16: // BFLOAT16
+      return 2;
+    case 7:  // INT64
+    case 11: // DOUBLE
+    case 13: // UINT64
+      return 8;
+    default:
+      return 0;
+  }
+}
 
 int listen_tcp(uint16_t port, int backlog) {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) return -1;

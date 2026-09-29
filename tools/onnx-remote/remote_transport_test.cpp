@@ -76,6 +76,21 @@ int main() {
   assert(decoded_subgraph.model == subgraph.model);
   assert(decoded_subgraph.inputs[0].data == subgraph.inputs[0].data);
 
+  // an empty tensor (a zero dimension) round-trips: a stateful runner reads it as "use the resident value"
+  Request empty_request;
+  empty_request.op = "run_compiled";
+  empty_request.inputs.push_back(Tensor{{0}, {}, 2, {}});
+  empty_request.inputs.push_back(Tensor{{3, 0}, {}, 1, {}});
+  assert(encode_request_payload(empty_request, payload, error));
+  Request decoded_empty;
+  assert(decode_request_payload(payload.data(), payload.size(), decoded_empty, error));
+  assert(decoded_empty.inputs.size() == 2);
+  assert(decoded_empty.inputs[0].shape == std::vector<int64_t>{0} && decoded_empty.inputs[0].dtype == 2);
+  assert(decoded_empty.inputs[0].raw_data.empty());
+  assert((decoded_empty.inputs[1].shape == std::vector<int64_t>{3, 0}) && decoded_empty.inputs[1].data.empty());
+  empty_request.inputs[0].raw_data = {1};  // a payload for zero elements is still a mismatch
+  assert(!encode_request_payload(empty_request, payload, error));
+
   Request typed_request;
   typed_request.op = "run_compiled";
   Tensor fp16;

@@ -275,10 +275,12 @@ static bool exchange(const std::string& host, uint16_t port, const Request& requ
 
 static int compile_run(int argc, char** argv) {
   // onnx-remote-client --compile-run COMPILER_HOST PORT RUNNER_HOST PORT MODEL.onnx
-  //     [--input-raw DTYPE:D0,D1,...:FILE]... [--expect FILE] [--dump FILE] [--iters N] [--profile]
+  //     [--input-raw DTYPE:D0,D1,...:FILE]... [--expect FILE] [--dump FILE] [--iters N] [--profile] [--resident IN:OUT,...]
   // The compiler/runner split end to end: COMPILE the model, load_compiled the artifact on the runner once, then
   // run_compiled without artifact bytes. Inputs are raw little-endian files in ONNX graph order; --expect compares the
-  // outputs, concatenated as float32, byte for byte.
+  // outputs' bytes, concatenated, byte for byte (of the first run). --resident names recurrent-state inputs and the outputs that
+  // are their next values (e.g. 4:1 for state_img_q <- next_state_img_q): after the first run they are sent empty so the runner
+  // uses its resident copy, and a check compares that against sending the state back explicitly.
   if (argc < 7) { std::cerr << "usage: onnx-remote-client --compile-run CHOST CPORT RHOST RPORT MODEL.onnx [...]\n"; return 2; }
   const std::string chost = argv[2], rhost = argv[4], model_path = argv[6];
   const auto cport = static_cast<uint16_t>(std::strtoul(argv[3], nullptr, 10));
@@ -287,6 +289,7 @@ static int compile_run(int argc, char** argv) {
   std::string expect_path, dump_path;
   int iters = 3;
   bool profiling = false;
+  std::vector<std::pair<size_t, size_t>> resident;  // (input index, output index)
   for (int i = 7; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--input-raw" && i + 1 < argc) {
@@ -307,6 +310,14 @@ static int compile_run(int argc, char** argv) {
     else if (a == "--dump" && i + 1 < argc) dump_path = argv[++i];
     else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
     else if (a == "--profile") profiling = true;
+    else if (a == "--resident" && i + 1 < argc) {
+      std::istringstream rs(argv[++i]);
+      for (std::string pair; std::getline(rs, pair, ',');) {
+        const auto colon = pair.find(':');
+        if (colon == std::string::npos) { std::cerr << "--resident takes IN:OUT pairs\n"; return 2; }
+        resident.emplace_back(std::strtoul(pair.substr(0, colon).c_str(), nullptr, 10), std::strtoul(pair.substr(colon + 1).c_str(), nullptr, 10));
+      }
+    }
     else { std::cerr << "unknown argument: " << a << '\n'; return 2; }
   }
   Request compile;
@@ -332,28 +343,82 @@ static int compile_run(int argc, char** argv) {
   run.artifact_id = load.artifact_id;
   run.inputs = std::move(inputs);
   run.profiling = profiling ? ProfilingLevel::Detailed : ProfilingLevel::Summary;
-  Response result;
-  double best = 1e30;
+  for (const auto& [in, out] : resident)
+    if (in >= run.inputs.size()) { std::cerr << "--resident input " << in << " out of range\n"; return 2; }
+  const std::vector<Tensor> full_inputs = run.inputs;
+  auto state_empty = [&](Request& r) { for (const auto& [in, out] : resident) r.inputs[in] = Tensor{{0}, {}, r.inputs[in].dtype, {}}; };
+  Response result, first;
+  double best = 1e30, first_ms = 0;
   for (int it = 0; it < std::max(iters, 1); ++it) {
     t0 = std::chrono::steady_clock::now();
     if (!exchange(rhost, rport, run, result)) return 1;
+    // with --resident the first run sends the state (its time is reported separately), the rest leave it on the runner
+    if (it == 0) { first = result; first_ms = ms(t0); if (!resident.empty()) { state_empty(run); if (iters > 1) continue; } }
     best = std::min(best, ms(t0));
   }
   std::cout << "run_compiled: " << result.outputs.size() << " outputs, best " << best << " ms of " << std::max(iters, 1)
-            << " (RPC-inclusive)\n";
-  for (const auto& e : result.profile)
-    if (e.category != "hexagon_call" || profiling) std::cout << "  " << e.name << ' ' << e.duration_us << " us " << e.detail << '\n';
+            << " (RPC-inclusive)";
+  if (!resident.empty()) std::cout << ", state resident on the runner after the first run (" << first_ms << " ms)";
+  std::cout << '\n';
+  auto bytes_of = [](const Tensor& t) {
+    if (t.dtype != 1) return t.raw_data;
+    const auto* b = reinterpret_cast<const uint8_t*>(t.data.data());
+    return std::vector<uint8_t>(b, b + t.data.size() * 4);
+  };
+  if (!resident.empty()) {
+    // the second step two ways: the first run's state outputs sent back explicitly, vs (after re-sending the original state,
+    // which resets the runner's copy to the same values) sent empty
+    Request explicit_run = run, reset = run, resident_run = run;
+    explicit_run.profiling = reset.profiling = resident_run.profiling = ProfilingLevel::Off;
+    explicit_run.inputs = full_inputs;
+    for (const auto& [in, out] : resident) {
+      if (out >= first.outputs.size()) { std::cerr << "--resident output " << out << " out of range\n"; return 2; }
+      explicit_run.inputs[in] = first.outputs[out];
+      explicit_run.inputs[in].shape = full_inputs[in].shape;
+    }
+    reset.inputs = full_inputs;
+    Response a, b, c;
+    if (!exchange(rhost, rport, explicit_run, a) || !exchange(rhost, rport, reset, b) || !exchange(rhost, rport, resident_run, c)) return 1;
+    bool same = a.outputs.size() == c.outputs.size();
+    for (size_t k = 0; same && k < a.outputs.size(); ++k) {
+      const bool is_state = std::any_of(resident.begin(), resident.end(), [&](const auto& r) { return r.second == k; });
+      if (!is_state) same = bytes_of(a.outputs[k]) == bytes_of(c.outputs[k]);
+      else same = c.outputs[k].data.empty() && c.outputs[k].raw_data.empty();
+    }
+    std::cout << "resident state: " << (same ? "bit-exact to sending it back" : "DIFFERS from sending it back") << '\n';
+    if (!same) return 1;
+  }
+  std::vector<const ProfileEvent*> calls;
+  for (const auto& e : result.profile) {
+    if (e.category == "hexagon_call") calls.push_back(&e);
+    else std::cout << "  " << e.name << ' ' << e.duration_us << " us " << e.detail << '\n';
+  }
+  if (profiling && !calls.empty()) {
+    // per-kernel device time of the last run, slowest first (PROF_TOP, default 15)
+    uint64_t total = 0;
+    for (const auto* e : calls) total += e->duration_us;
+    std::sort(calls.begin(), calls.end(), [](const ProfileEvent* a, const ProfileEvent* b) { return a->duration_us > b->duration_us; });
+    const char* top_env = std::getenv("PROF_TOP");
+    const size_t top = std::min(calls.size(), static_cast<size_t>(top_env ? std::atoi(top_env) : 15));
+    std::cout << "  " << calls.size() << " profiled calls, " << total << " us:\n";
+    for (size_t i = 0; i < top; ++i)
+      std::cout << "    " << calls[i]->name << ' ' << calls[i]->duration_us << " us " << (100.0 * calls[i]->duration_us / total)
+                << "% " << calls[i]->detail << '\n';
+  }
   if (!dump_path.empty()) {
     std::ofstream f(dump_path, std::ios::binary | std::ios::trunc);
-    for (const auto& t : result.outputs) f.write(reinterpret_cast<const char*>(t.data.data()), t.data.size() * 4);
+    for (const auto& t : first.outputs) {
+      const auto b = bytes_of(t);
+      f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+    }
   }
   if (!expect_path.empty()) {
     std::ifstream f(expect_path, std::ios::binary);
     std::vector<uint8_t> expect((std::istreambuf_iterator<char>(f)), {});
     std::vector<uint8_t> got;
-    for (const auto& t : result.outputs) {
-      const auto* b = reinterpret_cast<const uint8_t*>(t.data.data());
-      got.insert(got.end(), b, b + t.data.size() * 4);
+    for (const auto& t : first.outputs) {
+      const auto b = bytes_of(t);
+      got.insert(got.end(), b.begin(), b.end());
     }
     size_t bad = got.size() == expect.size() ? 0 : std::max(got.size(), expect.size());
     for (size_t i = 0; i < std::min(got.size(), expect.size()) && bad == 0; ++i) bad += got[i] != expect[i];

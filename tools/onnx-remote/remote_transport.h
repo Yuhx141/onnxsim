@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -16,6 +17,9 @@ struct Tensor {
   uint8_t dtype = 1;
   std::vector<uint8_t> raw_data;
 };
+
+// Bytes per element of an ONNX TensorProto.DataType the transport carries; 0 for an unsupported one.
+size_t dtype_bytes(uint8_t dtype);
 
 enum class ProfilingLevel : uint8_t {
   Off = 0,
