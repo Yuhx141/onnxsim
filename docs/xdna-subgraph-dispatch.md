@@ -321,6 +321,17 @@ and conv3 each run on a single core; only conv2 uses two). Spreading every conv 
 four cores of a column (data-parallel over output channels, with memtile join/broadcast between
 phases) is the change that would raise the ingress rate.
 
+Vitis AI inspection (`docs/xdna-vitis-ai-inspection.md`, measured on this host: 1.55 ms min on the
+same 32x32 quicktest model): one generic unified xclbin (8 columns, PDI only 19 KB), one HW
+context and exactly one EXEC_CMD per inference; an embedded ELF control program sequences 71
+layers (55 conv, 16 residual adds, pool) with no block fusion, and **every layer uses all 8
+columns** (`enable_col_num=8`, tiling modes OH4OC8/OH8OC4/OH16OC2 split output channels across
+columns) so each layer's weights stream on all 8 shim channels. All 25 MB of int8 weights sit in
+one host BO and are re-streamed every inference (no residency, no compression); activations
+round-trip through DDR between layers. Device time is ~98% of wall, and even Vitis reaches only
+~17 GB/s effective (2x its own cost model). This is the architecture that removes our floor:
+21 MB over 8 streams is ~0.4 ms versus ~3 ms over the one active stream per block kind.
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is
