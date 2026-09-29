@@ -204,3 +204,23 @@ def test_concat_header_found_once_in_every_conv_template():
         want = meta.get("concat_shift_class")
         if want and cats:
             assert (cats[0][5] == 0) == (want == "k0"), name
+
+
+# A bare live-operand [1,64,128] x [1,128,64] MatMul at layer precision U16
+# (``pilot_matmul_u16.py``), built at two calibrations. The 16-bit path adds
+# fixed 256.0/1.0 lanes and scales the npu_params multiplier lane by 256.
+U16 = {
+    name: _build(
+        os.path.join(HERE, f"matmul_1x64x128x64_u16_{name}.axmodel.gz"),
+        os.path.join(HERE, f"matmul_1x64x128x64_u16_{name}.quant.json.gz"),
+    )
+    for name in ("a", "b")
+}
+
+
+@pytest.mark.parametrize("src,dst", [("a", "b"), ("b", "a")])
+def test_u16_matmul_recalibrates_to_the_native_build(src, dst):
+    out, _ = mre.recalibrate(U16[src][0], U16[src][1], U16[dst][1])
+    diff = mre.compare(out, U16[dst][0])
+    assert diff["record_diffs"] == []
+    assert diff["params_diff_bytes"] == 0

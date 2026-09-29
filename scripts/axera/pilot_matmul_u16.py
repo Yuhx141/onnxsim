@@ -65,13 +65,17 @@ def main():
     ap.add_argument("work")
     ap.add_argument("--shape", nargs=3, type=int, default=[64, 128, 64])
     ap.add_argument("--precisions", default="U8,U16,S16")
+    ap.add_argument("--tag", default="", help="suffix for the build directory")
+    ap.add_argument("--xscale", type=float, default=1.0)
+    ap.add_argument("--wscale", type=float, default=1.0)
+    ap.add_argument("--xshift", type=float, default=0.0)
     a = ap.parse_args()
     m, k, n = a.shape
     rng = np.random.RandomState(0)
-    xs = [rng.randn(1, m, k).astype(np.float32) for _ in range(8)]
-    ws = [rng.randn(1, k, n).astype(np.float32) * 0.1 for _ in range(8)]
+    xs = [(rng.randn(1, m, k) * a.xscale + a.xshift).astype(np.float32) for _ in range(8)]
+    ws = [(rng.randn(1, k, n) * 0.1 * a.wscale).astype(np.float32) for _ in range(8)]
     for prec in a.precisions.split(","):
-        root, res = build_case(a.work, prec, m, k, n, prec, xs, ws)
+        root, res = build_case(a.work, prec + a.tag, m, k, n, prec, xs, ws)
         print(prec, "success", res.success, (res.error or res.stdout_tail or "")[-1500:] if not res.success else "")
         if not res.success:
             continue

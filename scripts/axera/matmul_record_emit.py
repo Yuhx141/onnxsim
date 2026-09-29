@@ -213,6 +213,9 @@ def evaluate(role: Role, scales: Scales) -> int:
         return _bits(s[role[1]] / s[role[2]])
     if kind == "mult":
         return _bits(s[role[1]] * s[role[2]] / s[role[3]])
+    if kind == "mult256":
+        # the 16-bit path's npu_params lane: 256 * s_a * s_b / s_y
+        return _bits(256 * s[role[1]] * s[role[2]] / s[role[3]])
     if kind == "meanr":
         # float32 arithmetic: in float64 the Gemm chain's lane comes out one
         # ulp high (0x3d84030f for the native 0x3d84030e).
@@ -361,6 +364,11 @@ def float_roles(tensors: Iterable[str]) -> list[Role]:
     roles += [("ratio", a, b) for a, b in itertools.permutations(ts, 2)]
     roles += [
         ("mult", a, b, c)
+        for a, b in itertools.combinations_with_replacement(ts, 2)
+        for c in ts
+    ]
+    roles += [
+        ("mult256", a, b, c)
         for a, b in itertools.combinations_with_replacement(ts, 2)
         for c in ts
     ]
@@ -656,6 +664,7 @@ PRECEDENCE = (
     "inv",
     "ratio",
     "mult",
+    "mult256",
     "meanr",
     "zpoff",
     "qshift",
@@ -672,7 +681,15 @@ double-rounding tie. So the simplest formula wins, and within a kind the
 formula must be unique."""
 
 
+FIXED_LANES = frozenset({0x43800000, 0x3F800000})
+"""Float32 lanes (256.0 and 1.0) that a U16/S16 MatMul carries at
+``0x0f50..0x1000`` next to its scale lanes. They match no scale formula and are
+identical in every 16-bit build of a shape, so they are left as they are."""
+
+
 def _new_value(where: str, value: int, roles: list[Role], new: Scales) -> int:
+    if not roles and value in FIXED_LANES:
+        return value
     if not roles:
         raise CalibrationError(f"{where}: value {value:#010x} matches no scale formula")
     kind = min((r[0] for r in roles), key=PRECEDENCE.index)

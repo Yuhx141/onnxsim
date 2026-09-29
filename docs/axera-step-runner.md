@@ -378,6 +378,12 @@ Mul) still on the host for lack of FP32 templates. Not yet run on the device.
 `op_types: ["MatMul"]`). Pulsar2 accepts U16 and S16 for MatMul. On the AX8850,
 [1,64,128]x[1,128,64] has relative error against float of 1.76e-2 at U8 and
 6.8e-5 at U16/S16 (about 260x lower), at comparable latency
-(0.38 ms U8, 0.28 ms U16). The 16-bit axmodel is larger (5,919 vs 4,343 bytes),
-so `matmul_record_emit` (which assumes an 8-bit record layout) needs to learn
-the 16-bit one before step-calibrated 16-bit templates can be emitted.
+(0.38 ms U8, 0.28 ms U16). The 16-bit axmodel is larger (5,919 vs 4,343 bytes)
+but uses the same scale-lane roles as 8-bit, plus two fixed lane constants
+(256.0 and 1.0, `matmul_record_emit.FIXED_LANES`) and an `npu_params`
+multiplier lane of `256 * s_x * s_w / s_y` (the `mult256` role). With those,
+`matmul_record_emit.recalibrate` moves one U16 build onto another exactly in
+both directions (records and params), and the emitted model matches the
+native held-out build bit for bit on the AX8850 (max diff 0.0, 6.5e-5 relative
+error against float). This is a bare MatMul: the step's Gather/Reshape chains
+and int8-symmetric input rules at 16 bits are still to be checked.
