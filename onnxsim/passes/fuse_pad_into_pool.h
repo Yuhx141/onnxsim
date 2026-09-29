@@ -21,6 +21,7 @@
 // -inf. Folding a zero-padding Pad into a MaxPool is therefore incorrect
 // (see https://github.com/onnxsim/onnxsim/issues/290).
 
+#include <algorithm>
 #include <limits>
 #include <numeric>
 
@@ -57,6 +58,31 @@ struct FusePadIntoPool final : public PredicateBasedPass {
 
     Node* pool = n;
     Node* pad = n->inputs()[0]->node();
+
+    // auto_pad overrides the explicit 'pads' attribute, so extra padding
+    // cannot be folded into it.
+    if (pool->hasAttribute(Symbol("auto_pad")) &&
+        pool->s(Symbol("auto_pad")) != "NOTSET") {
+      return false;
+    }
+
+    // MaxPool's optional 'Indices' output is a flat offset into the pool's
+    // input; folding the Pad changes that coordinate system.
+    if (pool->kind() == Symbol("MaxPool") && pool->outputs().size() > 1 &&
+        !pool->outputs()[1]->uses().empty()) {
+      return false;
+    }
+
+    // Pad-inserted zeros always count in the denominator. Fusing forces
+    // count_include_pad=1, which only matches the original two-stage
+    // behaviour if the pool's own padding was already counted.
+    if (pool->kind() == Symbol("AveragePool") && pool->hasAttribute(kpads) &&
+        std::any_of(pool->is(kpads).begin(), pool->is(kpads).end(),
+                    [](int64_t v) { return v != 0; }) &&
+        GetValueFromAttrWithDefault<int64_t>(pool, kcount_include_pad, 0) !=
+            1) {
+      return false;
+    }
 
     // Process 'pads' data
     std::vector<int64_t> pads;
