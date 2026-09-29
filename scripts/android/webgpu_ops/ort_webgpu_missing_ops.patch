@@ -1,0 +1,471 @@
+diff --git a/onnxruntime/core/providers/webgpu/math/softmax.cc b/onnxruntime/core/providers/webgpu/math/softmax.cc
+index dfc950c..a367635 100644
+--- a/onnxruntime/core/providers/webgpu/math/softmax.cc
++++ b/onnxruntime/core/providers/webgpu/math/softmax.cc
+@@ -42,6 +42,16 @@ ONNX_OPERATOR_KERNEL_EX(
+         .TypeConstraint("T", WebGpuSupportedNumberTypes()),
+     Softmax);
+ 
++ONNX_OPERATOR_VERSIONED_KERNEL_EX(
++    LogSoftmax, kOnnxDomain, 1, 10, kWebGpuExecutionProvider,
++    (*KernelDefBuilder::Create()).TypeConstraint("T", WebGpuSupportedNumberTypes()), LogSoftmax);
++ONNX_OPERATOR_VERSIONED_KERNEL_EX(
++    LogSoftmax, kOnnxDomain, 11, 12, kWebGpuExecutionProvider,
++    (*KernelDefBuilder::Create()).TypeConstraint("T", WebGpuSupportedNumberTypes()), LogSoftmax);
++ONNX_OPERATOR_KERNEL_EX(
++    LogSoftmax, kOnnxDomain, 13, kWebGpuExecutionProvider,
++    (*KernelDefBuilder::Create()).TypeConstraint("T", WebGpuSupportedNumberTypes()), LogSoftmax);
++
+ static std::string MaxVector(const std::string& name, int components) {
+   switch (components) {
+     case 1:
+@@ -132,9 +142,10 @@ Status SoftmaxProgram::GenerateShaderCode(ShaderHelper& shader) const {
+ 
+       // Calculate the final value for each element in the row
+       << "  for (var col = lindex; col < cols; col += wg) {\n"
+-      << "    var value = exp(getValue(row, col, row_stride) - row_max_shared) / row_sum_shared;\n"
+-      << "    // max operation protects against NaN since all values should be >=0\n"
+-      << "    value = max(value, x_value_t(0.0));\n"
++      << (is_log_ ? "    let value = (getValue(row, col, row_stride) - row_max_shared) - log(row_sum_shared);\n"
++                  : "    var value = exp(getValue(row, col, row_stride) - row_max_shared) / row_sum_shared;\n"
++                    "    // max operation protects against NaN since all values should be >=0\n"
++                    "    value = max(value, x_value_t(0.0));\n")
+       << "    setValue(row, col, row_stride, value);\n"
+       << "  }\n";
+ 
+@@ -184,7 +195,7 @@ Status Softmax::ComputeInternal(ComputeContext& context) const {
+   // check input tensor element type is float
+   const bool is_fp32 = input_tensor->GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+ 
+-  SoftmaxProgram program{workgroup_size, is_fp32};
++  SoftmaxProgram program{workgroup_size, is_fp32, is_log_};
+   if (is_transpose_required) {
+     program
+         .AddInputs({{&transposed_input_tensor, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components)}})
+@@ -196,7 +207,7 @@ Status Softmax::ComputeInternal(ComputeContext& context) const {
+   }
+ 
+   program
+-      .CacheHint(std::to_string(components), std::to_string(workgroup_size))
++      .CacheHint(std::to_string(components), std::to_string(workgroup_size), is_log_ ? "log" : "")
+       .SetWorkgroupSize(workgroup_size)
+       .SetDispatchGroupSize(static_cast<uint32_t>(rows))
+       .AddUniformVariables({{static_cast<int32_t>(packed_cols)}});
+diff --git a/onnxruntime/core/providers/webgpu/math/softmax.h b/onnxruntime/core/providers/webgpu/math/softmax.h
+index 532a56f..1938e50 100644
+--- a/onnxruntime/core/providers/webgpu/math/softmax.h
++++ b/onnxruntime/core/providers/webgpu/math/softmax.h
+@@ -11,9 +11,9 @@
+ namespace onnxruntime {
+ namespace webgpu {
+ 
+-class Softmax final : public WebGpuKernel {
++class Softmax : public WebGpuKernel {
+  public:
+-  Softmax(const OpKernelInfo& info) : WebGpuKernel{info} {
++  Softmax(const OpKernelInfo& info, bool is_log = false) : WebGpuKernel{info}, is_log_{is_log} {
+     opset_ = info.node().SinceVersion();
+     int64_t axis;
+     Status status = info.GetAttr<int64_t>("axis", &axis);
+@@ -34,12 +34,18 @@ class Softmax final : public WebGpuKernel {
+  private:
+   int64_t axis_;
+   int opset_;
++  bool is_log_;
++};
++
++class LogSoftmax final : public Softmax {
++ public:
++  LogSoftmax(const OpKernelInfo& info) : Softmax{info, true} {}
+ };
+ 
+ class SoftmaxProgram final : public Program<SoftmaxProgram> {
+  public:
+-  SoftmaxProgram(uint32_t wg, bool is_fp32)
+-      : Program{"Softmax"}, wg_{wg}, is_fp32_{is_fp32} {
++  SoftmaxProgram(uint32_t wg, bool is_fp32, bool is_log = false)
++      : Program{is_log ? "LogSoftmax" : "Softmax"}, wg_{wg}, is_fp32_{is_fp32}, is_log_{is_log} {
+   }
+ 
+   Status GenerateShaderCode(ShaderHelper& sh) const override;
+@@ -49,6 +55,7 @@ class SoftmaxProgram final : public Program<SoftmaxProgram> {
+  private:
+   uint32_t wg_;
+   bool is_fp32_;
++  bool is_log_;
+ };
+ 
+ }  // namespace webgpu
+diff --git a/onnxruntime/core/providers/webgpu/math/unary_elementwise_ops.cc b/onnxruntime/core/providers/webgpu/math/unary_elementwise_ops.cc
+index c159e03..76a5ad2 100644
+--- a/onnxruntime/core/providers/webgpu/math/unary_elementwise_ops.cc
++++ b/onnxruntime/core/providers/webgpu/math/unary_elementwise_ops.cc
+@@ -1,6 +1,7 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#include <sstream>
+ #include <utility>
+ #include <cstring>
+ #include <limits>
+@@ -451,5 +452,58 @@ class Softplus final : public UnaryElementwise {
+ WEBGPU_ELEMENTWISE_VERSIONED_KERNEL(Softplus, 1, 21, WebGpuSupportedFloatTypes())
+ WEBGPU_ELEMENTWISE_KERNEL(Softplus, 22, WebGpuSupportedFloatTypes())
+ 
++// Sign, Round, Softsign, Selu and IsNaN. WGSL round() rounds halves to even, as ONNX Round does.
++WEBGPU_ELEMENTWISE_IMPL(Sign, "sign(a)")
++WEBGPU_ELEMENTWISE_VERSIONED_KERNEL(Sign, 9, 12, WebGpuSupportedFloatTypes())
++WEBGPU_ELEMENTWISE_KERNEL(Sign, 13, WebGpuSupportedFloatTypes())
++
++WEBGPU_ELEMENTWISE_IMPL(Round, "round(a)")
++WEBGPU_ELEMENTWISE_VERSIONED_KERNEL(Round, 11, 21, WebGpuSupportedFloatTypes())
++WEBGPU_ELEMENTWISE_KERNEL(Round, 22, WebGpuSupportedFloatTypes())
++
++WEBGPU_ELEMENTWISE_IMPL(Softsign, "a / (x_value_t(1.0) + abs(a))", "", ShaderUsage::UseValueTypeAlias)
++WEBGPU_ELEMENTWISE_VERSIONED_KERNEL(Softsign, 1, 21, WebGpuSupportedFloatTypes())
++WEBGPU_ELEMENTWISE_KERNEL(Softsign, 22, WebGpuSupportedFloatTypes())
++
++// Selu: y = gamma * (x > 0 ? x : alpha * (exp(x) - 1)). alpha/gamma are static attributes, so they are
++// baked into the shader (and the cache hint) as literals.
++static std::string SeluExpression(const OpKernelInfo& info) {
++  const float alpha = info.GetAttrOrDefault<float>("alpha", 1.67326319217681884765625f);
++  const float gamma = info.GetAttrOrDefault<float>("gamma", 1.05070102214721679687500f);
++  std::ostringstream ss;
++  ss.precision(9);
++  ss << "select(x_value_t(" << (gamma * alpha) << ") * (exp(a) - x_value_t(1.0)), x_value_t(" << gamma
++     << ") * a, a > x_value_t(0.0))";
++  return ss.str();
++}
++
++class Selu final : public UnaryElementwise {
++ public:
++  Selu(const OpKernelInfo& info)
++      : UnaryElementwise{info, "Selu", SeluExpression(info), "", ShaderUsage::UseValueTypeAlias} {
++    cache_hint = SeluExpression(info);
++  }
++};
++
++WEBGPU_ELEMENTWISE_VERSIONED_KERNEL(Selu, 6, 21, WebGpuSupportedFloatTypes())
++WEBGPU_ELEMENTWISE_KERNEL(Selu, 22, WebGpuSupportedFloatTypes())
++
++// IsNaN: WGSL has no isnan() and the compiler may assume NaNs never occur, so test the f32 bit pattern.
++// float32 only; the output is bool like Not.
++WEBGPU_ELEMENTWISE_IMPL(IsNaN, "(bitcast<vec4<u32>>(a) & vec4<u32>(0x7fffffffu)) > vec4<u32>(0x7f800000u)")
++
++ONNX_OPERATOR_VERSIONED_KERNEL_EX(
++    IsNaN, kOnnxDomain, 9, 12, kWebGpuExecutionProvider,
++    KernelDefBuilder().TypeConstraint("T1", DataTypeImpl::GetTensorType<float>()).TypeConstraint("T2", DataTypeImpl::GetTensorType<bool>()),
++    IsNaN);
++ONNX_OPERATOR_VERSIONED_KERNEL_EX(
++    IsNaN, kOnnxDomain, 13, 19, kWebGpuExecutionProvider,
++    KernelDefBuilder().TypeConstraint("T1", DataTypeImpl::GetTensorType<float>()).TypeConstraint("T2", DataTypeImpl::GetTensorType<bool>()),
++    IsNaN);
++ONNX_OPERATOR_KERNEL_EX(
++    IsNaN, kOnnxDomain, 20, kWebGpuExecutionProvider,
++    KernelDefBuilder().TypeConstraint("T1", DataTypeImpl::GetTensorType<float>()).TypeConstraint("T2", DataTypeImpl::GetTensorType<bool>()),
++    IsNaN);
++
+ }  // namespace webgpu
+ }  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/nn/lrn.cc b/onnxruntime/core/providers/webgpu/nn/lrn.cc
+new file mode 100644
+index 0000000..43681f1
+--- /dev/null
++++ b/onnxruntime/core/providers/webgpu/nn/lrn.cc
+@@ -0,0 +1,86 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++#include "core/providers/webgpu/nn/lrn.h"
++#include "core/providers/webgpu/shader_helper.h"
++#include "core/providers/webgpu/webgpu_supported_types.h"
++#include "core/providers/webgpu/webgpu_utils.h"
++
++namespace onnxruntime {
++namespace webgpu {
++
++#define WEBGPU_LRN_VERSIONED_KERNEL(start, end, domain, is_nhwc)                      \
++  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                                                  \
++      LRN, domain, start, end, kWebGpuExecutionProvider,                              \
++      (*KernelDefBuilder::Create()).TypeConstraint("T", WebGpuSupportedFloatTypes()), \
++      LRN<is_nhwc>);
++
++#define WEBGPU_LRN_KERNEL(version, domain, is_nhwc)                                   \
++  ONNX_OPERATOR_KERNEL_EX(                                                            \
++      LRN, domain, version, kWebGpuExecutionProvider,                                 \
++      (*KernelDefBuilder::Create()).TypeConstraint("T", WebGpuSupportedFloatTypes()), \
++      LRN<is_nhwc>);
++
++WEBGPU_LRN_VERSIONED_KERNEL(1, 12, kOnnxDomain, false)
++WEBGPU_LRN_KERNEL(13, kOnnxDomain, false)
++WEBGPU_LRN_VERSIONED_KERNEL(1, 12, kMSInternalNHWCDomain, true)
++WEBGPU_LRN_KERNEL(13, kMSInternalNHWCDomain, true)
++
++Status LRNProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  const auto& x = shader.AddInput("x", ShaderUsage::UseUniform | ShaderUsage::UseElementTypeAlias);
++  const auto& y = shader.AddOutput("y", ShaderUsage::UseUniform | ShaderUsage::UseElementTypeAlias);
++
++  // The sum of squares is accumulated in f32 whatever the tensor type is.
++  shader.MainFunctionBody() << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size")
++                            << "  let p = global_idx % uniforms.stride;\n"
++                               "  let c = (global_idx / uniforms.stride) % uniforms.channels;\n"
++                               "  let base = global_idx - c * uniforms.stride;\n"
++                               "  let first = select(0u, c - uniforms.lo, c >= uniforms.lo);\n"
++                               "  let last = min(uniforms.channels - 1u, c + uniforms.hi);\n"
++                               "  var sum = 0.0;\n"
++                               "  for (var j = first; j <= last; j++) {\n"
++                               "    let v = f32("
++                            << x.GetByOffset("base + j * uniforms.stride") << ");\n"
++                            << "    sum += v * v;\n"
++                               "  }\n"
++                               "  let scale = pow(uniforms.bias + uniforms.alpha_over_size * sum, -uniforms.beta);\n"
++                            << "  " << y.SetByOffset("global_idx", "x_element_t(f32(" + x.GetByOffset("global_idx") + ") * scale)");
++  return Status::OK();
++}
++
++template <bool is_nhwc>
++Status LRN<is_nhwc>::ComputeInternal(ComputeContext& context) const {
++  const auto* input = context.Input(0);
++  const TensorShape& shape = input->Shape();
++  ORT_ENFORCE(shape.NumDimensions() >= 3, "LRN input must have at least 3 dimensions (N, C, ...).");
++  ORT_ENFORCE(size_ > 0, "LRN size must be positive.");
++  auto* output = context.Output(0, shape);
++  const int64_t total = shape.Size();
++  if (total == 0) {
++    return Status::OK();
++  }
++  // Distance in elements between consecutive channels of the same position.
++  const uint32_t channels = onnxruntime::narrow<uint32_t>(is_nhwc ? shape[shape.NumDimensions() - 1] : shape[1]);
++  const uint32_t stride = is_nhwc ? 1u : onnxruntime::narrow<uint32_t>(shape.SizeFromDimension(2));
++  const uint32_t lo = onnxruntime::narrow<uint32_t>((size_ - 1) / 2);
++  const uint32_t hi = onnxruntime::narrow<uint32_t>(size_ / 2);  // ceil((size - 1) / 2)
++
++  LRNProgram program;
++  program
++      .CacheHint(is_nhwc ? "NHWC" : "NCHW")
++      .AddInput({input, ProgramTensorMetadataDependency::Type})
++      .AddOutput({output, ProgramTensorMetadataDependency::None})
++      .SetDispatchGroupSize((total + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
++      .AddUniformVariables({{static_cast<uint32_t>(total)},
++                            {channels},
++                            {stride},
++                            {lo},
++                            {hi},
++                            {alpha_ / static_cast<float>(size_)},
++                            {beta_},
++                            {bias_}});
++  return context.RunProgram(program);
++}
++
++}  // namespace webgpu
++}  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/nn/lrn.h b/onnxruntime/core/providers/webgpu/nn/lrn.h
+new file mode 100644
+index 0000000..c0d00df
+--- /dev/null
++++ b/onnxruntime/core/providers/webgpu/nn/lrn.h
+@@ -0,0 +1,46 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++#pragma once
++
++#include "core/providers/webgpu/program.h"
++#include "core/providers/webgpu/webgpu_kernel.h"
++
++namespace onnxruntime {
++namespace webgpu {
++
++class LRNProgram final : public Program<LRNProgram> {
++ public:
++  LRNProgram() : Program{"LRN"} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"output_size", ProgramUniformVariableDataType::Uint32},
++                                          {"channels", ProgramUniformVariableDataType::Uint32},
++                                          {"stride", ProgramUniformVariableDataType::Uint32},
++                                          {"lo", ProgramUniformVariableDataType::Uint32},
++                                          {"hi", ProgramUniformVariableDataType::Uint32},
++                                          {"alpha_over_size", ProgramUniformVariableDataType::Float32},
++                                          {"beta", ProgramUniformVariableDataType::Float32},
++                                          {"bias", ProgramUniformVariableDataType::Float32});
++};
++
++// ONNX LRN over the channel axis (NCHW, or NHWC for the internal NHWC domain):
++//   y = x / (bias + alpha / size * sum_{j in [c - floor((size-1)/2), c + ceil((size-1)/2)]} x_j^2) ^ beta
++template <bool is_nhwc>
++class LRN final : public WebGpuKernel {
++ public:
++  LRN(const OpKernelInfo& info) : WebGpuKernel(info) {
++    alpha_ = info.GetAttrOrDefault<float>("alpha", 0.0001f);
++    beta_ = info.GetAttrOrDefault<float>("beta", 0.75f);
++    bias_ = info.GetAttrOrDefault<float>("bias", 1.0f);
++    size_ = info.GetAttr<int64_t>("size");
++  }
++
++  Status ComputeInternal(ComputeContext& context) const override;
++
++ private:
++  float alpha_, beta_, bias_;
++  int64_t size_;
++};
++
++}  // namespace webgpu
++}  // namespace onnxruntime
+diff --git a/onnxruntime/core/providers/webgpu/tensor/depth_to_space.cc b/onnxruntime/core/providers/webgpu/tensor/depth_to_space.cc
+index 9b54eca..8588f32 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/depth_to_space.cc
++++ b/onnxruntime/core/providers/webgpu/tensor/depth_to_space.cc
+@@ -36,6 +36,23 @@ WEBGPU_DEPTH_TO_SPACE_KERNEL(13, kOnnxDomain, false)
+ WEBGPU_DEPTH_TO_SPACE_VERSIONED_KERNEL(11, 12, kMSInternalNHWCDomain, true)
+ WEBGPU_DEPTH_TO_SPACE_KERNEL(13, kMSInternalNHWCDomain, true)
+ 
++#define WEBGPU_SPACE_TO_DEPTH_VERSIONED_KERNEL(start, end, domain, is_nhwc)                      \
++  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                                                            \
++      SpaceToDepth, domain, start, end, kWebGpuExecutionProvider,                               \
++      (*KernelDefBuilder::Create()).TypeConstraint("T", WebGpuSupportedFloatTypes()),           \
++      SpaceToDepth<is_nhwc>);
++
++#define WEBGPU_SPACE_TO_DEPTH_KERNEL(version, domain, is_nhwc)                                  \
++  ONNX_OPERATOR_KERNEL_EX(                                                                      \
++      SpaceToDepth, domain, version, kWebGpuExecutionProvider,                                  \
++      (*KernelDefBuilder::Create()).TypeConstraint("T", WebGpuSupportedFloatTypes()),           \
++      SpaceToDepth<is_nhwc>);
++
++WEBGPU_SPACE_TO_DEPTH_VERSIONED_KERNEL(1, 12, kOnnxDomain, false)
++WEBGPU_SPACE_TO_DEPTH_KERNEL(13, kOnnxDomain, false)
++WEBGPU_SPACE_TO_DEPTH_VERSIONED_KERNEL(1, 12, kMSInternalNHWCDomain, true)
++WEBGPU_SPACE_TO_DEPTH_KERNEL(13, kMSInternalNHWCDomain, true)
++
+ void AppendPermFunction(OStringStream& os, const ShaderVariableHelper& input, const int64_t* perm) {
+   os << "fn perm(i: input_indices_t) -> input_indices_t {\n"
+      << "  var a: input_indices_t;\n";
+@@ -143,5 +160,54 @@ Status DepthToSpace<is_nhwc>::ComputeInternal(onnxruntime::webgpu::ComputeContex
+   return context.RunProgram(program);
+ }
+ 
++template <bool is_nhwc>
++Status SpaceToDepth<is_nhwc>::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
++  const auto* input = context.Input(0);
++  const TensorShape input_shape = input->Shape();
++  ORT_ENFORCE(input_shape.NumDimensions() == 4, "Input must be rank 4.");
++  const int64_t n = input_shape[0];
++  const int64_t c = is_nhwc ? input_shape[3] : input_shape[1];
++  const int64_t h = is_nhwc ? input_shape[1] : input_shape[2];
++  const int64_t w = is_nhwc ? input_shape[2] : input_shape[3];
++  const int64_t b = blocksize_;
++  ORT_ENFORCE(b > 0 && h % b == 0 && w % b == 0, "SpaceToDepth: H and W must be divisible by blocksize.");
++
++  int64_t shape[6];
++  int64_t perm[6];
++  if (is_nhwc) {
++    const int64_t shape_values[] = {n, h / b, b, w / b, b, c};
++    const int64_t perm_values[] = {0, 1, 3, 2, 4, 5};
++    std::copy(shape_values, shape_values + 6, shape);
++    std::copy(perm_values, perm_values + 6, perm);
++  } else {
++    const int64_t shape_values[] = {n, c, h / b, b, w / b, b};
++    const int64_t perm_values[] = {0, 3, 5, 1, 2, 4};
++    std::copy(shape_values, shape_values + 6, shape);
++    std::copy(perm_values, perm_values + 6, perm);
++  }
++  TensorShape input_override_shape(std::vector<int64_t>(shape, shape + 6));
++  std::vector<int64_t> permuted(6);
++  for (int i = 0; i < 6; i++) {
++    permuted[i] = shape[perm[i]];
++  }
++  TensorShape output_override_shape(permuted);
++
++  auto* output = context.Output(0, is_nhwc ? TensorShape({n, h / b, w / b, c * b * b})
++                                           : TensorShape({n, c * b * b, h / b, w / b}));
++  const int64_t output_size = output->Shape().Size();
++  if (output_size == 0) {
++    return Status::OK();
++  }
++
++  DepthToSpaceProgram program{perm};
++  program
++      .AddInput({input, ProgramTensorMetadataDependency::TypeAndRank, input_override_shape, 1})
++      .AddOutput({output, ProgramTensorMetadataDependency::None, output_override_shape, 1})
++      .SetDispatchGroupSize((output_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
++      .CacheHint("S2D", absl::StrJoin(input_shape.GetDims(), "-"), blocksize_, is_nhwc ? "NHWC" : "NCHW")
++      .AddUniformVariable({static_cast<uint32_t>(output_size)});
++  return context.RunProgram(program);
++}
++
+ }  // namespace webgpu
+ }  // namespace onnxruntime
+\ No newline at end of file
+diff --git a/onnxruntime/core/providers/webgpu/tensor/depth_to_space.h b/onnxruntime/core/providers/webgpu/tensor/depth_to_space.h
+index 153618b..fa282af 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/depth_to_space.h
++++ b/onnxruntime/core/providers/webgpu/tensor/depth_to_space.h
+@@ -35,5 +35,21 @@ class DepthToSpace final : public WebGpuKernel {
+   bool is_dcr_;
+ };
+ 
++// SpaceToDepth. NCHW: reshape to [N, C, H/b, b, W/b, b], permute [0, 3, 5, 1, 2, 4], flatten to
++// [N, C*b*b, H/b, W/b]. NHWC: reshape to [N, H/b, b, W/b, b, C], permute [0, 1, 3, 2, 4, 5], flatten to
++// [N, H/b, W/b, b*b*C]. Reuses DepthToSpaceProgram, which is a generic permutation program.
++template <bool is_nhwc>
++class SpaceToDepth final : public WebGpuKernel {
++ public:
++  SpaceToDepth(const OpKernelInfo& info) : WebGpuKernel(info) {
++    blocksize_ = info.GetAttr<int64_t>("blocksize");
++  }
++
++  Status ComputeInternal(ComputeContext& context) const override;
++
++ private:
++  int64_t blocksize_;
++};
++
+ }  // namespace webgpu
+ }  // namespace onnxruntime
+\ No newline at end of file
+diff --git a/onnxruntime/core/providers/webgpu/webgpu_execution_provider.cc b/onnxruntime/core/providers/webgpu/webgpu_execution_provider.cc
+index c37ef9e..4e428d6 100644
+--- a/onnxruntime/core/providers/webgpu/webgpu_execution_provider.cc
++++ b/onnxruntime/core/providers/webgpu/webgpu_execution_provider.cc
+@@ -168,6 +168,17 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
+     KERNEL_CREATE_INFO(20, Gelu),
+     KERNEL_CREATE_INFO_VERSIONED(1, 21, Softplus),
+     KERNEL_CREATE_INFO(22, Softplus),
++    KERNEL_CREATE_INFO_VERSIONED(9, 12, Sign),
++    KERNEL_CREATE_INFO(13, Sign),
++    KERNEL_CREATE_INFO_VERSIONED(11, 21, Round),
++    KERNEL_CREATE_INFO(22, Round),
++    KERNEL_CREATE_INFO_VERSIONED(1, 21, Softsign),
++    KERNEL_CREATE_INFO(22, Softsign),
++    KERNEL_CREATE_INFO_VERSIONED(6, 21, Selu),
++    KERNEL_CREATE_INFO(22, Selu),
++    KERNEL_CREATE_INFO_VERSIONED(9, 12, IsNaN),
++    KERNEL_CREATE_INFO_VERSIONED(13, 19, IsNaN),
++    KERNEL_CREATE_INFO(20, IsNaN),
+ 
+     // // binary - math
+     // All binary elementwise ops (Add, Sub, Mul, Div, Max, Min, Equal, Greater, Less,
+@@ -259,6 +270,14 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
+ 
+     BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 11, 12, DepthToSpace)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 13, DepthToSpace)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 1, 12, SpaceToDepth)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 13, SpaceToDepth)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 1, 12, LRN)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 13, LRN)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSInternalNHWCDomain, 1, 12, SpaceToDepth)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSInternalNHWCDomain, 13, SpaceToDepth)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSInternalNHWCDomain, 1, 12, LRN)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSInternalNHWCDomain, 13, LRN)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSInternalNHWCDomain, 11, 12, DepthToSpace)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSInternalNHWCDomain, 13, DepthToSpace)>,
+ 
+@@ -320,6 +339,9 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
+     BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 1, 10, Softmax)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 11, 12, Softmax)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 13, Softmax)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 1, 10, LogSoftmax)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 11, 12, LogSoftmax)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 13, LogSoftmax)>,
+ 
+     BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 1, 1, Split)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 2, 10, Split)>,

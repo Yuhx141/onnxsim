@@ -98,8 +98,9 @@ Conv variants and ConvTranspose. Each runs on the phone and is compared to host 
   `Conv` with 1 output channel. (2) With the tiled path disabled
   (an experiment; that env-var patch has since been replaced, see the fix below) **all 40
   Transpose/Conv/Pool/BN/S2D failures pass in the default NHWC layout, including that 1-channel Conv.**
-- The remaining 5 mismatches (Equal, Greater, LessOrEqual, And, Cast-to-int) are a test artifact:
-  the phone CPU EP shows the identical 1-ulp input difference at the exact thresholds.
+- The remaining 5 mismatches (Equal, Greater, LessOrEqual, And, Cast-to-int) were a test artifact: the probe built
+  its input in float32 on the phone while the host used float64-then-round, so exact-tie thresholds differed by 1 ulp
+  (the phone CPU EP showed the same). With the input written to `x.bin` and read by both sides, all 235 match.
 - **Host reference (same ORT revision, unpatched, x86-64 build):** the RTX 5050 (NVIDIA
   driver), the Radeon 8060S (RADV) and lavapipe (software Vulkan) each pass 230/235; the 5
   misses are the same tie artifacts. So the tiled Transpose, and everything that goes through
@@ -123,4 +124,35 @@ Conv variants and ConvTranspose. Each runs on the phone and is compared to host 
   are the tie artifacts. The padded tile is kept for other vendors (avoids bank conflicts).
 - Not yet known: whether other Adreno generations (6xx, 8xx) share it, and the kernel-speed cost
   of the unpadded tile on Adreno.
-- Timing is not yet measured; only correctness was checked.
+
+### Ops with no WebGPU kernel (CPU fallback), now implemented
+
+A pass in the sweep does not mean the op ran on the GPU: the WebGPU EP silently assigns unsupported nodes to
+the CPU EP. `probe.cc` with `PROFILE=<prefix>` writes ORT's profile, and `placement.py` reports every node that
+ran on the CPU EP. In the 235-op sweep that found eight ops without a WebGPU kernel: **Sign, Round, Softsign,
+Selu, IsNaN, LogSoftmax, SpaceToDepth, LRN** (ArgMax/ArgMin/DepthToSpace are registered; the only other CPU
+nodes are the test's own int64 `Cast`s, which need the EP option `enableInt64`).
+
+`webgpu_ops/ort_webgpu_missing_ops.patch` (applies on ORT `125ea21` after the Transpose patch; new files under
+`onnxruntime/core/` need `git add -f` because of a global `core` gitignore pattern) adds them:
+
+- Sign, Round (WGSL `round` is ties-to-even like ONNX), Softsign, Selu (alpha/gamma baked into the shader and the
+  cache hint), opsets as in ONNX incl. 22.
+- IsNaN: float32 only, bool output; WGSL has no `isnan` and the compiler may assume no NaNs, so it tests the bit
+  pattern (`bitcast<u32>(x) & 0x7fffffff > 0x7f800000`).
+- LogSoftmax: the Softmax kernel with a flag: `(x - max) - log(sum)`, no clamp; opsets 1/11/13 like Softmax.
+- SpaceToDepth: reuses the generic permutation program of DepthToSpace (NCHW perm `[0,3,5,1,2,4]`, NHWC
+  `[0,1,3,2,4,5]`); LRN: a new per-element kernel, sum of squares over the channel window in f32, NCHW and NHWC via a
+  channel stride. Both need `kMSInternalNHWCDomain` registrations too, because ORT's layout transformer rewrites them
+  to NHWC on WebGPU (the first build failed at session creation with "Kernel not found: com.ms.internal.nhwc.LRN").
+
+Verification on the phone (`gen_new_op_tests.py`, 48 more models: NaN/Inf/denormal inputs spliced in with `Where`,
+exact halves and large values for Round, custom Selu alpha/gamma, block sizes 2/4/8 and rectangular/batched
+SpaceToDepth, a S2D->D2S round trip, LogSoftmax on all axes / 3072-long rows / very large logits / opset 11, LRN
+with sizes 1-7 at strong alpha): **283 models, 275 match host-CPU ORT; the other 8 are even-size LRN, which ORT's
+CPU LRN rejects, and all of LRN (incl. those) matches a float64 numpy reference to ~2e-7.** `placement.py` then
+shows 499 nodes on WebGPU and only the 6 int64 `Cast`s on CPU.
+
+Not covered: float16 (the new kernels accept it via `WebGpuSupportedFloatTypes`, but only fp32 was run), other
+Adreno generations, kernel speed (correctness only so far), and ORT's own unit tests (not built here).
+
