@@ -72,6 +72,9 @@ STEP_PRECISION_OVERRIDES = os.path.join(
     _HERE, "fixtures", "step_calibration", "resnet18_s16_overrides.json"
 )
 FP32_BINARY_FIXTURES = os.path.join(_HERE, "fixtures", "fp32_binary")
+SAFE_MASKED_DIV_FIXTURE = os.path.join(
+    _HERE, "fixtures", "safe_masked_div", "max_expand_div_1024x9x3136.axmodel.gz"
+)
 FP32_BINARY_SPEED_PROFILES = os.path.join(
     FP32_BINARY_FIXTURES, "native_mul_speed_profiles.json"
 )
@@ -241,8 +244,8 @@ class Segment:
     outputs: list[str]  # step tensors, in the template's output order
     detail: str
     emit: Callable[[], onnx.ModelProto] = dataclasses.field(repr=False)
-    in_q: list[tuple[float, int, bool]] = dataclasses.field(default_factory=list)
-    out_q: list[tuple[float, int, bool]] = dataclasses.field(default_factory=list)
+    in_q: list[tuple[float, int, bool] | None] = dataclasses.field(default_factory=list)
+    out_q: list[tuple[float, int, bool] | None] = dataclasses.field(default_factory=list)
     unsafe: str = ""  # why the template's semantics differ from the node's
     # A template built at batch N/k runs k times on batch slices; ``split``
     # marks the inputs that carry the batch axis (step_template batch_split).
@@ -268,6 +271,8 @@ class Segment:
         default=None, repr=False
     )
     profiled_faster: bool = False
+    prefer_fp32: bool = False
+    quantize_device_io: bool = False
 
 
 _RETARGET_KEY = re.compile(r"retarget of (\S+) \(")
@@ -767,6 +772,7 @@ def _fp32_binary_segment_for(rec: Mapping, model: onnx.ModelProto) -> Segment | 
     path = None
     template_inputs = inputs
     profiled_faster = False
+    prefer_fp32 = False
     index_path = os.path.join(FP32_BINARY_FIXTURES, "index.json")
     if os.path.isfile(index_path):
         with open(index_path, encoding="utf-8") as stream:
@@ -784,6 +790,7 @@ def _fp32_binary_segment_for(rec: Mapping, model: onnx.ModelProto) -> Segment | 
         )
         if entry is not None:
             path = os.path.join(FP32_BINARY_FIXTURES, entry["file"])
+            prefer_fp32 = rec["name"] in entry.get("prefer_fp32_nodes", ())
         # Mul is commutative. For the measured native-fast broadcast cases,
         # the source graph presents a [1] constant before the full tensor,
         # while the captured FP32 model uses full-tensor then [1]. Preserve
@@ -823,6 +830,7 @@ def _fp32_binary_segment_for(rec: Mapping, model: onnx.ModelProto) -> Segment | 
                     path = os.path.join(FP32_BINARY_FIXTURES, entry["file"])
                     template_inputs = [inputs[1], inputs[0]]
                     profiled_faster = True
+                    prefer_fp32 = rec["name"] in entry.get("prefer_fp32_nodes", ())
     # Preserve the initial one-off Add capture as a compatible legacy entry.
     if (
         path is None
@@ -864,6 +872,62 @@ def _fp32_binary_segment_for(rec: Mapping, model: onnx.ModelProto) -> Segment | 
         [],
         constant_inputs=[t for t in template_inputs if t in constants],
         profiled_faster=profiled_faster,
+        prefer_fp32=prefer_fp32,
+    )
+
+
+def _safe_masked_div_segment_for(
+    rec: Mapping, model: onnx.ModelProto
+) -> Segment | None:
+    """Use the device-validated zero-safe normalization for the crop mask.
+
+    This exact step node divides a nonnegative mask by its ReduceSum count.
+    Floating-point execution guarantees a count in [1, 9], while quantized
+    comparison inputs can produce an empty mask on device. The native model
+    expands the count, clamps it to one, then divides, making an empty mask
+    map to zero without relying on implicit broadcast in AxDiv.
+    """
+    if rec.get("name") != "Div_453" or rec.get("op") != "Div":
+        return None
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if len(inputs) != 2 or len(outputs) != 1 or not os.path.isfile(SAFE_MASKED_DIV_FIXTURE):
+        return None
+    producer = next(
+        (node for node in model.graph.node if inputs[1] in node.output), None
+    )
+    if (
+        producer is None
+        or producer.op_type != "ReduceSum"
+        or not producer.input
+        or producer.input[0] != inputs[0]
+    ):
+        return None
+    shapes = {
+        value.name: tuple(int(d.dim_value) for d in value.type.tensor_type.shape.dim)
+        for value in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    if (
+        shapes.get(inputs[0]) != (1024, 9, 3136)
+        or shapes.get(inputs[1]) != (1024, 1, 3136)
+        or shapes.get(outputs[0]) != (1024, 9, 3136)
+    ):
+        return None
+
+    def emit_safe_div():
+        with gzip.open(SAFE_MASKED_DIV_FIXTURE, "rb") as stream:
+            return onnx.load_model_from_string(stream.read())
+
+    return Segment(
+        rec["name"],
+        "safe_masked_div",
+        [rec["name"]],
+        inputs,
+        outputs,
+        "FP32 Expand -> Max(count, 1) -> Div; zero mask count maps to zero",
+        emit_safe_div,
+        [None, None],
+        [None],
+        input_shapes=[shapes[inputs[0]], shapes[inputs[1]]],
     )
 
 
@@ -1393,6 +1457,13 @@ def build_plan(
             else:
                 host[rec["name"]] = f"covered, kind {folded.kind} not selected"
             continue
+        safe_div = _safe_masked_div_segment_for(rec, model)
+        if safe_div is not None:
+            if not kinds or safe_div.kind in kinds:
+                candidates.append(safe_div)
+            else:
+                host[rec["name"]] = f"covered, kind {safe_div.kind} not selected"
+            continue
         precision_seg = _precision_binary_segment_for(
             rec,
             (precision_overrides or {}).get(rec["name"]),
@@ -1451,6 +1522,23 @@ def build_plan(
             candidates.append(exact_seg)
             continue
         fp32_seg = _fp32_binary_segment_for(rec, model)
+        if fp32_seg is not None and fp32_seg.prefer_fp32:
+            if not kinds or fp32_seg.kind in kinds:
+                qtable = calib.get("tensors", {})
+                if any(tensor in qtable for tensor in (*fp32_seg.inputs, *fp32_seg.outputs)):
+                    fp32_seg.in_q = [
+                        qparams_of(calib, tensor) if tensor in qtable else None
+                        for tensor in fp32_seg.inputs
+                    ]
+                    fp32_seg.out_q = [
+                        qparams_of(calib, tensor) if tensor in qtable else None
+                        for tensor in fp32_seg.outputs
+                    ]
+                    fp32_seg.quantize_device_io = True
+                candidates.append(fp32_seg)
+                continue
+            host[rec["name"]] = "covered, kind fp32_binary not selected"
+            continue
         legacy_fp32_add = rec.get("op") == "Add" and [
             value_shapes.get(t) for t in rec.get("inputs", ())
         ] == [(16, 1000), (16, 1000)]
@@ -1622,6 +1710,8 @@ class SegStat:
     sim_float_rel: float = 0.0  # simulation vs float: the quantization alone
     float_mismatch: float = 0.0  # unquantized outputs: fraction != float
     error: str = ""
+    runtime_fallback: bool = False
+    fallback_reason: str = ""
 
 
 class StepRunner:
@@ -1636,12 +1726,14 @@ class StepRunner:
         session=None,
         emit_dir: str | None = None,
         health_every: int = 0,
+        fallback_on_failure: bool = False,
     ):
         self.model = model
         self.host = HostOps(model)
         self.session = session
         self.emit_dir = emit_dir
         self.health_every = health_every
+        self.fallback_on_failure = fallback_on_failure
         self.device_runs = 0
         self.stalled: list[str] = []
         self.nodes = list(model.graph.node)
@@ -1711,6 +1803,10 @@ class StepRunner:
         return self._emitted[seg.name]
 
     def _float(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
+        if seg.kind == "safe_masked_div":
+            numerator = np.asarray(env[seg.inputs[0]], np.float32)
+            count = np.asarray(env[seg.inputs[1]], np.float32)
+            return [np.divide(numerator, np.maximum(count, np.float32(1.0)))]
         local = dict(env)
         for tensor in seg.constant_inputs:
             local[tensor] = np.asarray(self.host.inits[tensor], dtype=np.float32)
@@ -1721,12 +1817,16 @@ class StepRunner:
         return [local[t] for t in seg.outputs]
 
     def _sim(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
+        if seg.kind == "safe_masked_div":
+            numerator = np.asarray(env[seg.inputs[0]], np.float32)
+            count = np.asarray(env[seg.inputs[1]], np.float32)
+            return [np.divide(numerator, np.maximum(count, np.float32(1.0)))]
         local = dict(env)
         for tensor in seg.constant_inputs:
             local[tensor] = np.asarray(self.host.inits[tensor], dtype=np.float32)
         values = []
         for j, (t, qq) in enumerate(zip(seg.inputs, seg.in_q)):
-            value = fake_quant(local[t], *qq)
+            value = fake_quant(local[t], *qq) if qq else np.asarray(local[t])
             values.append(value)
         if seg.output_shape:
             target = np.broadcast_shapes(*(value.shape for value in values))
@@ -1761,6 +1861,11 @@ class StepRunner:
                         np.asarray(value, dtype=np.float32)
                     )
                 )
+            if seg.quantize_device_io:
+                ins = [
+                    fake_quant(value, *q) if q else value
+                    for value, q in zip(ins, seg.in_q)
+                ]
             model_inputs = getattr(m, "inputs", None)
             if model_inputs is not None and len(model_inputs) > len(ins):
                 initializer = {
@@ -1823,12 +1928,15 @@ class StepRunner:
             self.session.unload(m)
         want = {o.name: o for o in self.model.graph.value_info}
         out = []
-        for t, y in zip(seg.outputs, ys):
+        for j, (t, y) in enumerate(zip(seg.outputs, ys)):
             if seg.output_transform is not None:
                 y = seg.output_transform(y)
             vi = want.get(t)
             shape = [d.dim_value for d in vi.type.tensor_type.shape.dim] if vi else None
             y = y.astype(np.float32)
+            if seg.quantize_device_io and j < len(seg.out_q):
+                if seg.out_q[j]:
+                    y = fake_quant(y, *seg.out_q[j])
             if seg.output_take is not None:
                 y = y.reshape(-1)[: seg.output_take]
             out.append(
@@ -1942,6 +2050,14 @@ class StepRunner:
                                 for d, f in zip(dev, flt)
                             )
                     res = dev
+                    if (
+                        mode == "npu"
+                        and self.fallback_on_failure
+                        and not segment_passed(dataclasses.asdict(st))
+                    ):
+                        st.runtime_fallback = True
+                        st.fallback_reason = st.error or "device output failed validation"
+                        res = self._float(seg, env)
                 else:
                     res = sim
                 for t, v in zip(seg.outputs, res):
@@ -1960,6 +2076,8 @@ class StepRunner:
 def _rel(a, b) -> float:
     a = np.asarray(a, np.float64).ravel()
     b = np.asarray(b, np.float64).ravel()
+    if not np.isfinite(a).all() or not np.isfinite(b).all():
+        return math.inf
     return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-30))
 
 
@@ -1975,6 +2093,9 @@ def _compare(st: SegStat, seg: Segment, dev, sim) -> None:
         s = np.asarray(s, np.float32).ravel()
         if d.size != s.size:
             st.error = f"output {k}: {d.size} elements, expected {s.size}"
+            return
+        if not np.isfinite(d).all() or not np.isfinite(s).all():
+            st.error = f"output {k}: non-finite device or simulation values"
             return
         diff = np.abs(d - s)
         st.max_abs = max(st.max_abs, float(diff.max(initial=0)))
@@ -2009,6 +2130,112 @@ def _float_gradients(model, feeds, grad_names) -> dict[str, np.ndarray]:
 
 def load_step(path: str = STEP_ONNX) -> onnx.ModelProto:
     return shape_inference.infer_shapes(onnx.load(path))
+
+
+def rewrite_softmax_ratio_gradients(model: onnx.ModelProto) -> int:
+    """Remove unstable ``p * (a/p - sum(a/p*p))`` gradient chains.
+
+    For finite nonzero probabilities this is exactly ``a - p*sum(a)``. The
+    latter is also the continuous limit for zero-probability entries when
+    their corresponding ``a`` is zero, avoiding the ``0/0`` and ``0*inf``
+    generated by a quantized Softmax. Only rewrite the complete, exclusively
+    consumed pattern with a keepdims reduction; ambiguous graphs are left
+    untouched.
+    """
+    nodes = list(model.graph.node)
+    shapes = {
+        value.name: tuple(dim.dim_value for dim in value.type.tensor_type.shape.dim)
+        for value in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+        if value.type.tensor_type.HasField("shape")
+    }
+    graph_outputs = {value.name for value in model.graph.output}
+    consumers: dict[str, list[onnx.NodeProto]] = {}
+    for node in nodes:
+        for tensor in node.input:
+            consumers.setdefault(tensor, []).append(node)
+    remove: set[str] = set()
+    replacements: dict[str, onnx.NodeProto] = {}
+    for div in nodes:
+        if div.op_type != "Div" or len(div.input) != 2 or len(div.output) != 1:
+            continue
+        numerator, probability = div.input
+        ratio = div.output[0]
+        if not shapes.get(numerator) or shapes.get(numerator) != shapes.get(probability):
+            continue
+        ratio_users = consumers.get(ratio, [])
+        mul_users = [
+            n for n in ratio_users
+            if n.op_type == "Mul" and len(n.input) == 2 and probability in n.input
+            and ratio in n.input
+        ]
+        sub_users = [
+            n for n in ratio_users
+            if n.op_type == "Sub" and len(n.input) == 2 and n.input[0] == ratio
+        ]
+        if len(ratio_users) != 2 or len(mul_users) != 1 or len(sub_users) != 1:
+            continue
+        product, subtract = mul_users[0], sub_users[0]
+        if product.input[0] != probability and product.input[1] != probability:
+            continue
+        if len(consumers.get(product.output[0], [])) != 1:
+            continue
+        reduce = consumers[product.output[0]][0]
+        if reduce.op_type != "ReduceSum" or len(reduce.input) < 1:
+            continue
+        if reduce.input[0] != product.output[0] or len(reduce.output) != 1:
+            continue
+        keepdims = next(
+            (helper.get_attribute_value(a) for a in reduce.attribute if a.name == "keepdims"),
+            1,
+        )
+        if keepdims != 1 or len(consumers.get(reduce.output[0], [])) != 1:
+            continue
+        if consumers[reduce.output[0]][0] is not subtract:
+            continue
+        if len(consumers.get(subtract.output[0], [])) != 1:
+            continue
+        final = consumers[subtract.output[0]][0]
+        if final.op_type != "Mul" or len(final.input) != 2 or probability not in final.input:
+            continue
+        intermediates = {
+            ratio, product.output[0], reduce.output[0], subtract.output[0]
+        }
+        if intermediates & graph_outputs:
+            continue
+
+        reduce.input[0] = numerator
+        product.input[:] = [probability, reduce.output[0]]
+        subtract.input[:] = [numerator, product.output[0]]
+        replacements[final.output[0]] = helper.make_node(
+            "Identity", [subtract.output[0]], list(final.output), name=final.name
+        )
+        remove.add(ratio)
+
+    if remove:
+        kept = []
+        for node in model.graph.node:
+            if any(output in remove for output in node.output):
+                continue
+            replacement = next(
+                (replacements[output] for output in node.output if output in replacements),
+                None,
+            )
+            kept.append(replacement if replacement is not None else node)
+        available = {value.name for value in model.graph.input}
+        available.update(value.name for value in model.graph.initializer)
+        ordered = []
+        pending = list(kept)
+        while pending:
+            ready = [n for n in pending if all(t in available for t in n.input)]
+            if not ready:
+                raise ValueError("stable softmax-gradient rewrite made graph unsortable")
+            for node in ready:
+                pending.remove(node)
+                ordered.append(node)
+                available.update(node.output)
+        del model.graph.node[:]
+        model.graph.node.extend(ordered)
+    return len(remove)
 
 
 def load_records(path: str = STEP_OPS) -> list[dict]:
@@ -2088,7 +2315,36 @@ def segment_passed(st: Mapping) -> bool:
     """A device run agrees with the simulation: no error, at most 2 LSB off
     (rounding at a half-LSB tie on both sides), and 1 LSB or less on all but
     0.1% of the elements."""
-    return not st["error"] and st["max_lsb"] <= 2.01 and st["frac_gt1"] <= 0.001
+    return (
+        not st["error"]
+        and math.isfinite(float(st["max_lsb"]))
+        and math.isfinite(float(st["frac_gt1"]))
+        and st["max_lsb"] <= 2.01
+        and st["frac_gt1"] <= 0.001
+    )
+
+
+def validated_failures(report: Mapping, recheck: Sequence[str] = ()) -> set[str]:
+    """Failures from a report, minus explicitly selected segments to recheck."""
+    records = report.get("validation_stats", report.get("segment_stats", ()))
+    by_name = {item["segment"]: item for item in records}
+    failed = {name for name, stat in by_name.items() if not segment_passed(stat)}
+    recheck = set(recheck)
+    unknown = recheck - set(by_name)
+    if unknown:
+        raise ValueError(f"cannot recheck segments absent from validation report: {sorted(unknown)}")
+    not_failed = recheck - failed
+    if not_failed:
+        raise ValueError(f"recheck only accepts previously failing segments: {sorted(not_failed)}")
+    return failed - recheck
+
+
+def merge_validation_stats(previous: Mapping, current: Sequence[SegStat]) -> list[dict]:
+    """Retain unselected results while refreshing statuses for executed segments."""
+    records = previous.get("validation_stats", previous.get("segment_stats", ()))
+    merged = {item["segment"]: dict(item) for item in records}
+    merged.update({item.segment: dataclasses.asdict(item) for item in current})
+    return [merged[name] for name in sorted(merged)]
 
 
 def _reason_counts(host: Mapping[str, str]) -> dict[str, int]:
@@ -2161,6 +2417,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "2 LSB from the simulation there (or failed) stay on the host",
     )
     p.add_argument(
+        "--recheck",
+        default="",
+        help="comma-separated previously failing segments to retry on-device; "
+        "their new results are merged into the validation history",
+    )
+    p.add_argument(
+        "--fallback-on-failure",
+        action="store_true",
+        help="for NPU execution, substitute the host float op when a segment fails its live check",
+    )
+    p.add_argument(
         "--include-unsafe",
         action="store_true",
         help="also run segments whose template semantics differ (Reshape->Relu on signed data)",
@@ -2172,6 +2439,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="native health check every N device runs",
     )
     args = p.parse_args(argv)
+    if args.recheck and not args.validated:
+        p.error("--recheck requires --validated")
 
     model = load_step()
     records = load_records()
@@ -2214,10 +2483,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             for n in sg.nodes:
                 host[n] = "optimizer update kept in float on the host"
         segs = [sg for sg in segs if not set(sg.nodes) & opt]
+    previous_validation = None
     if args.validated:
         with open(args.validated) as f:
-            prev = {st["segment"]: st for st in json.load(f)["segment_stats"]}
-        failed = {n for n, st in prev.items() if not segment_passed(st)}
+            previous_validation = json.load(f)
+        failed = validated_failures(
+            previous_validation,
+            [name for name in args.recheck.split(",") if name],
+        )
         for sg in [sg for sg in segs if sg.name in failed]:
             for n in sg.nodes:
                 host[n] = (
@@ -2252,7 +2525,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         with axcl_session.AXSession() as sess:
             report["health_before_lsb"] = axcl_session.health_check(sess)
-            runner = StepRunner(model, segs, sess, args.emit_dir, args.health_every)
+            runner = StepRunner(
+                model,
+                segs,
+                sess,
+                args.emit_dir,
+                args.health_every,
+                fallback_on_failure=args.fallback_on_failure,
+            )
             runner._emitted.update(blobs)
             try:
                 outs, stats = runner.run(
@@ -2280,6 +2560,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     report["wall_s"] = time.time() - t0
     report["per_kind"] = summarize(stats)
     report["segment_stats"] = [dataclasses.asdict(s) for s in stats]
+    report["runtime_fallback_segments"] = sum(s.runtime_fallback for s in stats)
+    report["runtime_fallback_nodes"] = sum(
+        s.nodes for s in stats if s.runtime_fallback
+    )
+    if previous_validation is not None:
+        report["validation_stats"] = merge_validation_stats(previous_validation, stats)
 
     ref_out = ref["ref"]
     loss_name = "distill__add_27"
@@ -2322,7 +2608,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 k: v
                 for k, v in report.items()
-                if k not in ("segment_stats", "grads", "updates")
+                if k not in ("segment_stats", "validation_stats", "grads", "updates")
             },
             indent=1,
         )

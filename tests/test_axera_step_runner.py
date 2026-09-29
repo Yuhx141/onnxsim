@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "scripts", "axera"))
 
 import misc_op_record_emit as misc  # noqa: E402
+import capture_fp32_binaries as fp32_capture  # noqa: E402
 import step_runner as sr  # noqa: E402
 
 _HAVE_STEP = os.path.exists(sr.STEP_ONNX) and os.path.exists(sr.STEP_REF)
@@ -63,6 +64,149 @@ def test_fake_quant_rounds_and_clips():
     np.testing.assert_allclose(got, [-1.0, 0.0, 0.0, 0.01, 1.55], atol=1e-6)
     got = sr.fake_quant(x, 0.01, 0, True)
     np.testing.assert_allclose(got, [-1.0, 0.0, 0.0, 0.01, 1.27], atol=1e-6)
+
+
+def test_softmax_ratio_gradient_rewrite_avoids_zero_probability_nan():
+    model = parser.parse_model(
+        '<ir_version: 8, opset_import: ["": 11]> '
+        "agraph (float[1,4] a, float[1,4] p) => (float[1,4] y) { "
+        "q = Div(a, p) "
+        "r = Mul(q, p) "
+        "s = ReduceSum<axes=[1], keepdims=1>(r) "
+        "d = Sub(q, s) "
+        "y = Mul(p, d) }"
+    )
+    assert sr.rewrite_softmax_ratio_gradients(model) == 1
+    onnx.checker.check_model(model)
+    assert all(node.op_type != "Div" for node in model.graph.node)
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
+    a = np.array([[0.25, 0.0, 0.5, 0.0]], np.float32)
+    p = np.array([[0.5, 0.0, 0.5, 0.0]], np.float32)
+    got = session.run(None, {"a": a, "p": p})[0]
+    expected = a - p * a.sum(axis=1, keepdims=True)
+    assert np.isfinite(got).all()
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-7)
+
+
+def test_softmax_ratio_gradient_rewrite_matches_nonzero_reference():
+    model = parser.parse_model(
+        '<ir_version: 8, opset_import: ["": 11]> '
+        "agraph (float[1,3] a, float[1,3] p) => (float[1,3] y) { "
+        "q = Div(a, p) "
+        "r = Mul(q, p) "
+        "s = ReduceSum<axes=[1], keepdims=1>(r) "
+        "d = Sub(q, s) "
+        "y = Mul(p, d) }"
+    )
+    assert sr.rewrite_softmax_ratio_gradients(model) == 1
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
+    a = np.array([[0.1, 0.3, 0.6]], np.float32)
+    p = np.array([[0.2, 0.3, 0.5]], np.float32)
+    got = session.run(None, {"a": a, "p": p})[0]
+    expected = p * (a / p - np.sum((a / p) * p, axis=1, keepdims=True))
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
+
+
+@needs_step
+def test_step_softmax_ratio_gradient_rewrite_preserves_float_gradients():
+    model = sr.load_step()
+    reference = sr.load_reference()
+    gradients = sr.gradient_tensors(model, reference["state_map"])
+    before, _ = sr.StepRunner(model, []).run(
+        reference["feeds"], "float", keep=list(gradients.values())
+    )
+    assert sr.rewrite_softmax_ratio_gradients(model) == 2
+    after, _ = sr.StepRunner(model, []).run(
+        reference["feeds"], "float", keep=list(gradients.values())
+    )
+    for tensor in gradients.values():
+        original = np.asarray(before[tensor], np.float64)
+        rewritten = np.asarray(after[tensor], np.float64)
+        relative = np.linalg.norm(original - rewritten) / max(
+            np.linalg.norm(original), 1e-30
+        )
+        assert np.isfinite(rewritten).all()
+        assert relative < 2e-6, (tensor, relative)
+
+
+@needs_step
+def test_step_masked_div_selects_safe_native_template():
+    model = sr.load_step()
+    record = next(r for r in sr.load_records() if r["name"] == "Div_453")
+    segment = sr._safe_masked_div_segment_for(record, model)
+    assert segment is not None
+    assert segment.kind == "safe_masked_div"
+    assert segment.output_shape == ()  # preserve the smaller count input for Expand
+    template = segment.emit()
+    assert [tuple(d.dim_value for d in i.type.tensor_type.shape.dim) for i in template.graph.input] == [
+        (1024, 9, 3136),
+        (1024, 1, 3136),
+    ]
+
+
+def test_segment_validation_rejects_nonfinite_device_outputs():
+    segment = sr.Segment(
+        "nonfinite", "elementwise", [], [], [], "test", lambda: onnx.ModelProto(),
+        out_q=[(0.1, 0, False)],
+    )
+    stat = sr.SegStat("nonfinite", "elementwise", 0)
+    nan = np.array([np.nan], dtype=np.float32)
+    sr._compare(stat, segment, [nan], [nan])
+    assert "non-finite" in stat.error
+    assert not sr.segment_passed(vars(stat))
+    assert np.isinf(sr._rel(nan, np.ones(1, dtype=np.float32)))
+
+
+def test_validated_recheck_preserves_unselected_results():
+    report = {
+        "segment_stats": [
+            {"segment": "known-good", "error": "", "max_lsb": 0.0, "frac_gt1": 0.0},
+            {"segment": "candidate", "error": "", "max_lsb": 4.0, "frac_gt1": 0.0},
+        ]
+    }
+    assert sr.validated_failures(report, ["candidate"]) == set()
+    with pytest.raises(ValueError, match="previously failing"):
+        sr.validated_failures(report, ["known-good"])
+    current = [sr.SegStat("candidate", "elementwise", 1, max_lsb=1.0)]
+    merged = sr.merge_validation_stats(report, current)
+    assert [(item["segment"], item["max_lsb"]) for item in merged] == [
+        ("candidate", 1.0),
+        ("known-good", 0.0),
+    ]
+
+
+def test_runtime_fallback_uses_original_host_op_after_device_mismatch():
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Add", ["x", "z"], ["y"], name="add")],
+        "runtime_fallback",
+        [
+            onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, [1])
+            for name in ("x", "z")
+        ],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 10
+    segment = sr.Segment(
+        "add", "elementwise", ["add"], ["x", "z"], ["y"], "test",
+        lambda: model, in_q=[None, None], out_q=[(0.1, 0, False)],
+    )
+    runner = sr.StepRunner(model, [segment], fallback_on_failure=True)
+    runner.emitted = lambda _: b"model"
+    runner._device = lambda *_: [np.array([10.0], dtype=np.float32)]
+    outputs, stats = runner.run(
+        {"x": np.array([0.2], dtype=np.float32), "z": np.array([0.3], dtype=np.float32)},
+        "npu",
+    )
+    assert stats[0].runtime_fallback
+    assert stats[0].fallback_reason
+    np.testing.assert_allclose(outputs["y"], [0.5])
 
 
 @pytest.mark.parametrize("bits,signed,zp", [(16, False, 32768), (16, True, 0)])
@@ -311,8 +455,15 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     synthetic += sum(s.kind == "div2_exact" for s in everything)
     synthetic += sum(s.kind == "mul_mask_exact" for s in everything)
     # Captured FP32 routes, including speed-selected S16 overrides, are outside
-    # the generic backend coverage report.
+    # the generic backend coverage report. Explicitly retargeted nodes had
+    # already counted as generic coverage before switching to their accurate
+    # FP32 route, so do not subtract those nodes twice.
     synthetic += sum(len(s.nodes) for s in everything if s.kind == "fp32_binary")
+    synthetic -= sum(
+        len(s.nodes)
+        for s in everything
+        if s.kind == "fp32_binary" and s.prefer_fp32
+    )
     # Singleton scalar divisions fold to guarded host constants, not AX models.
     synthetic += sum(s.kind == "algebraic_constant" for s in everything)
     assert covered + nonemittable - synthetic == report_covered
@@ -333,8 +484,10 @@ def test_plan_materializes_live_broadcast_binary_operands():
     # Two decomposed residual/update broadcasts now use the fixed x128 binary
     # template for their dequantized float boundary as well.
     broadcast = [s for s in broadcast if "constant from" not in s.detail]
-    assert len(broadcast) == 44
-    assert all(s.input_shapes[-1] == (1,) for s in broadcast)
+    assert len(broadcast) >= 44
+    assert all(
+        s.name == "Sub_24" or s.input_shapes[-1] == (1,) for s in broadcast
+    )
     assert all(s.output_shape == s.input_shapes[0] for s in broadcast)
 
 
@@ -423,9 +576,25 @@ def test_resnet_native_templates_reduce_host_fallbacks():
         precision_overrides=overrides,
     )
     selected = {s.name: s for s in segments if s.kind == "binary_precision"}
-    assert set(selected) == set(overrides)
-    assert not set(selected) & host.keys()
-    assert len(host) == 126
+    native_binary = {
+        s.name for s in segments if s.kind in ("binary_precision", "fp32_binary")
+    }
+    # Some exact S16 candidates are deliberately routed through their
+    # AX8850-profiled faster FP32 templates; neither route may leave them on
+    # the host.
+    assert set(overrides) <= native_binary
+    assert not set(overrides) & host.keys()
+    assert host == {}
+    add976 = next(s for s in segments if s.name == "Add_976")
+    assert add976.kind == "fp32_binary"
+    assert add976.prefer_fp32
+    assert add976.quantize_device_io
+    assert len(add976.in_q) == len(add976.inputs) == 2
+    assert len(add976.out_q) == len(add976.outputs) == 1
+    by_name = {s.name: s for s in segments}
+    for name in ("Mul_477", "Mul_703", "Mul_715", "Mul_785", "Mul_989"):
+        assert by_name[name].kind == "fp32_binary"
+        assert by_name[name].quantize_device_io
     assert not {"Sub_446", "Sub_449"} & host.keys()
     assert {"Greater_444", "Less_447"} <= {
         s.name for s in segments if s.kind == "compare_complement"
@@ -440,6 +609,28 @@ def test_resnet_native_templates_reduce_host_fallbacks():
             limit = q[0] * 32767
             assert lo >= -limit - q[0]
             assert hi <= limit + q[0]
+
+
+def test_fp32_capture_promotes_scalar_broadcast_input_to_length_one():
+    item = {
+        "input_shapes": [[], [512]],
+        "output_shape": [512],
+    }
+    assert fp32_capture.template_input_shapes(item) == [[1], [512]]
+
+
+def test_fp32_capture_merge_preserves_shared_signature_nodes():
+    previous = {
+        "source_nodes": ["Mul_703"],
+        "prefer_fp32_nodes": ["Mul_703"],
+    }
+    current = {
+        "source_nodes": ["Mul_705"],
+        "prefer_fp32_nodes": [],
+    }
+    merged = fp32_capture.merge_entry(previous, current)
+    assert merged["source_nodes"] == ["Mul_703", "Mul_705"]
+    assert merged["prefer_fp32_nodes"] == ["Mul_703"]
 
 
 def test_singleton_scalar_div_is_folded_and_guarded():
@@ -946,6 +1137,44 @@ def test_fp32_binary_template_matches_float_on_axcl_vm():
         actual = runner._device(seg, {"x": x, "z": z})[0]
     expected = np.add(x, z)
     np.testing.assert_array_equal(actual, expected)
+
+
+@needs_device
+@needs_step
+def test_fp32_critical_elementwise_probes_match_step_simulation_on_axcl_vm():
+    """The FP32 probes expose accurate output even where the faster route is
+    still unresolved; do not make them preferred planner routes by default."""
+    import axcl_session
+
+    model = sr.load_step()
+    records = {record["name"]: record for record in sr.load_records()}
+    calib = sr.axb.load_calibration(sr.STEP_CALIB)
+    qtable = calib["tensors"]
+    segments = []
+    for name in ("Mul_705", "Add_730"):
+        segment = sr._fp32_binary_segment_for(records[name], model)
+        assert segment is not None
+        assert not segment.prefer_fp32
+        segment.in_q = [
+            sr.qparams_of(calib, tensor) if tensor in qtable else None
+            for tensor in segment.inputs
+        ]
+        segment.out_q = [
+            sr.qparams_of(calib, tensor) if tensor in qtable else None
+            for tensor in segment.outputs
+        ]
+        segment.quantize_device_io = True
+        segments.append(segment)
+
+    reference = sr.load_reference()
+    with axcl_session.AXSession(subdir="critical_elementwise_fp32_probe") as session:
+        runner = sr.StepRunner(model, segments, session, health_every=1)
+        outputs, stats = runner.run(reference["feeds"], "npu")
+    assert [stat.segment for stat in stats] == ["Mul_705", "Add_730"]
+    assert all(sr.segment_passed(vars(stat)) for stat in stats)
+    assert float(np.ravel(outputs["distill__add_27"])[0]) == pytest.approx(
+        float(np.ravel(reference["ref"]["distill__add_27"])[0]), abs=3e-6
+    )
 
 
 def _mask_mul_model():

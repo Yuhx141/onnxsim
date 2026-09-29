@@ -42,6 +42,14 @@ comes out.
     runner selects one of three checked-in templates by the exact measured
     input/output zero point and scale. Other Div constants or calibrations
     still require a general native template before they leave the host.
+  - The crop-mask normalization `Div_453` uses a checked-in FP32
+    `Expand -> Max(count, 1) -> Div` model. Float execution has counts in
+    `[1,9]`; quantized mask inputs can produce empty positions, where both
+    numerator and count are zero. The explicit clamp makes those positions
+    zero and avoids both implicit broadcast in AxDiv and `0/0`. The exact
+    `[1024,9,3136]` template passed an AX8850 VM test including zero counts;
+    the step runner also verifies this segment against its matching safe-div
+    simulation.
   - The checked-in exact S16 overrides are enabled by default; a different
     JSON file can be selected with `--precision-overrides overrides.json`.
     They select only templates whose full scale and
@@ -290,3 +298,41 @@ Capture and profile on the VM-backed device with:
 AXCL_LXD_VM=axcl-vm python scripts/axera/capture_fp32_binaries.py \
   --refresh --runs 30
 ```
+
+## Retargeting inaccurate covered binaries
+
+The default FP32 capture list is built from nodes that the current planner
+would leave on the host. `--nodes NAME,...` additionally captures named
+binary nodes even when another native emitter claims them; these explicit
+entries are selected by the planner and retain the step's calibrated input
+and output quantization boundaries. This lets a validated FP32 arithmetic
+kernel replace a failing quantized route without changing its surrounding
+calibration contract.
+
+On 2026-09-29, an AX8850 replay identified 27 distinct signatures among the
+failing binary segments. Pulsar2 built and device-validated 22 directly. Its
+calibrator rejected the five scalar-first Mul signatures because rank-0 input
+shapes fail in calibration, so the capture path now represents scalar inputs
+as `[1]` (broadcast-equivalent) in the compiled template and reshapes the
+single runtime value accordingly. All five then built and matched FP32
+exactly. The 27 targeted templates cover 30 named step nodes, including
+`Add_976` and the five scalar Mul nodes; a focused run of those five Mul nodes
+on real step data passed at 0 LSB with no NaN updates.
+
+The next full replay, with the five scalar templates included, ran 914 NPU
+segments (1,105 graph-node executions) with no device errors and no planner
+host nodes. It measured 175 exact FP32 binary segments; the strict 2-LSB gate
+still rejected 33 MatMul chains and 21 quantized elementwise segments. The
+training loss was 16.729 vs 17.058 float, and median gradient cosine was
+-0.577, so this is not yet a validated full-training result. Report:
+`/tmp/axera-fp32-qio-full-next.json`.
+
+Two high-impact elementwise failures (`Mul_705`, `Add_730`) were separately
+captured as FP32 templates and matched the calibrated simulation at 0 LSB on
+real step inputs; selecting just these two restored loss to within 2e-6 of
+float, with median update relative error 2.3e-6. They are deliberately not
+marked `prefer_fp32_nodes`: the measured end-to-end device path took 96/133 ms
+per segment, versus 14/32 ms for the local host simulation, and the capture
+round trips were 28/82 ms. Thus they are useful accuracy probes, but do not
+meet the faster-than-host criterion for replacing fallback. MatMul-chain
+calibration/emission and faster native arithmetic remain the priority.
