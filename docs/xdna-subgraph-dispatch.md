@@ -337,6 +337,18 @@ loop -- every call then pays a ~1.8 ms context switch, which produced bogus numb
   joining outputs across columns is not possible (an objectfifo cannot sit in two links and a
   memtile has ~6 input channels), so one drain per column remains.
 
+Full-size weight-volume run (`--layers 64 -k 1536 -n 256 -p 8 --once`, verified bit-exact, compute
+included): 64 layers x 393 KB = **25.2 MB streamed in 1.015 ms total (16 us/layer, 24.9 GB/s)**,
+with or without the broadcast activation stream. That is the ResNet-50 weight volume moved at
+Vitis-AI-like layer granularity in *less* than Vitis AI's whole 1.55 ms, so a layer-sequential
+engine's floor is ~1.0 ms and the remaining budget (~0.5 ms) is the real per-layer compute
+(3x3 im2col gather, residual adds, stem/pool). Design constraints found while sizing it: a core
+program unrolled over 53 different layers overflows program memory by 4.6 KB (a per-layer
+acquire/release sequence is ~300 B), so jobs must be uniform (loop over identical jobs, layer
+shape from the descriptor) or grouped per stage with `range_`; and FIFO objects are fixed-size,
+so a layer's per-core weight slice must be split into passes of at most one slot (K-split with an
+accumulator kept across jobs for the widest 3x3 layers).
+
 Projection for a full layer-sequential ResNet-50 engine: 55 conv layers x ~16 us sync (~0.9 ms)
 + streaming (~0.75 ms, partly overlapped) + compute + launch, roughly 2-2.5 ms versus ~3.5 ms
 now, i.e. a ~1.5x gain that still trails Vitis' 1.55 ms. It needs runtime-shaped kernels (per-
