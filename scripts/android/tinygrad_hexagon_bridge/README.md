@@ -462,6 +462,7 @@ TC_OPT=1`), 4 threads on the V69 phone, all bit-exact to the capture:
 | mixed W8/W16 heads (`drv_w16t10_a16_hmix`) with `ONNX_QDQ_INT_GEMM=1` for weights >= 65536 elements (`ONNX_QDQ_INT_GEMM_MIN`) | 237 / 262 | |
 | camera-frame mean subtraction as a table (`ONNX_QDQ_LUT` accepts a constant that is one value broadcast over the channels) | 240 / 252 | |
 | eight pixels per weight load in the vrmpy tensor core (`DSP_TC_MUPCAST`, default 8) | 203 / 226 | |
+| v65 elementwise kernels vectorize a unit-stride axis when nothing else did (`DSP_V65_COPY_VECTORIZE`; the frame-queue shift was a byte-by-byte copy: 4.6 ms -> 0.08 ms under qemu) | 198 / 220 | 94 |
 
 The last row is a cache effect that QEMU's instruction count hides (11% there, 16% on the phone: the tensor-core layers went
 78 -> 51 ms). Pixels per weight load, driving DSP ms: 1 -> 242, 2 -> 228, 4 -> 204, 8 -> 203, 16 -> 218. Storing the accumulators
@@ -485,6 +486,11 @@ Lossy options measured against the "plan error no worse than today" budget (`w16
 - Where the 203 ms goes (before the pixel blocking): elementwise 98 ms, of which 41 ms are integer copies, layout changes and
   plane splits, 28 ms float requantization epilogues (scalar float on v65) and 26 ms table lookups; vrmpy tensor-core convs 77 ms;
   depthwise 41 ms. The copies are lossless work; the epilogues would be integer fixed-point (up to one uint16 step of difference).
+
+The copy rule needs unit stride in *every* buffer that uses the axis: with "any buffer" DM went from 93.5 to 119.5 ms (13 kernels of
+a 345x3x64 shape vectorized an axis one of their buffers walks with a stride, so the vector was a gather). Elementwise total for
+driving is now 85.7 ms (98.0 before). What is left there is table lookups (about 20 ms), the stem's plane split + pad + channel-4
+interleave (7 ms: a 4-way transpose, which needs vector shuffles tinygrad cannot express) and many 1-4 ms layout kernels.
 
 Tried and dropped: blocking pixels inside the tensor-core construction (`DSP_TC_MBLOCK`): the compiler passes ran out of memory
 (12 GB in 6 s). The same blocking as an ordinary upcast after the tensor core (`DSP_TC_MUPCAST`) works.
