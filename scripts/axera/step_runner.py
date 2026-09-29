@@ -2238,6 +2238,39 @@ def rewrite_softmax_ratio_gradients(model: onnx.ModelProto) -> int:
     return len(remove)
 
 
+STEP_CALIB_CONFIG = "/home/takecheeze/npu-scratch/t6-r18fold/wd/config/step.json"
+
+
+def apply_stable_softmax_grad(
+    model: onnx.ModelProto, records: list[dict], cache: str
+) -> tuple[list[dict], dict]:
+    """Rewrite the softmax-ratio gradient chains in ``model`` (in place) and
+    return records and a calibration that match the rewritten graph.
+
+    The rewrite changes intermediate tensors, so the checked-in calibration no
+    longer describes them; the ranges are re-collected on the rewritten graph
+    over the same calibration set and cached in ``cache``."""
+    import step_calibration
+
+    if not rewrite_softmax_ratio_gradients(model):
+        raise ValueError("no softmax-ratio gradient chain found to rewrite")
+    by_name = {n.name: n for n in model.graph.node}
+    kept = []
+    for rec in records:
+        node = by_name.get(rec["name"])
+        if node is None or node.op_type != rec["op"]:
+            continue  # removed Div, or Mul turned into Identity: host
+        rec = dict(rec)
+        rec["inputs"] = list(node.input)
+        kept.append(rec)
+    if os.path.exists(cache):
+        return kept, axb.load_calibration(cache)
+    calib = step_calibration.calibrate_model(model, STEP_CALIB_CONFIG)
+    with open(cache, "w") as f:
+        json.dump(calib, f, sort_keys=True)
+    return kept, calib
+
+
 def load_records(path: str = STEP_OPS) -> list[dict]:
     with gzip.open(path, "rt") as f:
         return json.load(f)
@@ -2392,6 +2425,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"(default: {os.path.basename(STEP_PRECISION_OVERRIDES)})",
     )
     p.add_argument("--mode", default="npu", choices=["npu", "sim", "float"])
+    p.add_argument(
+        "--stable-softmax-grad",
+        metavar="CALIB_CACHE",
+        help="apply rewrite_softmax_ratio_gradients and use a calibration "
+        "regenerated for the rewritten graph (cached in this JSON file)",
+    )
     p.add_argument("--out", required=True)
     p.add_argument("--emit-dir")
     p.add_argument(
@@ -2445,6 +2484,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = load_step()
     records = load_records()
     calib = axb.load_calibration(STEP_CALIB)
+    if args.stable_softmax_grad:
+        records, calib = apply_stable_softmax_grad(
+            model, records, args.stable_softmax_grad
+        )
     kinds = set(args.kinds.split(",")) if args.kinds else None
     precision_overrides = None
     if args.precision_overrides:
@@ -2461,6 +2504,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError(
                     "precision override JSON must map node names to calibration"
                 )
+    if args.stable_softmax_grad and precision_overrides:
+        live = {rec["name"] for rec in records}
+        precision_overrides = {
+            k: v for k, v in precision_overrides.items() if k in live
+        }
     segs, host = build_plan(
         model,
         records,

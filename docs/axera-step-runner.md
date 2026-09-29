@@ -336,3 +336,25 @@ per segment, versus 14/32 ms for the local host simulation, and the capture
 round trips were 28/82 ms. Thus they are useful accuracy probes, but do not
 meet the faster-than-host criterion for replacing fallback. MatMul-chain
 calibration/emission and faster native arithmetic remain the priority.
+
+## Stable softmax-gradient rewrite (`--stable-softmax-grad`)
+
+`step_runner.py --stable-softmax-grad CALIB.json` applies
+`rewrite_softmax_ratio_gradients` to the step, patches the per-node records,
+and regenerates the calibration for the rewritten graph over the same 4-step
+calibration set (cached in `CALIB.json`; about a minute the first time). The
+rewrite replaces `p * (a/p - sum(a/p*p))` with `p * (a - p*sum(a))`, removing
+the quantized `0/0` behind the non-finite `Log_10`/`Div_21` segments.
+
+On 2026-09-29, on the AX8850 with `--host-optimizer`: 328 NPU segments, zero
+device errors, health 0 LSB before and after, no runtime fallbacks. Median
+gradient cosine against the float reference rose from -0.577 to **0.839** with
+no NaN (simulation: 0.918); median update cosine 0.53 (was -0.0001 with 7
+NaN updates). The loss is unchanged (16.729 vs 17.058, forward path). The
+remaining gradient error is in 34 MatMul-chain segments that fail the 2-LSB
+gate. The default run without the flag is unchanged.
+
+```sh
+AXCL_LXD_VM=axcl-vm $PY step_runner.py --mode npu --host-optimizer \
+  --stable-softmax-grad /path/stable-calib.json --out /path/stable.json
+```
