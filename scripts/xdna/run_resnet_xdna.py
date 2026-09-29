@@ -128,6 +128,8 @@ class XDNAResNetRunner:
         fused_blocks: list[tuple[str, str, str]] | None = None,
         fused_stages: list[tuple[tuple[str, str, str], str, str]] | None = None,
         fused_stage_blocked: bool = False,
+        fused_body_groups: list[list[str]] | None = None,
+        host_maxpool: bool = False,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
         maxpool_uint8_artifact: tuple[str, str] | None = None,
         maxpool_runtime: str = "iron",
@@ -207,6 +209,13 @@ class XDNAResNetRunner:
             if entry.get("compiled_artifact")
             or entry.get("status") == "zero_copy_device_view"
         }
+        if host_maxpool:
+            # Tiny pooling is cheaper on the host than a separate xclbin (each switch between
+            # xclbins costs ~0.75 ms on this device).
+            self.operation_specs = {
+                index: entry for index, entry in self.operation_specs.items()
+                if entry.get("op_type") != "MaxPool"
+            }
         graph_outputs = {str(value.name) for value in getattr(model.graph, "output", ())}
         self._host_qadd_fusions: dict[int, dict[str, Any]] = {}
         self._host_qadd_input_dqs: set[int] = set()
@@ -363,10 +372,12 @@ class XDNAResNetRunner:
         # state inference only packs the changing activation matrix.
         self._packed_weight_cache: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
         self._cpu_weight_cache: dict[int, np.ndarray] = {}
+        self._cpu_numpy_matrix_cache: dict[tuple[int, int], tuple[np.ndarray, bool]] = {}
         self._torch_weight_cache: dict[int, Any] = {}
         self._torch_int8_weight_cache: dict[int, tuple[Any, ...]] = {}
         fused_specs = list(fused_blocks or ())
-        self.fused_stage_blocked = fused_stage_blocked
+        self.fused_stage_blocked = fused_stage_blocked or bool(fused_body_groups)
+        self.fused_body_groups = fused_body_groups
         stage_specs = list(fused_stages or ())
         parallel_specs = list(parallel_projection_blocks or ())
         if any((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
@@ -395,8 +406,8 @@ class XDNAResNetRunner:
             prepared_blocks[prefix] = (block, binding, set(binding["covered_nodes"]), str(xclbin), str(insts))
 
         for prefixes, xclbin, insts in stage_specs:
-            if not 1 <= len(prefixes) <= 8:
-                raise ValueError("linked fused stage requires one to eight block prefixes")
+            if not 1 <= len(prefixes) <= 16:
+                raise ValueError("linked fused stage requires one to sixteen block prefixes")
             if not Path(xclbin).is_file() or not Path(insts).is_file():
                 raise ValueError("fused stage xclbin and instruction stream must exist")
             stage_blocks = []
@@ -412,7 +423,7 @@ class XDNAResNetRunner:
                 block = bottleneck_plans.get(prefix)
                 if block is None:
                     raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
-                binding = bind_fused_bottleneck(model, block, blocked=fused_stage_blocked)
+                binding = bind_fused_bottleneck(model, block, blocked=self.fused_stage_blocked)
                 if previous_binding is not None and (
                     previous_binding["output_shape"] != binding["input_shape"]
                     or previous_binding["output_raw_name"] != binding["input_raw_name"]
@@ -600,7 +611,7 @@ class XDNAResNetRunner:
                     from blocked_stage import pack_blocked_params
                 except ImportError:
                     from .blocked_stage import pack_blocked_params
-                stage_params = [pack_blocked_params(binding) for binding in bindings]
+                stage_params = [pack_blocked_params(binding, header=bool(self.fused_body_groups)) for binding in bindings]
             else:
                 stage_params = [binding["params"] for binding in bindings]
             parameter_tensor = iron.tensor(np.concatenate(stage_params), dtype=np.uint8, device="npu")
@@ -610,7 +621,14 @@ class XDNAResNetRunner:
                 # Debug: artifact built with --tap drains block 0's output as a 4th argument.
                 first_out = bindings[0]["output_shape"]
                 tap_tensor = iron.zeros(int(np.prod(first_out)), dtype=np.int8, device="npu")
+            extra_tensor = None
+            if self.fused_body_groups:
+                # Whole-body artifact: the 4th argument is a DDR scratch buffer holding
+                # every intermediate block boundary (all but the last block's output).
+                scratch = sum(int(np.prod(binding["output_shape"])) for binding in bindings[:-1])
+                extra_tensor = iron.zeros(max(scratch, 1), dtype=np.int8, device="npu")
             self._fused_stages[first_prefix] = {
+                "extra": extra_tensor,
                 "tap": tap_tensor,
                 "blocks": blocks, "bindings": bindings, "input": input_tensor,
                 "parameters": parameter_tensor, "output": output_tensor,
@@ -1279,9 +1297,22 @@ class XDNAResNetRunner:
         else:
             raw = np.empty(plan.output_shape, dtype=np.float32)
             for group in range(plan.groups):
-                w = weights[group * out_per_group : (group + 1) * out_per_group]
-                matrix = w.reshape(out_per_group, -1).T.astype(np.int32)
-                acc = panels[group].astype(np.int32) @ matrix
+                cache_key = (index, group)
+                cached = self._cpu_numpy_matrix_cache.get(cache_key)
+                if cached is None:
+                    w = weights[group * out_per_group : (group + 1) * out_per_group]
+                    reduction = int(np.prod(w.shape[1:]))
+                    # Centered int8 x int8 partial sums are below 2**24 for short reductions,
+                    # so a float32 BLAS GEMM is bit-exact and far faster than an int32 matmul.
+                    exact_float = reduction * 128 * 127 < (1 << 24)
+                    matrix = w.reshape(out_per_group, -1).T
+                    cached = (np.ascontiguousarray(matrix.astype(np.float32 if exact_float else np.int32)), exact_float)
+                    self._cpu_numpy_matrix_cache[cache_key] = cached
+                matrix, exact_float = cached
+                if exact_float:
+                    acc = panels[group].astype(np.float32) @ matrix
+                else:
+                    acc = panels[group].astype(np.int32) @ matrix
                 raw[:, group * out_per_group : (group + 1) * out_per_group] = acc.reshape(
                     batch, out_h, out_w, out_per_group
                 ).transpose(0, 3, 1, 2)
@@ -1483,6 +1514,8 @@ class XDNAResNetRunner:
                 shape = bindings[0]["output_shape"]
                 self._capture_outputs["stage_tap:block0"] = stage["tap"].numpy().view(np.uint8).reshape(
                     shape[0], shape[2], shape[3], shape[1]).transpose(0, 3, 1, 2).copy()
+        elif stage.get("extra") is not None:
+            stage["kernel"](stage_input, stage["parameters"], stage["output"], stage["extra"])
         else:
             stage["kernel"](stage_input, stage["parameters"], stage["output"])
         producer = "+".join(binding["block"].prefix for binding in bindings)
@@ -1734,6 +1767,12 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         metavar="BLOCK... XCLBIN INSTS",
         help="run one to three adjacent bottlenecks as one device-linked IRON stage",
     )
+    parser.add_argument(
+        "--fused-body", nargs=3, metavar=("XCLBIN", "INSTS", "GROUPS_JSON"),
+        help="run every bottleneck as ONE resnet_body_design.py artifact; GROUPS_JSON lists the "
+             "block-prefix groups in execution order, e.g. '[[\"/layer1/layer1.0\"],[...]]'",
+    )
+    parser.add_argument("--host-maxpool", action="store_true", help="run MaxPool on the host instead of an XDNA artifact")
     parser.add_argument("--fused-stage-blocked", action="store_true", help="fused stages were compiled with --blocked (vectorized layout)")
     parser.add_argument(
         "--parallel-projection-block", nargs=3, action="append", metavar=("PREFIX", "XCLBIN", "INSTS"),
@@ -1750,6 +1789,13 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
     manifest = json.loads(args.manifest.read_text())
     if bool(args.maxpool_uint8_xclbin) != bool(args.maxpool_uint8_insts):
         raise ValueError("--maxpool-uint8-xclbin and --maxpool-uint8-insts must be supplied together")
+    body_groups = None
+    body_stages = []
+    if args.fused_body:
+        import json as _json
+        body_groups = _json.loads(args.fused_body[2])
+        body_stages = [(tuple(prefix for group in body_groups for prefix in group), args.fused_body[0], args.fused_body[1])]
+
     runner = XDNAResNetRunner(
         model,
         manifest,
@@ -1763,8 +1809,10 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         fused_stages=[
             (tuple(items[:-2]), items[-2], items[-1])
             for items in (args.fused_stage or [])
-        ],
+        ] + body_stages,
         fused_stage_blocked=args.fused_stage_blocked,
+        fused_body_groups=body_groups,
+        host_maxpool=args.host_maxpool,
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
         ],
