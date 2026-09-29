@@ -85,7 +85,14 @@ def _body_groups(groups: Any) -> list[Any]:
     return groups
 
 
-_KINDS = ("resnet", "fused_bottleneck", "fused_stage", "resnet_body", "maxpool_u8")
+_KINDS = (
+    "resnet",
+    "fused_bottleneck",
+    "fused_stage",
+    "resnet_body",
+    "resnet_network",
+    "maxpool_u8",
+)
 
 
 def _compile_command(
@@ -172,6 +179,28 @@ def _compile_command(
         ]
         if options.get("blocked"):
             command.append("--blocked")
+    elif kind == "resnet_network":
+        # Stem Conv + MaxPool + every bottleneck stage (one core column per stage) as ONE xclbin.
+        stages = _body_groups(options.get("stages"))
+        command = [
+            _xdna_python(header),
+            str(_script("resnet_stage_design.py")),
+            "--dev",
+            str(options.get("device", "npu2")),
+            "--model",
+            str(model_path),
+            "--xclbin-path",
+            str(xclbin),
+            "--insts-path",
+            str(insts),
+        ]
+        if options.get("stem", True):
+            command.append("--stem")
+        for stage in stages:
+            command += [
+                "--stage",
+                *(stage["blocks"] if isinstance(stage, dict) else stage),
+            ]
     elif kind == "resnet_body":
         groups = _body_groups(options.get("groups"))
         command = [
@@ -467,6 +496,22 @@ def run_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
         ]
         if body.get("rt"):
             command.append("--fused-body-rt")
+    network = options.get("device_network")
+    if network is not None:
+        if not isinstance(network, dict) or not all(
+            key in network for key in ("xclbin", "insts", "stages")
+        ):
+            raise proto.RPCError("device_network needs xclbin, insts, and stages")
+        stages = [
+            s["blocks"] if isinstance(s, dict) else s
+            for s in _body_groups(network["stages"])
+        ]
+        command += [
+            "--device-network",
+            str(network["xclbin"]),
+            str(network["insts"]),
+            json.dumps(stages),
+        ]
     if options.get("host_maxpool"):
         command.append("--host-maxpool")
     pool = options.get("maxpool_uint8")

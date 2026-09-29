@@ -246,7 +246,9 @@ class Session:
         ``"fused_bottleneck"`` (needs ``options["block"]``), ``"fused_stage"`` (1-3 blocks, or
         1-8 with ``options["blocked"]``), ``"resnet_body"`` (the whole bottleneck body as ONE
         xclbin; needs ``options["groups"]``, block-prefix groups with one core column each), or
-        ``"maxpool_u8"``.
+        ``"resnet_network"`` (stem Conv + MaxPool + all four bottleneck stages on the device as ONE
+        xclbin, one core column per stage; needs ``options["stages"]``: block-prefix lists, projection
+        block first), or ``"maxpool_u8"``.
         Returned artifact paths are on the RPC server and can be passed to
         :meth:`xdna_run_resnet` on the same server.
 
@@ -261,6 +263,7 @@ class Session:
             "fused_bottleneck",
             "fused_stage",
             "resnet_body",
+            "resnet_network",
             "maxpool_u8",
         ):
             raise ValueError(f"unsupported XDNA compile kind {kind!r}")

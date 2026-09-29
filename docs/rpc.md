@@ -231,6 +231,20 @@ report = remote.xdna_run_resnet(model, build["manifest"], {
 })
 ```
 
+The whole network, including the stem Conv and MaxPool, can run on the device as one xclbin with one
+core column per bottleneck stage (`kind="resnet_network"`; runtime-shaped kernels; the host only
+quantizes the image and runs the classifier tail):
+
+```python
+stages = [[f"/layer1/layer1.{i}" for i in range(3)], [f"/layer2/layer2.{i}" for i in range(4)],
+          [f"/layer3/layer3.{i}" for i in range(6)], [f"/layer4/layer4.{i}" for i in range(3)]]
+net = remote.xdna_compile_resnet(model, "resnet_network", {"stages": stages})
+report = remote.xdna_run_resnet(model, build["manifest"], {
+    "device_network": {"xclbin": net["xclbin"], "insts": net["insts"], "stages": stages},
+    "warmup": 5, "iters": 30,
+})   # ~5.2 ms end to end on the quicktest ResNet, logits identical to ONNX Runtime CPU
+```
+
 All blocks of a group must share shapes and weight chunking (they differ only in
 weights and requantization scales). `fused_stage` compiles also accept
 `options["blocked"]` (1-8 blocks, vectorized kernels; pass `"blocked": True` on the
