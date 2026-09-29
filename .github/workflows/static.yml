@@ -425,11 +425,7 @@ jobs:
             python3 setup.py create_version
             mkdir -p scripts/convertmodel/pyodide-demo/onnxsim_src
             cp onnxsim/*.py scripts/convertmodel/pyodide-demo/onnxsim_src/
-            python3 - <<'PY' > scripts/convertmodel/pyodide-demo/onnxsim_src/files.json
-            import json
-            from pathlib import Path
-            print(json.dumps(sorted(p.name for p in Path("onnxsim").glob("*.py"))))
-            PY
+            python3 -c 'import json; from pathlib import Path; print(json.dumps(sorted(p.name for p in Path("onnxsim").glob("*.py"))))' > scripts/convertmodel/pyodide-demo/onnxsim_src/files.json
             echo "staged Pyodide demo at scripts/convertmodel/pyodide-demo/"
           fi
 
