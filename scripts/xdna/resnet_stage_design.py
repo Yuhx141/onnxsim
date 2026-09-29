@@ -201,6 +201,7 @@ def resnet_stages(
     nocompute: CompileTime[int] = 0,
     stem_spec: CompileTime[str] = "",
     split_weights: CompileTime[str] = "",
+    kflags: CompileTime[str] = "",
 ):
     cols = json.loads(stage_specs)
     n = len(cols)
@@ -261,7 +262,7 @@ def resnet_stages(
         half_ty = np.ndarray[(col["half_obj"],), np.dtype[np.int8]]
         join_ty = np.ndarray[(col["half_obj"] * 2 + out_obj,), np.dtype[np.int8]]
         out_ty = np.ndarray[(out_obj,), np.dtype[np.int8]]
-        flags = [f"-DRT_COL_BYTES={col['col_bytes']}", f"-DRT_SKIPX_BYTES={col['skipx_bytes']}"]
+        flags = [f"-DRT_COL_BYTES={col['col_bytes']}", f"-DRT_SKIPX_BYTES={col['skipx_bytes']}"] + [f for f in kflags.split() if f]
         src = str(_RT_KERNEL)
         prefix = f"s{index}"
         ident_ty = [act_ty, skip_ty, np.int32]
@@ -479,6 +480,7 @@ def _parser():
     parser.add_argument("--chunk-caps", default="", help="comma-separated weight-chunk byte cap per stage (0 = default)")
     parser.add_argument("--weight-depths", default="")
     parser.add_argument("--nocompute", type=int, default=0)
+    parser.add_argument("--kflags", default="", help="extra kernel compiler flags (profiling, e.g. -DRT_SKIP_GATHER, -DRT_REPEAT_GEMM=4)")
     parser.add_argument("--split-weights", default="", help="comma-separated 0/1 per stage: give each of the four cores its own weight stream (4 shim MM2S channels instead of 1)")
     parser.add_argument("--cols", type=int, default=0, help="array width to compile for (default: stages + stem column, min 3); use 8 to reach all shim DMA channels")
     parser.add_argument("--stem", action="store_true", help="also run the stem Conv + MaxPool on the device (extra column after the stages)")
@@ -507,7 +509,7 @@ def _compile_kwargs(opts):
     model = onnx.load(opts.model)
     caps = [int(v) for v in opts.chunk_caps.split(",")] if opts.chunk_caps else None
     cols, _ = stage_specs(model, opts.stage, caps)
-    kwargs = {"stage_specs": json.dumps(cols, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "split_weights": opts.split_weights}
+    kwargs = {"stage_specs": json.dumps(cols, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "split_weights": opts.split_weights, "kflags": opts.kflags}
     if opts.stem:
         kwargs["stem_spec"] = json.dumps(stem_spec(model, len(cols)), separators=(",", ":"))
     return kwargs
