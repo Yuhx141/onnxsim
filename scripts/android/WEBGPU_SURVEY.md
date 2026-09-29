@@ -313,3 +313,48 @@ one 1.71 -> 1.44 ms), but the extra partial-sum traffic and reduce dispatch canc
 on large-grid layers makes it worse. Since 4-16x more workgroups barely speeds a layer up, ORT's Conv is bound by its
 workgroup-memory load throughput, as computed above, and only a design with a higher FMA-per-load ratio (or fewer loads per FMA,
 e.g. fp16 storage with fp32 accumulation) can beat it. Not done: fusing Conv+Add+Relu / SiLU to cut the node count.
+
+## Operator fusion (2026-09-30)
+
+Bounds first (nodes deleted from the graph, numerics ignored, timing only), fp32 defaults, wall-clock median:
+
+| candidate | removed | saved |
+|---|---|---|
+| ResNet-50 ReLU after the residual Add | 16 dispatches | 0.28 ms (0.4%) |
+| ResNet-50 residual Add + ReLU | 32 dispatches | 0.36 ms (0.5%) |
+| YOLO11n SiLU (`QuickGelu`) after convolutions | 77 dispatches | 3.8 ms (5%) |
+
+So the small elementwise dispatches are cheap (10-25 us in ResNet, ~50 us in YOLO) and the ~0.19 ms per node floor seen earlier comes
+from the convolutions, not from them. Residual-Add fusion is not worth doing; SiLU is.
+
+**Conv + SiLU epilogue** (`ort_conv_silu_fusion.patch`, on top of the two base patches). ORT already turns `x * sigmoid(a * x)` into a
+`com.microsoft::QuickGelu` node after layout handling. Two small changes make the convolution absorb it:
+
+- `ConvActivationFusion` accepts a `QuickGelu` after a Conv on the WebGPU EP and stores `alpha` (default 1.702) as the fused activation
+  parameter;
+- the WebGPU EP gets `ActivationKind::QuickGelu`, parsed from the `activation` attribute, and one shader snippet
+  `value = value / (1 + exp(-alpha * value))` that every convolution path already shares (Conv2dMM, the MatMul path used for 1x1,
+  GroupedConv, Conv3D).
+
+| model | before | Conv+SiLU fused | change | dispatches |
+|---|---|---|---|---|
+| YOLO11n | 73.5 ms | 70.0 ms | -4.7% | 251 -> 174 |
+| YOLO26n | 66.1 ms | 63.4 ms | -4.1% | |
+| ResNet-50 | 66.3 ms | 67.0 ms | unchanged (no SiLU) | |
+
+Verified: YOLO11n / YOLO26n / ResNet-50 outputs match the CPU (2.3e-6 / 1.1e-6 / 5.6e-7 relative); the 283-model regression sweep is
+unchanged (275 match, 8 even-size LRN checked by numpy); dedicated tests in `gen_new_op_tests.py` cover 1x1, 3x3, with bias, stride 2,
+depthwise, `alpha` = 0.5 / 1.702 / 2.0 (all fuse, error <= 5.7e-7) and a SiLU whose pre-activation is also used elsewhere (correctly not
+fused). Limit: an explicit `com.microsoft::QuickGelu` node in the source model is not fused, because the transpose optimizer cannot move
+the layout transposes through a contrib op, so the Conv is followed by a Transpose; SiLU written as Sigmoid + Mul (what PyTorch exports)
+is the case that fuses.
+
+**Graph capture on top** (`iobind=1 enableGraphCapture=1`, with the fusion): YOLO11n 71.3 -> 64.8 ms (-9%), YOLO26n 64.4 -> 57.7 (-10%),
+SAM-L0 decoder 65.1 -> 58.1 (-11%), RT-DETR `pre` 396.9 -> 373.1 (-6%). YOLO11n end to end: 73.5 ms -> 64.8 ms (-12%).
+
+**What is left in YOLO11n** (after the fusion, GPU-timestamp sum per kind): Conv2dMM 24.1 ms and MatMul (1x1 convs) 14.0 ms, then Concat
+3.5 (23 dispatches), Transpose 3.0 (18), Softmax 2.1, GroupedConv 1.6, Pool 1.5, Split 1.5. ORT's optimized graph has 16 Transposes: about
+7 are the detection heads' `Reshape` (needs NCHW order), about 4 sit around attention MatMul/Softmax, and 4 surround the two `Resize` (nearest
+2x upsample) nodes, which the EP explicitly keeps out of NHWC (`ShouldConvertDataLayoutForOp`, kernels commented out). An NHWC Resize is
+feasible (the nearest path is already axis-generic; the bilinear/trilinear/cubic paths hard-code the last two axes as spatial, so they would
+need a transposing fallback) and would remove those 4 Transposes (~1.2 ms of GPU time, an estimated 1-2%); not done.

@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
   const std::string model = argv[1], prov = argv[2];
   const int warm = atoi(argv[3]), iters = atoi(argv[4]);
   int threads = 4;
-  std::string dump, dumplast, sync_model;
+  std::string dump, dumplast, sync_model, save_opt;
   bool iobind = false;
   std::map<std::string, std::vector<int64_t>> shape_override;
   std::vector<std::string> keys, vals;
@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     else if (k == "dump") dump = v;
     else if (k == "dumplast") dumplast = v;
     else if (k == "sync") sync_model = v;
+    else if (k == "save_opt") save_opt = v;
     else if (k == "iobind") iobind = v == "1";
     else if (k == "shape") {
       size_t c = v.find(':');
@@ -98,6 +99,7 @@ int main(int argc, char** argv) {
   CK(g->CreateSessionOptions(&so));
   CK(g->SetIntraOpNumThreads(so, threads));
   if (getenv("PROFILE")) CK(g->EnableProfiling(so, getenv("PROFILE")));
+  if (!save_opt.empty()) CK(g->SetOptimizedModelFilePath(so, save_opt.c_str()));
   if (prov == "webgpu") {
     std::vector<const char*> k, v;
     for (size_t i = 0; i < keys.size(); i++) { k.push_back(keys[i].c_str()); v.push_back(vals[i].c_str()); }

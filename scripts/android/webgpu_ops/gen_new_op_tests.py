@@ -129,3 +129,59 @@ for s in [1, 2, 3, 4, 5, 6, 7]:
         % s,
         {"K": np.float32(3), "S": np.array([1, 12, 16, 16], dtype="i8")},
     )
+
+
+# Conv + SiLU / QuickGelu: the WebGPU EP fuses these into the Conv epilogue (ConvActivationFusion + QuickGelu).
+# Covers the MatMul path (1x1), Conv2dMM (3x3), GroupedConv (depthwise), bias, stride, and alpha != 1.
+def _mk_ms(name, body, inits):
+    m = parser.parse_model(
+        '<ir_version: 9, opset_import: ["": 20, "com.microsoft": 1]>\n'
+        "g (float[1,3,32,32] X) => (float[?] Y) {\n" + body + "\n}"
+    )
+    for k, v in inits.items():
+        m.graph.initializer.append(numpy_helper.from_array(np.asarray(v), k))
+    del m.graph.output[:]
+    m.graph.output.append(helper.make_tensor_value_info("Y", 1, None))
+    onnx.save(m, f"m/{name}.onnx")
+
+
+_rng = np.random.default_rng(11)
+_w0 = (_rng.standard_normal((16, 3, 3, 3)) * 0.3).astype("f")
+_stem = "A=Conv<pads=[1,1,1,1]>(X,W0)\nR=Relu(A)\n"
+_silu = "S=Sigmoid(C)\nY=Mul(C,S)"
+_cases = {
+    "1x1": ("C=Conv(R,W)", (32, 16, 1, 1), None),
+    "3x3": ("C=Conv<pads=[1,1,1,1]>(R,W)", (32, 16, 3, 3), None),
+    "3x3_bias": ("C=Conv<pads=[1,1,1,1]>(R,W,B)", (32, 16, 3, 3), 32),
+    "3x3_s2": ("C=Conv<pads=[1,1,1,1],strides=[2,2]>(R,W,B)", (32, 16, 3, 3), 32),
+    "dw": ("C=Conv<pads=[1,1,1,1],group=16>(R,W,B)", (16, 1, 3, 3), 16),
+}
+for _n, (_conv, _ws, _nb) in _cases.items():
+    _inits = {"W0": _w0, "W": (_rng.standard_normal(_ws) * 0.2).astype("f")}
+    if _nb:
+        _inits["B"] = (_rng.standard_normal(_nb) * 0.5).astype("f")
+    _mk_ms(f"v_ConvSiLU_{_n}", _stem + _conv + "\n" + _silu, _inits)
+# x * sigmoid(alpha * x) with alpha != 1 (QuickGeluFusion turns it into QuickGelu(alpha), then Conv fuses it). An explicit
+# com.microsoft::QuickGelu node in the source model is NOT fused: the transpose optimizer cannot move layout through it.
+for _a in (1.702, 0.5, 2.0):
+    _inits = {
+        "W0": _w0,
+        "W": (_rng.standard_normal((32, 16, 3, 3)) * 0.2).astype("f"),
+        "B": (_rng.standard_normal(32) * 0.5).astype("f"),
+        "AL": np.float32(_a),
+    }
+    _mk_ms(
+        f"v_ConvSiLUalpha_{_a}",
+        _stem + "C=Conv<pads=[1,1,1,1]>(R,W,B)\nT=Mul(C,AL)\nS=Sigmoid(T)\nY=Mul(C,S)",
+        _inits,
+    )
+# SiLU that must NOT be fused: the pre-activation value is also consumed elsewhere
+_mk_ms(
+    "v_ConvSiLU_shared",
+    _stem + "C=Conv<pads=[1,1,1,1]>(R,W,B)\nS=Sigmoid(C)\nM=Mul(C,S)\nY=Add(M,C)",
+    {
+        "W0": _w0,
+        "W": (_rng.standard_normal((32, 16, 3, 3)) * 0.2).astype("f"),
+        "B": (_rng.standard_normal(32) * 0.5).astype("f"),
+    },
+)
