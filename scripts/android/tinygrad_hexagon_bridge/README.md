@@ -502,22 +502,28 @@ Tensor-core kernels in driving: 51.2 -> 39.1 ms. Not tried: weight-prefetch tuni
 between the two byte planes of an A16 activation. The compiler cache key is the fork commit: an uncommitted change re-serves the
 cached artifact, so commit before measuring.
 
-**A cost per distinct kernel, not explained.** Kernel bodies that repeat are cheap; each distinct kernel costs 100-200 us more, at
-any size. Measured on the phone with synthetic graphs of tiny (512-element) kernels: 300 calls of 3 distinct kernels 8.4 ms (28 us
-per call); 100 softmax + mul pairs with a different constant each (distinct source, identical structure and buffers) 29.0 ms;
-191 calls of distinct-size kernels 26.9 ms (141 us per call). The driving graph has 218 distinct kernels among 371 calls, so this
-may be a large part of its run (up to ~25-40 ms). Ruled out: the per-call timer, the thread pool (same with 1 thread), cold caches
-between runs, code size, software prefetch on/off, prefetching every kernel's code lines (`dcfetch` over the code, before the
-first call: 27.1 -> 27.0 ms), reading one byte of every code page first (24.1 -> 24.1 ms). Next probe: the DSP PMU counters
-(`libs/itrace/inc/itrace_dsp_events_pmu.h`), or an unsigned-PD-independent rebuild of the skel with the kernels in one section.
+**DSP clock vote (`DSP_V65_PERF_VOTE`, level 3 by default in `compile_v65.sh`).** The skel never voted for DSP power, so the cDSP ran
+at whatever DCVS chose for a light FastRPC client: identical runs of the same artifact ranged from 144 to 192 ms for driving and
+72 to 96 ms for DM, and a PMU probe of the tiny-kernel graphs measured about 360 MHz effective. The skel now takes the HVX power
+vote and a DCVS performance-mode request when an artifact opens (reference-counted over open programs, released when the last one
+closes; the same pattern as `scripts/android/mcc_hmx/tg/replay_impl.c`). Level 1 (performance mode, no pinned corner) was slower
+(synthetic 300-call graph 39.2 ms vs 29.2 ms unvoted), level 2 pins TURBO, level 3 pins the MAX corner. Interleaved A/B, two rounds:
 
-PMU probe (inconclusive). `qurt_pmu_enable/set/get` works from the unsigned PD (`process_class` includes `unsigned`); a skel build
-that stores four counter deltas per call (event bytes 0x10 I$ miss, 0x11 D$ miss, 0x5b ITLB miss, 0x8f DTLB miss; second set 0x02
-packets, 0x33 cycles with one thread running, 0x82 DU stall, 0x54 I$ access) gave, per call with the worker on one thread: D$ demand
-misses median 1942 for the graph of distinct tiny kernels against 521 for the repeated-kernel graph, I$ misses about 0 and TLB
-misses 0. Treat those as suggestive only: the counters are global unless matched to a hardware thread id
-(`QURT_PMUSTID0/1`, `QURT_PMUCNTSTID*`), which I did not set up, other clients' threads count too, and the packet and stall events
-read 0. The instrumentation is not in the tree (a small `#ifdef` in the skel's per-call loop and a `#define` from the emitter).
+| vote | driving DSP ms | DM DSP ms |
+|---|---:|---:|
+| none | 144-192 (varies) | 72-96 (varies) |
+| TURBO | 149.4, 147.4 | 76.4, 76.4 |
+| MAX (default) | 139.7, 139.2 (140.0, 140.2 in the final build) | 71.6, 71.6 (71.4) |
+
+Outputs are byte-identical with and without the vote. Two consequences. Every earlier A/B in this README was taken with the clock
+free-running: differences of a few ms between runs could be clock state, so decisions rest on the large or repeated ones (the
+pinned clock makes runs reproducible to about 1 ms from here on). And a pinned MAX corner costs power: for battery use pass
+`DSP_V65_PERF_VOTE=0`. The tiny-kernel "per distinct kernel" cost above was measured unvoted; the PMU's own cycle counts, with
+corrected V69 event codes (the itrace header's low bytes are offset by 2 from the V69 manual's: I$ miss 0x12, D$ miss 0x13, JTLB
+miss 0x58, DTLB miss 0xb3, packets 0x03, DU stall 0xa0, L2 DU read miss 0x7d, cycles with one thread 0x3b), showed a median call of
+only ~1.9 K packets with no cache or TLB misses: the "113 us floor" was an artifact of the profile listing only the slowest 254
+calls, and the tiny-graph slowness is the low clock. The first PMU probe of this file used the header's codes and counted other
+threads' packet commits instead; its numbers are void.
 
 **Depthwise (sliding-window vrmpy).** Each channel's padded image is one flat byte signal. A 128-lane vrmpy takes one unaligned
 128-byte load at offset `128b + s + ky*Wp + 4g` and a splat of 4 weights; four shifts s = 0..3 give 128 outputs, re-ordered with
