@@ -281,45 +281,30 @@ add a ~0.75 ms+ switch. Measured 7.0-8.4 ms end to end on a host under heavy unr
 load (body 4.9-5.8 ms in-runner vs 3.7 ms in isolation), logits identical to ORT CPU.
 Before this schedule: 13.6 ms (best hybrid) and 76 ms (all per-op XRT).
 
-Double-buffering the weight FIFO (`--weight-depths`, with a smaller per-group
-`--chunk-caps`) overlaps weight DMA with compute where tile memory allows: on the
-layer4 groups (small activations, ~16.5 KB slots after tap pruning) it gave ~17% on a
-layer4-only body (1.79 -> 1.49 ms, depth 3 no better than 2) and ~5% on the whole body;
-layers 1-3 have 18-37 KB slots plus large activations/static buffers and cannot hold two
-slots. Weight-chunk caps and depths must match between compile and run (they change the
-packed layout); the runner reads them from `--fused-body`'s group JSON
-(`{"blocks": [...], "chunk_cap": N, "depth": D}` entries).
+**Measurement correction.** The first round of tuning results (weight FIFO depth, segment gather,
+per-worker streams, memtile staging) was measured by alternating several xclbins in one timing
+loop. Each call then pays a ~1.8 ms hardware-context switch, which diluted every difference and
+was mistaken for host-load noise. Everything below was re-measured with one artifact per process
+(host load average 14-22, so treat +-0.3 ms as noise; repeated runs, minimum reported):
 
-Further tuning (interleaved, same window; the host was loaded and the body is DRAM-bandwidth
-bound, so absolute times swing 3.5 -> 8 ms with other jobs' memory traffic, ratios hold):
-building conv2's small-map 3x3 tiles from a few contiguous row segments instead of a
-static im2col buffer (`--seg-gather`, stride-1 maps of width 1/2/4) frees ~18 KB of tile
-memory for deeper weight FIFOs and smaller chunks, but the extra loads per MMUL cost
-more than the overlap gives (all-groups segments: +13% at depth 1; with depths 3/2/2/2
-and smaller chunk caps it only breaks even with the baseline). The best measured
-configuration is the plain body with double-buffered layer4 groups (about -6%);
-mixed segment/im2col was -2%. Weight prefetch depth is not the lever; per-stream weight
-bandwidth is.
+| Variant | Body (all 16 blocks) | Layer4-only body |
+| --- | ---: | ---: |
+| baseline (`resnet_body_design.py` defaults) | 3.6-3.7 ms | 1.90 ms |
+| layer4 weight FIFO depth 2 + chunk cap 17 KB (`--weight-depths`, `--chunk-caps`) | 3.3 ms (-9%) | 1.39 ms (-29%) |
+| per-worker weight streams (`--split-weights`, `--cols 8`) | n/a (needs > 16 shim channels) | 1.69 ms (-10%; streaming floor 1.21 -> 0.91 ms) |
+| memtile weight staging (`--l2-depths 8`) | - | 1.87 ms (no gain) |
+| segment gather instead of static im2col (`--seg-gather`) | 6.3 ms (+70%) | - |
+| depth 2/3 + smaller caps + segment gather on layer2/3 | 4.9-5.6 ms (worse) | - |
 
-Per-worker weight streams (`--split-weights`, needs `--cols 8`; each core gets its own FIFO and
-shim channel instead of a broadcast FIFO, so a group uses 4 of the 16 shim MM2S channels):
-exact, but on a layer4-only body the streaming-only floor is unchanged (1.37 ms broadcast vs
-1.35 ms split for 9.5 MB) and the real run gains only ~4% (1.82 -> 1.74 ms). Fitting a line
-through the streaming-only floors of layers 3 and 4 gives ~8 GB/s and ~0.2 ms fixed. Each
-block is a strict conv1 -> conv2 -> conv3 pipeline, so at any moment only one stage's
-weights are needed and depth-1/2 FIFOs cannot run ahead; more channels do not help, only
-staging larger runs of weights ahead of compute (memtile FIFOs) or fewer bytes could.
+So: double-buffer the layer4 weight FIFOs (small slots after tap pruning make room for two);
+keep the static im2col everywhere; memtile staging does not help; per-worker streams help but
+cannot be afforded body-wide because the 16 shim MM2S channels are all taken (8 input + 8
+weight streams). Chunk caps and depths must match between compile and run; the runner reads
+them from `--fused-body`'s group JSON (`{"blocks": [...], "chunk_cap": N, "depth": D}`).
+Recommended body build: `--chunk-caps 0,0,0,0,0,0,17000,17000 --weight-depths 1,1,1,1,1,1,2,2`.
 
-Memtile weight staging (`--l2-depths`: shim fills a deep memtile FIFO ahead of compute, the
-memtile forwards to the cores; BD limits cap it near depth ~8-12) is exact and gives nothing
-(layer4-only body 1.80 vs 1.84 ms). The NPU itself is not DDR-limited: the reference
-`memcpy` microbenchmark (8 columns x 2 channels) reaches 76 GB/s in+out. So the ~8 GB/s
-"weight-stream floor" is a property of this dataflow, not of the memory system: prefetching,
-more shim channels (`--split-weights`) and staging all leave it unchanged, consistent with
-per-core input-DMA ingress on the phase that is currently active (conv1, the projection skip
-and conv3 each run on a single core; only conv2 uses two). Spreading every conv across all
-four cores of a column (data-parallel over output channels, with memtile join/broadcast between
-phases) is the change that would raise the ingress rate.
+The NPU itself is not DDR-limited (reference `memcpy` benchmark: 76 GB/s in+out), and the
+weight stream is not limited by tile DMA: see the layer-engine probe below.
 
 Vitis AI inspection (`docs/xdna-vitis-ai-inspection.md`, measured on this host: 1.55 ms min on the
 same 32x32 quicktest model): one generic unified xclbin (8 columns, PDI only 19 KB), one HW
