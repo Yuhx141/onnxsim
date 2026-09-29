@@ -20,13 +20,14 @@ from aie.utils.hostruntime.cli import run_design_cli
 _KERNEL = Path(__file__).with_name("kernels") / "fused_identity_bottleneck.cc"
 _SKIP_KERNEL = Path(__file__).with_name("kernels") / "fused_bottleneck_skip.cc"
 _IDENTITY_SKIP_KERNEL = Path(__file__).with_name("kernels") / "fused_bottleneck_identity_skip.cc"
+_BLOCKED_KERNEL = Path(__file__).with_name("kernels") / "fused_bottleneck_blocked.cc"
 
 
 def _align4(value: int) -> int:
     return (value + 3) & ~3
 
 
-def _block_workers(chunks1, skip_chunks, chunks2, chunks3):
+def _block_workers(chunks1, skip_chunks, chunks2, chunks3, nocompute=0):
     """Bind per-block chunk counts now; IRON traces worker bodies after the block loop ends."""
     def discard(weights, count):
         for _ in range_(count):
@@ -38,16 +39,19 @@ def _block_workers(chunks1, skip_chunks, chunks2, chunks3):
         bundle = out.acquire(1)
         for i in range_(chunks1):
             w = weights.acquire(1)
-            kernel(x, w, bundle, i)
+            if not nocompute & 1:
+                kernel(x, w, bundle, i)
             weights.release(1)
         residual = skip_out.acquire(1)
         if skip_chunks:
             for i in range_(skip_chunks):
                 w = weights.acquire(1)
-                skip_kernel(x, w, residual, i)
+                if not nocompute & 2:
+                    skip_kernel(x, w, residual, i)
                 weights.release(1)
         else:
-            identity_kernel(x, residual)
+            if not nocompute & 2:
+                identity_kernel(x, residual)
         skip_out.release(1)
         out.release(1)
         inp.release(1)
@@ -59,7 +63,8 @@ def _block_workers(chunks1, skip_chunks, chunks2, chunks3):
         output = out.acquire(1)
         for i in range_(chunks2):
             w = weights.acquire(1)
-            kernel(bundle, w, output, i, channel_offset)
+            if not nocompute & 4:
+                kernel(bundle, w, output, i, channel_offset)
             weights.release(1)
         out.release(1)
         inp.release(1)
@@ -71,7 +76,8 @@ def _block_workers(chunks1, skip_chunks, chunks2, chunks3):
         output = out.acquire(1)
         for i in range_(chunks3):
             w = weights.acquire(1)
-            kernel(bundle, w, output, i)
+            if not nocompute & 8:
+                kernel(bundle, w, output, i)
             weights.release(1)
         out.release(1)
         inp.release(1)
@@ -87,6 +93,9 @@ def linked_bottleneck_stage(
     *,
     stage_specs: CompileTime[str],
     tap: CompileTime[int] = 0,
+    nocompute: CompileTime[int] = 0,
+    blocked: CompileTime[int] = 0,
+    dbg: CompileTime[int] = 0,
 ):
     """Run a fixed three-block stage with inter-block FIFOs on the device."""
     specs = json.loads(stage_specs)
@@ -120,7 +129,9 @@ def linked_bottleneck_stage(
 
         activation_ty = np.ndarray[(pixels * channels,), np.dtype[np.int8]]
         weight_ty = np.ndarray[(slot_bytes,), np.dtype[np.uint8]]
-        stage1_ty = np.ndarray[(pixels * mid_channels,), np.dtype[np.int8]]
+        # Blocked kernels keep conv1's output in a zero-padded [C/8][H+2][W+2][8] layout.
+        stage1_elems = (mid_channels // 8) * (height + 2) * (width + 2) * 8 if blocked else pixels * mid_channels
+        stage1_ty = np.ndarray[(stage1_elems,), np.dtype[np.int8]]
         skip_ty = np.ndarray[(output_pixels * output_channels,), np.dtype[np.int8]]
         stage2a_ty = np.ndarray[(output_pixels * (mid_channels // 2),), np.dtype[np.int8]]
         stage2b_ty = np.ndarray[(output_pixels * (mid_channels // 2),), np.dtype[np.int8]]
@@ -147,13 +158,18 @@ def linked_bottleneck_stage(
             f"-DFUSED_MAIN_RESIDUAL_SHIFT={spec['residual_main_shift']}",
             f"-DFUSED_SKIP_RESIDUAL_SHIFT={spec['residual_skip_shift']}",
         ]
+        if dbg:
+            flags = flags + [f"-DFUSED_DBG={dbg}"]
         symbol_prefix = f"stage{block_index}"
-        k1 = ExternalFunction("fused_bottleneck_conv1_chunk", source_file=str(_KERNEL), arg_types=[activation_ty, weight_ty, stage1_ty, np.int32], compile_flags=flags, symbol_prefix=symbol_prefix)
-        kskip = ExternalFunction("fused_bottleneck_skip_chunk", source_file=str(_SKIP_KERNEL), arg_types=[activation_ty, weight_ty, skip_ty, np.int32], compile_flags=flags, symbol_prefix=symbol_prefix)
-        kidentity = ExternalFunction("fused_bottleneck_identity_skip", source_file=str(_IDENTITY_SKIP_KERNEL), arg_types=[activation_ty, skip_ty], compile_flags=flags, symbol_prefix=symbol_prefix)
-        k2a = ExternalFunction("fused_bottleneck_conv2_chunk", source_file=str(_KERNEL), arg_types=[stage1_ty, weight_ty, stage2a_ty, np.int32, np.int32], compile_flags=flags, symbol_prefix=symbol_prefix + "a")
-        k2b = ExternalFunction("fused_bottleneck_conv2_chunk_b", source_file=str(_KERNEL), arg_types=[stage1_ty, weight_ty, stage2b_ty, np.int32, np.int32], compile_flags=flags, symbol_prefix=symbol_prefix + "b")
-        k3 = ExternalFunction("fused_bottleneck_conv3_chunk", source_file=str(_KERNEL), arg_types=[stage2_ty, weight_ty, output_ty, np.int32], compile_flags=flags, symbol_prefix=symbol_prefix)
+        _KERNEL_SRC = _SKIP_SRC = _IDENT_SRC = str(_BLOCKED_KERNEL) if blocked else None
+        if not blocked:
+            _KERNEL_SRC, _SKIP_SRC, _IDENT_SRC = str(_KERNEL), str(_SKIP_KERNEL), str(_IDENTITY_SKIP_KERNEL)
+        k1 = ExternalFunction("fused_bottleneck_conv1_chunk", source_file=_KERNEL_SRC, arg_types=[activation_ty, weight_ty, stage1_ty, np.int32], compile_flags=flags + ["-DBLK_CONV1"], symbol_prefix=symbol_prefix)
+        kskip = ExternalFunction("fused_bottleneck_skip_chunk", source_file=_SKIP_SRC, arg_types=[activation_ty, weight_ty, skip_ty, np.int32], compile_flags=flags + ["-DBLK_SKIP"], symbol_prefix=symbol_prefix)
+        kidentity = ExternalFunction("fused_bottleneck_identity_skip", source_file=_IDENT_SRC, arg_types=[activation_ty, skip_ty], compile_flags=flags + ["-DBLK_IDENTITY"], symbol_prefix=symbol_prefix)
+        k2a = ExternalFunction("fused_bottleneck_conv2_chunk", source_file=_KERNEL_SRC, arg_types=[stage1_ty, weight_ty, stage2a_ty, np.int32, np.int32], compile_flags=flags + ["-DBLK_CONV2A"], symbol_prefix=symbol_prefix + "a")
+        k2b = ExternalFunction("fused_bottleneck_conv2_chunk_b", source_file=_KERNEL_SRC, arg_types=[stage1_ty, weight_ty, stage2b_ty, np.int32, np.int32], compile_flags=flags + ["-DBLK_CONV2B"], symbol_prefix=symbol_prefix + "b")
+        k3 = ExternalFunction("fused_bottleneck_conv3_chunk", source_file=_KERNEL_SRC, arg_types=[stage2_ty, weight_ty, output_ty, np.int32], compile_flags=flags + ["-DBLK_CONV3"], symbol_prefix=symbol_prefix)
 
         input_fifo = ObjectFifo(activation_ty, depth=1, name=f"stage{block_index}_activation")
         weights_fifo = ObjectFifo(weight_ty, depth=1, name=f"stage{block_index}_weights")
@@ -164,7 +180,7 @@ def linked_bottleneck_stage(
         stage2_fifo = ObjectFifo(stage2_ty, depth=1, name=f"stage{block_index}_residual_join")
         output_fifo = ObjectFifo(output_ty, depth=1, name=f"stage{block_index}_output")
 
-        conv1_worker, conv2_worker, conv3_worker = _block_workers(chunks1, skip_chunks, chunks2, chunks3)
+        conv1_worker, conv2_worker, conv3_worker = _block_workers(chunks1, skip_chunks, chunks2, chunks3, int(nocompute))
 
         column = block_index
         workers.extend([
@@ -204,7 +220,16 @@ def linked_bottleneck_stage(
         else:
             xprod, ycons, *wprods = rest
         group = TaskGroup()
-        xprod.fill(x, wait=True, group=group)
+        if blocked:
+            first = specs[0]
+            xprod.fill(
+                x, wait=True, group=group,
+                sizes=[first["channels"] // 8, first["width"] * first["height"], 8],
+                strides=[8, first["channels"], 1],
+                transfer_len=first["width"] * first["height"] * first["channels"],
+            )
+        else:
+            xprod.fill(x, wait=True, group=group)
         group.finish()
         parameter_offset = 0
         for index, wprod in enumerate(wprods):
@@ -220,7 +245,16 @@ def linked_bottleneck_stage(
                 offset += spec["slot_bytes"]
             parameter_offset += spec["params_len"]
         group = TaskGroup()
-        ycons.drain(y, wait=True, group=group)
+        if blocked:
+            last = specs[-1]
+            ycons.drain(
+                y, wait=True, group=group,
+                sizes=[last["output_channels"] // 8, last["output_width"] * last["output_height"], 8],
+                strides=[8, last["output_channels"], 1],
+                transfer_len=last["output_width"] * last["output_height"] * last["output_channels"],
+            )
+        else:
+            ycons.drain(y, wait=True, group=group)
         if tap:
             tapcons.drain(tapbuf, wait=True, group=group)
         group.finish()
@@ -239,6 +273,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     add_compile_args(parser)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--nocompute", type=int, default=0, help="debug: bitmask of kernels to skip (1 conv1, 2 skip, 4 conv2, 8 conv3)")
+    parser.add_argument("--dbg", type=int, default=0, help="debug output mode for blocked conv3 (1 skip, 2 pre-residual main)")
+    parser.add_argument("--blocked", action="store_true", help="vectorized blocked-layout kernels (needs blocked_stage packing)")
     parser.add_argument("--tap", action="store_true", help="debug: also drain block 0 output to a 4th host buffer")
     parser.add_argument("--blocks", nargs="+", required=True)
     return parser
@@ -261,6 +298,13 @@ def _compile_kwargs(opts):
         if block is None:
             raise ValueError(f"no bottleneck block found for {prefix!r}")
         binding = bind_fused_bottleneck(model, block)
+        if opts.blocked:
+            try:
+                from .blocked_stage import blocked_supported
+            except ImportError:
+                from blocked_stage import blocked_supported
+            if not blocked_supported(binding):
+                raise ValueError(f"{prefix}: block shape is not supported by the blocked kernels")
         if previous_output is not None and previous_output != binding["input_shape"]:
             raise ValueError(f"{prefix}: its input shape does not match the previous block output")
         previous_output = binding["output_shape"]
@@ -280,7 +324,7 @@ def _compile_kwargs(opts):
             "conv1_mmul": True, "slot_bytes": binding["chunk_slot_bytes"],
             "parameter_chunks": len(binding["chunk_sizes"]), "params_len": binding["params"].size,
         })
-    return {"stage_specs": json.dumps(specs, separators=(",", ":")), "tap": int(opts.tap)}
+    return {"stage_specs": json.dumps(specs, separators=(",", ":")), "tap": int(opts.tap), "nocompute": int(opts.nocompute), "blocked": int(opts.blocked), "dbg": int(opts.dbg)}
 
 
 def main() -> None:

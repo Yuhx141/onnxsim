@@ -403,6 +403,8 @@ def bind_fused_bottleneck(
         "conv2_stride": conv2_stride,
         "skip_output_scale": skip_output_scale,
         "skip_output_zero_point": 128 if projection else None,
+        "raw_weights": {"w1": w1, "w2": w2, "w3": w3, "b1": b1, "b2": b2, "b3": b3,
+                        "skip_weight": skip_weight, "skip_bias": skip_bias},
         "parameter_stage_order": ("conv1", "skip", "conv2a", "conv2b", "conv3") if projection else ("conv1", "conv2a", "conv2b", "conv3"),
     }
 

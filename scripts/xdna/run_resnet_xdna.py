@@ -127,6 +127,7 @@ class XDNAResNetRunner:
         fused_block_insts: str | None = None,
         fused_blocks: list[tuple[str, str, str]] | None = None,
         fused_stages: list[tuple[tuple[str, str, str], str, str]] | None = None,
+        fused_stage_blocked: bool = False,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
         maxpool_uint8_artifact: tuple[str, str] | None = None,
         maxpool_runtime: str = "iron",
@@ -365,6 +366,7 @@ class XDNAResNetRunner:
         self._torch_weight_cache: dict[int, Any] = {}
         self._torch_int8_weight_cache: dict[int, tuple[Any, ...]] = {}
         fused_specs = list(fused_blocks or ())
+        self.fused_stage_blocked = fused_stage_blocked
         stage_specs = list(fused_stages or ())
         parallel_specs = list(parallel_projection_blocks or ())
         if any((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
@@ -593,9 +595,15 @@ class XDNAResNetRunner:
             input_count = int(np.prod(bindings[0]["input_shape"]))
             output_count = int(np.prod(bindings[-1]["output_shape"]))
             input_tensor = iron.tensor(np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu")
-            parameter_tensor = iron.tensor(
-                np.concatenate([binding["params"] for binding in bindings]), dtype=np.uint8, device="npu"
-            )
+            if self.fused_stage_blocked:
+                try:
+                    from blocked_stage import pack_blocked_params
+                except ImportError:
+                    from .blocked_stage import pack_blocked_params
+                stage_params = [pack_blocked_params(binding) for binding in bindings]
+            else:
+                stage_params = [binding["params"] for binding in bindings]
+            parameter_tensor = iron.tensor(np.concatenate(stage_params), dtype=np.uint8, device="npu")
             output_tensor = iron.zeros(output_count, dtype=np.int8, device="npu")
             tap_tensor = None
             if os.environ.get("ONNXSIM_XDNA_STAGE_TAP"):
@@ -1726,6 +1734,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         metavar="BLOCK... XCLBIN INSTS",
         help="run one to three adjacent bottlenecks as one device-linked IRON stage",
     )
+    parser.add_argument("--fused-stage-blocked", action="store_true", help="fused stages were compiled with --blocked (vectorized layout)")
     parser.add_argument(
         "--parallel-projection-block", nargs=3, action="append", metavar=("PREFIX", "XCLBIN", "INSTS"),
         help="run a projection bottleneck with main and skip branches on separate NPU columns",
@@ -1755,6 +1764,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
             (tuple(items[:-2]), items[-2], items[-1])
             for items in (args.fused_stage or [])
         ],
+        fused_stage_blocked=args.fused_stage_blocked,
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
         ],
