@@ -216,9 +216,8 @@ What the numbers say:
 - Tuning options do not help: `validationMode=disabled`, `maxNumPendingDispatches` 64/256 and
   `storageBufferCacheMode=bucket` are within noise or slightly worse; `preferredLayout=NCHW` is 2x slower;
   fp16 gives nothing (f16 arithmetic is slower than f32 on this driver).
-- **Graph capture is unmeasured.** With `enableGraphCapture=1` and CPU-side outputs, replays return no output
-  tensor ("the ort_value must contain a constructed tensor"), so the 0.4 ms / 30 ms figures it printed are not
-  latencies. It needs GPU-bound outputs (IO binding), which would remove the CPU encode cost but was not tried.
+- **Graph capture** returns no output tensors through plain `Run()`, so the 0.4 ms / 30 ms figures it first printed were
+  not latencies. Through `RunWithBinding` it works and is measured below (-28..-31% on small models, -3% on ResNet-50).
 - The adapter supports `timestamp-query`, and the profile's `Api` events carry per-dispatch durations (I believe
   they are GPU timestamps; not verified). The phone's kgsl clock and governor files need root, so GPU clocks and
   thermal state were not recorded, and the timings include whatever DVFS state the runs happened to be in.
