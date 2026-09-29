@@ -431,3 +431,15 @@ biggest chains overflow it).
   is 4e-4 from float, Log 1.4e-4 and ReduceSum exact.
 - The remaining gradient error is the still-8-bit backward MatMul chains
   (34 segments, 4-11% each).
+
+### `misc` at 16 bits closes the loss gap
+
+AX8850 replay with `--stable-softmax-grad --host-optimizer --exact-fp32-io
+--u16-kinds matmul_chain,misc` (61 segments at U16: the 20 forward Convs
+except `conv0_fwd`, eight small backward MatMuls, and the Softmax, Log, Neg and
+26 ReduceSum segments): loss **17.004 against 17.058** float (16.660 before),
+median gradient cosine **0.977**, median update cosine 0.75; zero device
+errors, health 0 LSB, no runtime fallback. Five 16-bit segments failed their
+gate or build (`ReduceSum_460` exceeded the 30 minute build timeout) and ran as
+float. The rest of the gradient error is the 34 backward MatMul chains still at
+8 bits (12 of them beyond 2 LSB of their simulation).
