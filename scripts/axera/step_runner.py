@@ -2049,6 +2049,14 @@ class StepRunner:
                         _compare(st, seg, dev, sim)
                         flt = self._float(seg, env)
                         st.float_rel = max(_rel(d, f) for d, f in zip(dev, flt))
+                        if seg.kind == "matmul_u16":
+                            # built at 16-bit on real data: the reference is
+                            # the float chain, not an 8-bit simulation
+                            st.max_lsb = st.frac_gt1 = 0.0
+                            if not st.float_rel <= U16_MAX_REL:
+                                st.error = (
+                                    f"16-bit segment {st.float_rel:.3g} from float"
+                                )
                         st.sim_float_rel = max(_rel(s_, f) for s_, f in zip(sim, flt))
                         if not seg.out_q:
                             st.float_mismatch = max(
@@ -2285,6 +2293,55 @@ def apply_stable_softmax_grad(
     return kept, calib
 
 
+U16_MAX_REL = 5e-3
+"""A 16-bit segment is accepted when it is within this relative error of the
+float chain (measured 1e-4 to 6e-4 on the step's MatMuls)."""
+
+
+def build_u16_segments(
+    model: onnx.ModelProto,
+    segs: Sequence[Segment],
+    feeds: Mapping[str, np.ndarray],
+    pattern: str,
+    cache_dir: str,
+) -> dict[str, bytes]:
+    """Move the 8-bit ``matmul_chain`` segments whose name matches ``pattern``
+    to 16-bit axmodels built on the reference batch's real tensors. Returns
+    the compiled blobs; the segments are switched to kind ``matmul_u16`` in
+    place. A segment whose build fails stays 8-bit."""
+    import u16_chain
+
+    nodes = {n.name: n for n in model.graph.node}
+    targets = [
+        s
+        for s in segs
+        if s.kind == "matmul_chain"
+        and re.search(pattern, s.name)
+        and any(nodes[n].op_type in u16_chain.OPS_16BIT for n in s.nodes)
+    ]
+    if not targets:
+        return {}
+    need = sorted({t for s in targets for t in s.inputs})
+    outs, _ = StepRunner(model, []).run(feeds, "float", keep=need)
+    work = os.path.join(cache_dir, "work")
+    blobs: dict[str, bytes] = {}
+    for k, seg in enumerate(targets):
+        try:
+            sub, post = u16_chain.chain_model(model, seg.inputs, seg.outputs)
+            data = {t: np.asarray(outs[t], np.float32) for t in seg.inputs}
+            blobs[seg.name] = u16_chain.cached_chain_axmodel(
+                cache_dir, work, seg.name, sub, data
+            )
+        except Exception as exc:  # stays 8-bit
+            print(f"  16-bit {seg.name}: {type(exc).__name__}: {exc}", flush=True)
+            continue
+        seg.kind = "matmul_u16"
+        seg.in_q, seg.out_q = [], []
+        seg.output_transform = post
+        print(f"  16-bit {seg.name} ({k + 1}/{len(targets)})", flush=True)
+    return blobs
+
+
 def load_records(path: str = STEP_OPS) -> list[dict]:
     with gzip.open(path, "rt") as f:
         return json.load(f)
@@ -2473,6 +2530,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "divides by 0 -> NaN) and cannot hold w - lr*update either",
     )
     p.add_argument(
+        "--u16-matmul",
+        metavar="REGEX",
+        help="build the matmul_chain segments whose name matches at 16-bit "
+        "(Pulsar2 U16) on the reference batch's real tensors; use '.' for all",
+    )
+    p.add_argument(
+        "--u16-cache-dir",
+        default=os.path.join(tempfile.gettempdir(), "axera-u16-chain-cache"),
+        help="cache of 16-bit segment builds",
+    )
+    p.add_argument(
         "--validated",
         help="a previous npu report: segments whose device output was more than "
         "2 LSB from the simulation there (or failed) stay on the host",
@@ -2576,6 +2644,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     segs, blobs = drop_unemittable(segs, host, args.emit_cache_dir or None)
     ref = load_reference()
     feeds = ref["feeds"]
+    if args.u16_matmul:
+        blobs.update(
+            build_u16_segments(
+                model, segs, feeds, args.u16_matmul, args.u16_cache_dir
+            )
+        )
     grad_names = gradient_tensors(model, ref["state_map"])
     float_grads = _float_gradients(model, feeds, grad_names)
     npu_nodes = sum(len(s.nodes) for s in segs)

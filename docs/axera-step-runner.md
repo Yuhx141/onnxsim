@@ -387,3 +387,34 @@ both directions (records and params), and the emitted model matches the
 native held-out build bit for bit on the AX8850 (max diff 0.0, 6.5e-5 relative
 error against float). This is a bare MatMul: the step's Gather/Reshape chains
 and int8-symmetric input rules at 16 bits are still to be checked.
+
+## 16-bit MatMul chains (`--u16-matmul`)
+
+`step_runner.py --u16-matmul REGEX` rebuilds the `matmul_chain` segments whose
+name matches with Pulsar2 `layer_configs` U16 (`u16_chain.py`), calibrated on
+the reference batch's real tensors (one axmodel per segment, cached in
+`--u16-cache-dir`). Segments still pass and return float32; a segment passes
+when it is within `U16_MAX_REL` (5e-3) of the float chain. Two Pulsar2
+details, both measured:
+
+- Every op type of the chain is set to U16, and the bias `Add` is also named
+  in a `layer_names` entry.
+- A `Transpose`/`Reshape` that ends the chain makes Pulsar2 quantize the whole
+  output path to 8 bits (the forward Conv chains stayed at 2.2e-2 error).
+  `chain_model` cuts those ops off and the runner applies them on the host as
+  the segment's `output_transform`; the forward `stage2_conv2` chain went from
+  2.2e-2 to 3.5e-4.
+
+On real step data the bare backward MatMuls are about 240x closer to float at
+U16 (median 2-7e-2 -> 1-6e-4) for about 2.5x the device time (100 ms -> 251 ms
+summed over 17 templates; `dX_MatMul_54` 14 -> 75 ms).
+
+AX8850 replay with `--stable-softmax-grad --host-optimizer` and the 20 forward
+Convs plus eight small backward MatMuls at 16-bit (28 segments; median
+float error 7e-4; health 0 LSB, no runtime fallback): median gradient cosine
+**0.974** (8-bit: 0.839; MatMul chains on the host in float: 0.994), median
+update cosine 0.72, loss 16.660 vs 17.058 float. Not yet at 16 bits:
+`conv0_fwd` (its Pulsar2 build exceeds the 30 minute timeout), `dense0_fwd`
+(1.4e-2 from float, so it ran as float), and the large backward chains
+(`TMPDIR` must point at disk: `/tmp` is tmpfs and the calibration tars of the
+biggest chains overflow it).
