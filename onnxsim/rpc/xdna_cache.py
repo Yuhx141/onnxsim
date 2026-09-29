@@ -99,7 +99,7 @@ def source_digest(directories: Iterable[Path]) -> str:
             and "__pycache__" not in p.parts
         )
         for path in files:
-            digest.update(str(path.relative_to(directory)).encode() + b"\0")
+            digest.update(path.relative_to(directory).as_posix().encode() + b"\0")
             digest.update(path.read_bytes())
             digest.update(b"\0")
     return digest.hexdigest()
@@ -220,7 +220,7 @@ def _relocate(value: Any, old: str, new: str) -> Any:
 
 def _file_sizes(entry: Path) -> Dict[str, int]:
     return {
-        str(p.relative_to(entry)): p.stat().st_size
+        p.relative_to(entry).as_posix(): p.stat().st_size
         for p in sorted(entry.rglob("*"))
         if p.is_file() and p.name != ENTRY_FILE
     }
