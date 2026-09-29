@@ -2049,7 +2049,7 @@ class StepRunner:
                         _compare(st, seg, dev, sim)
                         flt = self._float(seg, env)
                         st.float_rel = max(_rel(d, f) for d, f in zip(dev, flt))
-                        if seg.kind == "matmul_u16":
+                        if seg.kind == "u16_chain":
                             # built at 16-bit on real data: the reference is
                             # the float chain, not an 8-bit simulation
                             st.max_lsb = st.frac_gt1 = 0.0
@@ -2304,20 +2304,20 @@ def build_u16_segments(
     feeds: Mapping[str, np.ndarray],
     pattern: str,
     cache_dir: str,
+    kinds: Sequence[str] = ("matmul_chain",),
 ) -> dict[str, bytes]:
-    """Move the 8-bit ``matmul_chain`` segments whose name matches ``pattern``
-    to 16-bit axmodels built on the reference batch's real tensors. Returns
-    the compiled blobs; the segments are switched to kind ``matmul_u16`` in
-    place. A segment whose build fails stays 8-bit."""
+    """Move the 8-bit segments of ``kinds`` whose name matches ``pattern`` to
+    16-bit axmodels built on the reference batch's real tensors. Returns the
+    compiled blobs; the segments are switched to kind ``u16_chain`` in place.
+    A segment whose build fails stays 8-bit."""
     import u16_chain
 
-    nodes = {n.name: n for n in model.graph.node}
     targets = [
         s
         for s in segs
-        if s.kind == "matmul_chain"
+        if s.kind in kinds
         and re.search(pattern, s.name)
-        and any(nodes[n].op_type in u16_chain.OPS_16BIT for n in s.nodes)
+        and len(s.outputs) == 1
     ]
     if not targets:
         return {}
@@ -2335,7 +2335,7 @@ def build_u16_segments(
         except Exception as exc:  # stays 8-bit
             print(f"  16-bit {seg.name}: {type(exc).__name__}: {exc}", flush=True)
             continue
-        seg.kind = "matmul_u16"
+        seg.kind = "u16_chain"
         seg.in_q, seg.out_q = [], []
         seg.output_transform = post
         print(f"  16-bit {seg.name} ({k + 1}/{len(targets)})", flush=True)
@@ -2530,10 +2530,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "divides by 0 -> NaN) and cannot hold w - lr*update either",
     )
     p.add_argument(
+        "--exact-fp32-io",
+        action="store_true",
+        help="FP32 binary segments (unquantized templates) pass float straight "
+        "through instead of re-quantizing their inputs and outputs to the "
+        "step's 8-bit calibration boundaries",
+    )
+    p.add_argument(
         "--u16-matmul",
         metavar="REGEX",
         help="build the matmul_chain segments whose name matches at 16-bit "
         "(Pulsar2 U16) on the reference batch's real tensors; use '.' for all",
+    )
+    p.add_argument(
+        "--u16-kinds",
+        default="matmul_chain",
+        help="comma-separated segment kinds --u16-matmul applies to "
+        "(e.g. matmul_chain,misc,relu,elementwise,reducesum_flatten)",
     )
     p.add_argument(
         "--u16-cache-dir",
@@ -2644,10 +2657,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     segs, blobs = drop_unemittable(segs, host, args.emit_cache_dir or None)
     ref = load_reference()
     feeds = ref["feeds"]
+    if args.exact_fp32_io:
+        for sg in segs:
+            if sg.quantize_device_io:
+                sg.quantize_device_io = False
+                sg.in_q, sg.out_q = [], []
     if args.u16_matmul:
         blobs.update(
             build_u16_segments(
-                model, segs, feeds, args.u16_matmul, args.u16_cache_dir
+                model,
+                segs,
+                feeds,
+                args.u16_matmul,
+                args.u16_cache_dir,
+                args.u16_kinds.split(","),
             )
         )
     grad_names = gradient_tensors(model, ref["state_map"])

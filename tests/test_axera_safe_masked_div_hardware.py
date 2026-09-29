@@ -47,9 +47,7 @@ def test_safe_masked_div_template_handles_empty_rows(tmp_path):
         [y_info],
         [one, full_shape],
     )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 17)]
-    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
     model.ir_version = 8
     onnx.checker.check_model(model)
     onnx.save(model, os.path.join(work, "safe_div.onnx"))

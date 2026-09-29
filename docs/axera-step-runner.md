@@ -418,3 +418,16 @@ update cosine 0.72, loss 16.660 vs 17.058 float. Not yet at 16 bits:
 (1.4e-2 from float, so it ran as float), and the large backward chains
 (`TMPDIR` must point at disk: `/tmp` is tmpfs and the calibration tars of the
 biggest chains overflow it).
+
+### Where the remaining error is (16-bit MatMuls, AX8850 replay)
+
+- `--exact-fp32-io` lets the FP32 binary segments pass float instead of
+  re-quantizing to the step's 8-bit boundaries (11 segments, max error 0). It
+  leaves the gradients where they were (median cosine 0.971).
+- `--u16-kinds` extends `--u16-matmul` to other segment kinds. The forward
+  loss error comes only from the `misc` segments (Softmax, Log, Neg,
+  ReduceSum): simulation with `misc` on the host in float gives loss 17.073
+  against 17.058, and no other kind moves it. At U16 on the device Softmax
+  is 4e-4 from float, Log 1.4e-4 and ReduceSum exact.
+- The remaining gradient error is the still-8-bit backward MatMul chains
+  (34 segments, 4-11% each).

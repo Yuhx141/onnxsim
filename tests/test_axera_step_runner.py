@@ -81,7 +81,9 @@ def test_softmax_ratio_gradient_rewrite_avoids_zero_probability_nan():
     assert all(node.op_type != "Div" for node in model.graph.node)
     import onnxruntime as ort
 
-    session = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
     a = np.array([[0.25, 0.0, 0.5, 0.0]], np.float32)
     p = np.array([[0.5, 0.0, 0.5, 0.0]], np.float32)
     got = session.run(None, {"a": a, "p": p})[0]
@@ -103,7 +105,9 @@ def test_softmax_ratio_gradient_rewrite_matches_nonzero_reference():
     assert sr.rewrite_softmax_ratio_gradients(model) == 1
     import onnxruntime as ort
 
-    session = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
     a = np.array([[0.1, 0.3, 0.6]], np.float32)
     p = np.array([[0.2, 0.3, 0.5]], np.float32)
     got = session.run(None, {"a": a, "p": p})[0]
@@ -142,7 +146,10 @@ def test_step_masked_div_selects_safe_native_template():
     assert segment.kind == "safe_masked_div"
     assert segment.output_shape == ()  # preserve the smaller count input for Expand
     template = segment.emit()
-    assert [tuple(d.dim_value for d in i.type.tensor_type.shape.dim) for i in template.graph.input] == [
+    assert [
+        tuple(d.dim_value for d in i.type.tensor_type.shape.dim)
+        for i in template.graph.input
+    ] == [
         (1024, 9, 3136),
         (1024, 1, 3136),
     ]
@@ -150,7 +157,13 @@ def test_step_masked_div_selects_safe_native_template():
 
 def test_segment_validation_rejects_nonfinite_device_outputs():
     segment = sr.Segment(
-        "nonfinite", "elementwise", [], [], [], "test", lambda: onnx.ModelProto(),
+        "nonfinite",
+        "elementwise",
+        [],
+        [],
+        [],
+        "test",
+        lambda: onnx.ModelProto(),
         out_q=[(0.1, 0, False)],
     )
     stat = sr.SegStat("nonfinite", "elementwise", 0)
@@ -194,14 +207,24 @@ def test_runtime_fallback_uses_original_host_op_after_device_mismatch():
     )
     model.ir_version = 10
     segment = sr.Segment(
-        "add", "elementwise", ["add"], ["x", "z"], ["y"], "test",
-        lambda: model, in_q=[None, None], out_q=[(0.1, 0, False)],
+        "add",
+        "elementwise",
+        ["add"],
+        ["x", "z"],
+        ["y"],
+        "test",
+        lambda: model,
+        in_q=[None, None],
+        out_q=[(0.1, 0, False)],
     )
     runner = sr.StepRunner(model, [segment], fallback_on_failure=True)
     runner.emitted = lambda _: b"model"
     runner._device = lambda *_: [np.array([10.0], dtype=np.float32)]
     outputs, stats = runner.run(
-        {"x": np.array([0.2], dtype=np.float32), "z": np.array([0.3], dtype=np.float32)},
+        {
+            "x": np.array([0.2], dtype=np.float32),
+            "z": np.array([0.3], dtype=np.float32),
+        },
         "npu",
     )
     assert stats[0].runtime_fallback
@@ -460,9 +483,7 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     # FP32 route, so do not subtract those nodes twice.
     synthetic += sum(len(s.nodes) for s in everything if s.kind == "fp32_binary")
     synthetic -= sum(
-        len(s.nodes)
-        for s in everything
-        if s.kind == "fp32_binary" and s.prefer_fp32
+        len(s.nodes) for s in everything if s.kind == "fp32_binary" and s.prefer_fp32
     )
     # Singleton scalar divisions fold to guarded host constants, not AX models.
     synthetic += sum(s.kind == "algebraic_constant" for s in everything)
@@ -485,9 +506,7 @@ def test_plan_materializes_live_broadcast_binary_operands():
     # template for their dequantized float boundary as well.
     broadcast = [s for s in broadcast if "constant from" not in s.detail]
     assert len(broadcast) >= 44
-    assert all(
-        s.name == "Sub_24" or s.input_shapes[-1] == (1,) for s in broadcast
-    )
+    assert all(s.name == "Sub_24" or s.input_shapes[-1] == (1,) for s in broadcast)
     assert all(s.output_shape == s.input_shapes[0] for s in broadcast)
 
 
