@@ -156,3 +156,69 @@ shows 499 nodes on WebGPU and only the 6 int64 `Cast`s on CPU.
 Not covered: float16 (the new kernels accept it via `WebGpuSupportedFloatTypes`, but only fp32 was run), other
 Adreno generations, kernel speed (correctness only so far), and ORT's own unit tests (not built here).
 
+
+## Speed on the Adreno 730 (2026-09-30)
+
+Setup: ORT `125ea21` + the Transpose and missing-ops patches, WebGPU EP at defaults (NHWC layout, fp32),
+against the same build's CPU EP with 4 threads. Median of 10-30 timed runs after warm-up, under the phone
+lock (`bench.cc`, `bench_all.sh`, raw output in `webgpu_ops/bench_results.txt`). GFLOP counts Conv/MatMul/
+Gemm/ConvTranspose only (`model_flops.py`; 8.18 for ResNet-50 and 6.54 for YOLO11n match the published
+figures). The demo app's models are QDQ-quantized for the Hexagon, so they were converted to float twins
+(`qdq_to_float.py`: same architecture and dequantized weights, no activation quantization) to run on
+WebGPU. Outputs of every model match the CPU EP on the phone (worst relative error 5.6e-5, most ~1e-6).
+
+The GPU ceiling was measured, not taken from a datasheet: a Dawn FMA loop (`dawn_repro/peak.cc`) reaches
+**986 GFLOPS fp32** with 64 independent scalar chains (it was still rising slowly; 540 with vec2 and 8
+chains). `shader-f16` exists on the adapter, but f16 FMA measured only ~310 GFLOPS, slower than f32.
+
+| model | GFLOP | CPU EP x4 | WebGPU EP | first run | WebGPU GFLOPS | % of measured peak | ideal at peak |
+|---|---|---|---|---|---|---|---|
+| ResNet-50 (224) | 8.18 | 66.8 ms | 66.9 ms | 260 ms | 122 | 12.4% | 8.3 ms |
+| YOLO11n | 6.54 | 65.9 ms | 73.7 ms | 546 ms | 89 | 9.0% | 6.6 ms |
+| YOLO26n | 5.48 | 56.3 ms | 66.1 ms | 404 ms | 83 | 8.4% | 5.6 ms |
+| RT-DETR `pre` | 59.43 | 464.4 ms | 396.3 ms | 645 ms | 150 | 15.2% | 60.3 ms |
+| RT-DETR `mid0` | 0.81 | 6.2 ms | 19.6 ms | 100 ms | 41 | 4.2% | 0.8 ms |
+| RT-DETR `mid1` | 0.81 | 6.2 ms | 19.2 ms | 106 ms | 42 | 4.3% | 0.8 ms |
+| RT-DETR `post` | 0.45 | 3.1 ms | 10.8 ms | 60 ms | 41 | 4.2% | 0.5 ms |
+| EfficientViT-SAM-L0 encoder (512) | 69.58 | 579.1 ms | 440.5 ms | 611 ms | 158 | 16.0% | 70.6 ms |
+| EfficientViT-SAM-L0 decoder | 3.62 | 41.0 ms | 64.7 ms | 497 ms | 56 | 5.7% | 3.7 ms |
+
+Against the repo's Hexagon and tinygrad numbers for the same demo models (those are quantized QNN HTP runs
+or fp16 tinygrad, so not iso-precision; sources in `tinygrad_aot/README.md`, `vision_models/*/README.md`):
+
+| model | Hexagon HTP | tinygrad, Adreno OpenCL fp16 | ORT WebGPU fp32 | WebGPU / HTP |
+|---|---|---|---|---|
+| YOLO11n | 2.58 ms (int8) | 44.3 ms | 73.7 ms | 29x |
+| YOLO26n | 2.5 ms (int8) | 44.8 ms | 66.1 ms | 26x |
+| RT-DETR `pre` (default `bb8enc16`, uint8 value maps) | 11.8 ms | | 396 ms | 34x |
+| RT-DETR `mid0+mid1+post` | 3.06 ms | | 49.6 ms | 16x |
+| SAM-L0 encoder | 41.8 ms | | 440.5 ms | 10.5x |
+| SAM-L0 decoder | 11.0 ms | | 64.7 ms | 5.9x |
+| ResNet-50 | no number in the repo | | 66.9 ms | |
+
+(The RT-DETR MSDA kernel, 3.03 ms on the HVX, has no WebGPU counterpart here.) My CPU EP x4 numbers agree
+with the repo's: SAM decoder 41.0 ms here against 44.5 ms recorded.
+
+What the numbers say:
+
+- **WebGPU is on par with the 4-thread CPU on Conv-heavy models** (0.76-1.17x the CPU's time: faster on RT-DETR
+  `pre` and the SAM encoder, slower on YOLO) and 1.6-3.5x slower on small, many-node ones (SAM decoder 1.6x,
+  RT-DETR `mid` 3.1x, `post` 3.5x). It is 1.5-1.7x slower than tinygrad's fp16 OpenCL on
+  this same GPU and 26-34x slower than the HTP on the vision models.
+- **It reaches 4-16% of the measured FMA ceiling**, so the Conv kernels leave most of the GPU idle; ResNet-50
+  would take ~8 ms at the ceiling and takes 67 ms.
+- **Per-dispatch cost is ~0.2-0.3 ms**: tiny kernels take 200-300 us in the profiler (an Add over 200k
+  elements, a small Transpose), and RT-DETR `post` (30 nodes) costs 10.8 ms. That, not arithmetic, dominates
+  the small models.
+- **The first run costs 0.26-0.65 s** (shader compilation); an app must warm up at start.
+- **YOLO's profile** is dominated by layout Transposes (14.6 ms of encode time) and SiLU, which ORT fuses into
+  `QuickGelu` (19.8 ms), on top of the Convs (11.9 ms).
+- Tuning options do not help: `validationMode=disabled`, `maxNumPendingDispatches` 64/256 and
+  `storageBufferCacheMode=bucket` are within noise or slightly worse; `preferredLayout=NCHW` is 2x slower;
+  fp16 gives nothing (f16 arithmetic is slower than f32 on this driver).
+- **Graph capture is unmeasured.** With `enableGraphCapture=1` and CPU-side outputs, replays return no output
+  tensor ("the ort_value must contain a constructed tensor"), so the 0.4 ms / 30 ms figures it printed are not
+  latencies. It needs GPU-bound outputs (IO binding), which would remove the CPU encode cost but was not tried.
+- The adapter supports `timestamp-query`, and the profile's `Api` events carry per-dispatch durations (I believe
+  they are GPU timestamps; not verified). The phone's kgsl clock and governor files need root, so GPU clocks and
+  thermal state were not recorded, and the timings include whatever DVFS state the runs happened to be in.
