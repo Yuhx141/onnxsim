@@ -358,3 +358,26 @@ gate. The default run without the flag is unchanged.
 AXCL_LXD_VM=axcl-vm $PY step_runner.py --mode npu --host-optimizer \
   --stable-softmax-grad /path/stable-calib.json --out /path/stable.json
 ```
+
+## Adam update: `--fp32-optimizer`
+
+In simulation the NaN updates come from the uint8 `Sqrt` and `Add(eps)`
+segments in front of each optimizer `Div`: `sqrt(v)` is about 1e-5 against a
+tensor max of 0.43, so the 1e-8 eps is lost and 509,119 of 512,000 elements
+of the 1000x512 weight quantize to 0 (0/0 -> NaN). `--fp32-optimizer` never
+gives optimizer nodes a quantized template: each runs as an FP32 binary
+template when one is captured for its exact shapes, else on the host in float.
+Simulation gives 0 NaN updates and the same update cosine as
+`--host-optimizer` (0.64), with 263 optimizer nodes (Sqrt, Add-eps, scalar
+Mul) still on the host for lack of FP32 templates. Not yet run on the device.
+
+## 16-bit MatMul pilot
+
+`pilot_matmul_u16.py` builds a bare live-operand `MatMul(x, w)` with Pulsar2
+7.0-lite at U8, U16 and S16 (`quant.layer_configs` with
+`op_types: ["MatMul"]`). Pulsar2 accepts U16 and S16 for MatMul. On the AX8850,
+[1,64,128]x[1,128,64] has relative error against float of 1.76e-2 at U8 and
+6.8e-5 at U16/S16 (about 260x lower), at comparable latency
+(0.38 ms U8, 0.28 ms U16). The 16-bit axmodel is larger (5,919 vs 4,343 bytes),
+so `matmul_record_emit` (which assumes an 8-bit record layout) needs to learn
+the 16-bit one before step-calibrated 16-bit templates can be emitted.

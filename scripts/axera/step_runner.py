@@ -1252,9 +1252,14 @@ def build_plan(
     include_unsafe: bool = False,
     *,
     precision_overrides: Mapping[str, Mapping] | None = None,
+    fp32_only: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[Segment], dict[str, str]]:
     """NPU segments (only of ``kinds`` if given) and a per-node reason for
-    every node left on the host."""
+    every node left on the host.
+
+    Nodes in ``fp32_only`` (the Adam update: ``--fp32-optimizer``) never get a
+    quantized template. They run as an unquantized FP32 binary template when
+    one is captured for their exact shapes, otherwise on the host."""
     cache = axb.TemplateCache()
     inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
     value_shapes = {
@@ -1450,6 +1455,15 @@ def build_plan(
         for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
     }
     for rec, (status, detail) in zip(planned_records, plans):
+        if rec["name"] in fp32_only:
+            fp32_seg = _fp32_binary_segment_for(rec, model)
+            if fp32_seg is None:
+                host[rec["name"]] = "fp32-only optimizer node: no FP32 template"
+            elif kinds and fp32_seg.kind not in kinds:
+                host[rec["name"]] = f"covered, kind {fp32_seg.kind} not selected"
+            else:
+                candidates.append(fp32_seg)
+            continue
         folded = _singleton_scalar_div_fold(rec, calib, inits)
         if folded is not None:
             if not kinds or folded.kind in kinds:
@@ -2451,6 +2465,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="keep the Adam update (every node after the gradients) on the host in float",
     )
     p.add_argument(
+        "--fp32-optimizer",
+        action="store_true",
+        help="run the Adam update unquantized: FP32 binary templates where "
+        "captured, host float elsewhere (Sqrt, +eps, scalar Mul). The uint8 "
+        "Sqrt/Add(eps) segments round sqrt(v)+eps to 0 (the simulation "
+        "divides by 0 -> NaN) and cannot hold w - lr*update either",
+    )
+    p.add_argument(
         "--validated",
         help="a previous npu report: segments whose device output was more than "
         "2 LSB from the simulation there (or failed) stay on the host",
@@ -2504,6 +2526,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError(
                     "precision override JSON must map node names to calibration"
                 )
+    fp32_only: set[str] = set()
+    if args.fp32_optimizer:
+        fp32_only = optimizer_nodes(model, load_reference()["state_map"])
     if args.stable_softmax_grad and precision_overrides:
         live = {rec["name"] for rec in records}
         precision_overrides = {
@@ -2516,6 +2541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         kinds,
         args.include_unsafe,
         precision_overrides=precision_overrides,
+        fp32_only=fp32_only,
     )
     if args.only:
         only = set(args.only.split(","))
