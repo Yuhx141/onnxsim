@@ -8,7 +8,9 @@ from qdq_runtime import extract_qdq_edges, qdq_edge_map  # noqa: E402
 
 
 def _node(op, inputs, outputs, axis=None):
-    attrs = [] if axis is None else [SimpleNamespace(name="axis", ints=(), i=axis, s=b"")]
+    attrs = (
+        [] if axis is None else [SimpleNamespace(name="axis", ints=(), i=axis, s=b"")]
+    )
     return SimpleNamespace(op_type=op, input=inputs, output=outputs, attribute=attrs)
 
 

@@ -13,13 +13,20 @@ from conv_reference import execute_conv_reference, im2col_nchw  # noqa: E402
 def _value(name, shape):
     return SimpleNamespace(
         name=name,
-        type=SimpleNamespace(tensor_type=SimpleNamespace(shape=SimpleNamespace(dim=[SimpleNamespace(dim_value=v) for v in shape]))),
+        type=SimpleNamespace(
+            tensor_type=SimpleNamespace(
+                shape=SimpleNamespace(dim=[SimpleNamespace(dim_value=v) for v in shape])
+            )
+        ),
     )
 
 
 def test_grouped_conv_reference_matches_direct_convolution():
     conv = SimpleNamespace(
-        op_type="Conv", input=["x", "w", "b"], output=["y"], name="grouped",
+        op_type="Conv",
+        input=["x", "w", "b"],
+        output=["y"],
+        name="grouped",
         attribute=[
             SimpleNamespace(name="group", ints=(2,), i=0, s=b""),
             SimpleNamespace(name="pads", ints=(1, 1, 1, 1), i=0, s=b""),
@@ -27,9 +34,14 @@ def test_grouped_conv_reference_matches_direct_convolution():
     )
     model = SimpleNamespace(
         graph=SimpleNamespace(
-            node=[conv], input=[_value("x", (1, 4, 3, 3))], value_info=[],
+            node=[conv],
+            input=[_value("x", (1, 4, 3, 3))],
+            value_info=[],
             output=[_value("y", (1, 6, 3, 3))],
-            initializer=[SimpleNamespace(name="w", dims=(6, 2, 3, 3)), SimpleNamespace(name="b", dims=(6,))],
+            initializer=[
+                SimpleNamespace(name="w", dims=(6, 2, 3, 3)),
+                SimpleNamespace(name="b", dims=(6,)),
+            ],
         )
     )
     plan = plan_conv_gemm(model, 0, columns=1)

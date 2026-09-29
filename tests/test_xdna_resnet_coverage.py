@@ -8,7 +8,9 @@ from resnet_coverage import build_resnet_coverage, coverage_to_dict  # noqa: E40
 
 
 def _node(op, inputs, outputs):
-    return SimpleNamespace(op_type=op, input=inputs, output=outputs, attribute=[], name=op)
+    return SimpleNamespace(
+        op_type=op, input=inputs, output=outputs, attribute=[], name=op
+    )
 
 
 def test_all_semantic_nodes_are_covered_by_codegen_schedule():

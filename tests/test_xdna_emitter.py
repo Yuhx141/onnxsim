@@ -13,7 +13,9 @@ def _value(name, shape):
         name=name,
         type=SimpleNamespace(
             tensor_type=SimpleNamespace(
-                shape=SimpleNamespace(dim=[SimpleNamespace(dim_value=value) for value in shape])
+                shape=SimpleNamespace(
+                    dim=[SimpleNamespace(dim_value=value) for value in shape]
+                )
             )
         ),
     )
@@ -24,7 +26,9 @@ def _node(op, inputs, outputs, attrs=()):
         op_type=op,
         input=inputs,
         output=outputs,
-        attribute=[SimpleNamespace(name=k, ints=tuple(v), i=0, s=b"") for k, v in attrs],
+        attribute=[
+            SimpleNamespace(name=k, ints=tuple(v), i=0, s=b"") for k, v in attrs
+        ],
         name=op,
     )
 
@@ -42,7 +46,10 @@ def test_emitter_deduplicates_and_classifies_conv_artifacts():
             input=[_value("x", (1, 16, 8, 8))],
             value_info=[_value("co", (1, 32, 8, 8)), _value("y", (1, 32, 8, 8))],
             output=[_value("y", (1, 32, 8, 8))],
-            initializer=[SimpleNamespace(name="w", dims=(32, 16, 3, 3)), SimpleNamespace(name="b", dims=(32,))],
+            initializer=[
+                SimpleNamespace(name="w", dims=(32, 16, 3, 3)),
+                SimpleNamespace(name="b", dims=(32,)),
+            ],
         )
     )
     plan = build_codegen_plan(model, columns=1, strict=True)

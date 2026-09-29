@@ -1,5 +1,5 @@
-from pathlib import Path
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "xdna"))
 
@@ -8,10 +8,17 @@ from benchmark import benchmark_workload  # noqa: E402
 
 def test_benchmark_separates_fallback_coverage():
     result = benchmark_workload(
-        type("Workload", (), {
-            "name": "mixed", "ops": ("MatMul", "Unknown"), "macs": 16,
-            "bytes_moved": 32, "kernel": "gemm_f16",
-        })(),
+        type(
+            "Workload",
+            (),
+            {
+                "name": "mixed",
+                "ops": ("MatMul", "Unknown"),
+                "macs": 16,
+                "bytes_moved": 32,
+                "kernel": "gemm_f16",
+            },
+        )(),
         runs=2,
     )
     assert result["xdna_nodes"] == 1

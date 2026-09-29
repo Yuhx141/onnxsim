@@ -33,11 +33,13 @@ def main() -> None:
     )
     server.add_argument("--verbose", action="store_true")
     server.add_argument(
-        "--xdna-python", default=sys.executable,
+        "--xdna-python",
+        default=sys.executable,
         help="server-side Python with IRON/XRT installed (default: this server's Python)",
     )
     server.add_argument(
-        "--vitis-python", default=None,
+        "--vitis-python",
+        default=None,
         help="server-side Python with Vitis AI Execution Provider (default: --xdna-python)",
     )
     tracker = sub.add_parser("tracker", help="run a device-key tracker")
@@ -49,8 +51,13 @@ def main() -> None:
         from .server import RPCServer
 
         rpc_server = RPCServer(
-            args.host, args.port, args.key, args.workspace, verbose=args.verbose,
-            xdna_python=args.xdna_python, vitis_python=args.vitis_python,
+            args.host,
+            args.port,
+            args.key,
+            args.workspace,
+            verbose=args.verbose,
+            xdna_python=args.xdna_python,
+            vitis_python=args.vitis_python,
         )
         if args.tracker:
             host, _, port = args.tracker.rpartition(":")

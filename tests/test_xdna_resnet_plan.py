@@ -44,6 +44,8 @@ def test_qdq_edges_are_not_standalone_dispatches_and_conv_relu_fuses():
 
 
 def test_unknown_semantic_op_is_reported():
-    model = _model([_node("QuantizeLinear", ["x", "s", "z"], ["q"]), _node("Foo", ["q"], ["y"])])
+    model = _model(
+        [_node("QuantizeLinear", ["x", "s", "z"], ["q"]), _node("Foo", ["q"], ["y"])]
+    )
     plan = plan_qdq_resnet(model)
     assert plan.unsupported_ops == ("Foo",)

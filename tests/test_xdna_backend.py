@@ -1,35 +1,38 @@
 import json
 import sys
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "xdna"))
 
 from xdna_backend import (
+    XDNAArtifactExecutor,
     XDNAUnavailable,
     analyze_model,
-    execute,
-    load_kernel_manifest,
-    optimize_partitions,
-    partition_model,
-    select_matmul_tile,
-    matmul_kernel_key,
-    resolve_kernel_artifact,
-    XDNAArtifactExecutor,
     dispatch_matmul,
     dispatch_matmul_batch,
+    execute,
+    load_kernel_manifest,
     load_tuning_profile,
+    matmul_kernel_key,
+    optimize_partitions,
+    partition_model,
     plan_matmul,
-    validate_matmul_buffers,
-    plan_transfer,
     plan_pipeline_transfer,
+    plan_transfer,
+    resolve_kernel_artifact,
+    select_matmul_tile,
+    validate_matmul_buffers,
 )
 
 
 def _model(*ops):
-    nodes = [SimpleNamespace(op_type=op, name=f"{op}_{index}") for index, op in enumerate(ops)]
+    nodes = [
+        SimpleNamespace(op_type=op, name=f"{op}_{index}")
+        for index, op in enumerate(ops)
+    ]
     return SimpleNamespace(graph=SimpleNamespace(node=nodes))
 
 
@@ -62,7 +65,9 @@ def test_execution_is_explicitly_unavailable():
 
 
 def test_fuses_compute_post_ops_but_not_two_producers():
-    groups = optimize_partitions(partition_model(_model("MatMul", "Add", "Relu", "MatMul")))
+    groups = optimize_partitions(
+        partition_model(_model("MatMul", "Add", "Relu", "MatMul"))
+    )
     assert [group.op_types for group in groups] == [
         ("MatMul", "Add", "Relu"),
         ("MatMul",),
@@ -81,7 +86,9 @@ def test_matmul_tile_selection_uses_measured_dtype_hints():
 def test_profile_overrides_default_tile_when_shape_is_legal():
     profile = {"i8:512x512x512:c8": [64, 32, 32]}
     assert select_matmul_tile("i8", 512, 512, 512, 8, profile) == (64, 32, 32)
-    assert matmul_kernel_key("i8", 512, 512, 512, 8, profile) == "matmul_i8_m64k32n32_c8"
+    assert (
+        matmul_kernel_key("i8", 512, 512, 512, 8, profile) == "matmul_i8_m64k32n32_c8"
+    )
 
 
 def test_load_tuning_profile_validates_benchmark_report(tmp_path):
@@ -110,7 +117,9 @@ def test_matmul_buffers_are_validated_before_launch():
     c = SimpleNamespace(shape=(4, 16), dtype="int32")
     assert validate_matmul_buffers(plan, a, b, c)[0].shape == (4, 8)
     with pytest.raises(ValueError, match="output buffer"):
-        validate_matmul_buffers(plan, a, b, SimpleNamespace(shape=(4, 8), dtype="int16"))
+        validate_matmul_buffers(
+            plan, a, b, SimpleNamespace(shape=(4, 8), dtype="int16")
+        )
     with pytest.raises(ValueError, match="contiguous"):
         validate_matmul_buffers(
             plan,
@@ -127,7 +136,9 @@ def test_transfer_planner_selects_resident_and_double_buffered_modes():
     streamed = plan_transfer(1 << 20, 1 << 20)
     assert streamed.strategy == "double_buffered_stream"
     assert streamed.double_buffered is True
-    internal = plan_transfer(1 << 20, 1 << 20, input_resident=True, output_resident=True)
+    internal = plan_transfer(
+        1 << 20, 1 << 20, input_resident=True, output_resident=True
+    )
     assert internal.strategy == "device_resident"
     assert internal.estimated_bytes == 0
     pipeline = plan_pipeline_transfer(1 << 20, 1 << 20, [1 << 20, 1 << 18])
@@ -143,9 +154,9 @@ def test_kernel_manifest_resolves_tuned_artifact():
 
 
 def test_matmul_kernel_key_separates_output_dtypes():
-    assert matmul_kernel_key("i8", 512, 512, 512, 8, output_dtype="i8") != matmul_kernel_key(
-        "i8", 512, 512, 512, 8, output_dtype="i32"
-    )
+    assert matmul_kernel_key(
+        "i8", 512, 512, 512, 8, output_dtype="i8"
+    ) != matmul_kernel_key("i8", 512, 512, 512, 8, output_dtype="i32")
 
 
 def test_kernel_manifest_rejects_incomplete_artifact():

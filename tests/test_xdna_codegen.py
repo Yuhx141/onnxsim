@@ -11,7 +11,9 @@ def _value(name, shape):
     dims = [SimpleNamespace(dim_value=value) for value in shape]
     return SimpleNamespace(
         name=name,
-        type=SimpleNamespace(tensor_type=SimpleNamespace(shape=SimpleNamespace(dim=dims))),
+        type=SimpleNamespace(
+            tensor_type=SimpleNamespace(shape=SimpleNamespace(dim=dims))
+        ),
     )
 
 
@@ -20,7 +22,10 @@ def _node(op, inputs, outputs, attrs=(), name=""):
         op_type=op,
         input=inputs,
         output=outputs,
-        attribute=[SimpleNamespace(name=key, ints=tuple(value), i=0, s=b"") for key, value in attrs],
+        attribute=[
+            SimpleNamespace(name=key, ints=tuple(value), i=0, s=b"")
+            for key, value in attrs
+        ],
         name=name,
     )
 
@@ -31,7 +36,13 @@ def test_codegen_binds_conv_fusion_to_gemm_metadata():
             node=[
                 _node("QuantizeLinear", ["x", "s", "z"], ["xq"]),
                 _node("DequantizeLinear", ["xq", "s", "z"], ["xdq"]),
-                _node("Conv", ["xdq", "w", "b"], ["co"], (("pads", (1, 1, 1, 1)),), "conv1"),
+                _node(
+                    "Conv",
+                    ["xdq", "w", "b"],
+                    ["co"],
+                    (("pads", (1, 1, 1, 1)),),
+                    "conv1",
+                ),
                 _node("QuantizeLinear", ["co", "s", "z"], ["cq"]),
                 _node("DequantizeLinear", ["cq", "s", "z"], ["cdq"]),
                 _node("Relu", ["cdq"], ["y"], name="relu1"),
@@ -39,7 +50,10 @@ def test_codegen_binds_conv_fusion_to_gemm_metadata():
             input=[_value("x", (1, 64, 8, 8))],
             value_info=[_value("co", (1, 128, 8, 8))],
             output=[_value("y", (1, 128, 8, 8))],
-            initializer=[SimpleNamespace(name="w", dims=(128, 64, 3, 3)), SimpleNamespace(name="b", dims=(128,))],
+            initializer=[
+                SimpleNamespace(name="w", dims=(128, 64, 3, 3)),
+                SimpleNamespace(name="b", dims=(128,)),
+            ],
         )
     )
     plan = build_codegen_plan(model, columns=1, strict=True)
@@ -64,4 +78,6 @@ def test_codegen_strict_mode_reports_unsupported_ops():
     except ValueError as exc:
         assert "Foo" in str(exc)
     else:
-        raise AssertionError("strict codegen planning must reject unsupported operators")
+        raise AssertionError(
+            "strict codegen planning must reject unsupported operators"
+        )

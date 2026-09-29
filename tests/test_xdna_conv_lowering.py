@@ -9,7 +9,12 @@ from conv_lowering import plan_conv_gemm  # noqa: E402
 
 def _value(name, shape):
     dims = [SimpleNamespace(dim_value=value) for value in shape]
-    return SimpleNamespace(name=name, type=SimpleNamespace(tensor_type=SimpleNamespace(shape=SimpleNamespace(dim=dims))))
+    return SimpleNamespace(
+        name=name,
+        type=SimpleNamespace(
+            tensor_type=SimpleNamespace(shape=SimpleNamespace(dim=dims))
+        ),
+    )
 
 
 def _node(op, inputs, outputs, attrs=(), name=""):
@@ -17,13 +22,18 @@ def _node(op, inputs, outputs, attrs=(), name=""):
         op_type=op,
         input=inputs,
         output=outputs,
-        attribute=[SimpleNamespace(name=key, ints=tuple(value), i=0, s=b"") for key, value in attrs],
+        attribute=[
+            SimpleNamespace(name=key, ints=tuple(value), i=0, s=b"")
+            for key, value in attrs
+        ],
         name=name,
     )
 
 
 def test_conv_lowering_extracts_im2col_gemm_and_relu_fusion():
-    conv = _node("Conv", ["x", "w", "b"], ["co"], (("strides", (1, 1)), ("pads", (1, 1, 1, 1))))
+    conv = _node(
+        "Conv", ["x", "w", "b"], ["co"], (("strides", (1, 1)), ("pads", (1, 1, 1, 1)))
+    )
     relu = _node("Relu", ["co"], ["y"])
     model = SimpleNamespace(
         graph=SimpleNamespace(
@@ -31,7 +41,10 @@ def test_conv_lowering_extracts_im2col_gemm_and_relu_fusion():
             input=[_value("x", (1, 64, 56, 56))],
             value_info=[_value("co", (1, 128, 56, 56))],
             output=[_value("y", (1, 128, 56, 56))],
-            initializer=[SimpleNamespace(name="w", dims=(128, 64, 3, 3)), SimpleNamespace(name="b", dims=(128,))],
+            initializer=[
+                SimpleNamespace(name="w", dims=(128, 64, 3, 3)),
+                SimpleNamespace(name="b", dims=(128,)),
+            ],
         )
     )
     plan = plan_conv_gemm(model, 0, columns=8)
