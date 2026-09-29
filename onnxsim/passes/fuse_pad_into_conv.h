@@ -33,9 +33,7 @@ struct FusePadIntoConv final : public PredicateBasedPass {
   explicit FusePadIntoConv()
       : PredicateBasedPass(PassType::Fuse, PassEfficiency::Complete,
                            PassOptimizationType::Compute) {}
-  std::string getPassName() const override {
-    return "fuse_pad_into_conv";
-  }
+  std::string getPassName() const override { return "fuse_pad_into_conv"; }
   bool patternMatchPredicate(Node* node) override {
     return CheckKind(node, kConv, 0, kPad);
   }
@@ -159,4 +157,3 @@ struct FusePadIntoConv final : public PredicateBasedPass {
 }  // namespace onnxsim_passes
 }  // namespace optimization
 }  // namespace ONNX_NAMESPACE
-

@@ -60,7 +60,7 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
     return PassAnalysisType::CountBased;
   }
 
-  unsigned int EliminateCommonSubexpressions(Graph &graph) {
+  unsigned int EliminateCommonSubexpressions(Graph& graph) {
     // No longer cleared here: see EliminateDuplicateInitializer's identical
     // change for why (TensorContentDigest's cache now outlives a single pass
     // call; clearing it is Optimizer::optimize(Graph&, ...)'s job).
@@ -73,7 +73,8 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
     double filter_ms = 0.0;
     double lookup_ms = 0.0;
     double replace_ms = 0.0;
-    std::unordered_map<Node *, Node *, DomainAwareCSEHash, DomainAwareCSEEqual> hash_map;
+    std::unordered_map<Node*, Node*, DomainAwareCSEHash, DomainAwareCSEEqual>
+        hash_map;
     // See eliminate_deadend.h's identical use of GraphMayHaveCapturedValues
     // for why this turns hasUses() from an accidental O(nodes) cost on every
     // one of this loop's O(nodes) iterations into O(1), for the overwhelming
@@ -108,8 +109,7 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
       // bucket collision, CSEEqual -- see cse_util.h's node_hash_ms/
       // node_equal_ms for that same work's own breakdown.
       std::chrono::steady_clock::time_point t0;
-      if (profiling)
-        t0 = std::chrono::steady_clock::now();
+      if (profiling) t0 = std::chrono::steady_clock::now();
       auto insertion = hash_map.emplace(node, node);
       if (profiling) {
         const auto t1 = std::chrono::steady_clock::now();
@@ -120,8 +120,7 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
         auto outputs = other->outputs();
         auto replaced_outputs = node->outputs();
         std::chrono::steady_clock::time_point t2;
-        if (profiling)
-          t2 = std::chrono::steady_clock::now();
+        if (profiling) t2 = std::chrono::steady_clock::now();
         for (int i = 0; i < outputs.size(); ++i) {
           if (tryReplacingAllUsesWith(replaced_outputs[i], outputs[i])) {
             VLOG(1) << Str("kind: ", kind.toString(), ", ", node->name(), " [",
@@ -144,7 +143,7 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
     return cse_removed;
   }
 
-  std::shared_ptr<PostPassAnalysis> runPass(Graph &graph) override {
+  std::shared_ptr<PostPassAnalysis> runPass(Graph& graph) override {
     auto cse_removed = this->EliminateCommonSubexpressions(graph);
     VLOG(1) << Str("cse_removed count: ", cse_removed);
     return std::shared_ptr<PostPassAnalysis>(
