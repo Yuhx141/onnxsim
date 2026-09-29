@@ -459,6 +459,18 @@ TC_OPT=1`), 4 threads on the V69 phone, all bit-exact to the capture:
 | the vector upcast takes the axis at unit stride in the most buffers (a W16 7x7 depthwise vectorized its NCHW output width, gathering its input: 26.6 ms -> off the top list) | 347 / 631 | 93.6 |
 | outputs in their own dtypes (`ALL_OUTPUTS=2`): the 2 MB uint8 frame queue stays uint8, each output its own aligned slice | 337 / 470 | 94 |
 | recurrent state resident on the runner (`--resident 4:1,5:2,6:3`) | 340 / 356 | |
+| mixed W8/W16 heads (`drv_w16t10_a16_hmix`) with `ONNX_QDQ_INT_GEMM=1` for weights >= 65536 elements (`ONNX_QDQ_INT_GEMM_MIN`) | 237 / 262 | |
+| camera-frame mean subtraction as a table (`ONNX_QDQ_LUT` accepts a constant that is one value broadcast over the channels) | 240 / 252 | |
+
+The integer heads are not bit-exact to the float ones: `qmatmul` quantizes the activation to uint16 at run time, so on the
+same inputs they differ from an ORT float reference of the same weights by 0.15 on average (6.7 at most) on outputs whose mean
+magnitude is 894. Weights below 65536 elements stay float: converting all ~90 heads (32x32 layers included) was 891 ms.
+The second row's DSP time is unchanged within noise: the two ~12 ms preprocessing kernels are gone (5 ms of table lookups
+remain), but the hmix run-to-run spread is about 4 ms.
+
+Tried and dropped: blocking several output pixels per weight load in the vrmpy tensor core (`DSP_TC_MBLOCK`), aimed at the 1x1
+convs that run at about 5% of vrmpy peak. With more than one pixel per block the compiler passes ran out of memory (12 GB in
+6 s), so it is not in the tree; the 1x1 conv remains the largest integer-path item (about 25 ms per 12-block group).
 
 The last two are transport: casting the frame queue to float made an 8 MB output (and a 15 ms scalar cast kernel), and
 sending `state_*_q` in and `next_state_*_q` back every call moved 4.4 MB over `adb forward`. The runner now keeps each
