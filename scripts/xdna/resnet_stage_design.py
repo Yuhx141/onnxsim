@@ -126,11 +126,55 @@ def resnet_stages(
     stage_specs: CompileTime[str],
     weight_depths: CompileTime[str] = "",
     nocompute: CompileTime[int] = 0,
+    stem_spec: CompileTime[str] = "",
 ):
     cols = json.loads(stage_specs)
     n = len(cols)
     depths = [int(v) for v in weight_depths.split(",")] if weight_depths else [1] * n
     input_fifos, weight_fifos, output_fifos, workers = [], [], [], []
+    stem = json.loads(stem_spec) if stem_spec else None
+    stem_handles = []
+    stem_bytes = 0
+    if stem:
+        # On-device stem Conv (as an im2col GEMM) + MaxPool in one extra column: core 0 runs the GEMM chunk
+        # by chunk, core 1 assembles the map and pools it. Its own three shim streams: image chunks and
+        # weights in, pooled map out.
+        sc, chunks = stem["column"], stem["chunks"]
+        stem_bytes = stem["slot"]
+        in_ty = np.ndarray[(stem["chunk_in"],), np.dtype[np.int8]]
+        sw_ty = np.ndarray[(stem["slot"],), np.dtype[np.uint8]]
+        so_ty = np.ndarray[(stem["chunk_out"],), np.dtype[np.uint8]]
+        po_ty = np.ndarray[(stem["pool_out"],), np.dtype[np.uint8]]
+        pool_flags = [f"-DPOOL_H={stem['map_h']}", f"-DPOOL_W={stem['map_w']}", f"-DPOOL_OB={stem['out_blocks']}", f"-DPOOL_CHUNK_PX={stem['chunk_px']}", f"-DPOOL_CHUNKS={stem['chunks']}"]
+        src = str(_RT_KERNEL)
+        kstem = ExternalFunction("fused_stem_chunk", source_file=src, arg_types=[in_ty, sw_ty, so_ty, np.int32], compile_flags=["-DBLK_STEM"], symbol_prefix="stem")
+        kpool = ExternalFunction("fused_pool_step", source_file=src, arg_types=[so_ty, np.int32, po_ty], compile_flags=pool_flags + ["-DBLK_POOL"], symbol_prefix="pool")
+        stem_in = ObjectFifo(in_ty, depth=1, name="stem_image")
+        stem_w = ObjectFifo(sw_ty, depth=1, name="stem_weights")
+        stem_out = ObjectFifo(so_ty, depth=1, name="stem_out")
+        pool_out = ObjectFifo(po_ty, depth=1, name="pool_out")
+
+        def stem_worker(inp, weights, out, kern):
+            wc = weights.acquire(1)
+            for _ in range_(chunks):
+                a = inp.acquire(1)
+                o = out.acquire(1)
+                kern(a, wc, o, 0)
+                out.release(1)
+                inp.release(1)
+            weights.release(1)
+
+        def pool_worker(inp, out, step):
+            r = out.acquire(1)  # held while the chunks arrive; the last chunk triggers the pooling
+            for c in range(chunks):
+                o = inp.acquire(1)
+                step(o, c, r)
+                inp.release(1)
+            out.release(1)
+
+        workers.append(Worker(stem_worker, fn_args=[stem_in.cons(), stem_w.cons(), stem_out.prod(), kstem], tile=Tile(sc, 2), stack_size=0x1000))
+        workers.append(Worker(pool_worker, fn_args=[stem_out.cons(), pool_out.prod(), kpool], tile=Tile(sc, 3), stack_size=0x800, data_size=stem["map_bytes"] + 256))
+        stem_handles = [stem_in, stem_w, pool_out]
 
     for index, col in enumerate(cols):
         mid, act_obj, out_obj = col["mid"], col["act_obj"], col["out_obj"]
@@ -186,19 +230,21 @@ def resnet_stages(
         weight_fifos.append(weights_fifo)
         output_fifos.append(output_fifo)
 
-    act_ty = np.ndarray[(cols[0]["act_obj"],), np.dtype[np.int8]]
+    act_ty = np.ndarray[((stem["chunks"] * stem["chunk_in"]) if stem else cols[0]["act_obj"],), np.dtype[np.int8]]
     out_ty = np.ndarray[(cols[-1]["out_obj"],), np.dtype[np.int8]]
-    params_ty = np.ndarray[(sum(c["stream_chunks"] * (c["slot"] + RT_DESC_BYTES) for c in cols),), np.dtype[np.uint8]]
+    params_ty = np.ndarray[(stem_bytes + sum(c["stream_chunks"] * (c["slot"] + RT_DESC_BYTES) for c in cols),), np.dtype[np.uint8]]
     scratch_bytes = 0
     for col in cols:
         scratch_bytes += col["repeat"] * col["out_obj"] + col["out_obj"]
     scratch_bytes = scratch_bytes - cols[-1]["out_obj"] + max(c["act_obj"] for c in cols)
+    if stem:
+        scratch_bytes += cols[0]["act_obj"]  # slot for the pooled map feeding the first stage
     scratch_ty = np.ndarray[(scratch_bytes,), np.dtype[np.int8]]
 
     def sequence(x, packed, y, mid, *handles):
-        xprods, ycons, wprods = handles[:n], handles[n : 2 * n], handles[2 * n :]
+        xprods, ycons, wprods = handles[:n], handles[n : 2 * n], handles[2 * n : 3 * n]
         weights = TaskGroup()
-        offset = 0
+        offset = stem_bytes
         for col, wprod in zip(cols, wprods):
             total = col["stream_chunks"]
             slot_total = col["slot"] + RT_DESC_BYTES
@@ -206,6 +252,17 @@ def resnet_stages(
                        offset=offset, transfer_len=total * slot_total)
             offset += total * slot_total
         source, source_offset, mid_offset = x, 0, 0
+        if stem:
+            image_prod, stem_w_prod, pool_cons = handles[3 * n :]
+            pre = TaskGroup()
+            stem_w_prod.fill(packed, group=pre, offset=0, sizes=[1, 1, 1, stem["slot"]], strides=[0, 0, 0, 1],
+                             transfer_len=stem["slot"])
+            image_prod.fill(x, group=pre, offset=0, sizes=[1, 1, stem["chunks"], stem["chunk_in"]],
+                            strides=[0, 0, stem["chunk_in"], 1], transfer_len=stem["chunks"] * stem["chunk_in"])
+            pool_cons.drain(mid, wait=True, group=pre, offset=0, sizes=[1, 1, 1, stem["pool_out"]],
+                            strides=[0, 0, 0, 1], transfer_len=stem["pool_out"])
+            pre.finish()
+            source, source_offset, mid_offset = mid, 0, cols[0]["act_obj"]
         for ci, col in enumerate(cols):
             for it in range(col["repeat"] + 1):
                 final = ci == n - 1 and it == col["repeat"]
@@ -226,6 +283,7 @@ def resnet_stages(
     runtime = Runtime(sequence, [
         act_ty, params_ty, out_ty, scratch_ty,
         *[f.prod() for f in input_fifos], *[f.cons() for f in output_fifos], *[f.prod() for f in weight_fifos],
+        *([stem_handles[0].prod(), stem_handles[1].prod(), stem_handles[2].cons()] if stem else []),
     ])
     return Program(iron.get_current_device(), runtime, workers=workers).resolve_program()
 
@@ -314,20 +372,42 @@ def _parser():
     parser.add_argument("--chunk-caps", default="", help="comma-separated weight-chunk byte cap per stage (0 = default)")
     parser.add_argument("--weight-depths", default="")
     parser.add_argument("--nocompute", type=int, default=0)
+    parser.add_argument("--stem", action="store_true", help="also run the stem Conv + MaxPool on the device (extra column after the stages)")
     return parser
+
+
+def stem_spec(model, column):
+    """Compile-time description of the on-device stem/pool column."""
+    try:
+        from . import stem_pool
+    except ImportError:
+        import stem_pool
+    stem = stem_pool.extract_stem(model)
+    g = stem_pool.geometry(stem)
+    out_blocks = g["out_channels"] // 8
+    return {
+        "column": column, "chunks": g["chunks"], "chunk_in": g["k_pad"] * stem_pool.CHUNK_PIXELS,
+        "chunk_out": g["out_channels"] * stem_pool.CHUNK_PIXELS, "slot": stem_pool.stem_slot_bytes(stem),
+        "pool_out": g["out_channels"] * (g["oh"] // 2) * (g["ow"] // 2), "map_h": g["oh"], "map_w": g["ow"],
+        "out_blocks": out_blocks, "chunk_px": stem_pool.CHUNK_PIXELS, "map_bytes": g["out_channels"] * g["pixels"],
+    }
 
 
 def _compile_kwargs(opts):
     import onnx
+    model = onnx.load(opts.model)
     caps = [int(v) for v in opts.chunk_caps.split(",")] if opts.chunk_caps else None
-    cols, _ = stage_specs(onnx.load(opts.model), opts.stage, caps)
-    return {"stage_specs": json.dumps(cols, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute}
+    cols, _ = stage_specs(model, opts.stage, caps)
+    kwargs = {"stage_specs": json.dumps(cols, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute}
+    if opts.stem:
+        kwargs["stem_spec"] = json.dumps(stem_spec(model, len(cols)), separators=(",", ":"))
+    return kwargs
 
 
 def main() -> None:
     opts = _parser().parse_args()
     run_design_cli(resnet_stages, opts, compile_kwargs=_compile_kwargs,
-                   device=lambda value: device_from_args(value, n_cols=max(3, len(value.stage))))
+                   device=lambda value: device_from_args(value, n_cols=max(3, len(value.stage) + (1 if value.stem else 0))))
 
 
 if __name__ == "__main__":

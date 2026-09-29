@@ -335,3 +335,82 @@ extern "C" void fused_bottleneck_conv3_chunk(const uint8_t *bundle, const uint8_
   gemm_rt<false>(d.NB3, d.TO, 1, d.MB, d.weights, bias, a_base, d.OP * 8, epi);
 }
 #endif
+
+#ifdef BLK_STEM
+// Stem Conv as a 1x1 GEMM over a host-built im2col chunk: input [K/8][P][8] uint8 (zero point 128),
+// weights [ob][kb] tiles + bias, output [ob][P][8] uint8 = 128 + relu(requantized value).
+// The descriptor reuses the block fields: C = padded K, OUTC, P = W*H pixels of the chunk,
+// D_NBS = output blocks, D_SKBIAS = bias offset, D_SKIPSHIFT = requantization shift.
+extern "C" void fused_stem_chunk(const int8_t *input, const uint8_t *params, uint8_t *output, int32_t) {
+  set_modes();
+  const Dims d = load_dims(params);
+  const int32_t *bias = (const int32_t *)((const uint8_t *)d.weights + d.bs);
+  int8_t *out = (int8_t *)output;
+  const v64 zero = aie::zeros<int8, 64>();
+  auto a_base = [&](int t, int) { return input + t * 64; };
+  auto epi = [&](int ocl, int t, MMUL &c) __attribute__((noinline)) {
+    v64 v = aie::max(c.to_vector<int8>(d.shs), zero);
+    aie::store_unaligned_v(out + (ocl * d.P + t * 8) * 8, flip(v));
+  };
+  gemm_rt<true>(d.NBS, d.T1, 1, d.CB, d.weights, bias, a_base, d.P * 8, epi);
+}
+#endif
+
+#ifdef BLK_POOL
+// MaxPool 3x3 stride 2 pad 1 over the stem output map, kept in the [ob][pixel][8] blocked layout.
+// The map arrives as CHUNKS objects of CHUNK_PX pixels each (fused_pool_collect), then one call
+// pools it. Padding never wins: post-ReLU bytes are >= 128, so the pad value 0 is a valid -inf.
+#ifndef POOL_H
+#define POOL_H 16
+#endif
+#ifndef POOL_W
+#define POOL_W 16
+#endif
+#ifndef POOL_OB
+#define POOL_OB 8
+#endif
+#ifndef POOL_CHUNK_PX
+#define POOL_CHUNK_PX 64
+#endif
+#ifndef POOL_CHUNKS
+#define POOL_CHUNKS 4
+#endif
+alignas(64) static uint8_t pool_map[POOL_OB * POOL_H * POOL_W * 8];
+
+static void pool_collect(const uint8_t *chunk, int32_t index) {
+  constexpr int stride = POOL_H * POOL_W * 8, bytes = POOL_CHUNK_PX * 8;
+  for (int ob = 0; ob < POOL_OB; ++ob) {
+    uint8_t *dst = pool_map + ob * stride + index * bytes;
+    const uint8_t *src = chunk + ob * bytes;
+    for (int i = 0; i < bytes; i += 64) aie::store_unaligned_v(dst + i, aie::load_unaligned_v<64>(src + i));
+  }
+}
+
+static void pool_run(uint8_t *out) {
+  constexpr int OH = POOL_H / 2, OW = POOL_W / 2;
+  for (int ob = 0; ob < POOL_OB; ++ob)
+    for (int oy = 0; oy < OH; ++oy)
+      for (int ox = 0; ox < OW; ++ox) {
+        uint8_t best[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int ky = 0; ky < 3; ++ky) {
+          const int iy = oy * 2 + ky - 1;
+          if (iy < 0 || iy >= POOL_H) continue;
+          for (int kx = 0; kx < 3; ++kx) {
+            const int ix = ox * 2 + kx - 1;
+            if (ix < 0 || ix >= POOL_W) continue;
+            const uint8_t *p = pool_map + ((ob * POOL_H + iy) * POOL_W + ix) * 8;
+            for (int c = 0; c < 8; ++c) best[c] = p[c] > best[c] ? p[c] : best[c];
+          }
+        }
+        uint8_t *o = out + ((ob * OH + oy) * OW + ox) * 8;
+        for (int c = 0; c < 8; ++c) o[c] = best[c];
+      }
+}
+
+// One entry point (so both steps share the one static map): copy chunk `index`; after the last
+// chunk (POOL_CHUNKS - 1) also pool the assembled map into `out`.
+extern "C" void fused_pool_step(const uint8_t *chunk, int32_t index, uint8_t *out) {
+  pool_collect(chunk, index);
+  if (index == POOL_CHUNKS - 1) pool_run(out);
+}
+#endif
