@@ -100,8 +100,14 @@ Conv variants and ConvTranspose. Each runs on the phone and is compared to host 
   Transpose/Conv/Pool/BN/S2D failures pass in the default NHWC layout, including that 1-channel Conv.**
 - The remaining 5 mismatches (Equal, Greater, LessOrEqual, And, Cast-to-int) are a test artifact:
   the phone CPU EP shows the identical 1-ulp input difference at the exact thresholds.
-- Not yet known: whether the tiled kernel fails because of Adreno's `workgroupBarrier()`
-  handling on 2-D workgroups, a Tint SPIR-V lowering issue, or a driver bug. A host Vulkan run
-  (lavapipe) of the same kernel would say whether it is device-specific. Interim workaround:
-  the patch above; a real fix would be a plain-kernel fallback on Adreno.
+- **Host reference (same ORT revision, unpatched, x86-64 build):** the RTX 5050 (NVIDIA
+  driver), the Radeon 8060S (RADV) and lavapipe (software Vulkan) each pass 230/235; the 5
+  misses are the same tie artifacts. So the tiled Transpose, and everything that goes through
+  it, is correct on three other Vulkan implementations, including Tint's output on them. The
+  fault is specific to the Adreno 730 Vulkan stack (its driver/shader compiler) rather than ORT's
+  kernel logic. Driver selected per run with `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/<x>_icd.json`.
+- Not yet known: which construct trips the Adreno compiler (2-D `local_invocation_id`
+  indexing, the `tile_size + 1` padded stride, or barrier placement). A reduced standalone WGSL
+  kernel run through Dawn on the phone would narrow it. Interim workaround: the patch above; a
+  real fix would be a plain-kernel fallback selected for Adreno adapters.
 - Timing is not yet measured; only correctness was checked.
