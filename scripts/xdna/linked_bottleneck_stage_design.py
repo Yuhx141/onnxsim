@@ -119,7 +119,7 @@ def linked_bottleneck_stage(
         outputs3 = output_channels // chunks3
         skip_outputs = output_channels // (skip_chunks if skip_chunks else 1)
         bytes1 = _align4(outputs1 * channels) + outputs1 * 4
-        bytes2 = _align4(outputs2 * mid_channels * 9) + outputs2 * 4
+        bytes2 = _align4(outputs2 * mid_channels * spec.get("taps", 9)) + outputs2 * 4
         bytes3 = _align4(outputs3 * mid_channels) + outputs3 * 4
         bytes_skip = _align4(skip_outputs * channels) + skip_outputs * 4 if skip_chunks else 0
         slot_bytes = max(bytes1, bytes2, bytes3, bytes_skip)
@@ -152,7 +152,7 @@ def linked_bottleneck_stage(
             f"-DFUSED_C1_CHUNKS={chunks1}", f"-DFUSED_C2_CHUNKS={chunks2}", f"-DFUSED_C3_CHUNKS={chunks3}",
             f"-DFUSED_C1_OUTPUTS={outputs1}", f"-DFUSED_C2_OUTPUTS={outputs2}", f"-DFUSED_C3_OUTPUTS={outputs3}",
             f"-DFUSED_BIAS1_OFFSET={_align4(outputs1 * channels)}",
-            f"-DFUSED_BIAS2_OFFSET={_align4(outputs2 * mid_channels * 9)}",
+            f"-DFUSED_BIAS2_OFFSET={_align4(outputs2 * mid_channels * spec.get('taps', 9))}",
             f"-DFUSED_BIAS3_OFFSET={_align4(outputs3 * mid_channels)}",
             f"-DFUSED_C1_MMUL={1 if spec['conv1_mmul'] else 0}",
             f"-DFUSED_MAIN_RESIDUAL_SHIFT={spec['residual_main_shift']}",
@@ -219,17 +219,39 @@ def linked_bottleneck_stage(
             tapbuf, xprod, ycons, tapcons, *wprods = rest
         else:
             xprod, ycons, *wprods = rest
-        group = TaskGroup()
         if blocked:
-            first = specs[0]
+            # Concurrent streams: input, one whole-stream weight transfer per block, and
+            # the output drain are all issued before any wait. Consumers' FIFO locks
+            # throttle each stream, so no per-chunk host round trip is needed.
+            group = TaskGroup()
+            first, last = specs[0], specs[-1]
             xprod.fill(
-                x, wait=True, group=group,
+                x, group=group,
                 sizes=[first["channels"] // 8, first["width"] * first["height"], 8],
                 strides=[8, first["channels"], 1],
                 transfer_len=first["width"] * first["height"] * first["channels"],
             )
-        else:
-            xprod.fill(x, wait=True, group=group)
+            parameter_offset = 0
+            for index, wprod in enumerate(wprods):
+                spec = specs[index]
+                wprod.fill(
+                    packed, group=group, sizes=[1, 1, spec["parameter_chunks"], spec["slot_bytes"]],
+                    strides=[0, 0, spec["slot_bytes"], 1], offset=parameter_offset,
+                    transfer_len=spec["params_len"],
+                )
+                parameter_offset += spec["params_len"]
+            ycons.drain(
+                y, wait=True, group=group,
+                sizes=[last["output_channels"] // 8, last["output_width"] * last["output_height"], 8],
+                strides=[8, last["output_channels"], 1],
+                transfer_len=last["output_width"] * last["output_height"] * last["output_channels"],
+            )
+            if tap:
+                tapcons.drain(tapbuf, wait=True, group=group)
+            group.finish()
+            return
+        group = TaskGroup()
+        xprod.fill(x, wait=True, group=group)
         group.finish()
         parameter_offset = 0
         for index, wprod in enumerate(wprods):
@@ -245,16 +267,7 @@ def linked_bottleneck_stage(
                 offset += spec["slot_bytes"]
             parameter_offset += spec["params_len"]
         group = TaskGroup()
-        if blocked:
-            last = specs[-1]
-            ycons.drain(
-                y, wait=True, group=group,
-                sizes=[last["output_channels"] // 8, last["output_width"] * last["output_height"], 8],
-                strides=[8, last["output_channels"], 1],
-                transfer_len=last["output_width"] * last["output_height"] * last["output_channels"],
-            )
-        else:
-            ycons.drain(y, wait=True, group=group)
+        ycons.drain(y, wait=True, group=group)
         if tap:
             tapcons.drain(tapbuf, wait=True, group=group)
         group.finish()
@@ -297,7 +310,7 @@ def _compile_kwargs(opts):
         block = plans.get(prefix)
         if block is None:
             raise ValueError(f"no bottleneck block found for {prefix!r}")
-        binding = bind_fused_bottleneck(model, block)
+        binding = bind_fused_bottleneck(model, block, blocked=bool(opts.blocked))
         if opts.blocked:
             try:
                 from .blocked_stage import blocked_supported
@@ -321,7 +334,7 @@ def _compile_kwargs(opts):
             "skip_chunks": binding["skip_chunk_count"], "skip_shift": binding["skip_output_shift"] or 0,
             "residual_main_shift": binding["main_residual_shift"],
             "residual_skip_shift": binding["skip_residual_shift"],
-            "conv1_mmul": True, "slot_bytes": binding["chunk_slot_bytes"],
+            "conv1_mmul": True, "taps": len(binding["conv2_taps"]), "slot_bytes": binding["chunk_slot_bytes"],
             "parameter_chunks": len(binding["chunk_sizes"]), "params_len": binding["params"].size,
         })
     return {"stage_specs": json.dumps(specs, separators=(",", ":")), "tap": int(opts.tap), "nocompute": int(opts.nocompute), "blocked": int(opts.blocked), "dbg": int(opts.dbg)}

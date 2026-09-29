@@ -17,18 +17,17 @@ TILE = 8
 
 
 def blocked_supported(binding: dict[str, Any]) -> bool:
-    """Whether a block can use the blocked kernels (stride-1, 8-aligned dims)."""
-    width = int(binding["input_width"])
+    """Whether a block can use the blocked kernels (bound with ``blocked=True``)."""
     channels = int(binding["input_channels"])
     out_channels = int(binding["output_channels"])
-    raw = binding["raw_weights"]
-    mid = raw["w1"].shape[0]
+    mid = binding["raw_weights"]["w1"].shape[0]
+    c1, c2, c3 = binding["chunk_counts"]
+    rows = (mid // c1, (mid // 2) // c2, out_channels // c3)
     return (
-        tuple(binding["conv2_stride"]) == (1, 1)
-        and width % TILE == 0 and int(binding["output_width"]) == width
+        bool(binding.get("blocked"))
+        and tuple(binding["conv2_stride"]) in ((1, 1), (2, 2))
         and channels % TILE == 0 and out_channels % TILE == 0 and mid % (2 * TILE) == 0
-        and tuple(binding["chunk_counts"]) == (1, 1, 1)
-        and int(binding["skip_chunk_count"]) in (0, 1)
+        and all(r % TILE == 0 for r in rows)
     )
 
 
@@ -39,11 +38,24 @@ def _tile_1x1(weight: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(w.transpose(0, 2, 3, 1))  # ocb, icb, k, n
 
 
+def valid_taps(height: int, width: int, out_height: int, out_width: int, stride: int) -> list[int]:
+    """3x3 taps (ky*3+kx) that read at least one real (non-padding) input pixel."""
+    taps = []
+    for tap in range(9):
+        ky, kx = divmod(tap, 3)
+        if any(
+            0 <= oy * stride + ky - 1 < height and 0 <= ox * stride + kx - 1 < width
+            for oy in range(out_height) for ox in range(out_width)
+        ):
+            taps.append(tap)
+    return taps
+
+
 def _tile_3x3(weight: np.ndarray) -> np.ndarray:
-    """[oc][ic][3][3] -> tiles ordered [ocb][tap][icb] each B[k][n]."""
+    """[oc][ic][1][ntaps] (pruned taps) -> tiles ordered [ocb][tap][icb] each B[k][n]."""
     oc, ic = weight.shape[:2]
-    w = weight.reshape(oc // TILE, TILE, ic // TILE, TILE, 3, 3)  # ocb,n,icb,k,ky,kx
-    return np.ascontiguousarray(w.transpose(0, 4, 5, 2, 3, 1))  # ocb,ky,kx,icb,k,n
+    w = weight.reshape(oc // TILE, TILE, ic // TILE, TILE, -1)  # ocb,n,icb,k,tap
+    return np.ascontiguousarray(w.transpose(0, 4, 2, 3, 1))  # ocb,tap,icb,k,n
 
 
 def pack_blocked_params(binding: dict[str, Any]) -> np.ndarray:
@@ -51,13 +63,23 @@ def pack_blocked_params(binding: dict[str, Any]) -> np.ndarray:
     raw = binding["raw_weights"]
     mid = raw["w1"].shape[0]
     half = mid // 2
-    chunks: list[tuple[np.ndarray, np.ndarray]] = [(_tile_1x1(raw["w1"]), raw["b1"])]
-    if raw["skip_weight"] is not None:
-        chunks.append((_tile_1x1(raw["skip_weight"]), raw["skip_bias"]))
+    c1, c2, c3 = binding["chunk_counts"]
+    skip_chunks = int(binding["skip_chunk_count"])
+    chunks: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def add(weight, bias, count, tiler):
+        rows = weight.shape[0] // count
+        for index in range(count):
+            sl = slice(index * rows, (index + 1) * rows)
+            chunks.append((tiler(weight[sl]), bias[sl]))
+
+    add(raw["w1"], raw["b1"], c1, _tile_1x1)
+    if skip_chunks:
+        add(raw["skip_weight"], raw["skip_bias"], skip_chunks, _tile_1x1)
     for worker in range(2):
         sl = slice(worker * half, (worker + 1) * half)
-        chunks.append((_tile_3x3(raw["w2"][sl]), raw["b2"][sl]))
-    chunks.append((_tile_1x1(raw["w3"]), raw["b3"]))
+        add(raw["w2"][sl], raw["b2"][sl], c2, _tile_3x3)
+    add(raw["w3"], raw["b3"], c3, _tile_1x1)
     packed = []
     for weight, bias in chunks:
         raw_weight = np.ascontiguousarray(weight).view(np.uint8).reshape(-1)
@@ -67,8 +89,8 @@ def pack_blocked_params(binding: dict[str, Any]) -> np.ndarray:
         blob[bias_offset:] = np.ascontiguousarray(bias).view(np.uint8)
         packed.append(blob)
     slot = int(binding["chunk_slot_bytes"])
-    if max(blob.size for blob in packed) > slot:
-        raise ValueError("blocked parameter chunk exceeds the compiled weight slot")
+    if max(blob.size for blob in packed) > slot or len(packed) * slot != binding["params"].size:
+        raise ValueError("blocked parameter chunks do not match the compiled weight slot layout")
     params = np.zeros(len(packed) * slot, dtype=np.uint8)
     for index, blob in enumerate(packed):
         params[index * slot : index * slot + blob.size] = blob

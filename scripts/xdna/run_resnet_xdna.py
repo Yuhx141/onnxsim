@@ -412,7 +412,7 @@ class XDNAResNetRunner:
                 block = bottleneck_plans.get(prefix)
                 if block is None:
                     raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
-                binding = bind_fused_bottleneck(model, block)
+                binding = bind_fused_bottleneck(model, block, blocked=fused_stage_blocked)
                 if previous_binding is not None and (
                     previous_binding["output_shape"] != binding["input_shape"]
                     or previous_binding["output_raw_name"] != binding["input_raw_name"]

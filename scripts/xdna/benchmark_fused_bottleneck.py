@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,7 @@ def _quantizer_after(value: str, nodes: list[Any], consumers: dict[str, list[int
 
 
 def bind_fused_bottleneck(
-    model: Any, block: BottleneckBlockPlan, *, conv1_mmul: bool = True
+    model: Any, block: BottleneckBlockPlan, *, conv1_mmul: bool = True, blocked: bool = False
 ) -> dict[str, Any]:
     nodes = list(model.graph.node)
     edges = dict(qdq_edge_map(model))
@@ -244,6 +245,19 @@ def bind_fused_bottleneck(
     if final_dequantizer is None:
         raise ValueError("fused block output has no matching DequantizeLinear boundary")
 
+    conv2_taps = list(range(9))
+    if blocked:
+        # Drop 3x3 taps that only ever read zero padding (e.g. all but the centre tap
+        # on a 1x1 map); their weights are neither streamed nor multiplied.
+        try:
+            from .blocked_stage import valid_taps
+        except ImportError:
+            from blocked_stage import valid_taps
+        conv2_taps = valid_taps(height, width, output_height, output_width, conv2_stride[0])
+        flat = weight_arrays[1].reshape(weight_arrays[1].shape[0], weight_arrays[1].shape[1], 9)
+        weight_arrays[1] = np.ascontiguousarray(flat[:, :, conv2_taps]).reshape(
+            flat.shape[0], flat.shape[1], 1, len(conv2_taps)
+        )
     # Pack output-channel chunks independently so each transfer fits an NPU2
     # DMA descriptor. Each worker reuses one weight FIFO for its whole stage.
     w1, w2, w3 = weight_arrays
@@ -260,7 +274,16 @@ def bind_fused_bottleneck(
         + int(np.prod((1, mid_channels, height, width)))
         + int(np.prod(output_shape))
     )
-    max_chunk_bytes = min(36864, tile_memory_bytes - worker_stack_bytes - live_tensor_bytes)
+    if blocked:
+        # Blocked kernels keep conv1's output in a zero-padded [C/8][H+2][W+2][8]
+        # buffer and the projection/identity skip in [OUT_C/8][OP][8].
+        live_tensor_bytes = (
+            int(np.prod(input_shape))
+            + (mid_channels // 8) * (height + 2) * (width + 2) * 8
+            + int(np.prod(output_shape))
+            + 1024
+        )
+    max_chunk_bytes = min(int(os.environ.get("XDNA_BLOCKED_MAX_CHUNK", "49152")) if blocked else 36864, tile_memory_bytes - worker_stack_bytes - live_tensor_bytes)
     if max_chunk_bytes <= 0:
         raise ValueError(
             f"{block.prefix}: full-tensor producer buffers need {live_tensor_bytes} bytes; "
@@ -271,6 +294,8 @@ def bind_fused_bottleneck(
         for count in range(1, outputs + 1):
             if outputs % count == 0:
                 rows = outputs // count
+                if blocked and rows % 8:
+                    continue
                 if _align4(rows * weight_bytes_per_output) + rows * 4 <= max_chunk_bytes:
                     return count
         raise ValueError("could not divide weight stage into DMA-sized output-channel chunks")
@@ -403,6 +428,8 @@ def bind_fused_bottleneck(
         "conv2_stride": conv2_stride,
         "skip_output_scale": skip_output_scale,
         "skip_output_zero_point": 128 if projection else None,
+        "blocked": blocked,
+        "conv2_taps": tuple(conv2_taps),
         "raw_weights": {"w1": w1, "w2": w2, "w3": w3, "b1": b1, "b2": b2, "b3": b3,
                         "skip_weight": skip_weight, "skip_bias": skip_bias},
         "parameter_stage_order": ("conv1", "skip", "conv2a", "conv2b", "conv3") if projection else ("conv1", "conv2a", "conv2b", "conv3"),
