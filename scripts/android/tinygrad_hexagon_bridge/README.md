@@ -518,7 +518,7 @@ closes; the same pattern as `scripts/android/mcc_hmx/tg/replay_impl.c`). Level 1
 Outputs are byte-identical with and without the vote. Two consequences. Every earlier A/B in this README was taken with the clock
 free-running: differences of a few ms between runs could be clock state, so decisions rest on the large or repeated ones (the
 pinned clock makes runs reproducible to about 1 ms from here on). And a pinned MAX corner costs power: for battery use pass
-`DSP_V65_PERF_VOTE=0`. The tiny-kernel "per distinct kernel" cost above was measured unvoted; the PMU's own cycle counts, with
+`DSP_V65_PERF_VOTE=0`. The tiny-kernel graphs (300 calls of 512-element softmaxes, 100 distinct-size slices) were measured unvoted, where distinct kernels looked 100-200 us each more expensive than repeats; the PMU's own cycle counts, with
 corrected V69 event codes (the itrace header's low bytes are offset by 2 from the V69 manual's: I$ miss 0x12, D$ miss 0x13, JTLB
 miss 0x58, DTLB miss 0xb3, packets 0x03, DU stall 0xa0, L2 DU read miss 0x7d, cycles with one thread 0x3b), showed a median call of
 only ~1.9 K packets with no cache or TLB misses: the "113 us floor" was an artifact of the profile listing only the slowest 254
