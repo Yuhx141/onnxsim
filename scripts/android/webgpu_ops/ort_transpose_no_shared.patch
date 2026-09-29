@@ -1,0 +1,21 @@
+diff --git a/onnxruntime/core/providers/webgpu/tensor/transpose.cc b/onnxruntime/core/providers/webgpu/tensor/transpose.cc
+index 4f45305..b0f2982 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/transpose.cc
++++ b/onnxruntime/core/providers/webgpu/tensor/transpose.cc
+@@ -1,6 +1,7 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#include <cstdlib>
+ #include "core/common/span_utils.h"
+ #include "core/common/inlined_containers.h"
+ #include "core/providers/cpu/tensor/utils.h"
+@@ -187,7 +188,7 @@ Status Transpose::DoTranspose(onnxruntime::webgpu::ComputeContextBase& context,
+   SqueezeShape(input_shape.GetDims(), permutations, new_shape, new_perm);
+   const bool channels_last = new_perm == TensorShapeVector({2, 3, 1});
+   const bool channels_first = new_perm == TensorShapeVector({3, 1, 2});
+-  const bool use_shared = (new_shape.size() == 2 && new_perm[0] > new_perm[1]) || channels_last || channels_first;
++  const bool use_shared = std::getenv("ORT_WGPU_NO_SHARED_TRANSPOSE") == nullptr && ((new_shape.size() == 2 && new_perm[0] > new_perm[1]) || channels_last || channels_first);
+   auto new_input_shape = input_shape;
+ 
+   if (use_shared) {
