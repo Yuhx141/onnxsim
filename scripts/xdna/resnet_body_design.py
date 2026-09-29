@@ -101,6 +101,7 @@ def resnet_body(
     nocompute: CompileTime[int] = 0,
     seg_gather: CompileTime[str] = "",
     split_weights: CompileTime[str] = "",
+    l2_depths: CompileTime[str] = "",
 ):
     groups = json.loads(body_specs)
     if not 1 <= len(groups) <= 8:
@@ -109,6 +110,9 @@ def resnet_body(
     depths = [int(v) for v in weight_depths.split(",")] if weight_depths else [1] * len(groups)
     seg_modes = [int(v) for v in seg_gather.split(",")] if seg_gather else [0] * len(groups)
     splits = [int(v) for v in split_weights.split(",")] if split_weights else [0] * len(groups)
+    l2 = [int(v) for v in l2_depths.split(",")] if l2_depths else [0] * len(groups)
+    if len(l2) != len(groups):
+        raise ValueError("l2_depths needs one entry per group")
     if len(depths) != len(groups) or len(seg_modes) != len(groups) or len(splits) != len(groups):
         raise ValueError("weight_depths needs one entry per group")
 
@@ -171,7 +175,14 @@ def resnet_body(
             w_fifos = [ObjectFifo(weight_ty, depth=depths[index], name=f"g{index}_w{tag}") for tag in ("1", "2a", "2b", "3")]
             weights_fifo = None
         else:
-            weights_fifo = ObjectFifo(weight_ty, depth=depths[index], name=f"g{index}_weights")
+            if l2[index]:
+                # Stage weights in the column's memtile: the shim fills a deep L2 FIFO ahead of
+                # compute and the memtile forwards chunks to the four cores as they need them.
+                l2_fifo = ObjectFifo(weight_ty, depth=l2[index], name=f"g{index}_weights_l2")
+                weights_fifo = l2_fifo.cons().forward(depth=depths[index], name=f"g{index}_weights")
+            else:
+                l2_fifo = None
+                weights_fifo = ObjectFifo(weight_ty, depth=depths[index], name=f"g{index}_weights")
             w_fifos = None
         stage1_fifo = ObjectFifo(stage1_ty, depth=1, name=f"g{index}_conv1_out")
         skip_fifo = ObjectFifo(skip_ty, depth=1, name=f"g{index}_skip")
@@ -200,7 +211,7 @@ def resnet_body(
             src_offsets=[0, output_pixels * (mid_channels // 2), output_pixels * mid_channels],
         )
         input_fifos.append(input_fifo)
-        weight_fifos.append(w_fifos if split else [weights_fifo])
+        weight_fifos.append(w_fifos if split else [l2_fifo or weights_fifo])
         output_fifos.append(output_fifo)
         spec["_slot"], spec["_chunks"] = slot_bytes, chunk_count
 
@@ -283,6 +294,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seg-gather", default="", help="comma-separated 0/1 per group: build small-map 3x3 tiles from row segments (no static im2col, frees tile memory) instead of a static im2col buffer (default 0: the static buffer is faster where it fits)")
     parser.add_argument("--split-weights", default="", help="comma-separated 0/1 per group: give each of the four cores its own weight FIFO/shim stream (4 shim MM2S channels instead of 1; total channels are limited to 16)")
     parser.add_argument("--cols", type=int, default=0, help="array width to compile for (default: one column per group, min 3); widen it to get more shim DMA channels")
+    parser.add_argument("--l2-depths", default="", help="comma-separated memtile weight-staging depth per group (0 = stream shim -> cores directly); the shim prefetches this many weight slots into the memtile ahead of compute")
     parser.add_argument("--chunk-caps", default="", help="comma-separated weight-chunk byte cap per group (0 = default); smaller chunks leave room for deeper weight FIFOs")
     parser.add_argument("--weight-depths", default="", help="comma-separated weight FIFO depth per group (2 double-buffers the weight DMA where tile memory allows; layer4 groups fit)")
     parser.add_argument("--group", nargs="+", action="append", required=True,
@@ -355,7 +367,7 @@ def _compile_kwargs(opts):
     import onnx
     caps = [int(v) for v in opts.chunk_caps.split(",")] if opts.chunk_caps else None
     specs, _ = group_specs(onnx.load(opts.model), opts.group, caps)
-    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "seg_gather": opts.seg_gather, "split_weights": opts.split_weights}
+    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "seg_gather": opts.seg_gather, "split_weights": opts.split_weights, "l2_depths": opts.l2_depths}
 
 
 def main() -> None:
