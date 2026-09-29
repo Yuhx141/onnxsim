@@ -1,5 +1,7 @@
 // Latency benchmark for one ONNX model on the ORT C API: CPU EP or WebGPU EP.
 //   bench model.onnx cpu|webgpu WARMUP ITERS [threads=N] [dump=DIR] [dumplast=DIR] [sync=tiny.onnx] [shape=INPUT:d0,d1,...] [key=value ...]
+// iobind=1 runs through OrtIoBinding (CPU inputs bound, outputs bound to CPU memory) with run option
+// gpu_graph_id=0; needed for enableGraphCapture=1, where plain Run() returns no output tensors on replay.
 // sync=tiny.onnx: a second, tiny float[1,4] model (X -> Add) run and read back after every iteration on the
 // same WebGPU device. A readback waits for all earlier queued GPU work, so this makes graph-capture
 // (async) runs measurable; the tiny model's own latency is measured alone and subtracted.
@@ -63,6 +65,7 @@ int main(int argc, char** argv) {
   const int warm = atoi(argv[3]), iters = atoi(argv[4]);
   int threads = 4;
   std::string dump, dumplast, sync_model;
+  bool iobind = false;
   std::map<std::string, std::vector<int64_t>> shape_override;
   std::vector<std::string> keys, vals;
   for (int i = 5; i < argc; i++) {
@@ -74,6 +77,7 @@ int main(int argc, char** argv) {
     else if (k == "dump") dump = v;
     else if (k == "dumplast") dumplast = v;
     else if (k == "sync") sync_model = v;
+    else if (k == "iobind") iobind = v == "1";
     else if (k == "shape") {
       size_t c = v.find(':');
       std::vector<int64_t> d;
@@ -177,6 +181,15 @@ int main(int argc, char** argv) {
   for (auto& x : in_names) inn.push_back(x.c_str());
   for (auto& x : out_names) outn.push_back(x.c_str());
 
+  OrtIoBinding* io = nullptr;
+  OrtRunOptions* ropts = nullptr;
+  if (iobind) {
+    CK(g->CreateIoBinding(s, &io));
+    for (size_t i = 0; i < nin; i++) CK(g->BindInput(io, inn[i], in_vals[i]));
+    for (size_t o = 0; o < nout; o++) CK(g->BindOutputToDevice(io, outn[o], mi));
+    CK(g->CreateRunOptions(&ropts));
+    CK(g->AddRunConfigEntry(ropts, "gpu_graph_id", "0"));
+  }
   auto run_sync = [&]() -> int {
     float x[4] = {1, 2, 3, 4};
     int64_t sh[2] = {1, 4};
@@ -208,7 +221,16 @@ int main(int argc, char** argv) {
   for (int it = 0; it < warm + iters; it++) {
     std::vector<OrtValue*> outs(nout, nullptr);
     auto t0 = std::chrono::steady_clock::now();
-    CK(g->Run(s, nullptr, inn.data(), in_vals.data(), nin, outn.data(), nout, outs.data()));
+    if (iobind) {
+      CK(g->RunWithBinding(s, ropts, io));
+      OrtValue** bound = nullptr;
+      size_t nb = 0;
+      CK(g->GetBoundOutputValues(io, al, &bound, &nb));
+      for (size_t o = 0; o < nb && o < nout; o++) outs[o] = bound[o];
+      if (bound) al->Free(al, bound);
+    } else {
+      CK(g->Run(s, nullptr, inn.data(), in_vals.data(), nin, outn.data(), nout, outs.data()));
+    }
     if (sync_s && run_sync()) return 2;
     double d = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - (sync_s ? sync_base : 0.0);
     if (it == 0) cold = d;

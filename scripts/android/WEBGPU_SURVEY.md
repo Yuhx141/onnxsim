@@ -222,3 +222,64 @@ What the numbers say:
 - The adapter supports `timestamp-query`, and the profile's `Api` events carry per-dispatch durations (I believe
   they are GPU timestamps; not verified). The phone's kgsl clock and governor files need root, so GPU clocks and
   thermal state were not recorded, and the timings include whatever DVFS state the runs happened to be in.
+
+## Graph capture and convolution investigation (2026-09-30)
+
+### Graph capture
+
+`enableGraphCapture=1` works, but not through plain `Run()` (replays return no output tensors). It needs
+`RunWithBinding` with the run option `gpu_graph_id=0`, inputs bound with `BindInput` and outputs with
+`BindOutputToDevice` (CPU memory info); `bench.cc iobind=1` does this. Timing needs a real GPU sync after every run:
+`sync=tiny.onnx` runs and reads back a second tiny model on the same device (its own latency, ~0.3 ms, is subtracted;
+baseline numbers with and without it agree). Outputs after replay are identical to the baseline's (same relative
+error vs the CPU: 3.6e-7 / 7.7e-7 / 5.6e-7).
+
+| model | baseline | graph capture | change |
+|---|---|---|---|
+| RT-DETR `post` (30 nodes) | 10.7 ms | 7.4 ms | -31% |
+| RT-DETR `mid0` (71 nodes) | 20.4 ms | 14.8 ms | -28% |
+| ResNet-50 224 (91 nodes) | 67.3 ms | 65.4 ms | -3% |
+| ResNet-50 64x64 input | 30.5 ms | 21.0 ms | -31% |
+| ResNet-50 32x32 input | 27.7 ms | 16.9 ms | -39% |
+
+So capture removes roughly 0.1 ms of CPU cost per node, which matters for small, many-node models and not for
+GPU-bound ones. Even with capture, ResNet-50 on a 32x32 input (0.17 GFLOP) still takes 17 ms, about 0.19 ms per
+dispatch, so the remaining floor is GPU-side.
+
+### Where the time goes (Adreno 730 through WebGPU)
+
+Measured ceilings (`dawn_repro/peak.cc`, `bw.cc`, `chain.cc`), all in Dawn directly:
+
+| resource | measured |
+|---|---|
+| fp32 FMA, scalar, 64 independent chains | 986 GFLOPS (vec4-typed FMA loops: about half) |
+| fp16 FMA (`shader-f16` present) | ~310 GFLOPS |
+| vec4 loads, storage buffer | 163 GB/s (10 G loads/s), even for a 4 KB working set |
+| vec4 loads, texture | 240 GB/s (15 G loads/s) |
+| vec4 loads, workgroup memory | 200-277 GB/s (13-17 G loads/s) |
+| one dependent tiny dispatch | ~6 us GPU, ~2 us CPU (a pass per dispatch or a submit per dispatch: 6 / 19 us) |
+
+1. **ORT's Conv is close to the limit of its own design.** Conv2dMM/MatMul stage tiles in workgroup memory and give each
+   thread 4x4 outputs, i.e. 8 FMA per workgroup-memory vec4 load. At 17 G loads/s that caps at ~272 GFLOPS; ResNet-50's
+   convolutions average 217 GFLOPS (37.7 ms of GPU time for 8.17 GFLOP), about 80% of that bound and 22% of the FMA peak.
+2. **Tile shape sweep inside ORT** (env overrides, `ort_tile_env_override_experiment.patch`; outputs verified): the
+   default 4 rows per thread on an 8x8 workgroup is best. ResNet-50 / YOLO11n: 66.5 / 73.7 ms default, 71.9 / 79.4 with
+   2 rows, 85.2 / 90.3 with 8 rows, 99.9 / 122.5 with 8 rows on an 8x4 workgroup. Other workgroup shapes are rejected by the
+   shader generator's constraints. Bigger register tiles lose to register pressure.
+3. **Alternatives I wrote did not beat it.** In `dawn_repro/gemm.cc`: register-only vec4 and scalar kernels, textures
+   for A and/or B, an NC4HW4-style coalesced layout, and shared-memory kernels reach 109-276 GFLOPS depending on shape
+   (about 165 on short-K layers, 230-276 on long-K ones). Summed over ResNet-50's 20 distinct conv shapes the best
+   variant per shape projects to 54 ms against ORT's 37.7 ms. Dawn's robustness / Vulkan-memory-model toggles (as ORT
+   sets them) change nothing beyond noise (126-168 GFLOPS).
+4. **Small grids are the real inefficiency.** A batch-1 layer with a 14x14 or 7x7 output has only ~100 workgroups
+   and a long serial K-loop: a single dispatch of a late-stage GEMM runs at 50-63 GFLOPS where the same GEMM in
+   throughput mode reaches 137-183. Layers with <=196 output pixels are 46% of ResNet-50's conv GPU time (14x14 stage 14.1 ms,
+   7x7 stage 3.2 ms of 37.8 ms). Split-K or smaller tiles for those layers is the lever; ORT's Conv2dMM has none
+   (its MatMul has split-K for small M).
+5. **A fixed per-node cost remains** (~0.1 ms CPU removed by graph capture, ~0.19 ms GPU-side that is not): ResNet-50
+   never goes below ~17-26 ms however small the input, so many-node models pay it in full (fusing nodes would help).
+6. **Per-kernel timings need care**: the profiler's `Api` events are GPU timestamps, but in profile mode every dispatch
+   is its own pass and they sum to 42.5 of ResNet's 69 ms; use them for per-layer comparison, not as a total.
+
+Not done: an implicit-GEMM split-K Conv kernel inside ORT, fp16 storage with fp32 accumulation, and operator fusion
+(Conv+Add+Relu, SiLU) to cut the node count.
