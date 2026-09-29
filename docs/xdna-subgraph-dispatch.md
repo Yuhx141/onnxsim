@@ -343,6 +343,39 @@ now, i.e. a ~1.5x gain that still trails Vitis' 1.55 ms. It needs runtime-shaped
 shape code does not fit 16 KB of program memory across all block kinds), a generic 3x3/1x1/skip/
 residual engine and a per-layer parameter header, so it is a substantial rewrite; not started.
 
+### Runtime-shaped kernels (`kernels/fused_bottleneck_rt.cc`, `resnet_body_design.py --rt`)
+
+The compile-time kernels bake a block's geometry in through `-D` macros, so every block kind
+needs its own code and a core cannot serve two shapes (program memory is 16 KB/core). The
+runtime-shaped kernels read the geometry from a 192-byte descriptor at the start of every weight
+slot (`blocked_stage.rt_descriptor` / `pack_rt_params`: W/H/C/MID/OUT/OW/OH/stride, chunk counts,
+tap list, bias offsets, shifts, and per-chunk output-block counts precomputed on the host); only
+buffer *capacities* (`RT_COL_BYTES`, `RT_SKIPX_BYTES`) stay compile-time. One kernel set serves
+all 16 ResNet-50 blocks: the whole body built on it is bit-exact and takes 4.16 ms vs 3.6 ms
+compile-time (1.16x; 7.0 ms before the fixes below). Per stage vs compile-time: layer1 0.65 / 0.59,
+layer2 0.90 / 0.65, layer3 2.17 / 1.80 ms.
+
+What made the difference (each was found by keep-one-kernel profiling and, once, reading the
+generated assembly):
+- **No division in any loop.** The AIE has no integer divider, so `x / runtime` is a software
+  routine (~100+ cycles). Compile-time shapes hid this (divisions became shifts). Runtime
+  versions computed `kk / MB`, `o / OW`, `t*8 / W` in the GEMM, epilogues and gathers; replacing
+  them with nested tap x block loops, per-pixel row/column tables filled by counters, and
+  host-precomputed block counts took layer1 from 2.4x to 1.1x.
+- **Base pointer + stride inner loop.** The GEMM takes `a_base(t, tt)` and `a_stride`, so the
+  inner loop is one load, one pointer add and G MACs. Index math inside the loop produced a ~60
+  line non-pipelined body with stack spills.
+- **`noinline` epilogues.** Inlining four epilogues into every GEMM instantiation overflowed
+  program memory by 450 B-1.6 KB; the epilogues run once per output tile, so `noinline` is free.
+  Two instantiations only (G=4 and G=2 with a guarded dead tail for odd block counts).
+- **Gather rows with 64-bit accesses.** The im2col/strided-skip builds compute the eight source
+  pixel offsets once per (tap, tile) and copy each row with one aligned `uint64` access for every
+  input block (byte-wise `memcpy` of unknown alignment was ~4x slower).
+- The identity-skip kernel takes its byte count as an argument, and a conv1 core links only the
+  skip kernel it actually uses (identity groups never link the projection skip).
+- Descriptor + weights must match: use `--rt` at compile time and `pack_rt_params` (runner:
+  `--fused-body-rt`; RPC: `options["rt"]` on compile, `fused_body["rt"]` on run).
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is

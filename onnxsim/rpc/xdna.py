@@ -186,6 +186,10 @@ def _compile_command(
             "--insts-path",
             str(insts),
         ]
+        if options.get("rt"):
+            command.append(
+                "--rt"
+            )  # runtime-shaped kernels (geometry from a per-chunk descriptor)
         for group in groups:
             command += [
                 "--group",
@@ -461,6 +465,8 @@ def run_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
             str(body["insts"]),
             json.dumps(_body_groups(body["groups"])),
         ]
+        if body.get("rt"):
+            command.append("--fused-body-rt")
     if options.get("host_maxpool"):
         command.append("--host-maxpool")
     pool = options.get("maxpool_uint8")

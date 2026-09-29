@@ -27,7 +27,7 @@ def _align4(value: int) -> int:
     return (value + 3) & ~3
 
 
-def _block_workers(chunks1, skip_chunks, chunks2, chunks3, nocompute=0):
+def _block_workers(chunks1, skip_chunks, chunks2, chunks3, nocompute=0, identity_bytes=None):
     """Bind per-block chunk counts now; IRON traces worker bodies after the block loop ends."""
     def discard(weights, count):
         for _ in range_(count):
@@ -51,7 +51,10 @@ def _block_workers(chunks1, skip_chunks, chunks2, chunks3, nocompute=0):
                 weights.release(1)
         else:
             if not nocompute & 2:
-                identity_kernel(x, residual)
+                if identity_bytes is None:
+                    identity_kernel(x, residual)
+                else:
+                    identity_kernel(x, residual, identity_bytes)
         skip_out.release(1)
         out.release(1)
         inp.release(1)

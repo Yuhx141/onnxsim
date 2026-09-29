@@ -37,9 +37,11 @@ except ImportError:  # run as a script
     from linked_bottleneck_stage_design import _BLOCKED_KERNEL, _align4, _block_workers
 
 HEADER_BYTES = 64
+RT_DESC_BYTES = 192
+_RT_KERNEL = Path(__file__).with_name("kernels") / "fused_bottleneck_rt.cc"
 
 
-def _split_workers(chunks1, skip_chunks, chunks2, chunks3, nocompute=0):
+def _split_workers(chunks1, skip_chunks, chunks2, chunks3, nocompute=0, identity_bytes=None):
     """Workers for per-worker weight FIFOs: each core sees only its own chunks (no discards)."""
 
     def conv1_worker(inp, weights, out, skip_out, kernel, skip_kernel, identity_kernel):
@@ -59,7 +61,10 @@ def _split_workers(chunks1, skip_chunks, chunks2, chunks3, nocompute=0):
                 weights.release(1)
         else:
             if not nocompute & 2:
-                identity_kernel(x, residual)
+                if identity_bytes is None:
+                    identity_kernel(x, residual)
+                else:
+                    identity_kernel(x, residual, identity_bytes)
         skip_out.release(1)
         out.release(1)
         inp.release(1)
@@ -102,6 +107,8 @@ def resnet_body(
     seg_gather: CompileTime[str] = "",
     split_weights: CompileTime[str] = "",
     l2_depths: CompileTime[str] = "",
+    rt: CompileTime[int] = 0,
+    kflags: CompileTime[str] = "",
 ):
     groups = json.loads(body_specs)
     if not 1 <= len(groups) <= 8:
@@ -134,7 +141,7 @@ def resnet_body(
         payload = max(bytes1, bytes2, bytes3, bytes_skip)
         if payload != spec["slot_bytes"]:
             raise ValueError(f"{spec['prefix']}: packed slot does not match the compiled kernels")
-        slot_bytes = payload + HEADER_BYTES
+        slot_bytes = payload + (RT_DESC_BYTES if rt else HEADER_BYTES)
         chunk_count = chunks1 + skip_chunks + 2 * chunks2 + chunks3
 
         activation_ty = np.ndarray[(pixels * channels,), np.dtype[np.int8]]
@@ -146,23 +153,37 @@ def resnet_body(
         output_ty = np.ndarray[(output_pixels * output_channels,), np.dtype[np.int8]]
 
         conv2_stride = spec["conv2_stride"]
-        flags = [
-            f"-DFUSED_W={width}", f"-DFUSED_H={height}", f"-DFUSED_C={channels}",
-            f"-DFUSED_OUT_W={output_width}", f"-DFUSED_OUT_H={output_height}", f"-DFUSED_OUT_C={output_channels}",
-            f"-DFUSED_CONV2_STRIDE={conv2_stride}", f"-DFUSED_SKIP_STRIDE={conv2_stride}",
-            f"-DFUSED_SKIP_CHUNKS={max(skip_chunks, 1)}", f"-DFUSED_MID={mid_channels}",
-            f"-DFUSED_SKIP_BIAS_OFFSET={_align4(skip_outputs * channels)}",
-            f"-DFUSED_C1_CHUNKS={chunks1}", f"-DFUSED_C2_CHUNKS={chunks2}", f"-DFUSED_C3_CHUNKS={chunks3}",
-            f"-DFUSED_BIAS1_OFFSET={_align4(outputs1 * channels)}",
-            f"-DFUSED_BIAS2_OFFSET={_align4(outputs2 * mid_channels * taps)}",
-            f"-DFUSED_BIAS3_OFFSET={_align4(outputs3 * mid_channels)}",
-            "-DFUSED_RT_SHIFTS", f"-DFUSED_HDR_OFFSET={payload}", f"-DFUSED_SEG_GATHER={seg_modes[index]}",
-        ]
+        out_tiles = (output_pixels + 7) // 8
+        row_tiles2 = width % 8 == 0 and conv2_stride == 1 and output_width == width
+        strided_skip = bool(skip_chunks) and not (conv2_stride == 1 and output_pixels == pixels)
+        if rt:
+            # Runtime-shaped kernels: geometry comes from the per-chunk descriptor; only buffer
+            # capacities are compile-time.
+            col_bytes = 64 if row_tiles2 else max(64, taps * (mid_channels // 8) * out_tiles * 64)
+            skipx_bytes = max(64, (channels // 8) * out_tiles * 64) if strided_skip else 64
+            flags = [f"-DRT_COL_BYTES={col_bytes}", f"-DRT_SKIPX_BYTES={skipx_bytes}"]
+            src = str(_RT_KERNEL)
+            identity_types = [activation_ty, skip_ty, np.int32]
+        else:
+            flags = [
+                f"-DFUSED_W={width}", f"-DFUSED_H={height}", f"-DFUSED_C={channels}",
+                f"-DFUSED_OUT_W={output_width}", f"-DFUSED_OUT_H={output_height}", f"-DFUSED_OUT_C={output_channels}",
+                f"-DFUSED_CONV2_STRIDE={conv2_stride}", f"-DFUSED_SKIP_STRIDE={conv2_stride}",
+                f"-DFUSED_SKIP_CHUNKS={max(skip_chunks, 1)}", f"-DFUSED_MID={mid_channels}",
+                f"-DFUSED_SKIP_BIAS_OFFSET={_align4(skip_outputs * channels)}",
+                f"-DFUSED_C1_CHUNKS={chunks1}", f"-DFUSED_C2_CHUNKS={chunks2}", f"-DFUSED_C3_CHUNKS={chunks3}",
+                f"-DFUSED_BIAS1_OFFSET={_align4(outputs1 * channels)}",
+                f"-DFUSED_BIAS2_OFFSET={_align4(outputs2 * mid_channels * taps)}",
+                f"-DFUSED_BIAS3_OFFSET={_align4(outputs3 * mid_channels)}",
+                "-DFUSED_RT_SHIFTS", f"-DFUSED_HDR_OFFSET={payload}", f"-DFUSED_SEG_GATHER={seg_modes[index]}",
+            ]
+            src = str(_BLOCKED_KERNEL)
+            identity_types = [activation_ty, skip_ty]
+        flags = flags + [f for f in kflags.split() if f]
         prefix = f"g{index}"
-        src = str(_BLOCKED_KERNEL)
         k1 = ExternalFunction("fused_bottleneck_conv1_chunk", source_file=src, arg_types=[activation_ty, weight_ty, stage1_ty, np.int32], compile_flags=flags + ["-DBLK_CONV1"], symbol_prefix=prefix)
         kskip = ExternalFunction("fused_bottleneck_skip_chunk", source_file=src, arg_types=[activation_ty, weight_ty, skip_ty, np.int32], compile_flags=flags + ["-DBLK_SKIP"], symbol_prefix=prefix)
-        kidentity = ExternalFunction("fused_bottleneck_identity_skip", source_file=src, arg_types=[activation_ty, skip_ty], compile_flags=flags + ["-DBLK_IDENTITY"], symbol_prefix=prefix)
+        kidentity = ExternalFunction("fused_bottleneck_identity_skip", source_file=src, arg_types=identity_types, compile_flags=flags + ["-DBLK_IDENTITY"], symbol_prefix=prefix)
         k2a = ExternalFunction("fused_bottleneck_conv2_chunk", source_file=src, arg_types=[stage1_ty, weight_ty, stage2h_ty, np.int32, np.int32], compile_flags=flags + ["-DBLK_CONV2A"], symbol_prefix=prefix + "a")
         k2b = ExternalFunction("fused_bottleneck_conv2_chunk_b", source_file=src, arg_types=[stage1_ty, weight_ty, stage2h_ty, np.int32, np.int32], compile_flags=flags + ["-DBLK_CONV2B"], symbol_prefix=prefix + "b")
         k3 = ExternalFunction("fused_bottleneck_conv3_chunk", source_file=src, arg_types=[stage2_ty, weight_ty, output_ty, np.int32], compile_flags=flags + ["-DBLK_CONV3"], symbol_prefix=prefix)
@@ -191,7 +212,7 @@ def resnet_body(
         stage2_fifo = ObjectFifo(stage2_ty, depth=1, name=f"g{index}_residual_join")
         output_fifo = ObjectFifo(output_ty, depth=1, name=f"g{index}_output")
         make_workers = _split_workers if split else _block_workers
-        conv1_worker, conv2_worker, conv3_worker = make_workers(chunks1, skip_chunks, chunks2, chunks3, int(nocompute))
+        conv1_worker, conv2_worker, conv3_worker = make_workers(chunks1, skip_chunks, chunks2, chunks3, int(nocompute), pixels * channels if rt else None)
         wc1, wc2a, wc2b, wc3 = ([f.cons() for f in w_fifos] if split else [weights_fifo.cons() for _ in range(4)])
 
         out_tiles = (output_pixels + 7) // 8
@@ -201,7 +222,7 @@ def resnet_body(
         conv1_data = (channels // 8) * out_tiles * 64 + 256 if skip_chunks and not (conv2_stride == 1 and output_pixels == pixels) else None
         column = index
         workers.extend([
-            Worker(conv1_worker, fn_args=[input_fifo.cons(), wc1, stage1_fifo.prod(), skip_fifo.prod(), k1, kskip, kidentity], tile=Tile(column, 2), stack_size=0x1000, data_size=conv1_data),
+            Worker(conv1_worker, fn_args=[input_fifo.cons(), wc1, stage1_fifo.prod(), skip_fifo.prod(), k1, kskip if skip_chunks else k1, k1 if skip_chunks else kidentity], tile=Tile(column, 2), stack_size=0x1000, data_size=conv1_data),
             Worker(conv2_worker, fn_args=[stage1_fifo.cons(), wc2a, stage2a_fifo.prod(), k2a, 0, True], tile=Tile(column, 3), stack_size=0x1000, data_size=conv2_data),
             Worker(conv2_worker, fn_args=[stage1_fifo.cons(), wc2b, stage2b_fifo.prod(), k2b, mid_channels // 2, False], tile=Tile(column, 5), stack_size=0x1000, data_size=conv2_data),
             Worker(conv3_worker, fn_args=[stage2_fifo.cons(), wc3, output_fifo.prod(), k3], tile=Tile(column, 4), stack_size=0x1000),
@@ -219,7 +240,11 @@ def resnet_body(
     activation_ty = np.ndarray[(first["width"] * first["height"] * first["channels"],), np.dtype[np.int8]]
     output_ty = np.ndarray[(last["output_width"] * last["output_height"] * last["output_channels"],), np.dtype[np.int8]]
     parameters_ty = np.ndarray[(sum(g["repeat"] * g["_chunks"] * g["_slot"] for g in groups),), np.dtype[np.uint8]]
-    scratch_bytes = sum(g["repeat"] * g["output_width"] * g["output_height"] * g["output_channels"] for g in groups[:-1]) or 1
+    # Every iteration except the very last drains its output to scratch (the last group's
+    # non-final iterations included).
+    scratch_bytes = sum(g["repeat"] * g["output_width"] * g["output_height"] * g["output_channels"] for g in groups)
+    scratch_bytes -= last["output_width"] * last["output_height"] * last["output_channels"]
+    scratch_bytes = max(scratch_bytes, 1)
     scratch_ty = np.ndarray[(scratch_bytes,), np.dtype[np.int8]]
 
     def sequence(x, packed, y, mid, *handles):
@@ -295,6 +320,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-weights", default="", help="comma-separated 0/1 per group: give each of the four cores its own weight FIFO/shim stream (4 shim MM2S channels instead of 1; total channels are limited to 16)")
     parser.add_argument("--cols", type=int, default=0, help="array width to compile for (default: one column per group, min 3); widen it to get more shim DMA channels")
     parser.add_argument("--l2-depths", default="", help="comma-separated memtile weight-staging depth per group (0 = stream shim -> cores directly); the shim prefetches this many weight slots into the memtile ahead of compute")
+    parser.add_argument("--rt", action="store_true", help="use the runtime-shaped kernels (fused_bottleneck_rt.cc): geometry from a per-chunk descriptor instead of compile-time flags; needs blocked_stage.pack_rt_params packing")
+    parser.add_argument("--kflags", default="", help="extra compiler flags for the kernels (debug/profiling, e.g. -DRT_SKIP_GATHER)")
     parser.add_argument("--chunk-caps", default="", help="comma-separated weight-chunk byte cap per group (0 = default); smaller chunks leave room for deeper weight FIFOs")
     parser.add_argument("--weight-depths", default="", help="comma-separated weight FIFO depth per group (2 double-buffers the weight DMA where tile memory allows; layer4 groups fit)")
     parser.add_argument("--group", nargs="+", action="append", required=True,
@@ -367,7 +394,7 @@ def _compile_kwargs(opts):
     import onnx
     caps = [int(v) for v in opts.chunk_caps.split(",")] if opts.chunk_caps else None
     specs, _ = group_specs(onnx.load(opts.model), opts.group, caps)
-    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "seg_gather": opts.seg_gather, "split_weights": opts.split_weights, "l2_depths": opts.l2_depths}
+    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "seg_gather": opts.seg_gather, "split_weights": opts.split_weights, "l2_depths": opts.l2_depths, "rt": 1 if opts.rt else 0, "kflags": opts.kflags}
 
 
 def main() -> None:

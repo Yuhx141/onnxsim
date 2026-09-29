@@ -71,6 +71,54 @@ def runtime_header(binding: dict[str, Any]) -> np.ndarray:
     )
 
 
+RT_DESC_BYTES = 192
+RT_DESC_WORDS = RT_DESC_BYTES // 4
+
+
+def _align4(value: int) -> int:
+    return (value + 3) & ~3
+
+
+def rt_descriptor(binding: dict[str, Any]) -> np.ndarray:
+    """int32[48] block descriptor read by fused_bottleneck_rt.cc (word indices: see its enum)."""
+    raw = binding["raw_weights"]
+    mid = int(raw["w1"].shape[0])
+    ch = int(binding["input_channels"])
+    out_c = int(binding["output_channels"])
+    c1, c2, c3 = binding["chunk_counts"]
+    skip = int(binding["skip_chunk_count"])
+    taps = list(binding["conv2_taps"])
+    stride = int(binding["conv2_stride"][0])
+    desc = np.zeros(RT_DESC_WORDS, dtype=np.int32)
+    desc[0:6] = runtime_header(binding)
+    desc[6:15] = [
+        int(binding["input_width"]), int(binding["input_height"]), ch, mid, out_c,
+        int(binding["output_width"]), int(binding["output_height"]), stride, stride,
+    ]
+    desc[15:20] = [c1, c2, c3, skip, len(taps)]
+    desc[20 : 20 + len(taps)] = taps
+    desc[29] = _align4((mid // c1) * ch)
+    desc[30] = _align4(((mid // 2) // c2) * mid * len(taps))
+    desc[31] = _align4((out_c // c3) * mid)
+    desc[32] = _align4((out_c // skip) * ch) if skip else 0
+    desc[33:37] = [(mid // 8) // c1, (mid // 16) // c2, (out_c // 8) // c3, (out_c // 8) // skip if skip else 0]
+    return desc
+
+
+def pack_rt_params(binding: dict[str, Any]) -> np.ndarray:
+    """Weight stream for the runtime-shaped kernels: every slot = [192 B descriptor][chunk payload]."""
+    plain = pack_blocked_params(binding)
+    slot = int(binding["chunk_slot_bytes"])
+    count = plain.size // slot
+    desc = rt_descriptor(binding).view(np.uint8)
+    stride = RT_DESC_BYTES + slot
+    out = np.zeros(count * stride, dtype=np.uint8)
+    for index in range(count):
+        out[index * stride : index * stride + RT_DESC_BYTES] = desc
+        out[index * stride + RT_DESC_BYTES : (index + 1) * stride] = plain[index * slot : (index + 1) * slot]
+    return out
+
+
 def pack_blocked_params(binding: dict[str, Any], *, header: bool = False) -> np.ndarray:
     """Return the packed parameter tensor for one block in blocked layout.
 

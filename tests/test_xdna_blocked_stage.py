@@ -110,3 +110,73 @@ def test_pack_blocked_params_headers_every_slot():
             np.int32
         )
         assert header.tolist() == [3, 4, 5, 0, 0, 1]
+
+
+def test_rt_descriptor_fields_and_slot_layout():
+    from blocked_stage import RT_DESC_BYTES, pack_rt_params, rt_descriptor
+
+    rng = np.random.default_rng(3)
+    mid, cin, cout = 32, 16, 64
+    raw = {
+        "w1": rng.integers(-128, 128, (mid, cin, 1, 1), dtype=np.int8),
+        "w2": rng.integers(-128, 128, (mid, mid, 1, 4), dtype=np.int8),
+        "w3": rng.integers(-128, 128, (cout, mid, 1, 1), dtype=np.int8),
+        "b1": np.arange(mid, dtype=np.int32),
+        "b2": np.arange(mid, dtype=np.int32),
+        "b3": np.arange(cout, dtype=np.int32),
+        "skip_weight": rng.integers(-128, 128, (cout, cin, 1, 1), dtype=np.int8),
+        "skip_bias": np.arange(cout, dtype=np.int32),
+    }
+    slot = 8192
+    binding = {
+        "raw_weights": raw,
+        "chunk_counts": (2, 1, 2),
+        "skip_chunk_count": 2,
+        "input_width": 4,
+        "input_height": 4,
+        "input_channels": cin,
+        "output_width": 2,
+        "output_height": 2,
+        "output_channels": cout,
+        "conv2_stride": (2, 2),
+        "conv2_taps": (4, 5, 7, 8),
+        "chunk_slot_bytes": slot,
+        "params": np.zeros(8 * slot, dtype=np.uint8),
+        "shifts": (5, 6, 7),
+        "skip_output_shift": 4,
+        "main_residual_shift": -1,
+        "skip_residual_shift": 0,
+    }
+    desc = rt_descriptor(binding)
+    assert desc.size * 4 == RT_DESC_BYTES
+    assert desc[:6].tolist() == [5, 6, 7, 4, -1, 0]  # shifts / residual exponents
+    assert desc[6:15].tolist() == [
+        4,
+        4,
+        cin,
+        mid,
+        cout,
+        2,
+        2,
+        2,
+        2,
+    ]  # W H C MID OUT OW OH S SS
+    assert desc[15:20].tolist() == [2, 1, 2, 2, 4]  # chunk counts, skip chunks, taps
+    assert desc[20:24].tolist() == [4, 5, 7, 8]
+    # bias offsets are relative to the tile area: align4(rows * K [* taps])
+    assert desc[29:33].tolist() == [16 * 16, 16 * 32 * 4, 32 * 32, 32 * 16]
+    # blocks per chunk, precomputed so the core never divides
+    assert desc[33:37].tolist() == [
+        (mid // 8) // 2,
+        (mid // 16) // 1,
+        (cout // 8) // 2,
+        (cout // 8) // 2,
+    ]
+
+    packed = pack_rt_params(binding)
+    stride = RT_DESC_BYTES + slot
+    assert packed.size == 8 * stride  # conv1 x2, skip x2, conv2a, conv2b, conv3 x2
+    for chunk in range(8):  # every slot starts with the same descriptor
+        assert np.array_equal(
+            packed[chunk * stride : chunk * stride + RT_DESC_BYTES], desc.view(np.uint8)
+        )

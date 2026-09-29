@@ -131,6 +131,7 @@ class XDNAResNetRunner:
         fused_body_groups: list[list[str]] | None = None,
         fused_body_chunk_caps: dict[str, int | None] | None = None,
         host_maxpool: bool = False,
+        fused_body_rt: bool = False,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
         maxpool_uint8_artifact: tuple[str, str] | None = None,
         maxpool_runtime: str = "iron",
@@ -379,6 +380,7 @@ class XDNAResNetRunner:
         fused_specs = list(fused_blocks or ())
         self.fused_stage_blocked = fused_stage_blocked or bool(fused_body_groups)
         self.fused_body_groups = fused_body_groups
+        self.fused_body_rt = fused_body_rt
         self.fused_body_chunk_caps = fused_body_chunk_caps or {}
         stage_specs = list(fused_stages or ())
         parallel_specs = list(parallel_projection_blocks or ())
@@ -613,10 +615,14 @@ class XDNAResNetRunner:
             input_tensor = iron.tensor(np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu")
             if self.fused_stage_blocked:
                 try:
-                    from blocked_stage import pack_blocked_params
+                    from blocked_stage import pack_blocked_params, pack_rt_params
                 except ImportError:
-                    from .blocked_stage import pack_blocked_params
-                stage_params = [pack_blocked_params(binding, header=bool(self.fused_body_groups)) for binding in bindings]
+                    from .blocked_stage import pack_blocked_params, pack_rt_params
+                if self.fused_body_rt:
+                    # runtime-shaped kernels: every weight slot starts with a geometry descriptor
+                    stage_params = [pack_rt_params(binding) for binding in bindings]
+                else:
+                    stage_params = [pack_blocked_params(binding, header=bool(self.fused_body_groups)) for binding in bindings]
             else:
                 stage_params = [binding["params"] for binding in bindings]
             parameter_tensor = iron.tensor(np.concatenate(stage_params), dtype=np.uint8, device="npu")
@@ -1777,6 +1783,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         help="run every bottleneck as ONE resnet_body_design.py artifact; GROUPS_JSON lists the "
              "block-prefix groups in execution order, e.g. '[[\"/layer1/layer1.0\"],[...]]'",
     )
+    parser.add_argument("--fused-body-rt", action="store_true", help="the --fused-body artifact was compiled with resnet_body_design.py --rt (runtime-shaped kernels)")
     parser.add_argument("--host-maxpool", action="store_true", help="run MaxPool on the host instead of an XDNA artifact")
     parser.add_argument("--fused-stage-blocked", action="store_true", help="fused stages were compiled with --blocked (vectorized layout)")
     parser.add_argument(
@@ -1826,6 +1833,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         fused_body_groups=body_groups,
         fused_body_chunk_caps=body_caps,
         host_maxpool=args.host_maxpool,
+        fused_body_rt=args.fused_body_rt,
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
         ],
