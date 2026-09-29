@@ -529,7 +529,8 @@ tinygrad FastRPC/ION runtime setup.
 | `hvx65/kernels.c`, `build_sim.sh`, `run_sim.sh` | V65 HVX kernels + hexagon-sim harness (`dw3`/`dwc3`: §7's depthwise kernels; `dwc2`/`dwc4`: the variants that didn't pay off; `warm` runs a kernel once untimed first) |
 | `project_latency.py`, `sim_cycles_cache.json`, `results/` | per-layer sim runs → model latency projection |
 | `tinygrad_dsp_check.py` | upstream tinygrad `DEV=DSP MOCKDSP=1` vs ORT on real DM frames |
-| `evaluate.py` | held-out-segment scoring vs fp32 through openpilot's parser (driving + DM) |
+| `evaluate.py` | held-out-segment scoring vs fp32 through openpilot's parser (driving + DM); `--backend phone` runs the models on the phone through the compiler/runner RPC |
+| `phone_session.py`, `../android/tinygrad_hexagon_bridge/openpilot_v65/phone_worker.sh` | the phone as an ORT-style session (onnx-remote v5 wire protocol; recurrent state stays on the phone) and the script that starts the phone's runner |
 | `adaround_conv.py` | layer-wise AdaRound for Conv int8 per-channel weights (torch) |
 | `mixed_bits.py` | per-conv int16 weights on top of `quantize_full_qdq`, per-conv / activation-window sensitivity sweeps, per-channel activation experiment |
 | `project_heads.py`, `head_bits.py`, `results/heads_*.json`, `results/headsweep_driving*.json` | §8: simulated head GEMVs, head weight-precision sweeps |
@@ -550,3 +551,25 @@ scripts/openpilot_dsp/hvx65/build_sim.sh && scripts/openpilot_dsp/hvx65/run_sim.
 python scripts/openpilot_dsp/project_latency.py driving_fp32.onnx --act uint16 \
   --policy scripts/openpilot_dsp/policy_driving_mixed.json
 ```
+
+## Accuracy on the phone path (`evaluate.py --backend phone`)
+
+The same held-out segments (8 and 5, 600 frames each, recurrent state fed back), scored against the fp32 model through
+openpilot's parser, but with the model compiled by the onnx-remote compiler service and run on the phone's Hexagon runner: the
+numerics the phone actually has (tinygrad's v65 integer path; for the mixed-head model the integer GEMVs with their run-time
+uint16 activation quantization). Start the compiler service and the runner first
+(`openpilot_v65/run.sh compiler ONNX_QDQ_INT_CONV=1 ONNX_QDQ_LUT=1 TC_OPT=1 ONNX_QDQ_INT_GEMM=1`, `openpilot_v65/phone_worker.sh start`):
+
+    python evaluate.py driving name=model.onnx --backend phone --compiler 127.0.0.1:39504 --runner 127.0.0.1:39520
+
+| model (segment 8 / 5) | plan lateral (m) | plan lateral @10 s p95 (m) | lead prob err | lead decision agreement | lead distance err (m) |
+|---|---:|---:|---:|---:|---:|
+| fp16 (deployed precision, ORT) | 0.0009 / 0.0004 | 0.016 / 0.005 | 1.1e-4 / 5.7e-6 | 1 / 1 | 0.015 / 0.008 |
+| W16 (t10) A16, float heads, on the phone | 0.0143 / 0.0173 | 0.216 / 0.296 | 3.9e-3 / 2.6e-4 | 0.998 / 1 | 0.46 / 0.36 |
+| same with mixed W8/W16 integer heads (`hmix`), on the phone | 0.0140 / 0.0170 | 0.233 / 0.299 | 5.4e-3 / 2.9e-4 | 0.993 / 1 | 0.68 / 0.55 |
+
+These match the ORT-simulated scores of the same configurations (`results/acc_driving.json`: `v3_w16t10_a16` 0.0143 / 0.0172 m,
+`v6_w16t10_a16_hC` 0.014 / 0.017 m, lead prob 5.4e-3 / 2.8e-4): the phone's numerics, including the integer heads' run-time
+activation quantization, add nothing measurable to what the offline weight quantization already costs. Both are still 15-40x the
+fp16 model's own error, as in section 6; the mixed heads cost lead probability and distance (about 1.4x and 1.5x), not the plan.
+Results: `results/acc_phone.json`.

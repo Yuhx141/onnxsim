@@ -162,16 +162,30 @@ bool load(const std::string& id, const std::vector<uint8_t>& artifact, Response&
     if (!so) { response.error = "cannot write the skel to the cache dir"; return false; }
   }
   const std::string uri = "file:///" + so_name + "?tg_graph_skel_handle_invoke&_modver=1.0&_dom=cdsp";
-  int rc = tg_graph_open(uri.c_str(), &program->handle);
-  if (rc) { response.error = "FastRPC open of " + so_name + " failed: " + std::to_string(rc); return false; }
-  const auto& [boff, bn] = files["blob.bin"];
+  const size_t boff = files["blob.bin"].first, bn = files["blob.bin"].second;  // (plain locals: the lambda below captures them)
   constexpr size_t kChunk = 8u << 20;  // well under FastRPC's per-buffer limit
-  for (size_t at = 0; at < bn || at == 0; at += kChunk) {
-    const size_t n = std::min(kChunk, bn - at);
-    rc = tg_graph_load(program->handle, static_cast<int>(at), static_cast<int>(bn), artifact.data() + boff + at, static_cast<int>(n));
-    if (rc) { tg_graph_close(program->handle); response.error = "weight upload failed: " + std::to_string(rc); return false; }
-    if (bn == 0) break;
+  // Open the skel and upload the weights. The DSP's unsigned PD has room for a few hundred MB, and every loaded program keeps its
+  // weights there: when a load fails while others are loaded, evict them (they re-attach from the client's artifact on their
+  // next load_compiled) and try once more.
+  auto attempt = [&]() -> int {
+    int rc = tg_graph_open(uri.c_str(), &program->handle);
+    if (rc) { response.error = "FastRPC open of " + so_name + " failed: " + std::to_string(rc); return rc; }
+    for (size_t at = 0; at < bn || at == 0; at += kChunk) {
+      const size_t n = std::min(kChunk, bn - at);
+      rc = tg_graph_load(program->handle, static_cast<int>(at), static_cast<int>(bn), artifact.data() + boff + at, static_cast<int>(n));
+      if (rc) { tg_graph_close(program->handle); response.error = "weight upload failed: " + std::to_string(rc); return rc; }
+      if (bn == 0) break;
+    }
+    return 0;
+  };
+  int rc = attempt();
+  if (rc && !g_programs.empty()) {
+    for (auto& entry : g_programs) tg_graph_close(entry.second->handle);
+    g_programs.clear();
+    rc = attempt();
   }
+  if (rc) return false;
+  response.error.clear();
   g_programs[id] = std::move(program);
   return true;
 }
