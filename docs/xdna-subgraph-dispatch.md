@@ -414,6 +414,16 @@ layer4 stage alone 2.22-2.28 -> 1.98-2.04 ms (-10%); image -> layer4 with layer3
 than the baseline in every same-window comparison (5.4-5.9 vs 6.4-7.9 ms device call on a host at load
 12-19, so absolute times there are inflated).
 
+Tuning the stage-column network further (host at load ~6; one artifact per process): double-buffering
+layer4's per-core weight FIFOs (`--weight-depths 1,1,1,2`; depth 3 is no better) takes image -> layer4
+from 3.56 to 3.15 ms (-11%); layer3 cannot double-buffer (its 33 KB slots sit next to the 18 KB im2col
+buffer), and splitting layers 1-2 as well is impossible: the placer reports all 8 shim tiles at 16/16 MM2S
+channels once layers 3 and 4 are split (4 activation + 2 stem + 2 + 8 weight streams). Best configuration:
+`resnet_stage_design.py --stem --cols 8 --split-weights 0,0,1,1 --weight-depths 1,1,1,2`. Through the
+graph runner (`--device-network`) that measures **3.55-3.84 ms end to end** (device call 3.2 ms, host prep
+0.12-0.18 ms) versus 4.6-5.1 ms for the unsplit baseline in the same windows, logits identical to ORT CPU;
+Vitis AI is 1.55 ms, so the remaining gap is ~2.3x.
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is
