@@ -16,11 +16,12 @@
 - Fusing `/layer1/layer1.0`–`.2` is exact but slower on this 8x8 feature map: 107.8 ms vs 76.3 ms unfused. Per-block fused times were 11.1 ms (projection) and 6.9 ms (identity). Keep those fusions opt-in pending retile/runtime work.
 - uint8 MaxPool reduced kernel time from about 1.53 ms to 0.80 ms, but one full-graph sample regressed; repeat end-to-end timing before recommending it.
 
-## Linked stage fix (latest)
+## Linked stage (latest)
 
-- The linked multi-block stage bug was a Python late-binding closure in `linked_bottleneck_stage_design.py` (all blocks used the last block's chunk counts); fixed via `_block_workers`. Linked layer1 stages of 2 and 3 blocks are now bit-exact; 3-block stage = 16.7 ms vs 24.9 ms for three separate fused blocks. See `docs/xdna-subgraph-dispatch.md`.
-- To build/run on this host: `PATH=/opt/xilinx/xrt/bin:$PATH PYTHONPATH=/opt/xilinx/xrt/python LD_LIBRARY_PATH=/opt/xilinx/xrt/lib` with the IRON venv python; the IRON venv has no torch/onnxruntime (use `--cpu-backend numpy`, compute references with the Ryzen AI venv).
-- Next: cut weight-streaming cost (167 KB per launch, one awaited chunk at a time) -- resident weights or un-awaited fills -- then extend linked stages to layer2-4.
+- Bug fixed: Python late-binding closure in `linked_bottleneck_stage_design.py` made all blocks use the last block's chunk counts (`_block_workers`).
+- Weight streaming is NOT the bottleneck (~1 ms for a 3-block stage); scalar kernel gathers/epilogues were (~15 of 16.7 ms). New vectorized `--blocked` kernels (`kernels/fused_bottleneck_blocked.cc`, `blocked_stage.py`, runner `--fused-stage-blocked`) are bit-exact and take the linked layer1 stage from 16.7 ms to 1.65 ms. See `docs/xdna-subgraph-dispatch.md`.
+- Build/run on this host: `PATH=/opt/xilinx/xrt/bin:$PATH PYTHONPATH=/opt/xilinx/xrt/python LD_LIBRARY_PATH=/opt/xilinx/xrt/lib` with the IRON venv python; it has no torch/onnxruntime (use `--cpu-backend numpy`; make references with the Ryzen AI venv). Set `aie::set_saturation(saturate)` explicitly in any new srs kernel.
+- Next: generalize the blocked kernels to layer2-4 (stride-2 first blocks, W<8 maps via flattened padded tiling, multi-chunk weights); then the remaining CPU convs (42 in the quicktest graph) are the main end-to-end cost (numpy CPU conv 30 ms; torch-int8 13.6 ms). Wire `blocked` into the RPC `fused_stage` compile/run options.
 
 ## Compile timing
 

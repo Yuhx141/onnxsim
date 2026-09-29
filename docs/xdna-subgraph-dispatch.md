@@ -155,12 +155,54 @@ blocks (`--blocks A [B [C]]`, runner `--fused-stage BLOCK... XCLBIN INSTS`), and
 (note: broadcasting the linked FIFO to a host drain currently times out on the
 device, so it is not yet a usable tap).
 
-Measured: the linked three-block `layer1` stage takes 16.7 ms per launch, versus
-24.9 ms for three separately dispatched fused blocks (11.1 + 6.9 + 6.9). It is
-still far from Vitis AI's ~1.6 ms whole-model latency: the stage streams 167 KB
-of weights from host DDR one awaited 18.5 KB chunk at a time, so weight
-streaming, not compute, is the next target (keep weights resident in L2/memtile
-across inferences, or issue chunk fills without a per-chunk await).
+Measured before kernel work: the linked three-block `layer1` stage took 16.7 ms
+per launch, versus 24.9 ms for three separately dispatched fused blocks
+(11.1 + 6.9 + 6.9).
+
+### Weight streaming was not the bottleneck; scalar kernels were
+
+Skipping every kernel call (`--nocompute 15`, weights still streamed and awaited
+chunk by chunk) left only **~1.0-1.4 ms** for the whole 3-block stage, so the
+serialized 167 KB weight stream costs ~1 ms including launch. Skipping all but
+one kernel (bitmask `--nocompute`) attributed the remaining ~15 ms as: conv1
+~2.5, skip/identity ~3.2, conv2 ~7.3, conv3 ~3.3 ms. Reading the kernels showed
+why: the "mmul" paths gathered every 8x8 operand tile with per-byte scalar loops
+and branches, ran 64-bit scalar round-half-even per output element, and the
+projection skip conv and identity skip were fully scalar. The MMUL unit was a
+small fraction of the runtime.
+
+### Vectorized blocked kernels (`--blocked`)
+
+`kernels/fused_bottleneck_blocked.cc` + `blocked_stage.py`:
+
+- Activations are `[C/8][pixel][8]` int8 tiles, so an MMUL A operand is one
+  64-byte load. conv1 writes its output into a zero-padded
+  `[C/8][H+2][W+2][8]` buffer, so each 3x3 tap of conv2 is also one (unaligned)
+  64-byte load of 8 consecutive pixels (needs `W % 8 == 0`, stride 1).
+- Weights are pre-tiled on the host into 8x8 MMUL `B[k][n]` tiles; the packed
+  chunk order/slot size is unchanged, so the weight FIFO schedule is unchanged.
+- The MMUL accumulator is initialized from the bias tile; requantization is one
+  vector `srs` with `rounding_mode::conv_even` and **explicit
+  `saturation_mode::saturate`** (without it, extreme values wrapped: 28
+  mismatching elements), relu is a vector max, and the residual add is two
+  `from_vector` shifts plus one add and `srs`.
+- The shim DMA converts NHWC <-> blocked at the stage input/output using
+  strided BDs, so the host/runner interface is unchanged.
+- Debug modes (`--dbg`, `--nocompute`) and an integer numpy model of the block
+  were used to bisect skip/q2/q3 stages against ORT.
+
+Result (bit-exact against ORT boundaries at every compared edge):
+
+| Stage | Scalar kernels | Blocked kernels |
+| --- | ---: | ---: |
+| `layer1.0` (projection) alone | ~5 ms | 0.61 ms |
+| `layer1.1` (identity) alone | ~5 ms | 0.65 ms |
+| `layer1.0`-`.2` linked | 16.7 ms | **1.65 ms** |
+
+Limits of the blocked path (`blocked_supported`): stride-1 conv2, width a
+multiple of 8, channels multiples of 8, single weight chunk per conv. Layer2-4
+(4x4/2x2/1x1 maps, stride-2 first blocks, multi-chunk weights) still need the
+scalar path or a generalized tiling.
 
 The Vitis capture adds selected quantized tensors as ONNX graph outputs and
 runs them through a separate Vitis AI session. RPC XDNA capture saves linked
