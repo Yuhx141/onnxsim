@@ -105,17 +105,24 @@ def rt_descriptor(binding: dict[str, Any]) -> np.ndarray:
     return desc
 
 
-def pack_rt_params(binding: dict[str, Any]) -> np.ndarray:
-    """Weight stream for the runtime-shaped kernels: every slot = [192 B descriptor][chunk payload]."""
+def pack_rt_params(binding: dict[str, Any], slot_bytes: int | None = None) -> np.ndarray:
+    """Weight stream for the runtime-shaped kernels: every slot = [192 B descriptor][chunk payload].
+
+    ``slot_bytes`` (payload size, default the binding's own) lets several blocks that share one
+    core column use a common slot: each chunk is zero-padded up to it.
+    """
     plain = pack_blocked_params(binding)
     slot = int(binding["chunk_slot_bytes"])
+    target = int(slot_bytes) if slot_bytes else slot
+    if target < slot:
+        raise ValueError("slot_bytes is smaller than the block's own chunk slot")
     count = plain.size // slot
     desc = rt_descriptor(binding).view(np.uint8)
-    stride = RT_DESC_BYTES + slot
+    stride = RT_DESC_BYTES + target
     out = np.zeros(count * stride, dtype=np.uint8)
     for index in range(count):
         out[index * stride : index * stride + RT_DESC_BYTES] = desc
-        out[index * stride + RT_DESC_BYTES : (index + 1) * stride] = plain[index * slot : (index + 1) * slot]
+        out[index * stride + RT_DESC_BYTES : index * stride + RT_DESC_BYTES + slot] = plain[index * slot : (index + 1) * slot]
     return out
 
 
