@@ -16,6 +16,12 @@
 - Fusing `/layer1/layer1.0`–`.2` is exact but slower on this 8x8 feature map: 107.8 ms vs 76.3 ms unfused. Per-block fused times were 11.1 ms (projection) and 6.9 ms (identity). Keep those fusions opt-in pending retile/runtime work.
 - uint8 MaxPool reduced kernel time from about 1.53 ms to 0.80 ms, but one full-graph sample regressed; repeat end-to-end timing before recommending it.
 
+## Linked stage fix (latest)
+
+- The linked multi-block stage bug was a Python late-binding closure in `linked_bottleneck_stage_design.py` (all blocks used the last block's chunk counts); fixed via `_block_workers`. Linked layer1 stages of 2 and 3 blocks are now bit-exact; 3-block stage = 16.7 ms vs 24.9 ms for three separate fused blocks. See `docs/xdna-subgraph-dispatch.md`.
+- To build/run on this host: `PATH=/opt/xilinx/xrt/bin:$PATH PYTHONPATH=/opt/xilinx/xrt/python LD_LIBRARY_PATH=/opt/xilinx/xrt/lib` with the IRON venv python; the IRON venv has no torch/onnxruntime (use `--cpu-backend numpy`, compute references with the Ryzen AI venv).
+- Next: cut weight-streaming cost (167 KB per launch, one awaited chunk at a time) -- resident weights or un-awaited fills -- then extend linked stages to layer2-4.
+
 ## Compile timing
 
 For `test_model.onnx`, with `npu2`, 8 columns, and `optimize_small_m` enabled:

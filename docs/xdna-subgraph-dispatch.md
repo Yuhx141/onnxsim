@@ -138,17 +138,29 @@ only the first activation, packed parameters, and final output host-visible.
 The compiled MLIR contains both links, and the parameter DMA offsets advance
 through each packed block in order.
 
-The hardware run is **not numerically correct yet**, so do not use this option
-for inference results or performance claims. A capture run compared the linked
-`layer1` stage with Vitis AI outputs at all three block boundaries. Each
-standalone XDNA block matched Vitis AI exactly at its boundary (max and mean
-absolute error 0 for all three). The linked stage's final output differed from
-Vitis AI with max absolute error 127, mean 13.024, and 10,210 of 16,384 elements
-different. This rules out the block kernels, their parameter packing, and the
-input tensor as the cause; the failure is in the new multi-block linked path.
-The earlier graph-level comparison reported max error 5.875 and mean error
-3.025 because downstream operators reduce the boundary mismatch. The existing
-per-block implementation remains the correctness baseline.
+**Root cause found and fixed.** The linked stage was wrong because the per-block
+worker functions in `linked_bottleneck_stage_design.py` were closures defined in
+the block loop. IRON traces worker bodies after the loop ends, so every block ran
+with the *last* block's `chunks1/chunks2/chunks3/skip_chunks`. Identity->identity
+links happened to be exact (both blocks have `skip_chunks=0`), but a projection
+block followed by anything ran with the wrong weight-stream shape and its
+consumers read garbage. The worker factory `_block_workers` now binds the counts.
+Bisect that located it: 1 block exact; projection->identity max error 127
+(pixel-constant, bias-only-looking output); identity->identity exact.
+
+After the fix, linked `layer1.0`->`.1` and `.0`->`.1`->`.2` are bit-exact against
+the CPU reference at every compared boundary. The design now accepts one to three
+blocks (`--blocks A [B [C]]`, runner `--fused-stage BLOCK... XCLBIN INSTS`), and
+`--tap` (with `ONNXSIM_XDNA_STAGE_TAP=1` in the runner) exists as a debug hook
+(note: broadcasting the linked FIFO to a host drain currently times out on the
+device, so it is not yet a usable tap).
+
+Measured: the linked three-block `layer1` stage takes 16.7 ms per launch, versus
+24.9 ms for three separately dispatched fused blocks (11.1 + 6.9 + 6.9). It is
+still far from Vitis AI's ~1.6 ms whole-model latency: the stage streams 167 KB
+of weights from host DDR one awaited 18.5 KB chunk at a time, so weight
+streaming, not compute, is the next target (keep weights resident in L2/memtile
+across inferences, or issue chunk fills without a per-chunk await).
 
 The Vitis capture adds selected quantized tensors as ONNX graph outputs and
 runs them through a separate Vitis AI session. RPC XDNA capture saves linked

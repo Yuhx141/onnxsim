@@ -26,6 +26,59 @@ def _align4(value: int) -> int:
     return (value + 3) & ~3
 
 
+def _block_workers(chunks1, skip_chunks, chunks2, chunks3):
+    """Bind per-block chunk counts now; IRON traces worker bodies after the block loop ends."""
+    def discard(weights, count):
+        for _ in range_(count):
+            weights.acquire(1)
+            weights.release(1)
+
+    def conv1_worker(inp, weights, out, skip_out, kernel, skip_kernel, identity_kernel):
+        x = inp.acquire(1)
+        bundle = out.acquire(1)
+        for i in range_(chunks1):
+            w = weights.acquire(1)
+            kernel(x, w, bundle, i)
+            weights.release(1)
+        residual = skip_out.acquire(1)
+        if skip_chunks:
+            for i in range_(skip_chunks):
+                w = weights.acquire(1)
+                skip_kernel(x, w, residual, i)
+                weights.release(1)
+        else:
+            identity_kernel(x, residual)
+        skip_out.release(1)
+        out.release(1)
+        inp.release(1)
+        discard(weights, 2 * chunks2 + chunks3)
+
+    def conv2_worker(inp, weights, out, kernel, channel_offset, is_a):
+        discard(weights, chunks1 + skip_chunks + (0 if is_a else chunks2))
+        bundle = inp.acquire(1)
+        output = out.acquire(1)
+        for i in range_(chunks2):
+            w = weights.acquire(1)
+            kernel(bundle, w, output, i, channel_offset)
+            weights.release(1)
+        out.release(1)
+        inp.release(1)
+        discard(weights, (chunks2 if is_a else 0) + chunks3)
+
+    def conv3_worker(inp, weights, out, kernel):
+        discard(weights, chunks1 + skip_chunks + 2 * chunks2)
+        bundle = inp.acquire(1)
+        output = out.acquire(1)
+        for i in range_(chunks3):
+            w = weights.acquire(1)
+            kernel(bundle, w, output, i)
+            weights.release(1)
+        out.release(1)
+        inp.release(1)
+
+    return conv1_worker, conv2_worker, conv3_worker
+
+
 @iron.jit
 def linked_bottleneck_stage(
     activation: In,
@@ -33,11 +86,12 @@ def linked_bottleneck_stage(
     result: Out,
     *,
     stage_specs: CompileTime[str],
+    tap: CompileTime[int] = 0,
 ):
     """Run a fixed three-block stage with inter-block FIFOs on the device."""
     specs = json.loads(stage_specs)
-    if len(specs) != 3:
-        raise ValueError("linked stage currently requires exactly three bottleneck blocks")
+    if not 1 <= len(specs) <= 3:
+        raise ValueError("linked stage supports one to three bottleneck blocks")
 
     input_fifos = []
     weight_fifos = []
@@ -110,53 +164,7 @@ def linked_bottleneck_stage(
         stage2_fifo = ObjectFifo(stage2_ty, depth=1, name=f"stage{block_index}_residual_join")
         output_fifo = ObjectFifo(output_ty, depth=1, name=f"stage{block_index}_output")
 
-        def discard(weights, count):
-            for _ in range_(count):
-                weights.acquire(1)
-                weights.release(1)
-
-        def conv1_worker(inp, weights, out, skip_out, kernel, skip_kernel, identity_kernel):
-            x = inp.acquire(1)
-            bundle = out.acquire(1)
-            for i in range_(chunks1):
-                w = weights.acquire(1)
-                kernel(x, w, bundle, i)
-                weights.release(1)
-            residual = skip_out.acquire(1)
-            if skip_chunks:
-                for i in range_(skip_chunks):
-                    w = weights.acquire(1)
-                    skip_kernel(x, w, residual, i)
-                    weights.release(1)
-            else:
-                identity_kernel(x, residual)
-            skip_out.release(1)
-            out.release(1)
-            inp.release(1)
-            discard(weights, 2 * chunks2 + chunks3)
-
-        def conv2_worker(inp, weights, out, kernel, channel_offset, is_a):
-            discard(weights, chunks1 + skip_chunks + (0 if is_a else chunks2))
-            bundle = inp.acquire(1)
-            output = out.acquire(1)
-            for i in range_(chunks2):
-                w = weights.acquire(1)
-                kernel(bundle, w, output, i, channel_offset)
-                weights.release(1)
-            out.release(1)
-            inp.release(1)
-            discard(weights, (chunks2 if is_a else 0) + chunks3)
-
-        def conv3_worker(inp, weights, out, kernel):
-            discard(weights, chunks1 + skip_chunks + 2 * chunks2)
-            bundle = inp.acquire(1)
-            output = out.acquire(1)
-            for i in range_(chunks3):
-                w = weights.acquire(1)
-                kernel(bundle, w, output, i)
-                weights.release(1)
-            out.release(1)
-            inp.release(1)
+        conv1_worker, conv2_worker, conv3_worker = _block_workers(chunks1, skip_chunks, chunks2, chunks3)
 
         column = block_index
         workers.extend([
@@ -175,7 +183,7 @@ def linked_bottleneck_stage(
 
     # Link block outputs directly to the next block's activation input. Only
     # the first input and final output remain host-visible.
-    for index in range(2):
+    for index in range(len(specs) - 1):
         previous = specs[index]
         following = specs[index + 1]
         if previous["output_width"] * previous["output_height"] * previous["output_channels"] != following["width"] * following["height"] * following["channels"]:
@@ -187,12 +195,19 @@ def linked_bottleneck_stage(
     parameter_bytes = sum(spec["params_len"] for spec in specs)
     parameters_ty = np.ndarray[(parameter_bytes,), np.dtype[np.uint8]]
 
-    def sequence(x, packed, y, xprod, w0prod, w1prod, w2prod, ycons):
+    tap_cons = output_fifos[0].cons() if tap else None
+    tap_ty = np.ndarray[(specs[0]["output_width"] * specs[0]["output_height"] * specs[0]["output_channels"],), np.dtype[np.int8]]
+
+    def sequence(x, packed, y, *rest):
+        if tap:
+            tapbuf, xprod, ycons, tapcons, *wprods = rest
+        else:
+            xprod, ycons, *wprods = rest
         group = TaskGroup()
         xprod.fill(x, wait=True, group=group)
         group.finish()
         parameter_offset = 0
-        for index, wprod in enumerate((w0prod, w1prod, w2prod)):
+        for index, wprod in enumerate(wprods):
             spec = specs[index]
             offset = parameter_offset
             for chunk in range(spec["parameter_chunks"]):
@@ -206,12 +221,16 @@ def linked_bottleneck_stage(
             parameter_offset += spec["params_len"]
         group = TaskGroup()
         ycons.drain(y, wait=True, group=group)
+        if tap:
+            tapcons.drain(tapbuf, wait=True, group=group)
         group.finish()
 
     runtime = Runtime(sequence, [
         activation_ty, parameters_ty, output_ty,
-        input_fifos[0].prod(), weight_fifos[0].prod(), weight_fifos[1].prod(),
-        weight_fifos[2].prod(), output_fifos[-1].cons(),
+        *([tap_ty] if tap else []),
+        input_fifos[0].prod(), output_fifos[-1].cons(),
+        *([tap_cons] if tap else []),
+        *[fifo.prod() for fifo in weight_fifos],
     ])
     return Program(iron.get_current_device(), runtime, workers=workers).resolve_program()
 
@@ -220,7 +239,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     add_compile_args(parser)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--blocks", nargs=3, required=True)
+    parser.add_argument("--tap", action="store_true", help="debug: also drain block 0 output to a 4th host buffer")
+    parser.add_argument("--blocks", nargs="+", required=True)
     return parser
 
 
@@ -260,7 +280,7 @@ def _compile_kwargs(opts):
             "conv1_mmul": True, "slot_bytes": binding["chunk_slot_bytes"],
             "parameter_chunks": len(binding["chunk_sizes"]), "params_len": binding["params"].size,
         })
-    return {"stage_specs": json.dumps(specs, separators=(",", ":"))}
+    return {"stage_specs": json.dumps(specs, separators=(",", ":")), "tap": int(opts.tap)}
 
 
 def main() -> None:

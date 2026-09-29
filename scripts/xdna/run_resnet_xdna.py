@@ -393,8 +393,8 @@ class XDNAResNetRunner:
             prepared_blocks[prefix] = (block, binding, set(binding["covered_nodes"]), str(xclbin), str(insts))
 
         for prefixes, xclbin, insts in stage_specs:
-            if len(prefixes) != 3:
-                raise ValueError("linked fused stage requires exactly three block prefixes")
+            if not 1 <= len(prefixes) <= 3:
+                raise ValueError("linked fused stage requires one to three block prefixes")
             if not Path(xclbin).is_file() or not Path(insts).is_file():
                 raise ValueError("fused stage xclbin and instruction stream must exist")
             stage_blocks = []
@@ -597,7 +597,13 @@ class XDNAResNetRunner:
                 np.concatenate([binding["params"] for binding in bindings]), dtype=np.uint8, device="npu"
             )
             output_tensor = iron.zeros(output_count, dtype=np.int8, device="npu")
+            tap_tensor = None
+            if os.environ.get("ONNXSIM_XDNA_STAGE_TAP"):
+                # Debug: artifact built with --tap drains block 0's output as a 4th argument.
+                first_out = bindings[0]["output_shape"]
+                tap_tensor = iron.zeros(int(np.prod(first_out)), dtype=np.int8, device="npu")
             self._fused_stages[first_prefix] = {
+                "tap": tap_tensor,
                 "blocks": blocks, "bindings": bindings, "input": input_tensor,
                 "parameters": parameter_tensor, "output": output_tensor,
                 "kernel": self._kernel(xclbin, insts), "xclbin": xclbin,
@@ -1463,7 +1469,14 @@ class XDNAResNetRunner:
             resident_input = False
 
         started = time.perf_counter()
-        stage["kernel"](stage_input, stage["parameters"], stage["output"])
+        if stage.get("tap") is not None:
+            stage["kernel"](stage_input, stage["parameters"], stage["output"], stage["tap"])
+            if self._capture_enabled:
+                shape = bindings[0]["output_shape"]
+                self._capture_outputs["stage_tap:block0"] = stage["tap"].numpy().view(np.uint8).reshape(
+                    shape[0], shape[2], shape[3], shape[1]).transpose(0, 3, 1, 2).copy()
+        else:
+            stage["kernel"](stage_input, stage["parameters"], stage["output"])
         producer = "+".join(binding["block"].prefix for binding in bindings)
         if self._capture_enabled:
             self._capture_outputs[f"fused_stage:{producer}"] = (
@@ -1709,9 +1722,9 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         help="add a fused bottleneck specialization; repeat to fuse multiple blocks",
     )
     parser.add_argument(
-        "--fused-stage", nargs=5, action="append",
-        metavar=("BLOCK0", "BLOCK1", "BLOCK2", "XCLBIN", "INSTS"),
-        help="run three adjacent bottlenecks as one device-linked IRON stage",
+        "--fused-stage", nargs="+", action="append",
+        metavar="BLOCK... XCLBIN INSTS",
+        help="run one to three adjacent bottlenecks as one device-linked IRON stage",
     )
     parser.add_argument(
         "--parallel-projection-block", nargs=3, action="append", metavar=("PREFIX", "XCLBIN", "INSTS"),
@@ -1739,8 +1752,8 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         fused_block_insts=str(args.fused_block_insts) if args.fused_block_insts else None,
         fused_blocks=[(prefix, xclbin, insts) for prefix, xclbin, insts in (args.fused_block or [])],
         fused_stages=[
-            ((block0, block1, block2), xclbin, insts)
-            for block0, block1, block2, xclbin, insts in (args.fused_stage or [])
+            (tuple(items[:-2]), items[-2], items[-1])
+            for items in (args.fused_stage or [])
         ],
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
