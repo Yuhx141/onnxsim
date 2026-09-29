@@ -199,10 +199,56 @@ Result (bit-exact against ORT boundaries at every compared edge):
 | `layer1.1` (identity) alone | ~5 ms | 0.65 ms |
 | `layer1.0`-`.2` linked | 16.7 ms | **1.65 ms** |
 
-Limits of the blocked path (`blocked_supported`): stride-1 conv2, width a
-multiple of 8, channels multiples of 8, single weight chunk per conv. Layer2-4
-(4x4/2x2/1x1 maps, stride-2 first blocks, multi-chunk weights) still need the
-scalar path or a generalized tiling.
+### Generalization to every ResNet-50 block shape
+
+The blocked kernels now cover all 16 bottlenecks of the quicktest ResNet (8x8, 4x4,
+2x2 and 1x1 maps; stride-2 first blocks; projection skips; weight streams split
+into up to 32 output-channel chunks):
+
+- Tiles are 8 flattened output pixels. Maps with `W % 8 == 0` keep the direct
+  unaligned-row loads; narrower/smaller maps build their 3x3 windows once per block
+  (`chunk == 0`) into a static im2col buffer, and strided projection skips gather the
+  sampled input once into a static buffer. Rows past the pixel count are ignored and
+  partial tiles are stored through a small scratch copy. Static buffers are reserved
+  with `Worker(data_size=...)`: the linker's `data` region is only what is left after
+  the FIFO buffers, and the binder budgets them together with the weight slot.
+- 3x3 taps that only read padding are pruned from both the kernel loops (compile-time
+  tap table) and the packed weight stream (a 1x1 map keeps only the centre tap:
+  layer4 conv2 streams 9x fewer bytes).
+- Chunking in blocked mode uses output-channel groups that are multiples of 8, a
+  larger slot cap (up to 48 KB when tile memory allows) and, with the FIFO/static
+  budget, `XDNA_BLOCKED_MAX_CHUNK` overrides it for experiments.
+- The runtime sequence issues one whole-stream weight transfer per block plus the
+  input fill and output drain without per-chunk waits (FIFO locks throttle each
+  stream), so all blocks' streams are in flight together. Streaming-only stages run at
+  ~7 GB/s aggregate (layer3 7.5 MB in 1.1 ms; layer4 9.5 MB in 1.3 ms).
+- Hot-loop lesson: `MMUL c[G]` accumulator groups must be fully unrolled
+  (`#pragma clang loop unroll(full)`); otherwise the accumulators spill to memory and
+  every mac becomes a load/store (layer4.0: 3.5 -> 1.0 ms). Also keep constexpr
+  helper loops out of runtime paths (a runtime call into a constexpr tap search cost
+  ~1.5x on layer3) and use aligned loads for the 64-byte weight tiles.
+
+Stage results, all bit-exact against ORT at the last block's boundary (best of
+interleaved runs on a loaded host, single artifact per stage, harness `k()` call):
+
+| Stage (blocks) | Scalar kernels | Blocked kernels |
+| --- | ---: | ---: |
+| layer1 (3) | 16.7 ms | 0.40 ms |
+| layer2 (4) | ~30 ms est. | 0.76 ms |
+| layer3 (6) | CPU convs | 1.87 ms |
+| layer4 (3) | CPU convs | 1.30 ms |
+
+Whole quicktest graph through `run_resnet_xdna.py` with the four stages
+(`--fused-stage ... --fused-stage-blocked`): **11.6 ms average**, 0 CPU convs, 16
+bottlenecks in 4 launches, output logits identical to ORT CPU (max abs error 0).
+Of that, ~8.3 ms is the four stage launches as seen by the runner (host load and
+per-launch setup included), ~1.3 ms MaxPool, ~1.9 ms stem Conv dispatch+post and
+host QDQ. Vitis AI runs the same graph in ~1.6 ms as one fused provider node.
+
+Note: the `numpy` CPU-conv fallback is not bit-exact for the large layers (it fed
+layer3 blocks a slightly different input than ORT and looked like a kernel bug);
+validate blocks with `--capture`/reference boundary tensors rather than through that
+fallback.
 
 The Vitis capture adds selected quantized tensors as ONNX graph outputs and
 runs them through a separate Vitis AI session. RPC XDNA capture saves linked
