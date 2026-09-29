@@ -461,6 +461,11 @@ TC_OPT=1`), 4 threads on the V69 phone, all bit-exact to the capture:
 | recurrent state resident on the runner (`--resident 4:1,5:2,6:3`) | 340 / 356 | |
 | mixed W8/W16 heads (`drv_w16t10_a16_hmix`) with `ONNX_QDQ_INT_GEMM=1` for weights >= 65536 elements (`ONNX_QDQ_INT_GEMM_MIN`) | 237 / 262 | |
 | camera-frame mean subtraction as a table (`ONNX_QDQ_LUT` accepts a constant that is one value broadcast over the channels) | 240 / 252 | |
+| eight pixels per weight load in the vrmpy tensor core (`DSP_TC_MUPCAST`, default 8) | 203 / 226 | |
+
+The last row is a cache effect that QEMU's instruction count hides (11% there, 16% on the phone: the tensor-core layers went
+78 -> 51 ms). Pixels per weight load, driving DSP ms: 1 -> 242, 2 -> 228, 4 -> 204, 8 -> 203, 16 -> 218. Storing the accumulators
+contiguously (a pixel-major 1x1 conv, one vector store instead of 32 scalar ones) was exact but slower and is not in the tree.
 
 The integer heads are not bit-exact to the float ones: `qmatmul` quantizes the activation to uint16 at run time, so on the
 same inputs they differ from an ORT float reference of the same weights by 0.15 on average (6.7 at most) on outputs whose mean
@@ -468,9 +473,8 @@ magnitude is 894. Weights below 65536 elements stay float: converting all ~90 he
 The second row's DSP time is unchanged within noise: the two ~12 ms preprocessing kernels are gone (5 ms of table lookups
 remain), but the hmix run-to-run spread is about 4 ms.
 
-Tried and dropped: blocking several output pixels per weight load in the vrmpy tensor core (`DSP_TC_MBLOCK`), aimed at the 1x1
-convs that run at about 5% of vrmpy peak. With more than one pixel per block the compiler passes ran out of memory (12 GB in
-6 s), so it is not in the tree; the 1x1 conv remains the largest integer-path item (about 25 ms per 12-block group).
+Tried and dropped: blocking pixels inside the tensor-core construction (`DSP_TC_MBLOCK`): the compiler passes ran out of memory
+(12 GB in 6 s). The same blocking as an ordinary upcast after the tensor core (`DSP_TC_MUPCAST`) works.
 
 The last two are transport: casting the frame queue to float made an 8 MB output (and a 15 ms scalar cast kernel), and
 sending `state_*_q` in and `next_state_*_q` back every call moved 4.4 MB over `adb forward`. The runner now keeps each
