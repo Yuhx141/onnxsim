@@ -449,6 +449,20 @@ CLIENT=.../onnx-remote-client openpilot_v65/e2e.sh worker/onnx-remote-hexagon-wo
 | `dmonitoring_model` | ~20 min | 14.7 MB | 474 ms | 479 / 437 ms | bit-exact |
 | `driving_supercombo` (4 outputs) | ~45 min | 121 MB | 3580 ms | 1740 / 1494 ms | bit-exact |
 
+**Compile time.** One compiler service handles requests concurrently: cache hits are served while models compile, `--jobs`
+(`COMPILE_JOBS`, default 2) bounds concurrent cold compiles, and a second request for a model already compiling waits for it
+and reuses the artifact. Each kernel is compiled once and cached by source across compiles (the mock-DSP capture build through
+tinygrad's disk cache, the program's objects through `DSP_GRAPH_OBJ_CACHE`); the qemu check and the skel build share those
+objects and run side by side; compile3's self-test reruns are skipped. Quantized models, W8/W16 A16:
+
+| | before | cold | warm (new cache key, unchanged kernels) |
+|---|---:|---:|---:|
+| `driving_supercombo` | 812 s | 495 s (compiled alongside DM) | 139 s |
+| `dmonitoring_model` | 69 s | 56 s | |
+
+What a warm compile still spends is qemu running the model: three capture runs and the reference, about 17 s each for driving,
+plus the 16 s check of the emitted program.
+
 The compiler's cache key is the target, `--compiler-id`, command string and model bytes. It does not include the tinygrad
 checkout the command runs, so put the fork's commit in `--compiler-id` (for example `tinygrad-$(git -C "$TINYGRAD_ROOT"
 rev-parse --short HEAD)`); otherwise a codegen change keeps serving old artifacts. The compiler service is one request at a
