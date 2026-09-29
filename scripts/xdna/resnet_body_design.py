@@ -46,11 +46,15 @@ def resnet_body(
     scratch: In,
     *,
     body_specs: CompileTime[str],
+    weight_depths: CompileTime[str] = "",
 ):
     groups = json.loads(body_specs)
     if not 1 <= len(groups) <= 8:
         raise ValueError("the body needs one to eight block-kind groups")
     input_fifos, weight_fifos, output_fifos, workers = [], [], [], []
+    depths = [int(v) for v in weight_depths.split(",")] if weight_depths else [1] * len(groups)
+    if len(depths) != len(groups):
+        raise ValueError("weight_depths needs one entry per group")
 
     for index, spec in enumerate(groups):
         width, height, channels = spec["width"], spec["height"], spec["channels"]
@@ -104,7 +108,7 @@ def resnet_body(
         k3 = ExternalFunction("fused_bottleneck_conv3_chunk", source_file=src, arg_types=[stage2_ty, weight_ty, output_ty, np.int32], compile_flags=flags + ["-DBLK_CONV3"], symbol_prefix=prefix)
 
         input_fifo = ObjectFifo(activation_ty, depth=1, name=f"g{index}_activation")
-        weights_fifo = ObjectFifo(weight_ty, depth=1, name=f"g{index}_weights")
+        weights_fifo = ObjectFifo(weight_ty, depth=depths[index], name=f"g{index}_weights")
         stage1_fifo = ObjectFifo(stage1_ty, depth=1, name=f"g{index}_conv1_out")
         skip_fifo = ObjectFifo(skip_ty, depth=1, name=f"g{index}_skip")
         stage2a_fifo = ObjectFifo(stage2h_ty, depth=1, name=f"g{index}_conv2a")
@@ -188,14 +192,31 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     add_compile_args(parser)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--chunk-caps", default="", help="comma-separated weight-chunk byte cap per group (0 = default); smaller chunks leave room for deeper weight FIFOs")
+    parser.add_argument("--weight-depths", default="", help="comma-separated weight FIFO depth per group (2 double-buffers the weight DMA where tile memory allows; layer4 groups fit)")
     parser.add_argument("--group", nargs="+", action="append", required=True,
                         help="block prefixes served by one column, in execution order; "
                              "all blocks of a group must share shapes and chunking")
     return parser
 
 
-def group_specs(model, groups):
-    """Bind every group's blocks and build the compile-time spec (shared by tests/runners)."""
+def normalize_groups(groups):
+    """Accept prefix lists or {"blocks": [...], "chunk_cap": N, "depth": D} entries."""
+    out = []
+    for group in groups:
+        if isinstance(group, dict):
+            out.append((list(group["blocks"]), group.get("chunk_cap"), int(group.get("depth", 1))))
+        else:
+            out.append((list(group), None, 1))
+    return out
+
+
+def group_specs(model, groups, caps=None):
+    """Bind every group's blocks and build the compile-time spec (shared by tests/runners).
+
+    ``caps`` optionally gives a per-group weight-chunk byte cap; a group's caps must match
+    between compile and run because the packed weight layout depends on it.
+    """
     try:
         from .benchmark_fused_bottleneck import bind_fused_bottleneck
         from .blocked_stage import blocked_supported
@@ -206,10 +227,11 @@ def group_specs(model, groups):
         from resnet_bottleneck import plan_bottleneck_blocks
     plans = {block.prefix: block for block in plan_bottleneck_blocks(model)}
     specs, bindings, previous_output = [], [], None
-    for prefixes in groups:
+    for group_index, prefixes in enumerate(groups):
         binds = []
         for prefix in prefixes:
-            binding = bind_fused_bottleneck(model, plans[prefix], blocked=True)
+            cap = caps[group_index] if caps else None
+            binding = bind_fused_bottleneck(model, plans[prefix], blocked=True, max_chunk=cap or None)
             if not blocked_supported(binding):
                 raise ValueError(f"{prefix}: shape not supported by the blocked kernels")
             binds.append(binding)
@@ -240,8 +262,9 @@ def group_specs(model, groups):
 
 def _compile_kwargs(opts):
     import onnx
-    specs, _ = group_specs(onnx.load(opts.model), opts.group)
-    return {"body_specs": json.dumps(specs, separators=(",", ":"))}
+    caps = [int(v) for v in opts.chunk_caps.split(",")] if opts.chunk_caps else None
+    specs, _ = group_specs(onnx.load(opts.model), opts.group, caps)
+    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths}
 
 
 def main() -> None:

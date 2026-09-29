@@ -57,19 +57,30 @@ def _run_inprocess(command: list[str]) -> None:
         raise proto.RPCError(f"XDNA runner returned status {status}")
 
 
-def _body_groups(groups: Any) -> list[list[str]]:
-    """Validate ``options.groups``: block-prefix groups, one core column per group."""
-    if (
-        not isinstance(groups, list)
-        or not 1 <= len(groups) <= 8
-        or not all(
-            isinstance(group, list) and group and all(isinstance(p, str) for p in group)
-            for group in groups
-        )
-    ):
+def _body_groups(groups: Any) -> list[Any]:
+    """Validate ``options.groups``.
+
+    Each entry is a non-empty list of block prefixes (one core column per group) or
+    ``{"blocks": [...], "chunk_cap": bytes, "depth": weight_fifo_depth}``.
+    """
+
+    def blocks_of(group: Any) -> Any:
+        return group.get("blocks") if isinstance(group, dict) else group
+
+    if not isinstance(groups, list) or not 1 <= len(groups) <= 8:
         raise proto.RPCError(
-            "resnet_body needs options.groups: 1-8 non-empty lists of block prefixes"
+            "resnet_body needs options.groups: 1-8 block-prefix groups"
         )
+    for group in groups:
+        blocks = blocks_of(group)
+        if not (
+            isinstance(blocks, list)
+            and blocks
+            and all(isinstance(prefix, str) for prefix in blocks)
+        ):
+            raise proto.RPCError(
+                "each resnet_body group needs a non-empty list of block prefixes"
+            )
     return groups
 
 
@@ -185,7 +196,18 @@ def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
             str(insts),
         ]
         for group in groups:
-            command += ["--group", *group]
+            command += [
+                "--group",
+                *(group["blocks"] if isinstance(group, dict) else group),
+            ]
+        caps = [
+            int(g.get("chunk_cap") or 0) if isinstance(g, dict) else 0 for g in groups
+        ]
+        depths = [int(g.get("depth", 1)) if isinstance(g, dict) else 1 for g in groups]
+        if any(caps):
+            command += ["--chunk-caps", ",".join(map(str, caps))]
+        if any(depth != 1 for depth in depths):
+            command += ["--weight-depths", ",".join(map(str, depths))]
     else:
         required = (
             "channels",

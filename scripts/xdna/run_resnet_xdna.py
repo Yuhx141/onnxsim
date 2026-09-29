@@ -129,6 +129,7 @@ class XDNAResNetRunner:
         fused_stages: list[tuple[tuple[str, str, str], str, str]] | None = None,
         fused_stage_blocked: bool = False,
         fused_body_groups: list[list[str]] | None = None,
+        fused_body_chunk_caps: dict[str, int | None] | None = None,
         host_maxpool: bool = False,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
         maxpool_uint8_artifact: tuple[str, str] | None = None,
@@ -378,6 +379,7 @@ class XDNAResNetRunner:
         fused_specs = list(fused_blocks or ())
         self.fused_stage_blocked = fused_stage_blocked or bool(fused_body_groups)
         self.fused_body_groups = fused_body_groups
+        self.fused_body_chunk_caps = fused_body_chunk_caps or {}
         stage_specs = list(fused_stages or ())
         parallel_specs = list(parallel_projection_blocks or ())
         if any((fused_block_prefix, fused_block_xclbin, fused_block_insts)):
@@ -423,7 +425,10 @@ class XDNAResNetRunner:
                 block = bottleneck_plans.get(prefix)
                 if block is None:
                     raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
-                binding = bind_fused_bottleneck(model, block, blocked=self.fused_stage_blocked)
+                binding = bind_fused_bottleneck(
+                    model, block, blocked=self.fused_stage_blocked,
+                    max_chunk=self.fused_body_chunk_caps.get(prefix) or None,
+                )
                 if previous_binding is not None and (
                     previous_binding["output_shape"] != binding["input_shape"]
                     or previous_binding["output_raw_name"] != binding["input_raw_name"]
@@ -1790,10 +1795,17 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
     if bool(args.maxpool_uint8_xclbin) != bool(args.maxpool_uint8_insts):
         raise ValueError("--maxpool-uint8-xclbin and --maxpool-uint8-insts must be supplied together")
     body_groups = None
+    body_caps: dict[str, int | None] = {}
     body_stages = []
     if args.fused_body:
         import json as _json
-        body_groups = _json.loads(args.fused_body[2])
+        raw_groups = _json.loads(args.fused_body[2])
+        # Entries are prefix lists or {"blocks": [...], "chunk_cap": N, "depth": D}.
+        body_groups = [g["blocks"] if isinstance(g, dict) else g for g in raw_groups]
+        body_caps = {
+            prefix: g.get("chunk_cap")
+            for g in raw_groups if isinstance(g, dict) for prefix in g["blocks"]
+        }
         body_stages = [(tuple(prefix for group in body_groups for prefix in group), args.fused_body[0], args.fused_body[1])]
 
     runner = XDNAResNetRunner(
@@ -1812,6 +1824,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         ] + body_stages,
         fused_stage_blocked=args.fused_stage_blocked,
         fused_body_groups=body_groups,
+        fused_body_chunk_caps=body_caps,
         host_maxpool=args.host_maxpool,
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
