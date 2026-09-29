@@ -23,6 +23,7 @@ from pathlib import Path
 
 import aie.iron as iron
 import numpy as np
+from aie.iron.controlflow import range_
 from aie.iron import CompileTime, ExternalFunction, In, ObjectFifo, Out, Runtime, Worker, Program
 from aie.iron.dataflow import ObjectFifoLink
 from aie.iron.device import Tile
@@ -38,6 +39,56 @@ except ImportError:  # run as a script
 HEADER_BYTES = 64
 
 
+def _split_workers(chunks1, skip_chunks, chunks2, chunks3, nocompute=0):
+    """Workers for per-worker weight FIFOs: each core sees only its own chunks (no discards)."""
+
+    def conv1_worker(inp, weights, out, skip_out, kernel, skip_kernel, identity_kernel):
+        x = inp.acquire(1)
+        bundle = out.acquire(1)
+        for i in range_(chunks1):
+            w = weights.acquire(1)
+            if not nocompute & 1:
+                kernel(x, w, bundle, i)
+            weights.release(1)
+        residual = skip_out.acquire(1)
+        if skip_chunks:
+            for i in range_(skip_chunks):
+                w = weights.acquire(1)
+                if not nocompute & 2:
+                    skip_kernel(x, w, residual, i)
+                weights.release(1)
+        else:
+            if not nocompute & 2:
+                identity_kernel(x, residual)
+        skip_out.release(1)
+        out.release(1)
+        inp.release(1)
+
+    def conv2_worker(inp, weights, out, kernel, channel_offset, is_a):
+        bundle = inp.acquire(1)
+        output = out.acquire(1)
+        for i in range_(chunks2):
+            w = weights.acquire(1)
+            if not nocompute & 4:
+                kernel(bundle, w, output, i, channel_offset)
+            weights.release(1)
+        out.release(1)
+        inp.release(1)
+
+    def conv3_worker(inp, weights, out, kernel):
+        bundle = inp.acquire(1)
+        output = out.acquire(1)
+        for i in range_(chunks3):
+            w = weights.acquire(1)
+            if not nocompute & 8:
+                kernel(bundle, w, output, i)
+            weights.release(1)
+        out.release(1)
+        inp.release(1)
+
+    return conv1_worker, conv2_worker, conv3_worker
+
+
 @iron.jit
 def resnet_body(
     activation: In,
@@ -49,6 +100,7 @@ def resnet_body(
     weight_depths: CompileTime[str] = "",
     nocompute: CompileTime[int] = 0,
     seg_gather: CompileTime[str] = "",
+    split_weights: CompileTime[str] = "",
 ):
     groups = json.loads(body_specs)
     if not 1 <= len(groups) <= 8:
@@ -56,7 +108,8 @@ def resnet_body(
     input_fifos, weight_fifos, output_fifos, workers = [], [], [], []
     depths = [int(v) for v in weight_depths.split(",")] if weight_depths else [1] * len(groups)
     seg_modes = [int(v) for v in seg_gather.split(",")] if seg_gather else [0] * len(groups)
-    if len(depths) != len(groups) or len(seg_modes) != len(groups):
+    splits = [int(v) for v in split_weights.split(",")] if split_weights else [0] * len(groups)
+    if len(depths) != len(groups) or len(seg_modes) != len(groups) or len(splits) != len(groups):
         raise ValueError("weight_depths needs one entry per group")
 
     for index, spec in enumerate(groups):
@@ -111,14 +164,24 @@ def resnet_body(
         k3 = ExternalFunction("fused_bottleneck_conv3_chunk", source_file=src, arg_types=[stage2_ty, weight_ty, output_ty, np.int32], compile_flags=flags + ["-DBLK_CONV3"], symbol_prefix=prefix)
 
         input_fifo = ObjectFifo(activation_ty, depth=1, name=f"g{index}_activation")
-        weights_fifo = ObjectFifo(weight_ty, depth=depths[index], name=f"g{index}_weights")
+        split = bool(splits[index])
+        if split:
+            # Per-worker weight FIFOs: conv1 (+skip), conv2a, conv2b, conv3 each get their own
+            # shim stream and see only their own chunks.
+            w_fifos = [ObjectFifo(weight_ty, depth=depths[index], name=f"g{index}_w{tag}") for tag in ("1", "2a", "2b", "3")]
+            weights_fifo = None
+        else:
+            weights_fifo = ObjectFifo(weight_ty, depth=depths[index], name=f"g{index}_weights")
+            w_fifos = None
         stage1_fifo = ObjectFifo(stage1_ty, depth=1, name=f"g{index}_conv1_out")
         skip_fifo = ObjectFifo(skip_ty, depth=1, name=f"g{index}_skip")
         stage2a_fifo = ObjectFifo(stage2h_ty, depth=1, name=f"g{index}_conv2a")
         stage2b_fifo = ObjectFifo(stage2h_ty, depth=1, name=f"g{index}_conv2b")
         stage2_fifo = ObjectFifo(stage2_ty, depth=1, name=f"g{index}_residual_join")
         output_fifo = ObjectFifo(output_ty, depth=1, name=f"g{index}_output")
-        conv1_worker, conv2_worker, conv3_worker = _block_workers(chunks1, skip_chunks, chunks2, chunks3, int(nocompute))
+        make_workers = _split_workers if split else _block_workers
+        conv1_worker, conv2_worker, conv3_worker = make_workers(chunks1, skip_chunks, chunks2, chunks3, int(nocompute))
+        wc1, wc2a, wc2b, wc3 = ([f.cons() for f in w_fifos] if split else [weights_fifo.cons() for _ in range(4)])
 
         out_tiles = (output_pixels + 7) // 8
         row_tiles2 = width % 8 == 0 and conv2_stride == 1 and output_width == width
@@ -127,17 +190,17 @@ def resnet_body(
         conv1_data = (channels // 8) * out_tiles * 64 + 256 if skip_chunks and not (conv2_stride == 1 and output_pixels == pixels) else None
         column = index
         workers.extend([
-            Worker(conv1_worker, fn_args=[input_fifo.cons(), weights_fifo.cons(), stage1_fifo.prod(), skip_fifo.prod(), k1, kskip, kidentity], tile=Tile(column, 2), stack_size=0x1000, data_size=conv1_data),
-            Worker(conv2_worker, fn_args=[stage1_fifo.cons(), weights_fifo.cons(), stage2a_fifo.prod(), k2a, 0, True], tile=Tile(column, 3), stack_size=0x1000, data_size=conv2_data),
-            Worker(conv2_worker, fn_args=[stage1_fifo.cons(), weights_fifo.cons(), stage2b_fifo.prod(), k2b, mid_channels // 2, False], tile=Tile(column, 5), stack_size=0x1000, data_size=conv2_data),
-            Worker(conv3_worker, fn_args=[stage2_fifo.cons(), weights_fifo.cons(), output_fifo.prod(), k3], tile=Tile(column, 4), stack_size=0x1000),
+            Worker(conv1_worker, fn_args=[input_fifo.cons(), wc1, stage1_fifo.prod(), skip_fifo.prod(), k1, kskip, kidentity], tile=Tile(column, 2), stack_size=0x1000, data_size=conv1_data),
+            Worker(conv2_worker, fn_args=[stage1_fifo.cons(), wc2a, stage2a_fifo.prod(), k2a, 0, True], tile=Tile(column, 3), stack_size=0x1000, data_size=conv2_data),
+            Worker(conv2_worker, fn_args=[stage1_fifo.cons(), wc2b, stage2b_fifo.prod(), k2b, mid_channels // 2, False], tile=Tile(column, 5), stack_size=0x1000, data_size=conv2_data),
+            Worker(conv3_worker, fn_args=[stage2_fifo.cons(), wc3, output_fifo.prod(), k3], tile=Tile(column, 4), stack_size=0x1000),
         ])
         ObjectFifoLink(
             [stage2a_fifo.cons(), stage2b_fifo.cons(), skip_fifo.cons()], stage2_fifo.prod(),
             src_offsets=[0, output_pixels * (mid_channels // 2), output_pixels * mid_channels],
         )
         input_fifos.append(input_fifo)
-        weight_fifos.append(weights_fifo)
+        weight_fifos.append(w_fifos if split else [weights_fifo])
         output_fifos.append(output_fifo)
         spec["_slot"], spec["_chunks"] = slot_bytes, chunk_count
 
@@ -153,11 +216,31 @@ def resnet_body(
         xprods, ycons, wprods = handles[:n], handles[n : 2 * n], handles[2 * n :]
         weights = TaskGroup()
         offset = 0
-        for g, wprod in zip(groups, wprods):
+        cursor = 0
+        for g, is_split in zip(groups, splits):
             total = g["repeat"] * g["_chunks"]
-            wprod.fill(packed, group=weights, sizes=[1, 1, total, g["_slot"]], strides=[0, 0, g["_slot"], 1],
-                       offset=offset, transfer_len=total * g["_slot"])
-            offset += total * g["_slot"]
+            slot = g["_slot"]
+            if is_split:
+                # Slice each block's [conv1, skip, conv2a, conv2b, conv3] chunk run into the four
+                # per-worker streams (same repeat stride), each on its own shim channel.
+                bounds = [0, g["chunks1"] + g["skip_chunks"], g["chunks2"], g["chunks2"], g["chunks3"]]
+                start = 0
+                for part in range(4):
+                    n_chunks = bounds[part + 1]
+                    wprods[cursor].fill(
+                        packed, group=weights, sizes=[g["repeat"], 1, n_chunks, slot],
+                        strides=[g["_chunks"] * slot, 0, slot, 1],
+                        offset=offset + start * slot, transfer_len=n_chunks * slot,
+                    )
+                    start += n_chunks
+                    cursor += 1
+            else:
+                wprods[cursor].fill(
+                    packed, group=weights, sizes=[1, 1, total, slot], strides=[0, 0, slot, 1],
+                    offset=offset, transfer_len=total * slot,
+                )
+                cursor += 1
+            offset += total * slot
         source, source_offset = x, 0
         mid_offset = 0
         for gi, g in enumerate(groups):
@@ -187,7 +270,7 @@ def resnet_body(
 
     runtime = Runtime(sequence, [
         activation_ty, parameters_ty, output_ty, scratch_ty,
-        *[f.prod() for f in input_fifos], *[f.cons() for f in output_fifos], *[f.prod() for f in weight_fifos],
+        *[f.prod() for f in input_fifos], *[f.cons() for f in output_fifos], *[f.prod() for fifos in weight_fifos for f in fifos],
     ])
     return Program(iron.get_current_device(), runtime, workers=workers).resolve_program()
 
@@ -198,6 +281,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--nocompute", type=int, default=0, help="debug: bitmask of kernels to skip (1 conv1, 2 skip, 4 conv2, 8 conv3) to measure the streaming floor")
     parser.add_argument("--seg-gather", default="", help="comma-separated 0/1 per group: build small-map 3x3 tiles from row segments (no static im2col, frees tile memory) instead of a static im2col buffer (default 0: the static buffer is faster where it fits)")
+    parser.add_argument("--split-weights", default="", help="comma-separated 0/1 per group: give each of the four cores its own weight FIFO/shim stream (4 shim MM2S channels instead of 1; total channels are limited to 16)")
+    parser.add_argument("--cols", type=int, default=0, help="array width to compile for (default: one column per group, min 3); widen it to get more shim DMA channels")
     parser.add_argument("--chunk-caps", default="", help="comma-separated weight-chunk byte cap per group (0 = default); smaller chunks leave room for deeper weight FIFOs")
     parser.add_argument("--weight-depths", default="", help="comma-separated weight FIFO depth per group (2 double-buffers the weight DMA where tile memory allows; layer4 groups fit)")
     parser.add_argument("--group", nargs="+", action="append", required=True,
@@ -270,12 +355,12 @@ def _compile_kwargs(opts):
     import onnx
     caps = [int(v) for v in opts.chunk_caps.split(",")] if opts.chunk_caps else None
     specs, _ = group_specs(onnx.load(opts.model), opts.group, caps)
-    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "seg_gather": opts.seg_gather}
+    return {"body_specs": json.dumps(specs, separators=(",", ":")), "weight_depths": opts.weight_depths, "nocompute": opts.nocompute, "seg_gather": opts.seg_gather, "split_weights": opts.split_weights}
 
 
 def main() -> None:
     opts = _parser().parse_args()
-    run_design_cli(resnet_body, opts, compile_kwargs=_compile_kwargs, device=lambda value: device_from_args(value, n_cols=max(3, len(value.group))))
+    run_design_cli(resnet_body, opts, compile_kwargs=_compile_kwargs, device=lambda value: device_from_args(value, n_cols=value.cols or max(3, len(value.group))))
 
 
 if __name__ == "__main__":

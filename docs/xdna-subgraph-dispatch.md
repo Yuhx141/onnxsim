@@ -301,6 +301,15 @@ configuration is the plain body with double-buffered layer4 groups (about -6%);
 mixed segment/im2col was -2%. Weight prefetch depth is not the lever; per-stream weight
 bandwidth is.
 
+Per-worker weight streams (`--split-weights`, needs `--cols 8`; each core gets its own FIFO and
+shim channel instead of a broadcast FIFO, so a group uses 4 of the 16 shim MM2S channels):
+exact, but on a layer4-only body the streaming-only floor is unchanged (1.37 ms broadcast vs
+1.35 ms split for 9.5 MB) and the real run gains only ~4% (1.82 -> 1.74 ms). Fitting a line
+through the streaming-only floors of layers 3 and 4 gives ~8 GB/s and ~0.2 ms fixed. Each
+block is a strict conv1 -> conv2 -> conv3 pipeline, so at any moment only one stage's
+weights are needed and depth-1/2 FIFOs cannot run ahead; more channels do not help, only
+staging larger runs of weights ahead of compute (memtile FIFOs) or fewer bytes could.
+
 What bounds the body now: streaming-only runs of layers 3/4 take 1.1/1.3 ms
 (~7 GB/s per weight stream) and the whole body's 21 MB of weights need ~3 ms at that
 rate, against 3.7 ms total, so it is weight-bandwidth bound. Only one block kind is
