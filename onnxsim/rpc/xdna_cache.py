@@ -11,7 +11,6 @@ never leaves a half-written entry under a real key.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +21,14 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
+
+try:  # POSIX only; on Windows the per-key lock is in-process (the XDNA toolchain is Linux-only)
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
 
 # Bump when the entry layout or key composition changes.
 KEY_VERSION = 1
@@ -240,14 +247,21 @@ def load_entry(entry: Path) -> Optional[Dict[str, Any]]:
 
 @contextmanager
 def _key_lock(root: Path, key: str):
-    lock_dir = root / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    with open(lock_dir / f"{key}.lock", "a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
+    """Serialize compiles of one key: an in-process lock plus, where available, a cross-process flock."""
+    with _THREAD_LOCKS_GUARD:
+        thread_lock = _THREAD_LOCKS.setdefault(f"{root}:{key}", threading.Lock())
+    with thread_lock:
+        if fcntl is None:
             yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            return
+        lock_dir = root / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        with open(lock_dir / f"{key}.lock", "a+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def _remove(path: Path) -> None:
