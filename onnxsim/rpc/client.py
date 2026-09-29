@@ -249,6 +249,12 @@ class Session:
         ``"maxpool_u8"``.
         Returned artifact paths are on the RPC server and can be passed to
         :meth:`xdna_run_resnet` on the same server.
+
+        Compiles are cached on the server, content-addressed by the model bytes, the compiler
+        command (device, columns, blocks/groups, ...), the ``scripts/xdna`` sources, the IRON
+        toolchain identity and compile-relevant environment variables. The reply carries
+        ``"cache": "hit" | "miss" | "bypass"`` and ``"cache_key"``; pass
+        ``options["no_cache"] = True`` to force a fresh compile. See ``docs/rpc.md``.
         """
         if kind not in (
             "resnet",

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from . import _protocol as proto
+from . import xdna_cache as cache
 
 
 def _script(name: str) -> Path:
@@ -84,28 +85,20 @@ def _body_groups(groups: Any) -> list[Any]:
     return groups
 
 
-def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
-    """Compile the supported ResNet artifacts on the RPC server's XDNA toolchain."""
-    kind = header.get("kind")
-    if kind not in (
-        "resnet",
-        "fused_bottleneck",
-        "fused_stage",
-        "resnet_body",
-        "maxpool_u8",
-    ):
-        raise proto.RPCError(f"unsupported XDNA compile kind {kind!r}")
-    if not blobs:
-        raise proto.RPCError("XDNA compile requires an ONNX model blob")
-    options = header.get("options") or {}
-    if not isinstance(options, dict):
-        raise proto.RPCError("XDNA compile options must be an object")
-    root = Path(work_dir) / "xdna-rpc" / uuid.uuid4().hex
-    root.mkdir(parents=True, exist_ok=False)
+_KINDS = ("resnet", "fused_bottleneck", "fused_stage", "resnet_body", "maxpool_u8")
+
+
+def _compile_command(
+    header: Dict[str, Any], kind: str, options: Dict[str, Any], root: Path
+) -> tuple[list[str], Path | None, Path | None, Path | None]:
+    """Validate options and build the compiler command for ``root``.
+
+    Returns ``(command, xclbin, insts, manifest_path)``; ``manifest_path`` is set only for the
+    ``resnet`` kind and ``xclbin``/``insts`` only for the others.  Pure (no filesystem writes), so
+    the cache can call it with a placeholder root to derive the key.
+    """
     model_path = root / "model.onnx"
-    model_path.write_bytes(blobs[0])
     artifacts = root / "artifacts"
-    artifacts.mkdir()
 
     if kind == "resnet":
         example = Path(str(options.get("example", ""))).expanduser()
@@ -131,9 +124,7 @@ def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
             command.append("--compile-all")
         if options.get("optimize_small_m", True):
             command.append("--optimize-small-m")
-        _run(command)
-        result = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return {"kind": kind, "manifest": result, "artifact_dir": str(artifacts)}, []
+        return command, None, None, manifest_path
 
     xclbin, insts = artifacts / f"{kind}.xclbin", artifacts / f"{kind}.insts.bin"
     if kind == "fused_bottleneck":
@@ -263,7 +254,23 @@ def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
                 )
         command += ["--uint8", "--xclbin-path", str(xclbin), "--insts-path", str(insts)]
 
+    return command, xclbin, insts, None
+
+
+def _execute_compile(
+    command: list[str],
+    kind: str,
+    root: Path,
+    xclbin: Path | None,
+    insts: Path | None,
+    manifest_path: Path | None,
+) -> Dict[str, Any]:
+    artifacts = root / "artifacts"
     _run(command)
+    if manifest_path is not None:
+        result = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return {"kind": kind, "manifest": result, "artifact_dir": str(artifacts)}
+    assert xclbin is not None and insts is not None
     absent = [str(path) for path in (xclbin, insts) if not path.is_file()]
     if absent:
         raise proto.RPCError(
@@ -274,7 +281,101 @@ def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
         "xclbin": str(xclbin),
         "insts": str(insts),
         "artifact_dir": str(artifacts),
-    }, []
+    }
+
+
+def _scripts_dir() -> Path:
+    return _script("compile_resnet_kernels.py").parent
+
+
+def _cache_key(
+    header: Dict[str, Any],
+    kind: str,
+    options: Dict[str, Any],
+    model: bytes,
+    command: list[str],
+    root: Path,
+) -> str:
+    """Content-addressed key; see docs/rpc.md ("XDNA compile cache")."""
+    example = str(Path(str(options.get("example", ""))).expanduser())
+    example_hash = ""
+    if kind == "resnet":
+        example_hash = cache.sha256_file(Path(example))
+    normalized = [
+        "@EXAMPLE@"
+        if kind == "resnet" and arg == example
+        else arg.replace(str(root), "@ROOT@")
+        for arg in command
+    ]
+    scripts = _scripts_dir()
+    # The command (device, columns, blocks/groups, blocked, chunk caps, pool geometry, ...)
+    # captures every option that reaches the compiler; the example file is hashed by content.
+    # This module is hashed too, so changing how options map to commands invalidates entries.
+    sources = cache.source_digest([scripts]) + cache.sha256_file(Path(__file__))
+    return cache.make_key(
+        kind,
+        model,
+        normalized,
+        sources,
+        cache.toolchain_identity(_xdna_python(header)),
+        cache.compile_env(),
+        extra={"example": example_hash},
+    )
+
+
+def compile_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
+    """Compile the supported ResNet artifacts on the RPC server's XDNA toolchain.
+
+    Results are cached content-addressed (see :mod:`onnxsim.rpc.xdna_cache`); the reply gains
+    ``"cache": "hit" | "miss" | "bypass"`` and, when cached, ``"cache_key"``.
+    ``options["no_cache"]`` or ``ONNXSIM_XDNA_CACHE=0`` compiles into a fresh directory under
+    ``work_dir`` as before.
+    """
+    kind = header.get("kind")
+    if kind not in _KINDS:
+        raise proto.RPCError(f"unsupported XDNA compile kind {kind!r}")
+    if not blobs:
+        raise proto.RPCError("XDNA compile requires an ONNX model blob")
+    options = header.get("options") or {}
+    if not isinstance(options, dict):
+        raise proto.RPCError("XDNA compile options must be an object")
+    model = blobs[0]
+
+    def build(root: Path) -> Dict[str, Any]:
+        command, xclbin, insts, manifest = _compile_command(header, kind, options, root)
+        (root / "artifacts").mkdir(parents=True, exist_ok=True)
+        (root / "model.onnx").write_bytes(model)
+        try:
+            return _execute_compile(command, kind, root, xclbin, insts, manifest)
+        finally:
+            (root / "model.onnx").unlink(missing_ok=True)
+
+    if not cache.cache_enabled(options):
+        root = Path(work_dir) / "xdna-rpc" / uuid.uuid4().hex
+        root.mkdir(parents=True, exist_ok=False)
+        command, xclbin, insts, manifest = _compile_command(header, kind, options, root)
+        (root / "model.onnx").write_bytes(model)
+        (root / "artifacts").mkdir()
+        result = _execute_compile(command, kind, root, xclbin, insts, manifest)
+        return {**result, "cache": "bypass"}, []
+
+    probe_root = Path("@ROOT@")
+    command = _compile_command(header, kind, options, probe_root)[0]
+    key = _cache_key(header, kind, options, model, command, probe_root)
+
+    def required(_root: Path) -> list[str]:
+        if kind == "resnet":
+            return []
+        return [f"artifacts/{kind}.xclbin", f"artifacts/{kind}.insts.bin"]
+
+    result, status = cache.get_or_build(
+        cache.cache_root(options, work_dir),
+        key,
+        build,
+        required,
+        cache.max_entries(options),
+    )
+    return {**result, "cache": status, "cache_key": key}, []
 
 
 def run_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):

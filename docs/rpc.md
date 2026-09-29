@@ -239,6 +239,36 @@ IRON `whole_array.py` path as `options["example"]`. Compiled paths remain on the
 server, so compile and run calls must use the same server. Compiler failures
 are returned with the subprocess log tail for diagnosis.
 
+### XDNA compile cache
+
+Compiles take 40 s to a few minutes and are usually repeated with identical inputs, so
+`xdna_compile_resnet` caches artifacts on the server, content-addressed. The reply has the same
+shape as a fresh compile plus `"cache": "hit" | "miss" | "bypass"` and `"cache_key"`; artifact
+paths point into the cache entry (`<cache>/<key>/artifacts/...`) and stay valid until the entry is
+evicted.
+
+The key is a SHA-256 over: the compile kind; the model bytes; the exact compiler command
+(device, columns, `compile_all`, `optimize_small_m`, block(s), groups/chunk caps/depths, `blocked`,
+pool geometry, ... -- only options that reach the compiler count, so e.g. `no_cache` does not);
+the content hash of the `resnet` `example` file; every `.py`/`.cc`/`.h` file under
+`scripts/xdna` (excluding `__pycache__`) plus `onnxsim/rpc/xdna.py`; the IRON python identity
+(path, Python version, mlir_aie/aie version, Peano `clang` stat, XRT `version.info`, probed once
+per process); and the compile-relevant environment (`XDNA_*` such as `XDNA_BLOCKED_MAX_CHUNK`,
+`AIE_*`, `IRON_*`, `PEANO*`, `MLIR_AIE*`, `XILINX_XRT`, `PYTHONPATH`, `PATH`,
+`LD_LIBRARY_PATH`). Any change to these misses; nothing else needs manual invalidation.
+
+Entries are built in a temp directory and published by atomic rename under a per-key `flock`, so
+concurrent identical requests compile once and a crash never leaves a partial entry. On a hit
+every recorded file must still exist with its recorded non-zero size, otherwise the entry is
+discarded and rebuilt. The cache keeps the newest entries by last use (LRU by mtime).
+
+| Setting | Meaning |
+| --- | --- |
+| `options["no_cache"]=True` | skip the cache; compile into a fresh `<work_dir>/xdna-rpc/<uuid>` (`"cache": "bypass"`) |
+| `ONNXSIM_XDNA_CACHE=0` | disable the cache server-wide |
+| `ONNXSIM_XDNA_CACHE_DIR` / `options["cache_dir"]` | cache root (default `<work_dir>/xdna-cache`) |
+| `ONNXSIM_XDNA_CACHE_MAX_ENTRIES` / `options["cache_max_entries"]` | entries kept (default 20) |
+
 For an apples-to-apples full-graph comparison, use
 `Session.xdna_compare_vitis_resnet(model, manifest, options)`. It runs the XDNA
 graph and then Vitis AI sequentially on the same server, with identical input
