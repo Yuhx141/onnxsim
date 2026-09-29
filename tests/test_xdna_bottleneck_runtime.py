@@ -10,9 +10,18 @@ onnx = pytest.importorskip("onnx")
 from bottleneck_runtime import bind_bottleneck_block  # noqa: E402
 from resnet_bottleneck import plan_bottleneck_blocks  # noqa: E402
 
+QUICKTEST_MODEL = Path("/home/takecheeze/ryzen_ai-1.8.0/venv/quicktest/test_model.onnx")
+
+
+def _quicktest_model() -> str:
+    """The Ryzen AI quicktest ResNet-50 (only present on the XDNA development host)."""
+    if not QUICKTEST_MODEL.is_file():
+        pytest.skip(f"quicktest model not available: {QUICKTEST_MODEL}")
+    return str(QUICKTEST_MODEL)
+
 
 def test_quicktest_bottleneck_bindings_reject_bias_or_downsample():
-    model = onnx.load("/home/takecheeze/ryzen_ai-1.8.0/venv/quicktest/test_model.onnx")
+    model = onnx.load(_quicktest_model())
     bindings = [
         bind_bottleneck_block(model, block) for block in plan_bottleneck_blocks(model)
     ]

@@ -186,8 +186,8 @@ def _value_metadata(model: Any) -> tuple[dict[str, tuple[int, ...]], dict[str, i
         from onnx import numpy_helper
         for value in getattr(graph, "initializer", ()):
             constant_ints[str(value.name)] = tuple(int(x) for x in numpy_helper.to_array(value).reshape(-1))
-    except (ImportError, TypeError, ValueError):
-        pass
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass  # not real protobuf tensors (e.g. test doubles): no constant values
     for node in graph.node:
         if str(node.op_type) != "Constant" or not node.output:
             continue
