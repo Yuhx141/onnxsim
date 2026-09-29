@@ -15,11 +15,14 @@ import dataclasses
 import math
 import os
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 import binary_op_scale_emit
 import compose_emit
+import elementwise_scale_emit
 import matmul_record_emit
 import misc_op_record_emit
+import numpy as np
 import onnx
 import reshape_emit
 import transpose_real_shapes
@@ -64,23 +67,19 @@ def _retarget_schedule_names(
     Retarget the sidecar by IO position while leaving the model and its MCode
     untouched.
     """
-    if len(model.graph.input) != len(source.graph.input) or len(
-        model.graph.output
-    ) != len(source.graph.output):
-        # Calibration-free comparison templates may expose an additional
-        # constant/runtime input that is not present in the source UOp graph.
-        # Their generated sidecar is still useful for inspection, but cannot
-        # be positionally retargeted.
+    if len(model.graph.output) != len(source.graph.output) or len(
+        model.graph.input
+    ) < len(source.graph.input):
         return
     rename = {
-        new.name: old.name
-        for old, new in zip(model.graph.input, source.graph.input)
+        old.name: new.name
+        for old, new in zip(source.graph.input, model.graph.input)
         if old.name != new.name
     }
     rename.update(
         {
-            new.name: old.name
-            for old, new in zip(model.graph.output, source.graph.output)
+            old.name: new.name
+            for old, new in zip(source.graph.output, model.graph.output)
             if old.name != new.name
         }
     )
@@ -109,8 +108,109 @@ def _retarget_schedule_names(
                 else int(spec.type.tensor_type.elem_type)
             )
             entry["nbytes"] = math.prod(entry["shape"]) * 4
+
+    # A measured template may expose a broadcast/helper tensor as an extra
+    # runtime input even when the source UOp represented it as a scalar
+    # constant.  Give it a real allocation and thread it into the one emitted
+    # neu-mode kernel; AXCL has no implicit broadcast input at this boundary.
+    extra_inputs = list(model.graph.input[len(source.graph.input) :])
+    if extra_inputs:
+        allocations = retargeted.setdefault("allocations", [])
+        existing_inputs = {entry["name"] for entry in retargeted.get("inputs", ())}
+        used_end = max(
+            (int(item["offset"]) + int(item["nbytes"]) for item in allocations),
+            default=0,
+        )
+        for spec in extra_inputs:
+            if spec.name in existing_inputs:
+                continue
+            shape = [int(dim.dim_value) for dim in spec.type.tensor_type.shape.dim]
+            nbytes = math.prod(shape) * 4
+            offset = (used_end + 63) // 64 * 64
+            allocations.append(
+                {
+                    "first_kernel": 0,
+                    "last_kernel": len(retargeted["kernels"]) - 1,
+                    "name": spec.name,
+                    "nbytes": nbytes,
+                    "offset": offset,
+                }
+            )
+            retargeted["inputs"].append(
+                {
+                    "elem_type": 15
+                    if spec.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+                    else int(spec.type.tensor_type.elem_type),
+                    "kind": "input",
+                    "name": spec.name,
+                    "nbytes": nbytes,
+                    "shape": shape,
+                }
+            )
+            used_end = offset + nbytes
+            existing_inputs.add(spec.name)
+        retargeted["memory_size"] = max(int(retargeted["memory_size"]), used_end)
+        if len(retargeted["kernels"]) == 1 and len(model.graph.node) == 1:
+            retargeted["kernels"][0]["inputs"] = list(model.graph.node[0].input)
     schedule.clear()
     schedule.update(retargeted)
+
+
+def _retarget_model_names(model: onnx.ModelProto, source: onnx.ModelProto) -> None:
+    """Retarget a measured template's public IO names to the source graph.
+
+    Emitters keep the names from their measured build (for example the FC
+    template uses ``distill__...`` names).  The mcode is independent of those
+    names, but an emitted ONNX model must still implement the source model's
+    input/output contract.  Only positional public IO names are changed;
+    extra side outputs exposed by a measured template remain untouched.
+    """
+    # Some measured misc ``neu mode`` programs carry their source tensor names
+    # in compiled metadata.  Renaming those values changes AXCL setup
+    # (0x80300709) even though the ONNX graph remains structurally equivalent.
+    # Keep those measured names and retarget the sidecar schedule below; all
+    # other graph forms continue through the positional source retargeting.
+    name_sensitive_ops = {
+        "Neg",
+        "Log",
+        "Softmax",
+        "ReduceMean",
+        "ReduceSum",
+        "MaxPool",
+        "Greater",
+        "Less",
+        "MatMul",
+        "Gemm",
+    }
+    if (
+        len(model.graph.node) == 1
+        and model.graph.node[0].op_type == "neu mode"
+        and any(node.op_type in name_sensitive_ops for node in source.graph.node)
+    ):
+        return
+    if len(model.graph.input) != len(source.graph.input) or len(
+        model.graph.output
+    ) != len(source.graph.output):
+        return
+    rename = {
+        new.name: old.name
+        for old, new in zip(source.graph.input, model.graph.input)
+        if old.name != new.name
+    }
+    rename.update(
+        {
+            new.name: old.name
+            for old, new in zip(source.graph.output, model.graph.output)
+            if old.name != new.name
+        }
+    )
+    if not rename:
+        return
+    for node in model.graph.node:
+        node.input[:] = [rename.get(name, name) for name in node.input]
+        node.output[:] = [rename.get(name, name) for name in node.output]
+    for value in (*model.graph.input, *model.graph.output, *model.graph.value_info):
+        value.name = rename.get(value.name, value.name)
 
 
 def _shape(value) -> tuple[int, ...]:
@@ -125,6 +225,31 @@ def _initializer_map(model: onnx.ModelProto) -> dict[str, onnx.TensorProto]:
     return {item.name: item for item in model.graph.initializer}
 
 
+def _normalize_commutative_constant_binary(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Put a constant second for measured commutative binary templates.
+
+    The emitter's public slots are ``x`` then ``z``.  ONNX permits either
+    operand order for Add/Mul, so normalize only those operations; Sub/Div
+    must retain their order because swapping them changes the result.
+    """
+    if len(model.graph.node) != 1:
+        return model
+    node = model.graph.node[0]
+    initializers = _initializer_map(model)
+    graph_inputs = {item.name for item in model.graph.input}
+    if (
+        node.op_type not in ("Add", "Mul")
+        or len(node.input) != 2
+        or node.input[0] not in initializers
+        or node.input[1] not in graph_inputs
+    ):
+        return model
+    normalized = onnx.ModelProto()
+    normalized.CopyFrom(model)
+    normalized.graph.node[0].input[:] = [node.input[1], node.input[0]]
+    return normalized
+
+
 def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     """Recognize and schedule one measured composed graph.
 
@@ -134,6 +259,7 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     launches.  Inputs ``x``, ``w`` and ``b`` are required to remain runtime
     inputs; constant folding them would select a different compiled family.
     """
+    model = _normalize_commutative_constant_binary(model)
     model = onnx.shape_inference.infer_shapes(model)
     nodes = list(model.graph.node)
     values = {
@@ -183,6 +309,19 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                     position,
                 ),
             )
+        )
+    if len(nodes) == 1 and nodes[0].op_type == "Relu":
+        relu = nodes[0]
+        if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
+            raise ValueError("standalone Relu requires one runtime input named x")
+        shape = values.get("x", ())
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
+        if not shape or output_shape != shape or list(relu.input) != ["x"]:
+            raise ValueError("standalone Relu requires matching static x/y shapes")
+        return GraphPlan(
+            (GraphSegment("relu", ("x",), model.graph.output[0].name, shape, shape),)
         )
     if len(nodes) == 1 and nodes[0].op_type == "Transpose":
         transpose = nodes[0]
@@ -300,6 +439,59 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
+    if len(nodes) == 1 and nodes[0].op_type == "Conv":
+        conv = nodes[0]
+        init = _initializer_map(model)
+        if len(model.graph.input) != 1 or model.graph.input[0].name != conv.input[0]:
+            raise ValueError("standalone Conv requires one runtime input named x")
+        if conv.input[1] not in init:
+            raise ValueError("standalone Conv requires a frozen weight initializer")
+        shape = values.get(conv.input[0], ())
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
+        weight_shape = tuple(int(d) for d in init[conv.input[1]].dims)
+        attrs = _attrs(conv)
+        strides = tuple(attrs.get("strides", (1, 1)))
+        pads = tuple(attrs.get("pads", (0, 0, 0, 0)))
+        dilations = tuple(attrs.get("dilations", (1, 1)))
+        if (
+            not shape
+            or not output_shape
+            or len(conv.input) not in (2, 3)
+            or (len(conv.input) == 3 and conv.input[2] not in init)
+            or attrs.get("group", 1) != 1
+            or dilations != (1, 1)
+        ):
+            raise ValueError("standalone Conv is not a validated frozen-weight form")
+        # Resolve the exact committed Conv template now, before generation.
+        # The emitter deliberately refuses every unmeasured shape/stride/pad.
+        from tinygrad_ax_backend import TemplateCache, TemplateKey
+
+        TemplateCache().lookup(
+            TemplateKey(
+                "Conv",
+                (tuple(shape),),
+                (
+                    ("pads", pads),
+                    ("strides", strides),
+                    ("w", weight_shape),
+                ),
+                weight_dtype="s8",
+            )
+        )
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "conv",
+                    (conv.input[0],),
+                    model.graph.output[0].name,
+                    tuple(shape),
+                    tuple(output_shape),
+                    operand_shape=weight_shape,
+                ),
+            )
+        )
     if (
         len(nodes) == 2
         and nodes[0].op_type in ("Greater", "Less")
@@ -414,28 +606,45 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         )
     if len(nodes) == 1 and nodes[0].op_type in ("Add", "Sub", "Mul", "Div"):
         add = nodes[0]
-        if len(model.graph.input) != 2 or [item.name for item in model.graph.input] != [
-            "x",
-            "z",
-        ]:
+        init = _initializer_map(model)
+        runtime_inputs = [item.name for item in model.graph.input]
+        constant_second = (
+            len(runtime_inputs) == 1
+            and runtime_inputs == ["x"]
+            and len(add.input) == 2
+            and add.input[1] in init
+        )
+        if not constant_second and runtime_inputs != ["x", "z"]:
             raise ValueError(
                 f"standalone {add.op_type} generator requires runtime inputs named x and z"
             )
-        if len(add.input) != 2 or tuple(values.get(name, ()) for name in add.input) != (
-            values.get("x", ()),
-            values.get("z", ()),
+        if (
+            len(add.input) != 2
+            or add.input[0] != "x"
+            or (not constant_second and add.input[1] != "z")
         ):
             raise ValueError(
                 f"standalone {add.op_type} inputs must be the graph inputs"
             )
-        shape = values.get("x", ())
-        if not shape or values.get("z", ()) != shape:
+        input_shapes = (
+            values.get("x", ()),
+            (
+                tuple(int(dim) for dim in init[add.input[1]].dims) or (1,)
+                if constant_second
+                else values.get("z", ())
+            ),
+        )
+        if not all(input_shapes):
+            raise ValueError(f"standalone {add.op_type} requires static input shapes")
+        try:
+            shape = tuple(np.broadcast_shapes(*input_shapes))
+        except ValueError as exc:
             raise ValueError(
-                f"standalone {add.op_type} requires equal static input shapes"
-            )
+                f"standalone {add.op_type} inputs are not broadcast-compatible"
+            ) from exc
         if not model.graph.output or values.get(model.graph.output[0].name) != shape:
             raise ValueError(
-                f"standalone {add.op_type} output shape must match its inputs"
+                f"standalone {add.op_type} output shape must match its broadcast shape"
             )
         return GraphPlan(
             (
@@ -511,7 +720,7 @@ def generate(
     *,
     indices: Sequence[int] | None = None,
     schedule_path: str | None = None,
-    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+    calibration: Mapping[str, Any] | None = None,
 ) -> GraphPlan:
     """Generate an AX model from a supported ONNX graph without Pulsar2.
 
@@ -521,6 +730,7 @@ def generate(
     initializer and must stay in the template's calibrated range.
     """
     model = onnx.load(source_path, load_external_data=False)
+    model = _normalize_commutative_constant_binary(model)
     plan = schedule_graph(model)
     if schedule_path is not None:
         # Keep schedule generation on the same validated source model and
@@ -529,11 +739,45 @@ def generate(
 
         import schedule_ir
 
-        schedule = schedule_ir.build(model)
+        schedule_model = model
+        # schedule_ir deliberately excludes ONNX initializers from its
+        # allocation graph.  Constant binary templates, however, consume the
+        # initializer through a second runtime slot, so present that slot as
+        # a graph input while constructing the sidecar.
+        if (
+            len(model.graph.node) == 1
+            and model.graph.node[0].op_type in ("Add", "Sub", "Mul", "Div")
+            and len(model.graph.node[0].input) == 2
+            and model.graph.node[0].input[1] in _initializer_map(model)
+        ):
+            schedule_model = onnx.ModelProto()
+            schedule_model.CopyFrom(model)
+            initializer = _initializer_map(schedule_model)[model.graph.node[0].input[1]]
+            del schedule_model.graph.initializer[:]
+            schedule_model.graph.input.append(
+                onnx.helper.make_tensor_value_info(
+                    initializer.name,
+                    initializer.data_type,
+                    list(initializer.dims) or [1],
+                )
+            )
+        schedule = schedule_ir.build(schedule_model)
         with open(schedule_path, "w", encoding="utf-8") as stream:
             json.dump(schedule.to_json(), stream, indent=2, sort_keys=True)
             stream.write("\n")
-    if plan.chain == "reshape_relu":
+    if plan.chain == "relu":
+        if calibration is None:
+            raise ValueError("standalone Relu generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError(
+                "Relu calibration requires scales and zero_points mappings"
+            )
+        elementwise_scale_emit.emit(
+            "Relu", plan.segments[0].input_shape, scales, zero_points, output_path
+        )
+    elif plan.chain == "reshape_relu":
         segment = plan.segments[0]
         reshape_emit.emit_fused_reshape_axmodel(
             segment.input_shape,
@@ -639,6 +883,49 @@ def generate(
             zero_points=zero_points,
         )
         onnx.save(model, output_path)
+    elif plan.chain == "conv":
+        if calibration is None:
+            raise ValueError("standalone Conv generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError(
+                "Conv calibration requires scales and zero_points mappings"
+            )
+        import tinygrad_ax_backend as axb
+
+        node = model.graph.node[0]
+        init = _initializer_map(model)
+        weights = numpy_helper.to_array(init[node.input[1]]).astype(np.float32)
+        bias = (
+            numpy_helper.to_array(init[node.input[2]]).astype(np.float32)
+            if len(node.input) == 3
+            else np.zeros(weights.shape[0], dtype=np.float32)
+        )
+        attrs = _attrs(node)
+        key = axb.TemplateKey(
+            "Conv",
+            (plan.segments[0].input_shape,),
+            (
+                ("pads", tuple(attrs.get("pads", (0, 0, 0, 0)))),
+                ("strides", tuple(attrs.get("strides", (1, 1)))),
+                ("w", tuple(weights.shape)),
+            ),
+            weight_dtype="s8",
+        )
+        generated = axb.EditSet(
+            [
+                axb.ConvWeightEdit(
+                    weights,
+                    bias,
+                    float(scales["x"]),
+                    float(zero_points["x"]),
+                    float(scales["y"]),
+                    float(zero_points["y"]),
+                )
+            ]
+        ).build(key)
+        onnx.save(generated, output_path)
     elif plan.chain in ("greatercast", "lesscast"):
         model = misc_op_record_emit.emit_spec(
             plan.chain.title().replace("cast", "Cast"),
@@ -683,13 +970,46 @@ def generate(
             raise ValueError(
                 f"{plan.chain.title()} calibration requires scales and zero_points mappings"
             )
-        binary_op_scale_emit.emit(
-            plan.chain.title(),
-            plan.segments[0].input_shape,
-            scales,
-            zero_points,
-            output_path,
-        )
+        precision = calibration.get("layer_precision", "U8")
+        if precision == "U8":
+            binary_op_scale_emit.emit(
+                plan.chain.title(),
+                plan.segments[0].input_shape,
+                scales,
+                zero_points,
+                output_path,
+            )
+        else:
+            if precision not in ("U16", "S16"):
+                raise ValueError(
+                    f"unsupported binary layer precision {precision!r}; "
+                    "expected U8, U16, or S16"
+                )
+            if not {"x", "z", "y"} <= set(scales) or not {
+                "x",
+                "z",
+                "y",
+            } <= set(zero_points):
+                raise ValueError(
+                    "high-precision binary calibration needs x, z, and y scales/zero_points"
+                )
+            zps = {name: int(zero_points[name]) for name in ("x", "y", "z")}
+            if any(float(zero_points[name]) != zps[name] for name in zps):
+                raise ValueError("binary zero points must be integral")
+            from tinygrad_ax_backend import TemplateCache, TemplateKey
+
+            key = TemplateKey(
+                plan.chain.title(),
+                (plan.segments[0].input_shape,),
+                calibration_class=",".join(
+                    f"{name}{zps[name]}" for name in ("x", "y", "z")
+                ),
+                layer_precision=precision,
+                calibration_scales=tuple(
+                    float(scales[name]) for name in ("x", "z", "y")
+                ),
+            )
+            onnx.save(TemplateCache().load(key), output_path)
     else:
         if indices is None:
             init = _initializer_map(model)
@@ -701,13 +1021,17 @@ def generate(
         compose_emit.emit_gather_in_graph(plan.chain, output_path, indices=indices)
     if not os.path.exists(output_path):
         raise RuntimeError(f"generator did not produce {output_path}")
+    emitted = onnx.load(output_path, load_external_data=False)
+    source = onnx.load(source_path, load_external_data=False)
+    _retarget_model_names(emitted, source)
+    onnx.save(emitted, output_path)
     if schedule_path is not None:
         with open(schedule_path, encoding="utf-8") as stream:
             schedule = json.load(stream)
         _retarget_schedule_names(
             schedule,
-            onnx.load(output_path, load_external_data=False),
-            onnx.load(source_path, load_external_data=False),
+            emitted,
+            source,
         )
         with open(schedule_path, "w", encoding="utf-8") as stream:
             json.dump(schedule, stream, indent=2, sort_keys=True)

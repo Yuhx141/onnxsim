@@ -1661,6 +1661,18 @@
   },
   "source": "mul_1000x512_zp128_t"
  },
+ "Mul:1024x512:x0,y0,z0": {
+  "file": "mul_1024x512_x0_y0_z0_unit.axmodel.gz",
+  "op": "Mul",
+  "shape": [1024, 512],
+  "scales": {
+   "x": 0.003921568859368563,
+   "z": 0.003921568859368563,
+   "y": 0.003921568859368563
+  },
+  "zero_points": {"x": 0, "z": 0, "y": 0},
+  "source": "native_shape_probe_mul_1024x512_unit"
+ },
  "Mul:128x128x3x3:x0,y0,z0": {
   "file": "mul_128x128x3x3_x0_y0_z0.axmodel.gz",
   "op": "Mul",
@@ -1909,6 +1921,42 @@
   },
   "source": "mul_16x256x14x14_zp128_t"
  },
+ "Mul:16x256x7x7:x0,y0,z0": {
+  "file": "mul_16x256x7x7_x0_y0_z0.axmodel.gz",
+  "op": "Mul",
+  "shape": [16, 256, 7, 7],
+  "scales": {
+   "x": 0.0050980388186872005,
+   "z": 0.0027450979687273502,
+   "y": 0.003568627405911684
+  },
+  "zero_points": {"x": 0, "z": 0, "y": 0},
+  "source": "native_shape_probe_mul_16x256x7x7"
+ },
+ "Mul:16x128x14x14:x0,y0,z0": {
+  "file": "mul_16x128x14x14_x0_y0_z0.axmodel.gz",
+  "op": "Mul",
+  "shape": [16, 128, 14, 14],
+  "scales": {
+   "x": 0.0050980388186872005,
+   "z": 0.0027450979687273502,
+   "y": 0.003568627405911684
+  },
+  "zero_points": {"x": 0, "z": 0, "y": 0},
+  "source": "native_shape_probe_mul_16x128x14x14"
+ },
+ "Mul:16x64x28x28:x0,y0,z0": {
+  "file": "mul_16x64x28x28_x0_y0_z0.axmodel.gz",
+  "op": "Mul",
+  "shape": [16, 64, 28, 28],
+  "scales": {
+   "x": 0.0050980388186872005,
+   "z": 0.0027450979687273502,
+   "y": 0.003568627405911684
+  },
+  "zero_points": {"x": 0, "z": 0, "y": 0},
+  "source": "native_shape_probe_mul_16x64x28x28"
+ },
  "Mul:16x512x7x7:x0,y0,z0": {
   "file": "mul_16x512x7x7_x0_y0_z0.axmodel.gz",
   "op": "Mul",
@@ -1971,6 +2019,18 @@
    "y": 0
   },
   "source": "mul_16x64x56x56_zp0_t"
+ },
+ "Mul:16x64x56x56:x115,y115,z0": {
+  "file": "mul_16x64x56x56_x115_y115_z0.axmodel.gz",
+  "op": "Mul",
+  "shape": [16, 64, 56, 56],
+  "scales": {
+   "x": 5.129870987730101e-05,
+   "z": 0.003921568859368563,
+   "y": 5.129870987730101e-05
+  },
+  "zero_points": {"x": 115, "z": 0, "y": 115},
+  "source": "native_shape_probe_correlated_mask_mul_16x64x56x56"
  },
  "Mul:16x64x56x56:x128,y128,z128": {
   "file": "mul_16x64x56x56_x128_y128_z128.axmodel.gz",
@@ -3208,5 +3268,124 @@
    "y": 128
   },
   "source": "sub_64x64x3x3_zp128_t"
+ },
+ "Add:1x1:x128,y128,z128": {
+  "file": "add_1x1_x128_y128_z128.axmodel.gz",
+  "op": "Add",
+  "shape": [
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.003921568859368563,
+   "y": 0.0117647061124444
+  },
+  "zero_points": {
+   "x": 128,
+   "z": 128,
+   "y": 128
+  },
+  "source": "native_shape_probe_add_1x1"
+ },
+ "Div:1x1:x128,y128,z0": {
+  "file": "div_1x1_x128_y128_z0.axmodel.gz",
+  "op": "Div",
+  "shape": [
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.0019607844296842813,
+   "y": 0.01568627543747425
+  },
+  "zero_points": {
+   "x": 128,
+   "z": 0,
+   "y": 128
+  },
+  "source": "native_shape_probe_div_1x1"
+ },
+ "Mul:1x1:x0,y0,z0": {
+  "file": "mul_1x1_x0_y0_z0.axmodel.gz",
+  "op": "Mul",
+  "shape": [
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.0035294117406010628,
+   "z": 0.004705882631242275,
+   "y": 0.004235294181853533
+  },
+  "zero_points": {
+   "x": 0,
+   "z": 0,
+   "y": 0
+  },
+ "source": "native_shape_probe_mul_1x1"
+ },
+ "Mul:1x1:x255,y255,z0": {
+  "file": "mul_1x1_x255_y255_z0.axmodel.gz",
+  "op": "Mul",
+  "shape": [
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.0034396550618112087,
+   "z": 0.0028381983283907175,
+   "y": 0.0014303958741948009
+  },
+  "zero_points": {
+   "x": 255,
+   "z": 0,
+   "y": 255
+  },
+  "source": "native_zp255_shape_probe_mul_1x1"
+ },
+ "Mul:16x1000:x255,y255,z0": {
+  "file": "mul_16x1000_x255_y255_z0.axmodel.gz",
+  "op": "Mul",
+  "shape": [
+   16,
+   1000
+  ],
+  "scales": {
+   "x": 0.0039215185679495335,
+   "z": 0.003921556752175093,
+   "y": 0.003910829313099384
+  },
+  "zero_points": {
+   "x": 255,
+   "z": 0,
+   "y": 255
+  },
+ "source": "native_zp255_shape_probe_mul_16x1000"
+ },
+ "Div:1x1:x255,y255,z0": {
+  "file": "div_1x1_x255_y255_z0.axmodel.gz",
+  "op": "Div",
+  "shape": [1, 1],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.0007843137136660516,
+   "y": 0.03921568766236305
+  },
+  "zero_points": {"x": 255, "z": 0, "y": 255},
+  "source": "native_zp255_shape_probe_div_1x1"
+ },
+ "Div:16x1000:x255,y255,z0": {
+  "file": "div_16x1000_x255_y255_z0.axmodel.gz",
+  "op": "Div",
+  "shape": [16, 1000],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.003921568859368563,
+   "y": 0.03921568766236305
+  },
+  "zero_points": {"x": 255, "z": 0, "y": 255},
+  "source": "native_zp255_shape_probe_div_16x1000"
  }
 }

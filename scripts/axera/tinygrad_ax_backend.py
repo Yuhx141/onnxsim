@@ -121,6 +121,11 @@ class TemplateKey:
     ``weight_dtype`` is how a constant weight is stored (``WEIGHT_DTYPES``
     names, see ``axera_weight_dtype``). It is ``""`` for ops without a
     constant weight, and for a Conv it means the template's own (``s8``).
+    ``layer_precision`` is the compiler's per-layer activation precision,
+    separate from the source graph's float32 tensor dtype, and participates in
+    cache identity so different arithmetic formats cannot alias templates.
+    ``calibration_scales`` is the exact (x, z, y) float scale tuple required
+    by high-precision binary templates, which do not support scale retargeting.
     """
 
     op: str
@@ -130,6 +135,8 @@ class TemplateKey:
     calibration_class: str = ""
     toolchain: str = TOOLCHAIN
     weight_dtype: str = ""
+    layer_precision: str = "U8"
+    calibration_scales: tuple[float, ...] = ()
 
     def attr(self, name: str, default=None):
         return dict(self.attrs).get(name, default)
@@ -145,6 +152,8 @@ class TemplateKey:
             "calibration_class": self.calibration_class,
             "toolchain": self.toolchain,
             "weight_dtype": self.weight_dtype,
+            "layer_precision": self.layer_precision,
+            "calibration_scales": list(self.calibration_scales),
         }
 
     @classmethod
@@ -163,6 +172,10 @@ class TemplateKey:
             calibration_class=d.get("calibration_class", ""),
             toolchain=d.get("toolchain", TOOLCHAIN),
             weight_dtype=d.get("weight_dtype", ""),
+            layer_precision=d.get("layer_precision", "U8"),
+            calibration_scales=tuple(
+                float(x) for x in d.get("calibration_scales", ())
+            ),
         )
 
 
@@ -529,15 +542,36 @@ class TemplateCache:
     delegated to :mod:`template_model_generator` and never invokes Pulsar2.
     """
 
+    def __init__(self):
+        self._entries: dict[TemplateKey, TemplateEntry] = {}
+
     def lookup(self, key: TemplateKey) -> TemplateEntry:
+        cached = self._entries.get(key)
+        if cached is not None:
+            return cached
+        entry = self._lookup(key)
+        self._entries[key] = entry
+        return entry
+
+    def _lookup(self, key: TemplateKey) -> TemplateEntry:
         if key.toolchain != TOOLCHAIN:
             raise ValueError(f"no templates for toolchain {key.toolchain!r}")
+        if key.layer_precision not in ("U8", "U16", "S16", "FP32"):
+            raise ValueError(
+                f"unsupported layer precision {key.layer_precision!r}; "
+                "expected U8, U16, S16, or FP32"
+            )
         if key.dtypes != ("float32",):
             raise ValueError(
                 f"only float32-activation templates exist, got {key.dtypes} "
                 "(a weight's storage type is weight_dtype)"
             )
         op = key.op
+        if key.layer_precision != "U8" and op not in bse.OPS:
+            raise ValueError(
+                f"no validated {key.layer_precision} layer-precision template "
+                f"for {op} at {key.shapes}"
+            )
         if op == "Conv":
             validate_weight_choice("build", "Conv", key.weight_dtype or "s8")
         elif key.weight_dtype:
@@ -565,6 +599,45 @@ class TemplateCache:
         if op in bse.OPS:
             (shape,) = key.shapes
             zps = _zero_points_from_class(key.calibration_class)
+            if key.layer_precision != "U8":
+                if key.layer_precision not in ("U16", "S16"):
+                    raise ValueError(
+                        f"no validated {key.layer_precision} layer-precision "
+                        f"template for {op} at {key.shapes}"
+                    )
+                index_path = os.path.join(
+                    _FIXTURES, "binary_op_precision", "index.json"
+                )
+                if not os.path.isfile(index_path):
+                    raise ValueError(
+                        f"no validated {key.layer_precision} layer-precision "
+                        f"template for {op} at {key.shapes}"
+                    )
+                with open(index_path) as f:
+                    index = json.load(f)
+                scales = tuple(float(x) for x in key.calibration_scales)
+                if len(scales) != 3:
+                    raise ValueError(
+                        "high-precision binary template needs exact x,z,y calibration_scales"
+                    )
+                for meta in index:
+                    if (
+                        meta["op"] == op
+                        and tuple(meta["shape"]) == shape
+                        and meta["precision"] == key.layer_precision
+                        and tuple(meta["zero_points"]) == (zps["x"], zps["y"], zps["z"])
+                        and tuple(meta["scales"]) == scales
+                    ):
+                        return TemplateEntry(
+                            "binary_precision",
+                            os.path.join(
+                                _FIXTURES, "binary_op_precision", meta["file"]
+                            ),
+                            meta,
+                        )
+                raise ValueError(
+                    f"no exact-calibration {key.layer_precision} template for {op} at {shape}"
+                )
             _, meta = bse.load_template(op, shape, zps)
             return TemplateEntry(
                 "binary", os.path.join(bse.TEMPLATE_DIR, meta["file"]), meta
@@ -681,6 +754,26 @@ class TemplateOnly:
 
     def to_json(self):
         return {"type": "template_only"}
+
+
+@dataclasses.dataclass
+class BinaryTemplateOnly:
+    """Keep an exact binary template for a collision class.
+
+    Binary scale retargeting rejects coincident scale formulas because that is
+    a different Pulsar2 program family. A shape probe can nevertheless match
+    the target calibration exactly, in which case no MCode edit is needed.
+    """
+
+    def validate(self, key, entry):
+        if entry.kind not in ("binary", "binary_precision"):
+            raise ValueError(f"{key.op} template is not a binary template")
+
+    def apply(self, key, entry, model):
+        return model
+
+    def to_json(self):
+        return {"type": "binary_template_only"}
 
 
 @dataclasses.dataclass
@@ -827,6 +920,8 @@ def edit_from_json(d: Mapping) -> Edit:
     kind = d.get("type")
     if kind == "template_only":
         return TemplateOnly()
+    if kind == "binary_template_only":
+        return BinaryTemplateOnly()
     if kind == "gather_indices":
         return GatherIndexEdit(list(d["indices"]))
     if kind == "elementwise_scales":
@@ -886,8 +981,13 @@ _ELEMENTWISE_ZP_CLASSES = ("x0,y0", "x128,y128")
 _BINARY_ZP_CLASSES = {
     "Add": ("x0,y0,z0", "x128,y128,z128"),
     "Sub": ("x0,y0,z0", "x128,y128,z128"),
-    "Mul": ("x0,y0,z0", "x128,y128,z128"),
-    "Div": ("x0,y0,z0", "x128,y128,z0"),
+    "Mul": (
+        "x0,y0,z0",
+        "x128,y128,z128",
+        "x255,y255,z0",
+        "x115,y115,z0",
+    ),
+    "Div": ("x0,y0,z0", "x128,y128,z0", "x255,y255,z0"),
 }
 
 
@@ -1044,6 +1144,11 @@ def key_for_record(
     rec: Mapping, calibration_class: str = "", weight_dtype: str = ""
 ) -> TemplateKey:
     attrs = rec.get("attrs", {})
+    shapes = rec["shapes"]
+    if rec["op"] in bse.OPS and attrs.get("template_shape"):
+        shapes = [attrs["template_shape"]]
+    elif rec["op"] in bse.OPS and attrs.get("output_shape"):
+        shapes = [attrs["output_shape"]]
     keep: dict[str, Any] = {}
     if rec["op"] == "Transpose":
         keep["perm"] = tuple(attrs["perm"])
@@ -1056,7 +1161,7 @@ def key_for_record(
         keep["pads"] = tuple(attrs["pads"])
     return TemplateKey(
         op=rec["op"],
-        shapes=tuple(_tup(s) for s in rec["shapes"]),
+        shapes=tuple(_tup(s) for s in shapes),
         attrs=tuple(sorted(keep.items())),
         calibration_class=calibration_class,
         weight_dtype=weight_dtype,
@@ -1129,11 +1234,11 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
             )
         if op in bse.OPS:
             form = attrs.get("form")
-            if form != "same_shape":
+            if form not in ("same_shape", "const", "broadcast"):
                 return (
                     "refused",
                     f"{op} with a {form} operand compiles to a different program; "
-                    "templates exist for two live same-shape inputs only",
+                    "templates exist for live, broadcast, and constant operands",
                 )
             hits = []
             for zp in _BINARY_ZP_CLASSES[op]:
@@ -1323,7 +1428,11 @@ def _at_calibration_matmul(rec: Mapping, calib: Mapping) -> str:
 
 
 def plan_at_calibration(
-    rec: Mapping, calib: Mapping, cache: TemplateCache | None = None
+    rec: Mapping,
+    calib: Mapping,
+    cache: TemplateCache | None = None,
+    *,
+    validate_live: bool = True,
 ) -> tuple[str, str]:
     """``plan_node`` with ``"conditional"`` settled against a real calibration
     (``step_calibration.calibrate``): ``"covered"`` when the node's predicted
@@ -1331,12 +1440,33 @@ def plan_at_calibration(
     ``recalibrate`` succeeds on the predicted scales), else ``"refused"``."""
     cache = cache or TemplateCache()
     status, detail = plan_node(rec, cache)
+    if (
+        status == "refused"
+        and rec.get("attrs", {}).get("form") == "broadcast"
+        and all(name in calib.get("tensors", {}) for name in rec.get("inputs", ())[:2])
+    ):
+        # A broadcast of live tensors can use the measured full-shape binary
+        # program after the smaller operand is expanded at the segment edge.
+        expanded = dict(rec)
+        expanded["shapes"] = [list(rec["shapes"][0])]
+        expanded["attrs"] = dict(rec.get("attrs", {}))
+        expanded["attrs"].update(
+            {"form": "same_shape", "output_shape": list(rec["shapes"][0])}
+        )
+        status, detail = plan_node(expanded, cache)
+        if status == "conditional":
+            rec = expanded
     if status != "conditional":
         return status, detail
     op, attrs = rec["op"], rec.get("attrs", {})
     try:
         live = mre.step_manifest()["nodes"].get(rec.get("name", ""))
         if live is not None and op in ("MatMul", "Gemm", "Conv"):
+            if not validate_live:
+                return "covered", (
+                    "matmul_record_emit.recalibrate deferred to segment emit "
+                    f"({live['template']})"
+                )
             return "covered", _at_calibration_matmul(rec, calib)
         key = attrs.get("misc_key")
         if key and (misc.load_index().get(key) or misc.equivalent_key(key)):
@@ -1356,12 +1486,127 @@ def plan_at_calibration(
                 )
             return "covered", f"ElementwiseScaleEdit ({cls})"
         if op in bse.OPS:
-            zx = _u8_zp(calib, rec["inputs"][0])
-            zz = _u8_zp(calib, rec["inputs"][1])
-            zy = _u8_zp(calib, rec["outputs"][0])
+            const_index = attrs.get("constant_input")
+            if attrs.get("form") == "const" and const_index is None:
+                # Coverage reports use the compact checked-in records, which
+                # do not carry the source initializer table.  Calibration
+                # membership still identifies which side is live.
+                const_index = 0 if rec["inputs"][0] not in calib.get("tensors", {}) else 1
+            if attrs.get("form") == "const" and const_index is not None:
+                if op not in ("Add", "Mul") and int(const_index) != 1:
+                    raise _NotAtCalibration(
+                        f"constant-first {op} is not a native commutative binary form"
+                    )
+                live_index = 1 - int(const_index)
+            else:
+                live_index = 0
+            zx = _u8_zp(calib, rec["inputs"][live_index])
+            out_q = _tensor_q(calib, rec["outputs"][0])
+            if attrs.get("tile_blocks") and out_q.get("signed"):
+                if int(out_q["zero_point"]) != 0:
+                    raise _NotAtCalibration(
+                        "tiled binary output must use symmetric zero point 0"
+                    )
+                zy = 0
+            else:
+                zy = _u8_zp(calib, rec["outputs"][0])
+            # Initializers are not activation calibration tensors.  The
+            # runner annotates their measured unsigned class when it has the
+            # source model; standalone coverage keeps the conservative z0
+            # default, which is also the only valid Div denominator class.
+            zz = int(attrs.get("constant_zero_point", 0))
+            if attrs.get("form") != "const":
+                zz = _u8_zp(calib, rec["inputs"][1])
             cls = f"x{zx},y{zy},z{zz}"
             hits = _class_hits(rec, _BINARY_ZP_CLASSES[op], cache)
+            if attrs.get("form") == "const" and cls not in hits:
+                for candidate in (128, 0):
+                    alternate = f"x{zx},y{zy},z{candidate}"
+                    if alternate in hits:
+                        cls, zz = alternate, candidate
+                        break
+            if (
+                op == "Mul"
+                and attrs.get("tile_blocks")
+                and cls in hits
+                and (
+                    attrs.get("form") == "const"
+                    or attrs.get("flat_blocks")
+                    or attrs.get("tile_layout") == "nchw"
+                )
+            ):
+                if attrs.get("flat_blocks") and cls == "x0,y0,z0":
+                    return "covered", (
+                        "ElementwiseScaleEdit (x0,y0,z0) flat-1024x512 "
+                        f"constant from ({cls})"
+                    )
+                if attrs.get("tile_layout") == "nchw":
+                    tile_side = int(attrs.get("tile_side", 56))
+                    return "covered", (
+                        f"ElementwiseScaleEdit ({cls}) tiled-{tile_side}x{tile_side} "
+                        "NCHW mask"
+                    )
+                if cls == "x0,y0,z0":
+                    tile_side = int(attrs.get("tile_side", 7))
+                    return "covered", (
+                        f"ElementwiseScaleEdit (x0,y0,z0) tiled-{tile_side}x{tile_side} "
+                        f"constant from ({cls})"
+                    )
             if cls not in hits:
+                # Constant positive Mul operands can use the measured
+                # x128/y128/z128 frame when the result remains unsigned.
+                # The runner stages the initializer using the frame's z128
+                # scale; signed outputs are excluded because they feed the
+                # separate MatMul int8 path.
+                if (
+                    op == "Mul"
+                    and attrs.get("form") == "const"
+                    and not bool(calib["tensors"][rec["outputs"][0]].get("signed"))
+                    and "x128,y128,z128" in hits
+                ):
+                    return "covered", (
+                        "ElementwiseScaleEdit (x128,y128,z128) fixed-frame "
+                        f"constant from ({cls})"
+                    )
+                # The scalar Add in the decomposed loss path has no native
+                # (1,1) x0 template, but the validated (1,128) x0 program
+                # is lane-independent.  Replicate the scalar inputs across
+                # its lanes and keep lane zero at the segment boundary.
+                if (
+                    op in ("Add", "Sub")
+                    and attrs.get("form") == "same_shape"
+                    and cls == "x0,y0,z0"
+                    and int(np.prod(rec.get("shapes", [[0]])[0] or [0])) == 1
+                ):
+                    expanded = dict(rec)
+                    expanded["shapes"] = [[1, 128]]
+                    try:
+                        cache.lookup(key_for_record(expanded, cls))
+                    except ValueError:
+                        pass
+                    else:
+                        return "covered", (
+                            "ElementwiseScaleEdit (x0,y0,z0) shape-expanded "
+                            "from (1,1) to (1,128)"
+                        )
+                # Add/Sub have a useful fixed-frame decomposition.  When the
+                # measured graph class is not one of the directly compiled
+                # classes, an x128/y128/z128 template can still execute the
+                # dequantized float boundary natively, with bounded extra
+                # quantization error.  This is especially useful for
+                # decomposed training graphs, where residual and optimizer
+                # arithmetic naturally gets distinct zero points at every
+                # edge.
+                if (
+                    op in ("Add", "Sub")
+                    and attrs.get("form") in ("same_shape", "broadcast")
+                    and cls != "x0,y0,z0"
+                    and "x128,y128,z128" in hits
+                ):
+                    return "covered", (
+                        "ElementwiseScaleEdit (x128,y128,z128) recentered from "
+                        f"({cls})"
+                    )
                 raise _NotAtCalibration(
                     f"zero points {cls} are not a template class {hits}"
                 )
@@ -1569,7 +1814,7 @@ def build_onnx_uop_request(
     source_path: str,
     output_path: str | None = None,
     schedule_path: str | None = None,
-    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+    calibration: Mapping[str, Any] | None = None,
 ) -> str:
     """Build an ``AXCompiler`` request for ONNX -> tinygrad UOp -> mcode."""
     req = {"kind": "onnx_uop", "source": source_path}
@@ -1604,13 +1849,33 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         )
 
     def lower_matmul(node):
+        def const_mul(value, candidate):
+            if candidate.op is not Ops.MUL or len(candidate.src) != 2:
+                return None
+            left, right = candidate.src
+            if left.op is Ops.CONST and float(left.arg) == value:
+                return right
+            if right.op is Ops.CONST and float(right.arg) == value:
+                return left
+            return None
+
         bias = None
         if node.op is Ops.ADD and len(node.src) == 2:
             candidate, other = node.src
-            if candidate.op is Ops.REDUCE and other.op is Ops.ALLOC:
+            if const_mul(0.0, candidate) is not None:
+                # ONNX Gemm with beta=0 still arrives from tinygrad as an
+                # explicit zero-scaled bias allocation.  It is semantically
+                # inactive, so remove only this exact wrapper.
+                node = other
+            elif const_mul(0.0, other) is not None:
+                node = candidate
+            elif candidate.op is Ops.REDUCE and other.op is Ops.ALLOC:
                 node, bias = candidate, other
             elif other.op is Ops.REDUCE and candidate.op is Ops.ALLOC:
                 node, bias = other, candidate
+        reduced = const_mul(1.0, node)
+        if reduced is not None and reduced.op is Ops.REDUCE:
+            node = reduced
         if node.op is not Ops.REDUCE or node.arg[0] is not Ops.ADD or node.arg[1] != 1:
             return None
         if not node.src or node.src[0].op is not Ops.PERMUTE:
@@ -2535,7 +2800,17 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         or float(false_value.val) != 0.0
     ):
         raise ValueError("AX UOp Relu branches are not in the supported canonical form")
-    if position == "before":
+    standalone = (
+        position == "before"
+        and data.op is Ops.RESHAPE
+        and len(data.src) >= 1
+        and data.src[0].op is Ops.ALLOC
+    )
+    if standalone:
+        source = data
+        source_shape = tuple(int(dim) for dim in data.shape)
+        target_shape = source_shape
+    elif position == "before":
         if (
             data.op is not Ops.RESHAPE
             or len(data.src) < 1
@@ -2566,7 +2841,9 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
 
     shape_name = "uop_reshape_shape"
     nodes = (
-        [
+        [onnx.helper.make_node("Relu", ["x"], ["y"])]
+        if standalone
+        else [
             onnx.helper.make_node("Reshape", ["x", shape_name], ["reshaped"]),
             onnx.helper.make_node("Relu", ["reshaped"], ["y"]),
         ]
@@ -2576,16 +2853,21 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             onnx.helper.make_node("Reshape", ["relu", shape_name], ["y"]),
         ]
     )
+    initializers = (
+        []
+        if standalone
+        else [
+            onnx.numpy_helper.from_array(
+                np.asarray(target_shape, dtype=np.int64), shape_name
+            )
+        ]
+    )
     graph = onnx.helper.make_graph(
         nodes,
         "tinygrad_uop_ax",
         [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, source_shape)],
         [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, target_shape)],
-        [
-            onnx.numpy_helper.from_array(
-                np.asarray(target_shape, dtype=np.int64), shape_name
-            )
-        ],
+        initializers,
     )
     return onnx.helper.make_model(
         graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
@@ -2595,7 +2877,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
 def compile_uop(
     root,
     schedule_path: str | None = None,
-    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+    calibration: Mapping[str, Any] | None = None,
 ) -> bytes:
     """Lower a supported tinygrad UOp and emit an AX model without Pulsar2.
 
@@ -2708,7 +2990,7 @@ def onnx_to_uop(model_or_path):
 def compile_onnx(
     model_or_path,
     schedule_path: str | None = None,
-    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+    calibration: Mapping[str, Any] | None = None,
 ) -> bytes:
     """Compile ONNX through the complete ``ONNX -> tinygrad UOp -> mcode`` path.
 
@@ -2717,11 +2999,77 @@ def compile_onnx(
     unsupported shapes and graph forms raise from :func:`compile_uop` rather
     than falling back to Pulsar2.
     """
-    return compile_uop(
-        onnx_to_uop(model_or_path),
-        schedule_path=schedule_path,
-        calibration=calibration,
-    )
+    root = onnx_to_uop(model_or_path)
+    if isinstance(model_or_path, onnx.ModelProto):
+        source_model = model_or_path
+    elif isinstance(model_or_path, (bytes, bytearray, memoryview)):
+        source_model = onnx.load_model_from_string(bytes(model_or_path))
+    else:
+        source_model = onnx.load(os.fspath(model_or_path), load_external_data=False)
+    # UOp intentionally represents Conv weights as runtime allocations, and a
+    # biased Conv is canonicalized as Conv + constant Add. For a frozen ONNX
+    # model, retain the source initializer so the validated ConvWeightEdit can
+    # encode it into the committed mcode template.
+    if (
+        len(source_model.graph.node) == 1
+        and source_model.graph.node[0].op_type == "Conv"
+        and len(source_model.graph.node[0].input) >= 2
+        and any(
+            init.name == source_model.graph.node[0].input[1]
+            for init in source_model.graph.initializer
+        )
+    ):
+        import graph_generator
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "frozen_conv.onnx")
+            output = os.path.join(directory, "frozen_conv.axmodel")
+            onnx.save(source_model, source)
+            graph_generator.generate(
+                source, output, schedule_path=schedule_path, calibration=calibration
+            )
+            with open(output, "rb") as stream:
+                return stream.read()
+    # tinygrad imports an initializer binary operand as a CONST UOp, which is
+    # intentionally not ALLOC-backed.  The measured AX binary program still
+    # requires two runtime tensor slots, so keep the UOp import as validation
+    # but route this source-aware case through graph_generator; its schedule
+    # exposes the initializer as a staged helper input instead of embedding it
+    # into the MCode model.
+    if (
+        len(source_model.graph.node) == 1
+        and source_model.graph.node[0].op_type in bse.OPS
+        and len(source_model.graph.input) == 1
+        and len(source_model.graph.node[0].input) == 2
+    ):
+        binary = source_model.graph.node[0]
+        initializer_names = {item.name for item in source_model.graph.initializer}
+        if binary.input[0] in initializer_names:
+            if binary.op_type not in ("Add", "Mul") or binary.input[1] not in {
+                item.name for item in source_model.graph.input
+            }:
+                return compile_uop(root, schedule_path=schedule_path, calibration=calibration)
+            normalized = onnx.ModelProto()
+            normalized.CopyFrom(source_model)
+            normalized.graph.node[0].input[:] = [binary.input[1], binary.input[0]]
+            source_model = normalized
+            binary = source_model.graph.node[0]
+        if binary.input[1] not in {
+            item.name for item in source_model.graph.initializer
+        }:
+            return compile_uop(root, schedule_path=schedule_path, calibration=calibration)
+        import graph_generator
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "constant_binary.onnx")
+            output = os.path.join(directory, "constant_binary.axmodel")
+            onnx.save(source_model, source)
+            graph_generator.generate(
+                source, output, schedule_path=schedule_path, calibration=calibration
+            )
+            with open(output, "rb") as stream:
+                return stream.read()
+    return compile_uop(root, schedule_path=schedule_path, calibration=calibration)
 
 
 def apply_policy(
@@ -2895,6 +3243,28 @@ def tinygrad_classes() -> dict[str, type]:
             self.session = ax_session()
             self.model = self.session.load(self.obj)
 
+        @staticmethod
+        def _stage_input(buffer, spec):
+            """Shape or broadcast a tinygrad input to the emitted model IO.
+
+            Binary templates are emitted at the full output shape because the
+            AX mcode has no separate broadcast instruction.  A scalar (or
+            another smaller broadcastable input) can therefore arrive in a
+            tinygrad buffer with fewer elements than the template expects.
+            """
+            raw = np.frombuffer(buffer, np.uint8, count=memoryview(buffer).nbytes).view(
+                spec.dtype
+            )
+            expected = int(np.prod(spec.shape, dtype=np.int64))
+            if raw.size == expected:
+                return raw.reshape(spec.shape)
+            try:
+                return np.broadcast_to(raw, spec.shape).copy()
+            except ValueError as exc:
+                raise ValueError(
+                    f"input has {raw.size} elements, cannot broadcast to {spec.shape}"
+                ) from exc
+
         def __call__(
             self,
             *bufs,
@@ -2910,8 +3280,7 @@ def tinygrad_classes() -> dict[str, type]:
                     f"model has {n_out} outputs + {len(m.inputs)} inputs, got {len(bufs)} buffers"
                 )
             ins = [
-                np.frombuffer(b, np.uint8, count=spec.nbytes).view(spec.dtype)
-                for b, spec in zip(bufs[n_out:], m.inputs)
+                self._stage_input(b, spec) for b, spec in zip(bufs[n_out:], m.inputs)
             ]
             before = self.session.exec_us
             outs = self.session.run(m, ins)

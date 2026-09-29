@@ -3366,5 +3366,131 @@
   "byte_exact_outside_segment0": false,
   "same_input_order": true,
   "source": "sub_64x64x3x3_zp128_h1"
+ },
+ "add_1x1_x128_y128_z128_h1.axmodel.gz": {
+  "op": "Add",
+  "shape": [
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.003921568859368563,
+   "y": 0.0117647061124444
+  },
+  "zero_points": {
+   "x": 128,
+   "z": 128,
+   "y": 128
+  },
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+  "source": "native_shape_probe_add_1x1"
+ },
+ "div_1x1_x128_y128_z0_h1.axmodel.gz": {
+  "op": "Div",
+  "shape": [
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.0019607844296842813,
+   "y": 0.01568627543747425
+  },
+  "zero_points": {
+   "x": 128,
+   "z": 0,
+   "y": 128
+  },
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+  "source": "native_shape_probe_div_1x1"
+ },
+ "mul_1x1_x0_y0_z0_h1.axmodel.gz": {
+  "op": "Mul",
+  "shape": [
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.0035294117406010628,
+   "z": 0.004705882631242275,
+   "y": 0.004235294181853533
+  },
+  "zero_points": {
+   "x": 0,
+   "z": 0,
+   "y": 0
+  },
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+ "source": "native_shape_probe_mul_1x1"
+ },
+ "mul_1x1_x255_y255_z0_h1.axmodel.gz": {
+  "op": "Mul",
+  "shape": [
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.0034396550618112087,
+   "z": 0.0028381983283907175,
+   "y": 0.0014303958741948009
+  },
+  "zero_points": {
+   "x": 255,
+   "z": 0,
+   "y": 255
+  },
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+  "source": "native_zp255_shape_probe_mul_1x1"
+ },
+ "mul_16x1000_x255_y255_z0_h1.axmodel.gz": {
+  "op": "Mul",
+  "shape": [
+   16,
+   1000
+  ],
+  "scales": {
+   "x": 0.0039215185679495335,
+   "z": 0.003921556752175093,
+   "y": 0.003910829313099384
+  },
+  "zero_points": {
+   "x": 255,
+   "z": 0,
+   "y": 255
+  },
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+ "source": "native_zp255_shape_probe_mul_16x1000"
+ },
+ "div_1x1_x255_y255_z0_h1.axmodel.gz": {
+  "op": "Div",
+  "shape": [1, 1],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.0007843137136660516,
+   "y": 0.03921568766236305
+  },
+  "zero_points": {"x": 255, "z": 0, "y": 255},
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+  "source": "native_zp255_shape_probe_div_1x1"
+ },
+ "div_16x1000_x255_y255_z0_h1.axmodel.gz": {
+  "op": "Div",
+  "shape": [16, 1000],
+  "scales": {
+   "x": 0.007843137718737125,
+   "z": 0.003921568859368563,
+   "y": 0.03921568766236305
+  },
+  "zero_points": {"x": 255, "z": 0, "y": 255},
+  "byte_exact_outside_segment0": false,
+  "same_input_order": true,
+  "source": "native_zp255_shape_probe_div_16x1000"
  }
 }

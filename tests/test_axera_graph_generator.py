@@ -2,6 +2,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import onnx
 import pytest
 
@@ -61,6 +62,34 @@ def test_schedule_arbitrary_matmul_carries_both_operand_shapes():
     assert plan.chain == "matmul"
     assert plan.segments[0].input_shape == (2, 3, 4)
     assert plan.segments[0].operand_shape == (4, 5)
+
+
+def test_generate_normalizes_initializer_first_commutative_binary(tmp_path):
+    shape = (1, 64)
+    constant = onnx.numpy_helper.from_array(np.array(0.2, dtype="float32"), "z")
+    model = _model(
+        [onnx.helper.make_node("Mul", ["z", "x"], ["y"])],
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        [constant],
+    )
+    _, meta = graph_generator.binary_op_scale_emit.load_template(
+        "Mul", shape, {"x": 0, "y": 0, "z": 0}
+    )
+    source = tmp_path / "constant_first.onnx"
+    output = tmp_path / "constant_first.axmodel"
+    schedule = tmp_path / "constant_first.schedule.json"
+    onnx.save(model, source)
+    plan = graph_generator.generate(
+        str(source),
+        str(output),
+        schedule_path=str(schedule),
+        calibration={"scales": meta["scales"], "zero_points": meta["zero_points"]},
+    )
+    assert plan.chain == "mul"
+    scheduled = json.loads(schedule.read_text())
+    assert [item["name"] for item in scheduled["inputs"]] == ["x", "z"]
+    assert scheduled["kernels"][0]["inputs"] == ["z", "x"]
 
 
 def test_generate_uses_one_fused_template(tmp_path):

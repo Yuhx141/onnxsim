@@ -32,13 +32,17 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import gzip
+import hashlib
 import json
+import math
 import os
 import pickle
 import re
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -64,6 +68,14 @@ STEP_OPS = os.path.join(
 STEP_CALIB = os.path.join(
     _HERE, "fixtures", "step_calibration", "resnet18_step_calibration.json.gz"
 )
+STEP_PRECISION_OVERRIDES = os.path.join(
+    _HERE, "fixtures", "step_calibration", "resnet18_s16_overrides.json"
+)
+FP32_BINARY_FIXTURES = os.path.join(_HERE, "fixtures", "fp32_binary")
+FP32_BINARY_SPEED_PROFILES = os.path.join(
+    FP32_BINARY_FIXTURES, "native_mul_speed_profiles.json"
+)
+STEP_BINARY_FIXTURES = os.path.join(_HERE, "fixtures", "step_binary_templates")
 
 
 # --------------------------------------------------------------------------
@@ -75,8 +87,77 @@ def qparams_of(calib: Mapping, name: str) -> tuple[float, int, bool]:
     return float(q["scale"]), int(q["zero_point"]), bool(q.get("signed"))
 
 
-def fake_quant(x: np.ndarray, scale: float, zp: int, signed: bool) -> np.ndarray:
-    lo, hi = (-128, 127) if signed else (0, 255)
+def load_step_precision_overrides(
+    model: onnx.ModelProto,
+    records: Sequence[Mapping],
+    calib: Mapping,
+    path: str = STEP_PRECISION_OVERRIDES,
+) -> dict[str, dict]:
+    """Load exact overrides and expand validated shared-scale ``lr * tensor`` templates."""
+    with open(path) as stream:
+        overrides = json.load(stream)
+    if not isinstance(overrides, dict):
+        raise ValueError("precision override JSON must map node names to calibration")
+    index_path = os.path.join(_HERE, "fixtures", "binary_op_precision", "index.json")
+    with open(index_path) as stream:
+        index = json.load(stream)
+    lr_templates = {
+        tuple(entry["shape"]): entry
+        for entry in index
+        if entry.get("source", "").startswith(
+            (
+                "Pulsar2 7.0-lite S16 ResNet18 lr-times-tensor broadcast shared calibration",
+                "Pulsar2 7.0-lite S16 ResNet18 lr-times-vector broadcast shared calibration",
+            )
+        )
+    }
+    shapes = {
+        value.name: tuple(int(d.dim_value) for d in value.type.tensor_type.shape.dim)
+        for value in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    records_by_name = {record["name"]: record for record in records}
+    for node in model.graph.node:
+        if node.op_type != "Mul" or not node.input or node.input[0] != "lr":
+            continue
+        record = records_by_name.get(node.name)
+        if record is None or len(record.get("inputs", ())) != 2:
+            continue
+        shape = shapes.get(node.output[0], ())
+        entry = lr_templates.get(shape)
+        if entry is None and len(shape) == 1:
+            entry = lr_templates.get((1, *shape))
+        if entry is None:
+            continue
+        scales = dict(zip(("x", "z", "y"), entry["scales"]))
+        zero_points = dict(zip(("x", "y", "z"), entry["zero_points"]))
+        limit = 32767
+        tensors = ("lr", node.input[1], node.output[0])
+        roles = ("x", "z", "y")
+        if any(
+            tensor not in calib.get("ranges", {})
+            or calib["ranges"][tensor][0] < -scales[role] * limit - scales[role]
+            or calib["ranges"][tensor][1] > scales[role] * limit + scales[role]
+            for tensor, role in zip(tensors, roles)
+        ):
+            continue
+        overrides[node.name] = {
+            "layer_precision": "S16",
+            "scales": scales,
+            "zero_points": zero_points,
+        }
+        if tuple(entry["shape"]) != shape:
+            overrides[node.name]["template_shape"] = list(entry["shape"])
+    return overrides
+
+
+def fake_quant(
+    x: np.ndarray, scale: float, zp: int, signed: bool, bits: int = 8
+) -> np.ndarray:
+    if bits not in (8, 16):
+        raise ValueError(f"unsupported fake-quant precision: {bits}")
+    lo, hi = (
+        (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, (1 << bits) - 1)
+    )
     s = np.float32(scale)
     q = np.clip(np.rint(x.astype(np.float32) / s) + zp, lo, hi)
     return ((q - zp) * s).astype(np.float32)
@@ -167,6 +248,26 @@ class Segment:
     # marks the inputs that carry the batch axis (step_template batch_split).
     batch_split: int = 1
     split: list[bool] = dataclasses.field(default_factory=list)
+    input_shapes: list[tuple[int, ...]] = dataclasses.field(default_factory=list)
+    output_shape: tuple[int, ...] = ()
+    constant_inputs: list[str] = dataclasses.field(default_factory=list)
+    # Shape decompositions may run a replicated lane template and retain only
+    # the prefix corresponding to the graph output.
+    output_take: int | None = None
+    # Calibration-exact scalar folds are guarded at runtime; an input outside
+    # the singleton calibration point is evaluated by the normal host path.
+    constant_value: np.ndarray | None = dataclasses.field(default=None, repr=False)
+    constant_guard: tuple[str, np.ndarray] | None = dataclasses.field(
+        default=None, repr=False
+    )
+    nan_guard: bool = False
+    input_transforms: dict[str, Callable[[np.ndarray], np.ndarray]] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
+    output_transform: Callable[[np.ndarray], np.ndarray] | None = dataclasses.field(
+        default=None, repr=False
+    )
+    profiled_faster: bool = False
 
 
 _RETARGET_KEY = re.compile(r"retarget of (\S+) \(")
@@ -199,9 +300,39 @@ def _segment_for(
 ) -> Segment | None:
     op, name = rec["op"], rec["name"]
     ins, outs = list(rec["inputs"]), list(rec["outputs"])
+    attrs = rec.get("attrs", {})
 
     def q(ts):
         return [qparams_of(calib, t) for t in ts]
+
+    # Exact algebraic reduction for optimizer masks that are literally all
+    # ones.  The live and output quantization records must match, otherwise
+    # removing the binary would change the graph's quantization boundary.
+    if (
+        op == "Mul"
+        and rec.get("attrs", {}).get("form") == "const"
+        and rec.get("attrs", {}).get("constant_input") is not None
+    ):
+        const_index = int(rec["attrs"]["constant_input"])
+        const_name = ins[const_index]
+        live_name = ins[1 - const_index]
+        value = inits.get(const_name)
+        if (
+            value is not None
+            and np.all(np.asarray(value) == 1)
+            and qparams_of(calib, live_name) == qparams_of(calib, outs[0])
+        ):
+            return Segment(
+                name,
+                "algebraic_identity",
+                [name],
+                [live_name],
+                outs,
+                "Mul by an all-ones initializer reduced to Identity",
+                lambda: None,
+                q([live_name]),
+                q(outs),
+            )
 
     if detail.startswith("matmul_record_emit.recalibrate"):
         entry = mre.step_template(name)
@@ -264,6 +395,32 @@ def _segment_for(
         cast = [c for c in consumers.get(outs[0], []) if c.op_type == "Cast"]
         if len(cast) != 1:
             return None
+        cast_out = cast[0].output[0]
+        subtract = [c for c in consumers.get(cast_out, []) if c.op_type == "Sub"]
+        if len(subtract) == 1:
+            sub = subtract[0]
+            if (
+                len(sub.input) == 2
+                and sub.input[1] == cast_out
+                and sub.input[0] in inits
+                and np.all(np.asarray(inits[sub.input[0]]) == 1)
+            ):
+                shape = rec.get("shapes", [[]])[0]
+                inverse_key = misc.template_key(
+                    "GreaterOrEqualCast" if op == "Greater" else "LessOrEqualCast",
+                    shape,
+                )
+                misc.load_template(inverse_key)
+                return Segment(
+                    name,
+                    "compare_complement",
+                    [name, cast[0].name, sub.name],
+                    [ins[1], ins[0]],
+                    [sub.output[0]],
+                    f"{inverse_key}: reversed inclusive comparison replaces 1-Cast({op})",
+                    lambda: misc.emit_model(inverse_key),
+                    nan_guard=True,
+                )
         tmpl, _ = misc.load_template(key)
         live = [t for t in ins if t not in inits][: len(tmpl.graph.input)]
         # not quantized: the device compares the float input directly
@@ -325,19 +482,199 @@ def _segment_for(
 
     if detail.startswith("ElementwiseScaleEdit"):
         cls = _CLASS.search(detail).group(1)
-        key = axb.key_for_record(rec, cls)
+        template_rec = rec
+        output_take = None
+        if "shape-expanded" in detail:
+            template_rec = dict(rec)
+            template_rec["shapes"] = [[1, 128]]
+            output_take = 1
+        key = axb.key_for_record(template_rec, cls)
+        constant_inputs = []
         if op in ew.OPS:
             sc, _ = _scale_dict(calib, {"x": ins[0], "y": outs[0]})
             live = ins[:1]
         else:
-            sc, _ = _scale_dict(calib, {"x": ins[0], "z": ins[1], "y": outs[0]})
-            live = ins[:2]
+            const_index = rec.get("attrs", {}).get("constant_input")
+            if (
+                rec.get("attrs", {}).get("form") == "const"
+                and const_index is not None
+                and ins[const_index] in inits
+            ):
+                const_name = ins[const_index]
+                live_index = 1 - int(const_index)
+                z = int(re.search(r",z(\d+)\)?", detail).group(1))
+                value = np.asarray(inits[const_name], dtype=np.float32)
+                bound = max(float(np.max(np.abs(value))), np.finfo(np.float32).tiny)
+                sc, _ = _scale_dict(calib, {"x": ins[live_index], "y": outs[0]})
+                sc["z"] = bound / (255.0 if z == 0 else 127.0)
+                live = [ins[live_index]]
+                constant_inputs = [const_name]
+            else:
+                sc, _ = _scale_dict(calib, {"x": ins[0], "z": ins[1], "y": outs[0]})
+                live = ins[:2]
+
+        # ``op_values`` is the inexpensive part of the binary emitter's
+        # validation. Reject scale-collision cases during planning instead of
+        # advertising a segment that only fails when the VM loads it: a
+        # collision is a distinct Pulsar2 program family, not a retargetable
+        # instance of the selected template.
+        template_only = False
+        if op in axb.bse.OPS:
+            try:
+                values = axb.bse.op_values(op, sc)
+                axb.bse._check_distinct(values, "target")
+            except ValueError:
+                # A binary 0/1 mask can have the same input and output
+                # scale. That is a compiler collision for scale retargeting,
+                # but it is safe to use the native template unchanged when
+                # the flat frame was built at exactly that calibration.
+                exact_template = False
+                if attrs.get("tile_blocks") and op == "Mul":
+                    entry = axb.TemplateCache().lookup(key)
+                    exact_template = all(
+                        abs(float(sc[name]) - float(entry.meta["scales"][name])) < 1e-7
+                        for name in ("x", "z", "y")
+                    )
+                flat_mask = (
+                    attrs.get("flat_blocks")
+                    and op == "Mul"
+                    and cls == "x0,y0,z0"
+                    and float(sc["x"]) == float(sc["y"])
+                    and abs(float(sc["z"]) - 1.0 / 255.0) < 1e-7
+                )
+                if not (flat_mask or exact_template):
+                    return None
+                template_only = True
 
         def emit_ew():
-            return axb.EditSet([axb.ElementwiseScaleEdit(sc)]).build(key)
+            edit = (
+                axb.BinaryTemplateOnly()
+                if template_only
+                else axb.ElementwiseScaleEdit(sc)
+            )
+            return axb.EditSet([edit]).build(key)
 
+        input_transforms = {}
+        output_transform = None
+        batch_split = 1
+        split = []
+        tile_match = re.search(r"tiled-(\d+)x\1", detail)
+        flat_match = re.search(r"flat-(\d+)x(\d+)", detail)
+        if tile_match:
+            tile_side = int(tile_match.group(1))
+            original_shape = tuple(
+                int(d.dim_value)
+                for d in next(
+                    v
+                    for v in (*model.graph.value_info, *model.graph.output)
+                    if v.name == outs[0]
+                ).type.tensor_type.shape.dim
+            )
+            if attrs.get("tile_layout") == "nchw":
+                b, channels, height, width = original_shape
+                tiles_y = height // tile_side
+                tiles_x = width // tile_side
+                batch_split = tiles_y * tiles_x
+
+                def tile_input(value, shape=original_shape):
+                    expanded = np.broadcast_to(np.asarray(value), shape)
+                    x = expanded.reshape(b, channels, height, width)
+                    return (
+                        x.reshape(b, channels, tiles_y, tile_side, tiles_x, tile_side)
+                        .transpose(0, 2, 4, 1, 3, 5)
+                        .reshape(b * tiles_y * tiles_x, channels, tile_side, tile_side)
+                    )
+
+                def untile_output(value):
+                    x = np.asarray(value).reshape(
+                        b, tiles_y, tiles_x, channels, tile_side, tile_side
+                    )
+                    return x.transpose(0, 3, 1, 4, 2, 5).reshape(original_shape)
+            else:
+                b, _, channels, pixels = original_shape
+                side = math.isqrt(pixels)
+                tiles = side // tile_side
+                batch_split = tiles * tiles
+
+                def tile_input(value, shape=original_shape):
+                    expanded = np.broadcast_to(np.asarray(value), shape)
+                    x = expanded[:, 0].reshape(b, channels, side, side)
+                    return (
+                        x.reshape(b, channels, tiles, tile_side, tiles, tile_side)
+                        .transpose(0, 2, 4, 1, 3, 5)
+                        .reshape(b * tiles * tiles, channels, tile_side, tile_side)
+                    )
+
+                def untile_output(value):
+                    x = np.asarray(value).reshape(
+                        b, tiles, tiles, channels, tile_side, tile_side
+                    )
+                    return x.transpose(0, 3, 1, 4, 2, 5).reshape(b, 1, channels, pixels)
+
+            for tensor in live:
+                input_transforms[tensor] = tile_input
+            for tensor in constant_inputs:
+                input_transforms[tensor] = tile_input
+            output_transform = untile_output
+            output_shape = ()
+            split = [True] * (len(live) + len(constant_inputs))
+        elif flat_match:
+            rows, cols = (int(x) for x in flat_match.groups())
+            original_shape = tuple(
+                int(d.dim_value)
+                for d in next(
+                    v
+                    for v in (*model.graph.value_info, *model.graph.output)
+                    if v.name == outs[0]
+                ).type.tensor_type.shape.dim
+            )
+            elements = int(np.prod(original_shape))
+            chunk = rows * cols
+            blocks = (elements + chunk - 1) // chunk
+            batch_split = blocks
+
+            def pack_input(value, shape=original_shape):
+                flat = np.broadcast_to(np.asarray(value), shape).reshape(-1)
+                padded = np.zeros(blocks * chunk, dtype=np.float32)
+                padded[: flat.size] = flat
+                return padded.reshape(blocks * rows, cols)
+
+            def unpack_output(value):
+                return np.asarray(value).reshape(-1)[:elements].reshape(original_shape)
+
+            for tensor in live:
+                input_transforms[tensor] = pack_input
+            for tensor in constant_inputs:
+                input_transforms[tensor] = pack_input
+            output_transform = unpack_output
+            output_shape = ()
+            split = [True] * (len(live) + len(constant_inputs))
+
+        input_shapes = [
+            tuple(int(d) for d in s)
+            for s in rec.get("attrs", {}).get("input_shapes", [])
+        ]
+        output_shape = tuple(
+            int(d) for d in rec.get("attrs", {}).get("output_shape", ())
+        )
         return Segment(
-            name, "elementwise", [name], live, outs, detail, emit_ew, q(live), q(outs)
+            name,
+            "elementwise",
+            [name],
+            live,
+            outs,
+            detail,
+            emit_ew,
+            q(live),
+            q(outs),
+            input_shapes=input_shapes,
+            output_shape=output_shape,
+            constant_inputs=constant_inputs,
+            output_take=output_take,
+            batch_split=batch_split,
+            split=split,
+            input_transforms=input_transforms,
+            output_transform=output_transform,
         )
 
     if op in ("Reshape", "Squeeze") and detail.startswith("reshape_record_emit"):
@@ -408,18 +745,634 @@ def _segment_for(
     return None
 
 
+def _fp32_binary_segment_for(rec: Mapping, model: onnx.ModelProto) -> Segment | None:
+    """Use a captured, unquantized binary template for an exact shape tuple."""
+    op = rec.get("op")
+    if op not in ("Add", "Sub", "Mul", "Div") or len(rec.get("inputs", ())) != 2:
+        return None
+    if len(rec.get("outputs", ())) != 1:
+        return None
+    by_name = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    by_name.update(
+        {t.name: tuple(int(d) for d in t.dims) for t in model.graph.initializer}
+    )
+    inputs, output = list(rec["inputs"]), rec["outputs"][0]
+    if any(t not in by_name for t in (*inputs, output)):
+        return None
+    input_shapes = [list(by_name[t]) for t in inputs]
+    output_shape = list(by_name[output])
+    path = None
+    template_inputs = inputs
+    profiled_faster = False
+    index_path = os.path.join(FP32_BINARY_FIXTURES, "index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as stream:
+            entries = json.load(stream).get("templates", [])
+        entry = next(
+            (
+                item
+                for item in entries
+                if item.get("validated") is True
+                and item.get("op") == op
+                and item.get("input_shapes") == input_shapes
+                and item.get("output_shape") == output_shape
+            ),
+            None,
+        )
+        if entry is not None:
+            path = os.path.join(FP32_BINARY_FIXTURES, entry["file"])
+        # Mul is commutative. For the measured native-fast broadcast cases,
+        # the source graph presents a [1] constant before the full tensor,
+        # while the captured FP32 model uses full-tensor then [1]. Preserve
+        # the compiled model's input order at the segment boundary.
+        if path is None and op == "Mul" and input_shapes == [[1], output_shape]:
+            try:
+                with open(FP32_BINARY_SPEED_PROFILES, encoding="utf-8") as stream:
+                    speed_profiles = json.load(stream)
+            except FileNotFoundError:
+                speed_profiles = {}
+            profile = next(
+                (
+                    item
+                    for item in speed_profiles.get("profiles", [])
+                    if item.get("op") == op
+                    and item.get("source_input_shapes") == input_shapes
+                    and item.get("output_shape") == output_shape
+                    and float(item.get("median_speedup", 0.0))
+                    >= float(speed_profiles.get("minimum_speedup", 1.10))
+                ),
+                None,
+            )
+            if profile is not None:
+                entry = next(
+                    (
+                        item
+                        for item in entries
+                        if item.get("validated") is True
+                        and item.get("op") == op
+                        and item.get("input_shapes")
+                        == profile.get("template_input_shapes")
+                        and item.get("output_shape") == output_shape
+                    ),
+                    None,
+                )
+                if entry is not None:
+                    path = os.path.join(FP32_BINARY_FIXTURES, entry["file"])
+                    template_inputs = [inputs[1], inputs[0]]
+                    profiled_faster = True
+    # Preserve the initial one-off Add capture as a compatible legacy entry.
+    if (
+        path is None
+        and op == "Add"
+        and input_shapes == [[16, 1000], [16, 1000]]
+        and output_shape == [16, 1000]
+    ):
+        path = os.path.join(FP32_BINARY_FIXTURES, "add_16x1000.axmodel.gz")
+    if path is None or not os.path.isfile(path):
+        return None
+    node = next((n for n in model.graph.node if n.name == rec["name"]), None)
+    if node is None or node.op_type != op or list(node.input) != inputs:
+        return None
+    # Restrict this entry point to ordinary float32 tensors. In particular,
+    # don't route integer/bool ONNX binaries through an FP32 template.
+    elem_types = {
+        v.name: v.type.tensor_type.elem_type
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    elem_types.update({t.name: t.data_type for t in model.graph.initializer})
+    if any(elem_types.get(t) != onnx.TensorProto.FLOAT for t in (*inputs, output)):
+        return None
+
+    def emit_fp32():
+        with gzip.open(path, "rb") as f:
+            return onnx.load_model_from_string(f.read())
+
+    constants = {item.name for item in model.graph.initializer}
+    return Segment(
+        rec["name"],
+        "fp32_binary",
+        [rec["name"]],
+        template_inputs,
+        [output],
+        f"Pulsar2 FP32 {op} exact template for {input_shapes} -> {output_shape}"
+        + (" (AX8850-profiled faster broadcast Mul)" if profiled_faster else ""),
+        emit_fp32,
+        [],
+        [],
+        constant_inputs=[t for t in template_inputs if t in constants],
+        profiled_faster=profiled_faster,
+    )
+
+
+def _exact_mask_mul_segment_for(
+    rec: Mapping, calib: Mapping, model: onnx.ModelProto
+) -> Segment | None:
+    """Exact-calibration native Mul for a common one-hot mask frame.
+
+    The frame is calibrated so x and y share a scale (making the scale
+    retarget registers ambiguous); only this exact measured scale/zp tuple is
+    accepted. Other masks still use the regular retargetable templates.
+    """
+    if rec.get("op") != "Mul" or rec.get("attrs", {}).get("form") != "same_shape":
+        return None
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if len(inputs) != 2 or len(outputs) != 1:
+        return None
+    shape = (16, 1000)
+    by_name = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    if any(by_name.get(t) != shape for t in (*inputs, outputs[0])):
+        return None
+    expected = {
+        inputs[0]: (0.00012254902685526758, 255),
+        inputs[1]: (0.003921568859368563, 0),
+        outputs[0]: (0.00012254902685526758, 255),
+    }
+    for tensor, (scale, zp) in expected.items():
+        if tensor not in calib.get("tensors", {}):
+            return None
+        actual = calib["tensors"][tensor]
+        if (
+            bool(actual.get("signed"))
+            or int(actual["zero_point"]) != zp
+            or abs(float(actual["scale"]) - scale) > 1e-10
+        ):
+            return None
+    path = os.path.join(STEP_BINARY_FIXTURES, "mul_mask_16x1000.axmodel.gz")
+    if not os.path.isfile(path):
+        return None
+
+    def emit_mask_mul():
+        with gzip.open(path, "rb") as f:
+            return onnx.load_model_from_string(f.read())
+
+    return Segment(
+        rec["name"],
+        "mul_mask_exact",
+        [rec["name"]],
+        inputs,
+        outputs,
+        "native Mul mask template at exact x255/y255/z0 calibration, shape 16x1000",
+        emit_mask_mul,
+        [qparams_of(calib, t) for t in inputs],
+        [qparams_of(calib, outputs[0])],
+    )
+
+
+def _exact_loss_sub_segment_for(
+    rec: Mapping, calib: Mapping, model: onnx.ModelProto
+) -> Segment | None:
+    """Exact-calibration native Sub for the loss-tail broadcast at 16x1000."""
+    if rec.get("op") != "Sub" or len(rec.get("inputs", ())) != 2:
+        return None
+    inputs, outputs = list(rec["inputs"]), list(rec.get("outputs", ()))
+    if len(outputs) != 1:
+        return None
+    shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    output_shape = (16, 1000)
+    if (
+        shapes.get(inputs[0]) != output_shape
+        or shapes.get(inputs[1]) != (16, 1)
+        or shapes.get(outputs[0]) != output_shape
+    ):
+        return None
+    expected = (
+        (6.96580696105957, 255),
+        (0.00012254902685526758, 255),
+        (6.96580696105957, 255),
+    )
+    for tensor, (scale, zp) in zip((*inputs, outputs[0]), expected):
+        actual = calib.get("tensors", {}).get(tensor)
+        if (
+            actual is None
+            or bool(actual.get("signed"))
+            or int(actual["zero_point"]) != zp
+            or abs(float(actual["scale"]) - scale) > 1e-10
+        ):
+            return None
+    path = os.path.join(STEP_BINARY_FIXTURES, "sub_loss_16x1000.axmodel.gz")
+    if not os.path.isfile(path):
+        return None
+
+    def emit_loss_sub():
+        with gzip.open(path, "rb") as f:
+            return onnx.load_model_from_string(f.read())
+
+    return Segment(
+        rec["name"],
+        "sub_loss_exact",
+        [rec["name"]],
+        inputs,
+        outputs,
+        "native Sub loss-tail template at exact calibration, broadcast to 16x1000",
+        emit_loss_sub,
+        [qparams_of(calib, t) for t in inputs],
+        [qparams_of(calib, outputs[0])],
+        input_shapes=[shapes[t] for t in inputs],
+        output_shape=output_shape,
+    )
+
+
+def _exact_div2_segment_for(
+    rec: Mapping,
+    calib: Mapping,
+    model: onnx.ModelProto,
+    inits: Mapping[str, np.ndarray],
+) -> Segment | None:
+    """Native Pulsar2 lowering for exact ``x / 2`` loss-tail templates."""
+    if rec.get("op") != "Div" or rec.get("attrs", {}).get("form") != "const":
+        return None
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if len(inputs) != 2 or len(outputs) != 1:
+        return None
+    const_index = rec.get("attrs", {}).get("constant_input")
+    if const_index is None or int(const_index) != 1:
+        return None
+    const_name, live_name, output = inputs[1], inputs[0], outputs[0]
+    if const_name not in inits or not np.all(np.asarray(inits[const_name]) == 2.0):
+        return None
+    shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    shape = (16, 1000)
+    if shapes.get(live_name) != shape or shapes.get(output) != shape:
+        return None
+    qx = calib.get("tensors", {}).get(live_name)
+    qy = calib.get("tensors", {}).get(output)
+    if qx is None or qy is None or qx.get("signed") or qy.get("signed"):
+        return None
+    zp = int(qx["zero_point"])
+    if int(qy["zero_point"]) != zp:
+        return None
+    scales = {
+        98: (0.05171579495072365, 0.025857897475361824),
+        101: (0.0531538687646389, 0.02657693438231945),
+        211: (2.16483895201236e-05, 1.08241947600618e-05),
+    }
+    expected = scales.get(zp)
+    if expected is None:
+        return None
+    sx, sy = expected
+    if abs(float(qx["scale"]) - sx) > 1e-10 or abs(float(qy["scale"]) - sy) > 1e-10:
+        return None
+    path = os.path.join(STEP_BINARY_FIXTURES, f"div2_16x1000_z{zp}.axmodel.gz")
+    if not os.path.isfile(path):
+        return None
+
+    def emit_div2():
+        with gzip.open(path, "rb") as f:
+            return onnx.load_model_from_string(f.read())
+
+    return Segment(
+        rec["name"],
+        "div2_exact",
+        [rec["name"]],
+        [live_name],
+        [output],
+        f"native Pulsar2 x/2 template at exact zp{zp} calibration, shape 16x1000",
+        emit_div2,
+        [qparams_of(calib, live_name)],
+        [qparams_of(calib, output)],
+    )
+
+
+def _singleton_scalar_div_fold(
+    rec: Mapping, calib: Mapping, inits: Mapping[str, np.ndarray]
+) -> Segment | None:
+    """Fold scalar constant/live Div only at a calibrated singleton input."""
+    if rec.get("op") != "Div" or rec.get("attrs", {}).get("constant_input") != 0:
+        return None
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if len(inputs) != 2 or len(outputs) != 1 or inputs[0] not in inits:
+        return None
+    ranges = calib.get("ranges", {})
+    bounds = ranges.get(inputs[1])
+    if not bounds or len(bounds) != 2 or float(bounds[0]) != float(bounds[1]):
+        return None
+    numerator = np.asarray(inits[inputs[0]], dtype=np.float32)
+    if numerator.size != 1 or float(bounds[0]) == 0.0:
+        return None
+    value = np.asarray(numerator / np.float32(bounds[0]), dtype=np.float32)
+    return Segment(
+        rec["name"],
+        "algebraic_constant",
+        [rec["name"]],
+        [inputs[1]],
+        outputs,
+        f"constant Div folded at singleton calibrated input {float(bounds[0])}",
+        lambda: None,
+        constant_value=value,
+        constant_guard=(inputs[1], np.asarray(bounds[0], dtype=np.float32)),
+    )
+
+
+def _precision_binary_segment_for(
+    rec: Mapping,
+    override: Mapping | None,
+    model: onnx.ModelProto,
+) -> Segment | None:
+    """Build a binary segment only for an explicitly selected exact template.
+
+    Overrides use the same role-keyed scale/zero-point contract as compile_onnx.
+    This path is deliberately opt-in: high-precision fixtures are not
+    interchangeable with the step graph's U8 activation calibration.
+    """
+    if override is None:
+        return None
+    op = rec.get("op")
+    inputs, outputs = list(rec.get("inputs", ())), list(rec.get("outputs", ()))
+    if op not in axb.bse.OPS or len(inputs) != 2 or len(outputs) != 1:
+        raise ValueError(f"{rec.get('name')}: precision override requires a binary op")
+    values = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    input_shapes = [values.get(t, ()) for t in inputs]
+    output_shape = values.get(outputs[0], ())
+    shape = output_shape
+    input_transforms = {}
+    if not shape or any(not item for item in input_shapes):
+        raise ValueError(
+            f"{rec.get('name')}: precision override requires known tensor shapes"
+        )
+    packed_vector = (
+        op == "Mul"
+        and len(output_shape) == 1
+        and tuple(override.get("template_shape", ())) == (1, *output_shape)
+    )
+    if packed_vector:
+        shape = (1, *output_shape)
+    if input_shapes != [shape, shape]:
+        if np.broadcast_shapes(*input_shapes) != output_shape or (
+            not packed_vector and np.broadcast_shapes(*input_shapes) != shape
+        ):
+            raise ValueError(
+                f"{rec.get('name')}: precision override inputs must broadcast to "
+                "the output shape"
+            )
+        for tensor, actual_shape in zip(inputs, input_shapes):
+            if actual_shape != shape:
+                if packed_vector and int(np.prod(actual_shape)) == 1:
+                    # Keep a scalar-shaped port scalar. The compiled `[1,N]`
+                    # model performs the broadcast inside its Mul node.
+                    continue
+                input_transforms[tensor] = lambda value, target=shape: np.broadcast_to(
+                    value, target
+                ).copy()
+    precision = override.get("layer_precision")
+    scales, zero_points = override.get("scales"), override.get("zero_points")
+    roles = {"x", "z", "y"}
+    if (
+        precision not in ("U16", "S16")
+        or not isinstance(scales, Mapping)
+        or not isinstance(zero_points, Mapping)
+    ):
+        raise ValueError(
+            f"{rec.get('name')}: precision override needs U16/S16 scales and zero_points"
+        )
+    if not roles <= set(scales) or not roles <= set(zero_points):
+        raise ValueError(
+            f"{rec.get('name')}: precision override needs x, z, and y calibration"
+        )
+    zps = {role: int(zero_points[role]) for role in roles}
+    if any(float(zero_points[role]) != zps[role] for role in roles):
+        raise ValueError(
+            f"{rec.get('name')}: precision override zero points must be integral"
+        )
+    key = axb.TemplateKey(
+        op,
+        (shape,),
+        calibration_class=",".join(f"{r}{zps[r]}" for r in ("x", "y", "z")),
+        layer_precision=precision,
+        calibration_scales=tuple(float(scales[r]) for r in ("x", "z", "y")),
+    )
+    cache = axb.TemplateCache()
+    entry = cache.lookup(key)
+    template = cache.load(key)
+    signed = precision == "S16"
+
+    def quant(role: str) -> tuple[float, int, bool, int]:
+        return float(scales[role]), zps[role], signed, 16
+
+    segment_input_shapes = [shape, shape]
+    return Segment(
+        rec["name"],
+        "binary_precision",
+        [rec["name"]],
+        inputs,
+        outputs,
+        f"exact {precision} binary template ({entry.meta['file']})",
+        lambda: template,
+        [quant("x"), quant("z")],
+        [quant("y")],
+        input_shapes=segment_input_shapes,
+        output_shape=() if packed_vector else output_shape,
+        input_transforms=input_transforms,
+    )
+
+
 def build_plan(
     model: onnx.ModelProto,
     records: Sequence[Mapping],
     calib: Mapping,
     kinds: set[str] | None = None,
     include_unsafe: bool = False,
+    *,
+    precision_overrides: Mapping[str, Mapping] | None = None,
 ) -> tuple[list[Segment], dict[str, str]]:
     """NPU segments (only of ``kinds`` if given) and a per-node reason for
     every node left on the host."""
     cache = axb.TemplateCache()
-    plans = [axb.plan_at_calibration(r, calib, cache) for r in records]
     inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+    value_shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    planned_records = []
+    for original in records:
+        rec = dict(original)
+        attrs = dict(rec.get("attrs", {}))
+        if attrs.get("form") == "const":
+            const = next((t for t in rec["inputs"][1:] if t in inits), None)
+            const_index = next(
+                (i for i, t in enumerate(rec["inputs"]) if t in inits), None
+            )
+            if const is None and const_index is not None:
+                const = rec["inputs"][const_index]
+            if const is not None:
+                value = np.asarray(inits[const], dtype=np.float32)
+                attrs["constant_zero_point"] = 0 if float(value.min()) >= 0 else 128
+                attrs["constant_input"] = const_index
+                # Constant broadcasts are compiled as the full output shape.
+                # The compact records historically kept the live input shape,
+                # which hid validated full-shape binary templates from the
+                # planner (for example the 16x512x1x1 * 1x1x7x7 path).
+                out_shape = value_shapes.get(rec["outputs"][0], ())
+                if out_shape and tuple(rec["shapes"][0]) != out_shape:
+                    attrs["output_shape"] = list(out_shape)
+                live_name = rec["inputs"][1 - int(const_index)]
+                live_shape = value_shapes.get(live_name, ())
+                tile_side = None
+                if (
+                    rec["op"] == "Mul"
+                    and len(live_shape) == 4
+                    and live_shape[1] == 1
+                    and live_shape[3] > 0
+                    and int(math.isqrt(live_shape[3])) ** 2 == live_shape[3]
+                ):
+                    side = math.isqrt(live_shape[3])
+                    # Prefer the largest validated spatial tile already in
+                    # the fixture corpus. A tiled mask keeps the same
+                    # contiguous channel/spatial layout, so a template can
+                    # serve any larger side divisible by its tile.
+                    for candidate in (56, 28, 14, 7):
+                        if side % candidate:
+                            continue
+                        trial = dict(rec)
+                        trial_attrs = dict(attrs)
+                        trial_attrs["template_shape"] = [
+                            live_shape[0],
+                            live_shape[2],
+                            candidate,
+                            candidate,
+                        ]
+                        trial["attrs"] = trial_attrs
+                        trial["shapes"] = [list(trial_attrs["template_shape"])]
+                        try:
+                            cache.lookup(axb.key_for_record(trial, "x0,y0,z0"))
+                        except ValueError:
+                            continue
+                        tile_side = candidate
+                        break
+                if tile_side is not None:
+                    attrs["template_shape"] = [
+                        live_shape[0],
+                        live_shape[2],
+                        tile_side,
+                        tile_side,
+                    ]
+                    attrs["tile_blocks"] = (side // tile_side) ** 2
+                    attrs["tile_side"] = tile_side
+                    rec["shapes"] = [list(attrs["template_shape"])]
+                elif (
+                    rec["op"] == "Mul"
+                    and np.all((value == 0) | (value == 1))
+                    and out_shape
+                    and int(np.prod(out_shape)) > 1024 * 512
+                ):
+                    # Binary masks are contiguous regardless of their ONNX
+                    # rank. Pack them into the validated 1000x512 frame and
+                    # run one native invocation per frame; padding is dropped
+                    # by the inverse transform at the segment boundary.
+                    flat_template = [1024, 512]
+                    trial = dict(rec)
+                    trial_attrs = dict(attrs)
+                    trial_attrs["template_shape"] = flat_template
+                    trial["attrs"] = trial_attrs
+                    trial["shapes"] = [flat_template]
+                    try:
+                        cache.lookup(axb.key_for_record(trial, "x0,y0,z0"))
+                    except ValueError:
+                        pass
+                    else:
+                        attrs["template_shape"] = flat_template
+                        attrs["flat_blocks"] = (
+                            int(np.prod(out_shape)) + 1024 * 512 - 1
+                        ) // (1024 * 512)
+                        attrs["tile_blocks"] = attrs["flat_blocks"]
+                        rec["shapes"] = [flat_template]
+        if (
+            rec["op"] == "Mul"
+            and attrs.get("form") in ("same_shape", "broadcast")
+            and not attrs.get("flat_blocks")
+        ):
+            out_shape = value_shapes.get(rec["outputs"][0], ())
+            if out_shape and int(np.prod(out_shape)) > 1024 * 512:
+                # Binary classes are ordered x, y, z while graph inputs are
+                # ordered x, z. Keep the output in the middle here.
+                qnames = (rec["inputs"][0], rec["outputs"][0], rec["inputs"][1])
+                zps = [
+                    int(calib["tensors"][t]["zero_point"])
+                    for t in qnames
+                    if t in calib.get("tensors", {})
+                ]
+                if len(zps) == 3 and zps == [0, 0, 0]:
+                    scales = [float(calib["tensors"][t]["scale"]) for t in qnames]
+                    if not all(abs(s - 1.0 / 255.0) < 1e-7 for s in scales):
+                        rec["attrs"] = attrs
+                        planned_records.append(rec)
+                        continue
+                    flat_template = [1024, 512]
+                    trial = dict(rec)
+                    trial_attrs = dict(attrs)
+                    trial_attrs["template_shape"] = flat_template
+                    trial["attrs"] = trial_attrs
+                    trial["shapes"] = [flat_template]
+                    try:
+                        cache.lookup(axb.key_for_record(trial, "x0,y0,z0"))
+                    except ValueError:
+                        pass
+                    else:
+                        attrs["template_shape"] = flat_template
+                        attrs["flat_blocks"] = (
+                            int(np.prod(out_shape)) + 1024 * 512 - 1
+                        ) // (1024 * 512)
+                        attrs["tile_blocks"] = attrs["flat_blocks"]
+                        rec["shapes"] = [flat_template]
+        if (
+            rec["op"] == "Mul"
+            and attrs.get("form") == "same_shape"
+            and len(value_shapes.get(rec["outputs"][0], ())) == 4
+        ):
+            out_shape = value_shapes[rec["outputs"][0]]
+            height, width = out_shape[2:]
+            if height == width and height % 56 == 0:
+                qnames = (rec["inputs"][0], rec["outputs"][0], rec["inputs"][1])
+                if all(t in calib.get("tensors", {}) for t in qnames):
+                    cls = "x{},y{},z{}".format(
+                        *(int(calib["tensors"][t]["zero_point"]) for t in qnames)
+                    )
+                    trial = dict(rec)
+                    trial_attrs = dict(attrs)
+                    trial_attrs["template_shape"] = [out_shape[0], out_shape[1], 56, 56]
+                    trial["attrs"] = trial_attrs
+                    trial["shapes"] = [list(trial_attrs["template_shape"])]
+                    try:
+                        cache.lookup(axb.key_for_record(trial, cls))
+                    except ValueError:
+                        pass
+                    else:
+                        attrs["template_shape"] = [out_shape[0], out_shape[1], 56, 56]
+                        attrs["tile_blocks"] = (height // 56) * (width // 56)
+                        attrs["tile_side"] = 56
+                        attrs["tile_layout"] = "nchw"
+                        rec["shapes"] = [list(attrs["template_shape"])]
+        rec["attrs"] = attrs
+        planned_records.append(rec)
+    unknown_overrides = set(precision_overrides or {}) - {
+        rec["name"] for rec in planned_records
+    }
+    if unknown_overrides:
+        raise ValueError(
+            f"precision overrides name unknown step nodes: {sorted(unknown_overrides)}"
+        )
+    # Live MatMul/Conv validation scans the compiled MCode.  The same scan is
+    # required by the segment emitter below, so defer it to
+    # ``drop_unemittable`` instead of doing it once during planning and again
+    # while materializing the models.
+    plans = [
+        axb.plan_at_calibration(r, calib, cache, validate_live=False)
+        for r in planned_records
+    ]
     consumers: dict[str, list[onnx.NodeProto]] = {}
     for n in model.graph.node:
         for t in n.input:
@@ -428,12 +1381,96 @@ def build_plan(
     host: dict[str, str] = {}
     taken: set[str] = set()
     candidates = []
-    for rec, (status, detail) in zip(records, plans):
+    value_shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    for rec, (status, detail) in zip(planned_records, plans):
+        folded = _singleton_scalar_div_fold(rec, calib, inits)
+        if folded is not None:
+            if not kinds or folded.kind in kinds:
+                candidates.append(folded)
+            else:
+                host[rec["name"]] = f"covered, kind {folded.kind} not selected"
+            continue
+        precision_seg = _precision_binary_segment_for(
+            rec,
+            (precision_overrides or {}).get(rec["name"]),
+            model,
+        )
+        if precision_seg is not None:
+            profiled_fp32 = _fp32_binary_segment_for(rec, model)
+            if (
+                profiled_fp32 is not None
+                and profiled_fp32.profiled_faster
+                and (not kinds or profiled_fp32.kind in kinds)
+            ):
+                candidates.append(profiled_fp32)
+                continue
+            if not kinds or precision_seg.kind in kinds:
+                candidates.append(precision_seg)
+                continue
+            host[rec["name"]] = f"covered, kind {precision_seg.kind} not selected"
+            continue
+        if (
+            status in ("refused", "covered")
+            and rec["op"] in axb.bse.OPS
+            and rec.get("attrs", {}).get("form") == "broadcast"
+            and detail.startswith("ElementwiseScaleEdit")
+        ):
+            input_shapes = [value_shapes.get(t, ()) for t in rec["inputs"][:2]]
+            output_shape = value_shapes.get(rec["outputs"][0], ())
+            if (
+                output_shape
+                and all(input_shapes)
+                and all(t in calib.get("tensors", {}) for t in rec["inputs"][:2])
+            ):
+                # A full-shape binary template is semantically identical when
+                # a live operand is broadcast at the segment boundary. Keep
+                # constants and uncalibrated operands conservative.
+                expanded = dict(rec)
+                expanded["shapes"] = [list(output_shape)]
+                expanded["attrs"] = dict(rec.get("attrs", {}))
+                expanded["attrs"].update(
+                    {
+                        "form": "same_shape",
+                        "output_shape": list(output_shape),
+                        "input_shapes": [list(s) for s in input_shapes],
+                    }
+                )
+                status, detail = axb.plan_at_calibration(
+                    expanded, calib, cache, validate_live=False
+                )
+                rec = expanded
+        exact_seg = _exact_mask_mul_segment_for(rec, calib, model)
+        if exact_seg is None:
+            exact_seg = _exact_loss_sub_segment_for(rec, calib, model)
+        if exact_seg is None:
+            exact_seg = _exact_div2_segment_for(rec, calib, model, inits)
+        if exact_seg is not None and (not kinds or exact_seg.kind in kinds):
+            candidates.append(exact_seg)
+            continue
+        fp32_seg = _fp32_binary_segment_for(rec, model)
+        legacy_fp32_add = rec.get("op") == "Add" and [
+            value_shapes.get(t) for t in rec.get("inputs", ())
+        ] == [(16, 1000), (16, 1000)]
+        use_fp32 = fp32_seg is not None and (not kinds or fp32_seg.kind in kinds)
+        if use_fp32 and legacy_fp32_add:
+            # Keep the original exact Add probe as the one explicit override
+            # of a regular calibrated segment.
+            candidates.append(fp32_seg)
+            continue
         if status != "covered":
+            if use_fp32:
+                candidates.append(fp32_seg)
+                continue
             host[rec["name"]] = f"{status}: {detail}"
             continue
         seg = _segment_for(rec, detail, calib, model, consumers, inits)
         if seg is None or (kinds and seg.kind not in kinds):
+            if use_fp32:
+                candidates.append(fp32_seg)
+                continue
             host[rec["name"]] = (
                 f"covered ({detail}) but no runner segment"
                 if seg is None
@@ -441,7 +1478,18 @@ def build_plan(
             )
             continue
         if seg.unsafe and not include_unsafe:
+            if use_fp32:
+                candidates.append(fp32_seg)
+                continue
             host[rec["name"]] = f"covered, but unsafe: {seg.unsafe}"
+            continue
+        if (
+            seg.kind == "binary_precision"
+            and fp32_seg is not None
+            and fp32_seg.profiled_faster
+            and (not kinds or fp32_seg.kind in kinds)
+        ):
+            candidates.append(fp32_seg)
             continue
         candidates.append(seg)
     # multi-node segments (chains, fused pairs) claim their nodes first
@@ -477,18 +1525,80 @@ def build_plan(
 
 
 def drop_unemittable(
-    segs: Sequence[Segment], host: dict[str, str]
+    segs: Sequence[Segment],
+    host: dict[str, str],
+    emit_cache_dir: str | None = None,
 ) -> tuple[list[Segment], dict[str, bytes]]:
     """Emit every segment up front; one whose emitter refuses goes back to
-    the host with the emitter's reason."""
+    the host with the emitter's reason.  When ``emit_cache_dir`` is set,
+    emitted models are reused across training-graph preparations.  The key
+    includes calibration inputs/outputs and a format version, so a different
+    calibration or emitter format cannot reuse an old model."""
     keep, blobs = [], {}
-    for seg in segs:
+    if emit_cache_dir:
+        os.makedirs(emit_cache_dir, exist_ok=True)
+
+    def emit_one(seg: Segment) -> tuple[Segment, bytes | None, Exception | None]:
         try:
-            blobs[seg.name] = seg.emit().SerializeToString()
+            if seg.kind in ("algebraic_identity", "algebraic_constant"):
+                return seg, None, None
+            cache_path = None
+            if emit_cache_dir:
+                payload = {
+                    "version": 1,
+                    "name": seg.name,
+                    "kind": seg.kind,
+                    "nodes": seg.nodes,
+                    "inputs": seg.inputs,
+                    "outputs": seg.outputs,
+                    "detail": seg.detail,
+                    "in_q": seg.in_q,
+                    "out_q": seg.out_q,
+                    "input_shapes": seg.input_shapes,
+                    "output_shape": seg.output_shape,
+                }
+                digest = hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, default=list).encode()
+                ).hexdigest()
+                cache_path = os.path.join(emit_cache_dir, f"{digest}.axmodel")
+                if os.path.exists(cache_path):
+                    with open(cache_path, "rb") as f:
+                        blob = f.read()
+                    onnx.load_model_from_string(blob)
+                else:
+                    blob = seg.emit().SerializeToString()
+                    tmp = f"{cache_path}.tmp-{os.getpid()}"
+                    with open(tmp, "wb") as f:
+                        f.write(blob)
+                    os.replace(tmp, cache_path)
+            else:
+                blob = seg.emit().SerializeToString()
+            return seg, blob, None
         except Exception as exc:
+            return seg, None, exc
+
+    # Emission is CPU-bound serialization/retargeting work and each segment
+    # owns its output buffer.  Keep the result collection in input order so
+    # plans and reports remain deterministic, while avoiding a long serial
+    # preparation tail for the training graph.  A small fixed pool avoids
+    # overwhelming the host when a graph has many elementwise segments.
+    workers = min(8, max(1, len(segs)))
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="axera-emit"
+    ) as pool:
+        results = list(pool.map(emit_one, segs))
+    for seg, blob, error in results:
+        if error is not None:
             for n in seg.nodes:
-                host[n] = f"covered, but the emitter refused: {exc}"
+                host[n] = f"covered, but the emitter refused: {error}"
             continue
+        if seg.kind in ("algebraic_identity", "algebraic_constant"):
+            # Algebraic segments need no AX program and must not be demoted to
+            # HostOps/ORT unless a guarded fold sees a different runtime value.
+            keep.append(seg)
+            continue
+        assert blob is not None
+        blobs[seg.name] = blob
         keep.append(seg)
     return keep, blobs
 
@@ -602,6 +1712,8 @@ class StepRunner:
 
     def _float(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
         local = dict(env)
+        for tensor in seg.constant_inputs:
+            local[tensor] = np.asarray(self.host.inits[tensor], dtype=np.float32)
         for n in sorted(seg.nodes, key=self.index.get):
             node = self.by_name[n]
             for t, v in zip([t for t in node.output if t], self.host.run(node, local)):
@@ -610,8 +1722,19 @@ class StepRunner:
 
     def _sim(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
         local = dict(env)
-        for t, qq in zip(seg.inputs, seg.in_q):
-            local[t] = fake_quant(local[t], *qq)
+        for tensor in seg.constant_inputs:
+            local[tensor] = np.asarray(self.host.inits[tensor], dtype=np.float32)
+        values = []
+        for j, (t, qq) in enumerate(zip(seg.inputs, seg.in_q)):
+            value = fake_quant(local[t], *qq)
+            values.append(value)
+        if seg.output_shape:
+            target = np.broadcast_shapes(*(value.shape for value in values))
+            for t, value in zip(seg.inputs, values):
+                local[t] = np.broadcast_to(value, target)
+        else:
+            for t, value in zip(seg.inputs, values):
+                local[t] = value
         for n in sorted(seg.nodes, key=self.index.get):
             node = self.by_name[n]
             for t, v in zip([t for t in node.output if t], self.host.run(node, local)):
@@ -625,7 +1748,63 @@ class StepRunner:
     def _device(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
         m = self.session.load(self.emitted(seg))
         try:
-            ins = [np.asarray(env[t], dtype=np.float32) for t in seg.inputs]
+            ins = []
+            for t in seg.inputs:
+                if t in env:
+                    value = env[t]
+                elif t in seg.constant_inputs:
+                    value = self.host.inits[t]
+                else:
+                    raise KeyError(t)
+                ins.append(
+                    seg.input_transforms.get(t, lambda x: x)(
+                        np.asarray(value, dtype=np.float32)
+                    )
+                )
+            model_inputs = getattr(m, "inputs", None)
+            if model_inputs is not None and len(model_inputs) > len(ins):
+                initializer = {
+                    item.name: numpy_helper.to_array(item)
+                    for item in self.model.graph.initializer
+                }
+                for node_name in seg.nodes:
+                    for tensor in self.by_name[node_name].input:
+                        if tensor not in seg.inputs and tensor in initializer:
+                            value = np.asarray(initializer[tensor], dtype=np.float32)
+                            ins.append(
+                                seg.input_transforms.get(tensor, lambda x: x)(value)
+                            )
+            if model_inputs is not None and len(ins) != len(model_inputs):
+                raise ValueError(
+                    f"segment {seg.name} emitted {len(m.inputs)} inputs, "
+                    f"but runner prepared {len(ins)}"
+                )
+            if model_inputs is not None:
+                matched = []
+                split_flags = seg.split or [False] * len(ins)
+                for value, spec, split in zip(ins, model_inputs, split_flags):
+                    # A measured template may run a smaller batch repeatedly.
+                    # Keep the expanded value intact until the split below;
+                    # broadcasting it to the per-run shape would reject a
+                    # valid (template_batch * batch_split) input.
+                    expanded_batch = (
+                        seg.batch_split > 1
+                        and split
+                        and value.ndim > 0
+                        and value.shape[0] == spec.shape[0] * seg.batch_split
+                    )
+                    same_size = value.size == math.prod(spec.shape)
+                    matched.append(
+                        value
+                        if expanded_batch or value.shape == spec.shape
+                        else value.reshape(spec.shape)
+                        if same_size
+                        else np.broadcast_to(value, spec.shape).copy()
+                    )
+                ins = matched
+            if seg.output_shape:
+                target = np.broadcast_shapes(*(x.shape for x in ins))
+                ins = [np.broadcast_to(x, target) for x in ins]
             if seg.batch_split > 1:
                 parts = [
                     self.session.run(
@@ -645,9 +1824,13 @@ class StepRunner:
         want = {o.name: o for o in self.model.graph.value_info}
         out = []
         for t, y in zip(seg.outputs, ys):
+            if seg.output_transform is not None:
+                y = seg.output_transform(y)
             vi = want.get(t)
             shape = [d.dim_value for d in vi.type.tensor_type.shape.dim] if vi else None
             y = y.astype(np.float32)
+            if seg.output_take is not None:
+                y = y.reshape(-1)[: seg.output_take]
             out.append(
                 y.reshape(shape) if shape and int(np.prod(shape)) == y.size else y
             )
@@ -674,6 +1857,37 @@ class StepRunner:
                 ):
                     env[t] = v
             if seg is not None and mode != "float" and self.fire_at[seg.name] == k:
+                if seg.kind == "algebraic_identity":
+                    env[seg.outputs[0]] = env[seg.inputs[0]]
+                    stats.append(SegStat(seg.name, seg.kind, len(seg.nodes)))
+                    continue
+                if seg.kind == "algebraic_constant":
+                    assert (
+                        seg.constant_value is not None
+                        and seg.constant_guard is not None
+                    )
+                    guard_name, expected = seg.constant_guard
+                    actual = np.asarray(env[guard_name])
+                    if actual.size == 1 and np.array_equal(
+                        actual.reshape(()), expected.reshape(())
+                    ):
+                        env[seg.outputs[0]] = seg.constant_value.copy()
+                    else:
+                        for t, v in zip(
+                            [t for t in node.output if t], self.host.run(node, env)
+                        ):
+                            env[t] = v
+                    stats.append(SegStat(seg.name, seg.kind, len(seg.nodes)))
+                    continue
+                if (
+                    mode == "npu"
+                    and seg.nan_guard
+                    and any(np.isnan(np.asarray(env[t])).any() for t in seg.inputs)
+                ):
+                    for tensor, value in zip(seg.outputs, self._float(seg, env)):
+                        env[tensor] = value
+                    stats.append(SegStat(seg.name, "host_nan_guard", len(seg.nodes)))
+                    continue
                 st = SegStat(seg.name, seg.kind, len(seg.nodes))
                 t1 = time.time()
                 sim = self._sim(seg, env) if (mode == "sim" or check) else None
@@ -915,9 +2129,20 @@ def summarize(stats: Sequence[SegStat]) -> dict:
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--kinds", help="comma-separated segment kinds to put on the NPU")
+    p.add_argument(
+        "--precision-overrides",
+        default=STEP_PRECISION_OVERRIDES,
+        help="JSON file mapping node names to exact U16/S16 binary calibration "
+        f"(default: {os.path.basename(STEP_PRECISION_OVERRIDES)})",
+    )
     p.add_argument("--mode", default="npu", choices=["npu", "sim", "float"])
     p.add_argument("--out", required=True)
     p.add_argument("--emit-dir")
+    p.add_argument(
+        "--emit-cache-dir",
+        default=os.path.join(tempfile.gettempdir(), "axera-step-emission-cache-v1"),
+        help="persistent cache for emitted segment models (set empty to disable)",
+    )
     p.add_argument(
         "--limit", type=int, default=0, help="only the first N segments on the NPU"
     )
@@ -952,7 +2177,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     records = load_records()
     calib = axb.load_calibration(STEP_CALIB)
     kinds = set(args.kinds.split(",")) if args.kinds else None
-    segs, host = build_plan(model, records, calib, kinds, args.include_unsafe)
+    precision_overrides = None
+    if args.precision_overrides:
+        if os.path.abspath(args.precision_overrides) == os.path.abspath(
+            STEP_PRECISION_OVERRIDES
+        ):
+            precision_overrides = load_step_precision_overrides(
+                model, records, calib, args.precision_overrides
+            )
+        else:
+            with open(args.precision_overrides) as stream:
+                precision_overrides = json.load(stream)
+            if not isinstance(precision_overrides, dict):
+                raise ValueError(
+                    "precision override JSON must map node names to calibration"
+                )
+    segs, host = build_plan(
+        model,
+        records,
+        calib,
+        kinds,
+        args.include_unsafe,
+        precision_overrides=precision_overrides,
+    )
     if args.only:
         only = set(args.only.split(","))
         segs = [s for s in segs if s.name in only]
@@ -979,7 +2226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         segs = [sg for sg in segs if sg.name not in failed]
     if args.limit:
         segs = segs[: args.limit]
-    segs, blobs = drop_unemittable(segs, host)
+    segs, blobs = drop_unemittable(segs, host, args.emit_cache_dir or None)
     ref = load_reference()
     feeds = ref["feeds"]
     grad_names = gradient_tensors(model, ref["state_map"])

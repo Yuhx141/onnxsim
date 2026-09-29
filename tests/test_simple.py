@@ -631,8 +631,8 @@ def test_fp8_qdq_modelopt_integration():
     )
     onnx.checker.check_model(model)
 
-    # ModelOpt's exact former call shape. Must not raise "no supported data
-    # type: 17"; check must be True so ModelOpt would keep the simplified model.
+    # ModelOpt's exact former call shape. Must not raise the unsupported ONNX
+    # data type 17 error; check must be True so ModelOpt keeps the simplified model.
     sim_model, check_ok = onnxsim.simplify(model)
     assert check_ok
     onnx.checker.check_model(sim_model)

@@ -10,6 +10,7 @@ import gzip
 import json
 import os
 import struct
+import subprocess
 import sys
 
 import numpy as np
@@ -68,9 +69,15 @@ def _gather_key():
 
 def test_template_key_json_round_trip():
     key = axb.TemplateKey(
-        "Transpose", ((16, 512),), (("perm", (1, 0)),), calibration_class=""
+        "Transpose",
+        ((16, 512),),
+        (("perm", (1, 0)),),
+        calibration_class="",
+        layer_precision="S16",
+        calibration_scales=(0.125, 0.25, 0.5),
     )
     assert axb.TemplateKey.from_json(json.loads(json.dumps(key.to_json()))) == key
+    assert dataclasses.replace(key, layer_precision="U16") != key
 
 
 @pytest.mark.parametrize(
@@ -87,6 +94,240 @@ def test_template_key_json_round_trip():
 def test_cache_refuses_unmeasured_keys(key):
     with pytest.raises(ValueError):
         axb.TemplateCache().lookup(key)
+
+
+@pytest.mark.parametrize("precision", ["U16", "S16", "FP32"])
+def test_cache_does_not_reuse_u8_binary_template_for_other_layer_precision(
+    precision,
+):
+    key = axb.TemplateKey("Mul", ((16, 64, 56, 56),), layer_precision=precision)
+    expected_error = (
+        "no validated FP32 layer-precision"
+        if precision == "FP32"
+        else "needs exact x,z,y calibration_scales"
+    )
+    with pytest.raises(ValueError, match=expected_error):
+        axb.TemplateCache().lookup(key)
+
+
+def test_template_key_refuses_unknown_layer_precision():
+    key = axb.TemplateKey("Mul", ((16, 64, 56, 56),), layer_precision="S4")
+    with pytest.raises(ValueError, match="unsupported layer precision"):
+        axb.TemplateCache().lookup(key)
+
+
+def test_precision_selection_flows_through_generic_compiler_request():
+    key = axb.TemplateKey("Mul", ((1000, 512),), calibration_class="x0,y0,z0")
+    request = axb.build_request(key, [axb.BinaryTemplateOnly()])
+    u8_model = onnx.load_model_from_string(axb.compile_request(request))
+    fixture, _ = bse.load_template("Mul", (1000, 512), {"x": 0, "y": 0, "z": 0})
+    assert u8_model.SerializeToString() == fixture.SerializeToString()
+
+    precision_cases = {
+        "U16": (
+            (
+                2.7466237952467054e-05,
+                2.7466237952467054e-05,
+                1.2359806532913353e-05,
+            ),
+            "x32768,y0,z32768",
+            "mul_16x64x56x56_u16.axmodel.gz",
+        ),
+        "S16": (
+            (
+                2.7466237952467054e-05,
+                2.7466237952467054e-05,
+                2.4719613065826707e-05,
+            ),
+            "x0,y0,z0",
+            "mul_16x64x56x56_s16.axmodel.gz",
+        ),
+    }
+    for precision, (scales, calibration_class, filename) in precision_cases.items():
+        high_key = axb.TemplateKey(
+            "Mul",
+            ((16, 64, 56, 56),),
+            calibration_class=calibration_class,
+            layer_precision=precision,
+            calibration_scales=scales,
+        )
+        high_request = axb.build_request(high_key, [axb.BinaryTemplateOnly()])
+        high_model = onnx.load_model_from_string(axb.compile_request(high_request))
+        expected = _load_gz(os.path.join(_FIX, "binary_op_precision", filename))
+        assert high_model.SerializeToString() == expected.SerializeToString()
+
+        miss = dataclasses.replace(
+            high_key, calibration_scales=(scales[0], scales[1], 0.01)
+        )
+        with pytest.raises(ValueError, match="no exact-calibration"):
+            axb.TemplateCache().lookup(miss)
+
+
+@pytest.mark.parametrize("precision", ["U16", "S16"])
+def test_high_precision_mul_template_on_axcl_vm(precision):
+    vm = os.environ.get("AXCL_LXD_VM", "axcl-vm")
+    try:
+        ready = (
+            subprocess.run(
+                [
+                    "lxc",
+                    "exec",
+                    vm,
+                    "--",
+                    "test",
+                    "-x",
+                    "/usr/bin/axcl/axcl_run_model",
+                    "-a",
+                    "-e",
+                    "/dev/axcl_host",
+                ],
+                capture_output=True,
+                timeout=30,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        ready = False
+    if not ready:
+        pytest.skip("needs the AX650 device via AXCL_LXD_VM")
+    import axcl_session
+
+    scale = 2.7466237952467054e-05
+    output_scale = (
+        1.2359806532913353e-05 if precision == "U16" else 2.4719613065826707e-05
+    )
+    zp = "x32768,y0,z32768" if precision == "U16" else "x0,y0,z0"
+    key = axb.TemplateKey(
+        "Mul",
+        ((16, 64, 56, 56),),
+        calibration_class=zp,
+        layer_precision=precision,
+        calibration_scales=(scale, scale, output_scale),
+    )
+    model = onnx.load_model_from_string(
+        axb.compile_request(axb.build_request(key, [axb.BinaryTemplateOnly()]))
+    )
+    rng = np.random.default_rng(18)
+    if precision == "U16":
+        # This fixture's calibration reuses identical x/z samples, so its
+        # output calibration is nonnegative (output zero point 0).
+        x = rng.uniform(0.1, 0.9, key.shapes[0]).astype(np.float32)
+        z = rng.uniform(0.1, 0.9, key.shapes[0]).astype(np.float32)
+    else:
+        x = rng.uniform(-0.9, 0.9, key.shapes[0]).astype(np.float32)
+        z = rng.uniform(-0.9, 0.9, key.shapes[0]).astype(np.float32)
+    with axcl_session.AXSession(subdir=f"precision_mul_{precision.lower()}") as session:
+        compiled = session.load(model.SerializeToString())
+        (actual,) = session.run(compiled, [x, z])
+    np.testing.assert_allclose(actual, x * z, atol=5e-5, rtol=0)
+
+
+def _binary_precision_cases():
+    with open(os.path.join(_FIX, "binary_op_precision", "index.json")) as stream:
+        entries = json.load(stream)
+    return [
+        entry
+        for entry in entries
+        if entry["shape"] == [16, 1000] and "ResNet18 step" not in entry["source"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "entry", _binary_precision_cases(), ids=lambda e: f"{e['op']}-{e['precision']}"
+)
+def test_high_precision_binary_template_through_onnx_uop_mcode(entry, tmp_path):
+    op, precision = entry["op"], entry["precision"]
+    shape = entry["shape"]
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node(op, ["x", "z"], ["y"])],
+            f"{op.lower()}_{precision.lower()}",
+            [
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, shape),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    calibration = {
+        "layer_precision": precision,
+        "scales": dict(zip(("x", "z", "y"), entry["scales"])),
+        "zero_points": dict(zip(("x", "y", "z"), entry["zero_points"])),
+    }
+    schedule = tmp_path / f"{op.lower()}_{precision.lower()}.json"
+    actual = onnx.load_model_from_string(
+        axb.compile_onnx(model, str(schedule), calibration)
+    )
+    expected = _load_gz(os.path.join(_FIX, "binary_op_precision", entry["file"]))
+    assert [node.op_type for node in actual.graph.node] == ["neu mode"]
+    assert _mcode(actual) == _mcode(expected)
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
+
+
+@pytest.mark.parametrize(
+    "entry", _binary_precision_cases(), ids=lambda e: f"{e['op']}-{e['precision']}"
+)
+def test_high_precision_binary_template_on_axcl_vm(entry):
+    vm = os.environ.get("AXCL_LXD_VM", "axcl-vm")
+    try:
+        ready = (
+            subprocess.run(
+                [
+                    "lxc",
+                    "exec",
+                    vm,
+                    "--",
+                    "test",
+                    "-x",
+                    "/usr/bin/axcl/axcl_run_model",
+                    "-a",
+                    "-e",
+                    "/dev/axcl_host",
+                ],
+                capture_output=True,
+                timeout=30,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        ready = False
+    if not ready:
+        pytest.skip("needs the AX650 device via AXCL_LXD_VM")
+    import axcl_session
+
+    op, precision = entry["op"], entry["precision"]
+    shape = tuple(entry["shape"])
+    model = _load_gz(os.path.join(_FIX, "binary_op_precision", entry["file"]))
+    rng = np.random.default_rng(1965)
+    if precision == "U16":
+        ranges = {
+            "Add": ((0.1, 0.9), (0.1, 0.9)),
+            "Sub": ((0.5, 0.9), (0.1, 0.4)),
+            "Mul": ((0.1, 0.9), (0.1, 0.9)),
+            "Div": ((0.1, 0.9), (0.5, 0.9)),
+        }[op]
+    else:
+        ranges = {
+            "Add": ((-0.9, 0.9), (-0.9, 0.9)),
+            # Keep differences inside the pinned output calibration interval.
+            "Sub": ((-0.75, 0.75), (-0.75, 0.75)),
+            "Mul": ((-0.9, 0.9), (-0.9, 0.9)),
+            "Div": ((-0.9, 0.9), (0.5, 0.9)),
+        }[op]
+    x, z = (rng.uniform(*bounds, shape).astype(np.float32) for bounds in ranges)
+    with axcl_session.AXSession(
+        subdir=f"binary_{op.lower()}_{precision.lower()}"
+    ) as session:
+        compiled = session.load(model.SerializeToString())
+        (actual,) = session.run(compiled, [x, z])
+    expected = {
+        "Add": np.add,
+        "Sub": np.subtract,
+        "Mul": np.multiply,
+        "Div": np.divide,
+    }[op](x, z)
+    np.testing.assert_allclose(actual, expected, atol=1.2e-4, rtol=2e-4)
 
 
 def test_cache_miss_is_not_built():
@@ -202,6 +443,24 @@ def test_lower_and_compile_tinygrad_reshape_relu_uop_without_pulsar2(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
 
 
+def test_lower_and_compile_tinygrad_standalone_relu_uop_without_pulsar2(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 64, 56, 56).relu().uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Relu"]
+    _, meta = ew.load_template("Relu", (16, 64, 56, 56), {"x": 0, "y": 0})
+    schedule = tmp_path / "relu.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+
+
 def test_compile_onnx_imports_through_tinygrad_uop_without_pulsar2(tmp_path):
     shape = numpy_helper.from_array(np.array([1, 1, 8, 16], dtype=np.int64), "shape")
     model = onnx.helper.make_model(
@@ -229,6 +488,142 @@ def test_compile_onnx_imports_through_tinygrad_uop_without_pulsar2(tmp_path):
     generated = onnx.load_from_string(axb.compile_onnx(model, str(schedule)))
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
+
+
+def test_compile_onnx_frozen_conv_keeps_uop_shape_and_emits_mcode(tmp_path):
+    rng = np.random.default_rng(1965)
+    weights = rng.normal(0.0, 0.02, (64, 64, 3, 3)).astype(np.float32)
+    bias = rng.normal(0.0, 0.01, (64,)).astype(np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Conv",
+                    ["x", "w", "b"],
+                    ["y"],
+                    pads=[1, 1, 1, 1],
+                    strides=[1, 1],
+                )
+            ],
+            "frozen_conv_to_uop",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+            [
+                numpy_helper.from_array(weights, "w"),
+                numpy_helper.from_array(bias, "b"),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "frozen_conv.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {
+                "scales": {"x": 0.007058821618556976, "y": 0.03239550068974495},
+                "zero_points": {"x": 127, "y": 125},
+            },
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert list(generated.graph.output[0].type.tensor_type.shape.dim)[0].dim_value == 16
+    assert json.loads(schedule.read_text())["kernels"][0]["inputs"] == ["x"]
+
+
+@pytest.mark.parametrize(
+    ("input_shape", "output_shape", "weight_shape", "pads", "strides"),
+    [
+        ((16, 64, 56, 56), (16, 128, 28, 28), (128, 64, 1, 1), (0, 0, 0, 0), (2, 2)),
+        ((16, 3, 224, 224), (16, 64, 112, 112), (64, 3, 7, 7), (3, 3, 3, 3), (2, 2)),
+    ],
+)
+def test_compile_onnx_frozen_conv_routes_all_validated_templates(
+    tmp_path, input_shape, output_shape, weight_shape, pads, strides
+):
+    rng = np.random.default_rng(sum(input_shape) + sum(weight_shape))
+    weights = rng.normal(0.0, 0.02, weight_shape).astype(np.float32)
+    bias = rng.normal(0.0, 0.01, (weight_shape[0],)).astype(np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Conv",
+                    ["x", "w", "b"],
+                    ["y"],
+                    pads=list(pads),
+                    strides=list(strides),
+                )
+            ],
+            "frozen_conv_template",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, input_shape
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, output_shape
+                )
+            ],
+            [numpy_helper.from_array(weights, "w"), numpy_helper.from_array(bias, "b")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "frozen_conv_template.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": {"x": 0.01, "y": 0.02}, "zero_points": {"x": 127, "y": 125}},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["inputs"] == ["x"]
+
+
+def test_compile_onnx_frozen_conv_without_bias_emits_zero_bias_mcode(tmp_path):
+    weights = np.zeros((64, 64, 3, 3), dtype=np.float32)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Conv", ["x", "w"], ["y"], pads=[1, 1, 1, 1], strides=[1, 1]
+                )
+            ],
+            "frozen_conv_without_bias",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+            [numpy_helper.from_array(weights, "w")],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "frozen_conv_without_bias.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": {"x": 0.01, "y": 0.02}, "zero_points": {"x": 127, "y": 125}},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["inputs"] == ["x"]
 
 
 def test_lower_and_compile_tinygrad_relu_reshape_uop_without_pulsar2(tmp_path):
@@ -259,6 +654,8 @@ def test_lower_and_compile_tinygrad_add_uop_with_explicit_calibration(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "add"
 
 
@@ -278,6 +675,323 @@ def test_lower_and_compile_tinygrad_mul_uop_with_explicit_calibration(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
+
+
+def test_compile_onnx_broadcast_mul_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Mul", ["x", "z"], ["y"])],
+            "onnx_broadcast_mul",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [1, 64]
+                ),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, [64]),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 64])],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template("Mul", (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / "onnx_broadcast_mul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
+
+
+@pytest.mark.parametrize("op", ["Add", "Div", "Sub"])
+def test_compile_onnx_live_binary_through_uop_to_mcode(tmp_path, op):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node(op, ["x", "z"], ["y"])],
+            f"onnx_live_{op.lower()}",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [1, 64]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, [1, 64]
+                ),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 64])],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = bse.load_template(op, (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / f"onnx_{op.lower()}.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == ["x", "z"]
+    assert [value.name for value in generated.graph.output] == ["y"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
+
+
+def test_compile_onnx_maxpool_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "MaxPool",
+                    ["x"],
+                    ["y"],
+                    kernel_shape=[3, 3],
+                    strides=[2, 2],
+                    pads=[1, 1, 1, 1],
+                )
+            ],
+            "onnx_maxpool",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 64, 112, 112]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 64, 56, 56]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    template_model, meta = misc.load_template(
+        "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1"
+    )
+    schedule = tmp_path / "onnx_maxpool.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "maxpool"
+
+
+def test_compile_onnx_reducemean_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "ReduceMean", ["x"], ["y"], axes=[2, 3], keepdims=1
+                )
+            ],
+            "onnx_reducemean",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 512, 7, 7]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 512, 1, 1]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    template_model, meta = misc.load_template("ReduceMean:16x512x7x7:axes2,3:k1")
+    schedule = tmp_path / "onnx_reducemean.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducemean"
+
+
+def test_compile_onnx_reducesum_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("ReduceSum", ["x"], ["y"], axes=[0], keepdims=1)],
+            "onnx_reducesum",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 1000]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [1, 1000]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    template_model, meta = misc.load_template("ReduceSum:16x1000:axes0:k1")
+    schedule = tmp_path / "onnx_reducesum.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
+
+
+def test_compile_onnx_softmax_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Softmax", ["x"], ["y"], axis=1)],
+            "onnx_softmax",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 1000]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 1000]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    template_model, meta = misc.load_template("Softmax:16x1000:axis1")
+    schedule = tmp_path / "onnx_softmax.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "softmax"
+
+
+@pytest.mark.parametrize(
+    ("op", "shape", "template"),
+    [
+        ("Sqrt", (512, 512, 3, 3), "Sqrt:512x512x3x3"),
+        ("Log", (16, 1000), "Log:16x1000"),
+    ],
+)
+def test_compile_onnx_unary_through_uop_to_mcode(tmp_path, op, shape, template):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node(op, ["x"], ["y"])],
+            f"onnx_{op.lower()}",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    template_model, meta = misc.load_template(template)
+    schedule = tmp_path / f"onnx_{op.lower()}.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [value.name for value in generated.graph.input] == [
+        value.name for value in template_model.graph.input
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        value.name for value in template_model.graph.output
+    ]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op.lower()
+
+
+def test_compile_onnx_neg_preserves_name_sensitive_template_io(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Neg", ["x"], ["y"])],
+            "onnx_neg",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 1])],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1])],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    _, meta = misc.load_template("Neg:1x1")
+    schedule = tmp_path / "onnx_neg.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [value.name for value in generated.graph.input] == ["distill__div_14"]
+    assert [value.name for value in generated.graph.output] == ["distill__neg_15"]
+    assert json.loads(schedule.read_text())["inputs"][0]["name"] == "distill__div_14"
+
+
+def test_lower_and_compile_tinygrad_broadcast_binary_uop(tmp_path):
+    Tensor = pytest.importorskip("tinygrad").Tensor
+
+    # The emitter uses the validated full-output-shape binary program. Runtime
+    # callers expand the smaller operand at the segment/device boundary.
+    root = (Tensor.empty(1, 64) * Tensor.empty(64)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Mul"]
+    assert [
+        tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+        for value in lowered.graph.input
+    ] == [(1, 64), (64,)]
+    _, meta = bse.load_template("Mul", (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / "broadcast_mul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert [
+        tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+        for value in generated.graph.input
+    ] == [(1, 64), (1, 64)]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
 
 
@@ -698,7 +1412,60 @@ def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
         )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
+    emitted_schedule = json.loads(schedule.read_text())
+    assert [value.name for value in generated.graph.input] == [
+        item["name"] for item in emitted_schedule["inputs"]
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        item["name"] for item in emitted_schedule["outputs"]
+    ]
+    assert emitted_schedule["kernels"][0]["chain"] == "matmul"
+
+
+def test_compile_onnx_live_matmul_through_uop_to_mcode(tmp_path):
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("MatMul", ["x", "z"], ["y"])],
+            "onnx_live_matmul",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 1000]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, [1000, 512]
+                ),
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 512]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "onnx_matmul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_onnx(
+            model,
+            str(schedule),
+            {
+                "scales": {"x": 0.1, "z": 0.2, "y": 0.3},
+                # This measured MatMul template has a symmetric input view;
+                # changing x from zero to nonzero would require a different
+                # record layout and must remain refused.
+                "zero_points": {"x": 0, "z": 0, "y": 125},
+            },
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    emitted_schedule = json.loads(schedule.read_text())
+    assert [value.name for value in generated.graph.input] == [
+        item["name"] for item in emitted_schedule["inputs"]
+    ]
+    assert [value.name for value in generated.graph.output] == [
+        item["name"] for item in emitted_schedule["outputs"]
+    ]
+    assert emitted_schedule["kernels"][0]["chain"] == "matmul"
 
 
 def test_lower_tinygrad_rank2_gemm_uop_to_onnx():
@@ -708,6 +1475,43 @@ def test_lower_tinygrad_rank2_gemm_uop_to_onnx():
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == ["Gemm"]
     assert [value.name for value in lowered.graph.input] == ["x", "z", "b"]
+
+
+def test_lower_onnx_gemm_beta_zero_to_matmul_uop():
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "Gemm",
+                    ["x", "z", "b"],
+                    ["y"],
+                    alpha=1.0,
+                    beta=0.0,
+                    transA=0,
+                    transB=0,
+                )
+            ],
+            "gemm_beta_zero_to_uop",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [16, 1000]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "z", onnx.TensorProto.FLOAT, [1000, 512]
+                ),
+                onnx.helper.make_tensor_value_info("b", onnx.TensorProto.FLOAT, [512]),
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [16, 512]
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    lowered = axb.lower_uop_to_onnx(axb.onnx_to_uop(model))
+    assert [node.op_type for node in lowered.graph.node] == ["MatMul"]
+    assert [value.name for value in lowered.graph.input] == ["x", "z"]
 
 
 def test_lower_tinygrad_stem_conv_uop_to_onnx():
@@ -1080,27 +1884,21 @@ def test_coverage_report_on_the_resnet18_step():
     )
     want = {"refused": 20 - live_conv, "conditional": live_conv}
     assert report["per_op"]["Conv"] == {k: v for k, v in want.items() if v}
-    # same-shape binary ops: ElementwiseScaleEdit (binary_op_scale_emit.py);
-    # constant and broadcast operands stay refused
-    assert report["per_op"]["Add"] == {"conditional": 101, "refused": 43}
+    # Binary ops are conditional on calibration class; native shape and
+    # zero-point-255 templates now cover additional scalar/1x1000 cases.
+    assert report["per_op"]["Add"] == {"conditional": 144}
     assert report["per_op"]["Sub"] == {"conditional": 42, "refused": 4}
-    assert report["per_op"]["Mul"] == {"conditional": 63, "refused": 334}
-    assert report["per_op"]["Div"] == {"conditional": 44, "refused": 8}
+    assert report["per_op"]["Mul"] == {"conditional": 355, "refused": 42}
+    assert report["per_op"]["Div"] == {"conditional": 51, "refused": 1}
     # Live-operand MatMul/Gemm/Conv nodes with a step template move from
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
-    live = len(axb.mre.step_manifest()["nodes"])
     rs = _step_reshape_templated()
     want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
     assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
     assert report["totals"] == {
-        "covered": 82 + _MISC_COVERED,
-        "conditional": 324 + live + _MISC_CONDITIONAL + rs + _SQUEEZE_CONDITIONAL,
-        "refused": 698
-        - live
-        - _MISC_COVERED
-        - _MISC_CONDITIONAL
-        - rs
-        - _SQUEEZE_CONDITIONAL,
+        "covered": 120,
+        "conditional": 937,
+        "refused": 47,
     }
 
 
@@ -1124,6 +1922,18 @@ def test_tinygrad_compiler_seam():
     src = axb.build_request(_gather_key(), [axb.GatherIndexEdit(list(range(8)))])
     out = classes["AXCompiler"]().compile_cached(src)
     assert out == axb.compile_request(src)
+
+
+def test_ax_program_stages_scalar_broadcast_input():
+    pytest.importorskip("tinygrad")
+    classes = axb.tinygrad_classes()
+    spec = dataclasses.make_dataclass("Spec", [("shape", tuple), ("dtype", object)])(
+        (1, 64), np.dtype(np.float32)
+    )
+    scalar = np.array([2.0], dtype=np.float32)
+    got = classes["AXProgram"]._stage_input(scalar, spec)
+    assert got.shape == (1, 64)
+    assert np.all(got == 2.0)
     pytest.importorskip("tinygrad")
     from tinygrad.device import Allocator, Program
 
@@ -1324,19 +2134,13 @@ def test_coverage_report_weight_dtypes_on_the_resnet18_step():
     report = axb.coverage_report(_step_records(), policy)
     # Live-operand MatMul/Gemm/Conv nodes with a step template move from
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
-    live = len(axb.mre.step_manifest()["nodes"])
     rs = _step_reshape_templated()
     want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
     assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
     assert report["totals"] == {
-        "covered": 82 + _MISC_COVERED,
-        "conditional": 324 + live + _MISC_CONDITIONAL + rs + _SQUEEZE_CONDITIONAL,
-        "refused": 698
-        - live
-        - _MISC_COVERED
-        - _MISC_CONDITIONAL
-        - rs
-        - _SQUEEZE_CONDITIONAL,
+        "covered": 120,
+        "conditional": 937,
+        "refused": 47,
     }
     assert len(report["per_node"]) == 1104
     # no weight in the training step is a constant: a weight dtype choice
