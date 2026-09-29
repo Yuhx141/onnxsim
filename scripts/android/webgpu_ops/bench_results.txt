@@ -1,0 +1,19 @@
+
+RESULT m/resnet50.onnx cpu load=121ms cold=68.1ms median=66.81ms mean=67.33ms min=66.48ms p90=71.21ms n=20
+RESULT m/resnet50.onnx webgpu load=208ms cold=259.8ms median=66.87ms mean=67.21ms min=66.01ms p90=69.21ms n=20
+RESULT m/yolo11n.onnx cpu load=49ms cold=74.6ms median=65.94ms mean=65.92ms min=65.62ms p90=66.13ms n=20
+RESULT m/yolo11n.onnx webgpu load=94ms cold=545.6ms median=73.67ms mean=73.65ms min=72.69ms p90=74.18ms n=20
+RESULT m/yolo26n.onnx cpu load=53ms cold=64.1ms median=56.30ms mean=56.39ms min=56.00ms p90=56.67ms n=20
+RESULT m/yolo26n.onnx webgpu load=152ms cold=404.2ms median=66.11ms mean=66.22ms min=65.77ms p90=66.81ms n=20
+RESULT m/rtdetr_pre.onnx cpu load=117ms cold=444.3ms median=464.38ms mean=461.33ms min=436.82ms p90=477.47ms n=10
+RESULT m/rtdetr_pre.onnx webgpu load=195ms cold=645.0ms median=396.29ms mean=396.18ms min=393.17ms p90=397.88ms n=10
+RESULT m/rtdetr_mid0.onnx cpu load=21ms cold=7.4ms median=6.18ms mean=6.18ms min=6.07ms p90=6.24ms n=30
+RESULT m/rtdetr_mid0.onnx webgpu load=20ms cold=99.7ms median=19.55ms mean=19.47ms min=18.20ms p90=20.58ms n=30
+RESULT m/rtdetr_mid1.onnx cpu load=21ms cold=7.7ms median=6.21ms mean=6.20ms min=6.09ms p90=6.24ms n=30
+RESULT m/rtdetr_mid1.onnx webgpu load=21ms cold=106.5ms median=19.20ms mean=19.28ms min=18.26ms p90=20.62ms n=30
+RESULT m/rtdetr_post.onnx cpu load=14ms cold=3.5ms median=3.08ms mean=3.05ms min=2.92ms p90=3.13ms n=30
+RESULT m/rtdetr_post.onnx webgpu load=13ms cold=60.2ms median=10.83ms mean=10.67ms min=9.20ms p90=11.35ms n=30
+RESULT m/sam_l0_enc.onnx cpu load=145ms cold=547.7ms median=579.08ms mean=572.07ms min=544.91ms p90=587.46ms n=8
+RESULT m/sam_l0_enc.onnx webgpu load=266ms cold=610.8ms median=440.51ms mean=440.48ms min=439.78ms p90=441.43ms n=8
+RESULT m/sam_l0_dec.onnx cpu load=73ms cold=47.2ms median=40.98ms mean=40.97ms min=40.37ms p90=41.44ms n=20
+RESULT m/sam_l0_dec.onnx webgpu load=73ms cold=496.6ms median=64.69ms mean=65.03ms min=63.54ms p90=65.74ms n=20

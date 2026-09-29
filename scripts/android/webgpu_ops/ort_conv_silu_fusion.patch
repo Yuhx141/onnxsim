@@ -1,0 +1,76 @@
+diff --git a/onnxruntime/core/optimizer/conv_activation_fusion.cc b/onnxruntime/core/optimizer/conv_activation_fusion.cc
+index 35f3683..ef8a5f3 100644
+--- a/onnxruntime/core/optimizer/conv_activation_fusion.cc
++++ b/onnxruntime/core/optimizer/conv_activation_fusion.cc
+@@ -79,7 +79,12 @@ class ConvActivationSelector : public NodeSelector {
+       return std::nullopt;
+     }
+ 
+-    auto is_supported_non_cuda_ep_activation = [&graph_viewer](const Node& activation_node) {
++    auto is_supported_non_cuda_ep_activation = [&graph_viewer, node_ep](const Node& activation_node) {
++      // The WebGPU EP can apply x * sigmoid(alpha * x) (SiLU, produced by QuickGeluFusion) in the Conv epilogue.
++      if (node_ep == kWebGpuExecutionProvider &&
++          graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "QuickGelu", {1}, kMSDomain)) {
++        return true;
++      }
+       if (graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "Relu", {6, 13, 14}) ||
+           graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "Sigmoid", {6, 13}) ||
+           graph_utils::IsSupportedOptypeVersionAndDomain(activation_node, "Tanh", {6, 13}) ||
+@@ -177,6 +182,9 @@ class FuseConvActivationAction : public ReplaceWithNew {
+                   "Failed to get Clip min/max constants.");
+       activation_params.push_back(min);
+       activation_params.push_back(max);
++    } else if (activation_op_type == "QuickGelu") {
++      const auto* alpha_attr = graph_utils::GetNodeAttribute(*activation, "alpha");
++      activation_params.push_back(alpha_attr == nullptr ? 1.702f : alpha_attr->f());  // 1.702 is the QuickGelu default
+     } else if (activation_op_type == "HardSigmoid") {
+       auto* alpha_attr = graph_utils::GetNodeAttribute(*activation, "alpha");
+       auto* beta_attr = graph_utils::GetNodeAttribute(*activation, "beta");
+diff --git a/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc b/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
+index aa0caab..49153de 100644
+--- a/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
++++ b/onnxruntime/core/providers/webgpu/nn/fuse_utils.cc
+@@ -30,6 +30,9 @@ Status GetFusedActivationAttr(const OpKernelInfo& info, Activation& activation)
+       } else if (activation_type == "HardSigmoid") {
+         activation.activation_kind_ = ActivationKind::HardSigmoid;
+         activation_params_count = 2;
++      } else if (activation_type == "QuickGelu") {
++        activation.activation_kind_ = ActivationKind::QuickGelu;
++        activation_params_count = 1;
+       } else {
+         return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "unimplemented activation: " + activation_type);
+       }
+@@ -75,6 +78,9 @@ std::string GetActivationSnippet(const Activation& activation, std::string value
+              " * value, value, value >= " + value_type_cast(0.0) + ");";
+     case ActivationKind::Tanh:
+       return "value = tanh(value);";
++    case ActivationKind::QuickGelu:
++      // x * sigmoid(alpha * x) = x / (1 + exp(-alpha * x)); exp overflows to +inf for very negative x, giving -0, which is right.
++      return "value = value / (" + value_type_cast(1.0) + " + exp(-" + base_type_cast(activation.activation_params_.QuickGelu.alpha_) + " * value));";
+     default:
+       return "";
+   }
+diff --git a/onnxruntime/core/providers/webgpu/nn/fuse_utils.h b/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
+index fad7d3d..3b3ce91 100644
+--- a/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
++++ b/onnxruntime/core/providers/webgpu/nn/fuse_utils.h
+@@ -19,7 +19,8 @@ enum class ActivationKind {
+   Clip,
+   HardSigmoid,
+   LeakyRelu,
+-  Tanh
++  Tanh,
++  QuickGelu  // x * sigmoid(alpha * x); alpha = 1 is SiLU/Swish
+ };
+ 
+ using Activation = struct Activation {
+@@ -42,6 +43,9 @@ using Activation = struct Activation {
+       float alpha_;
+       float beta_;
+     } HardSigmoid;
++    struct {
++      float alpha_;
++    } QuickGelu;
+     float values_[2];
+   };
+   ActivationParameters activation_params_ = {};

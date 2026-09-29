@@ -168,6 +168,12 @@ device nodes, so its DSP runtime does not directly match this Android/TVM RPC
 setup. The source offers a codegen experiment, but does not establish a
 phone-specific memory-bandwidth model.
 
+## WebGPU (Vulkan) survey
+
+See [WEBGPU_SURVEY.md](WEBGPU_SURVEY.md) for the survey of WebGPU implementations
+(ORT WebGPU EP/Dawn, wgpu, wonnx, burn, ...) on the Adreno 730 Vulkan backend, with
+known Adreno shader-compiler bugs and the plan for the ORT WebGPU EP on this phone.
+
 ## Other Mask R-CNN Hexagon operator timings
 
 `bench_tvm_hexagon_maskrcnn_ops.py` extends the phone measurements to
