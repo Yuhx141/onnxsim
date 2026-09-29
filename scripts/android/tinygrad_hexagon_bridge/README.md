@@ -487,6 +487,26 @@ Lossy options measured against the "plan error no worse than today" budget (`w16
   plane splits, 28 ms float requantization epilogues (scalar float on v65) and 26 ms table lookups; vrmpy tensor-core convs 77 ms;
   depthwise 41 ms. The copies are lossless work; the epilogues would be integer fixed-point (up to one uint16 step of difference).
 
+| depthwise convs as sliding-window vrmpy over each channel's flat padded image (`nn/dw_v65.py`; all 29 driving layers, 7x7/3x3/5x5, stride 2 and channel multipliers) | 163 / 185 | 79.5 |
+| u16 table lookups through VTCM `vgather` (`DSP_V65_VGATHER=1`, on by default in `compile_v65.sh`) | 154 / 178 | 75.0 |
+
+**Depthwise (sliding-window vrmpy).** Each channel's padded image is one flat byte signal. A 128-lane vrmpy takes one unaligned
+128-byte load at offset `128b + s + ky*Wp + 4g` and a splat of 4 weights; four shifts s = 0..3 give 128 outputs, re-ordered with
+`vshuff` -4 then -8 (the negative forms are the full-interleave constants). 56 vrmpys per 128 outputs for 7x7 and 12 for 3x3,
+instead of about three loads per output. The idea is the SDK's `qhdsp_hvx_conv7x7_ab.c` (read for technique, not copied: it is
+Qualcomm Proprietary). The old depthwise bucket was 40 ms; the new kernels are 0.03-0.3 ms each. The input planes come from a small
+custom prep kernel; the tinygrad-generated pad/flatten/plane-split version made DM slower (93.8 -> 101.9 ms). Not tried: the
+`valign` variant (aligned loads and register shifts).
+
+**Table lookups through `vgather`.** An unsigned PD gets VTCM with `HAP_compute_res_acquire` and a VTCM parameter (no HMX vote;
+2, 4 and 8 MB were all granted). The 128 KB tables need the word-offset gather (`Q6_vgather_ARMWw`, 64 halfwords per instruction,
+reads VTCM only, region within one page); the skel copies each distinct table into VTCM once after the weights load. Per call on
+98304 random indices: scalar loop 118-122 us, `vgather` with the table resident 12.5-13 us, with the table copied every call 191 us.
+Driving's 20 lookup calls went 8.6 -> 1.25 ms. The emitted program keeps the scalar loop and uses it when VTCM is unavailable, so
+qemu stays bit-exact. Not tested: a target with less VTCM than this phone's 8 MB (driving's 20 tables are 2.6 MB), and the driving
+and DM artifacts loaded together in one runner session (each takes its own VTCM).
+The earlier "26 ms of table lookups" was a loose classifier's number; the real u16 lookups were 8.6 ms.
+
 The copy rule needs unit stride in *every* buffer that uses the axis: with "any buffer" DM went from 93.5 to 119.5 ms (13 kernels of
 a 345x3x64 shape vectorized an axis one of their buffers walks with a stride, so the vector was a gather). Elementwise total for
 driving is now 85.7 ms (98.0 before). What is left there is table lookups (about 20 ms), the stem's plane split + pad + channel-4
