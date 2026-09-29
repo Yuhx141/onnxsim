@@ -473,6 +473,19 @@ magnitude is 894. Weights below 65536 elements stay float: converting all ~90 he
 The second row's DSP time is unchanged within noise: the two ~12 ms preprocessing kernels are gone (5 ms of table lookups
 remain), but the hmix run-to-run spread is about 4 ms.
 
+Lossy options measured against the "plan error no worse than today" budget (`w16t10` + `hmix` heads, held-out segments 8 and 5;
+`evaluate.py --backend phone`, `../../openpilot_dsp/README.md`):
+- **12- or 10-bit lookup tables** (index the uint16 tables by the nearest 16 or 64 values, so a table is 8 KB or 2 KB instead of
+  128 KB): driving DSP 203.6 -> 199.8 ms (12 bits) and 199.0 ms (10 bits). About 2% for a coarser activation inside those stages,
+  so it is not in the tree. The 12 lookup kernels of one shape cost about 23 cycles per element, so it is not the table's cache
+  misses that dominate them.
+- **uint8 activations in any backbone window** would remove a vrmpy pass, the plane-split copies and the 64K tables, but the
+  budget has no room: the backbone activations are heavy-tailed (max/std 20-60), A16 already gives 20-60x less relative precision
+  than fp16, and a block of uint8 windows measured 2x the plan error (0.137 vs 0.069 m, `../../openpilot_dsp/README.md` section 3).
+- Where the 203 ms goes (before the pixel blocking): elementwise 98 ms, of which 41 ms are integer copies, layout changes and
+  plane splits, 28 ms float requantization epilogues (scalar float on v65) and 26 ms table lookups; vrmpy tensor-core convs 77 ms;
+  depthwise 41 ms. The copies are lossless work; the epilogues would be integer fixed-point (up to one uint16 step of difference).
+
 Tried and dropped: blocking pixels inside the tensor-core construction (`DSP_TC_MBLOCK`): the compiler passes ran out of memory
 (12 GB in 6 s). The same blocking as an ordinary upcast after the tensor core (`DSP_TC_MUPCAST`) works.
 
