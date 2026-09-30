@@ -46,3 +46,21 @@ def test_resnet_network_rejects_mismatched_tuning_lists(tmp_path):
         xdna._compile_command(
             {"_xdna_python": "py"}, "resnet_network", options, tmp_path
         )
+
+
+def test_resnet_engine_compile_command(tmp_path):
+    command, xclbin, insts, manifest = xdna._compile_command(
+        {"_xdna_python": "py"}, "resnet_engine", {}, tmp_path
+    )
+    assert manifest is None and xclbin is not None and insts is not None
+    assert command[1].endswith("layer_engine_design.py")
+    assert command[command.index("--net") + 1] == "full"
+    assert command[command.index("--slot") + 1] == "4096"
+    assert "--looped" in command and command[command.index("--l2") + 1] == "2"
+    command, *_ = xdna._compile_command(
+        {"_xdna_python": "py"}, "resnet_engine", {"stem": False, "l2": 3}, tmp_path
+    )
+    assert (
+        command[command.index("--net") + 1] == "bodyr"
+        and command[command.index("--l2") + 1] == "3"
+    )

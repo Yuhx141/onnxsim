@@ -91,6 +91,7 @@ _KINDS = (
     "fused_stage",
     "resnet_body",
     "resnet_network",
+    "resnet_engine",
     "maxpool_u8",
 )
 
@@ -216,6 +217,26 @@ def _compile_command(
                         f"{option} needs one entry per stage ({len(stages)})"
                     )
                 command += [flag, ",".join(str(int(v)) for v in values)]
+    elif kind == "resnet_engine":
+        # Layer-sequential engine: stem Conv + MaxPool + every conv layer as jobs over all 32 cores.
+        # The artifact depends only on the ResNet-50 job structure (weights are packed at run time).
+        command = [
+            _xdna_python(header),
+            str(_script("layer_engine_design.py")),
+            "--dev",
+            str(options.get("device", "npu2")),
+            "--net",
+            "full" if options.get("stem", True) else "bodyr",
+            "--slot",
+            "4096",  # must match layer_engine.ENGINE_SLOT_BYTES, which the runner packs with
+            "--looped",
+            "--l2",
+            str(int(options.get("l2", 2))),
+            "--xclbin-path",
+            str(xclbin),
+            "--insts-path",
+            str(insts),
+        ]
     elif kind == "resnet_body":
         groups = _body_groups(options.get("groups"))
         command = [
@@ -526,6 +547,24 @@ def run_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
             str(network["insts"]),
             json.dumps(stages),
         ]
+    engine = options.get("layer_engine")
+    if engine is not None:
+        if not isinstance(engine, dict) or not all(
+            key in engine for key in ("xclbin", "insts", "stages")
+        ):
+            raise proto.RPCError("layer_engine needs xclbin, insts, and stages")
+        stages = [
+            s["blocks"] if isinstance(s, dict) else s
+            for s in _body_groups(engine["stages"])
+        ]
+        command += [
+            "--layer-engine",
+            str(engine["xclbin"]),
+            str(engine["insts"]),
+            json.dumps(stages),
+        ]
+        if engine.get("stem", True):
+            command.append("--layer-engine-stem")
     if options.get("host_maxpool"):
         command.append("--host-maxpool")
     pool = options.get("maxpool_uint8")

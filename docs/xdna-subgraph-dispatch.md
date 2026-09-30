@@ -337,11 +337,92 @@ loop -- every call then pays a ~1.8 ms context switch, which produced bogus numb
   joining outputs across columns is not possible (an objectfifo cannot sit in two links and a
   memtile has ~6 input channels), so one drain per column remains.
 
+Full-size weight-volume run (`--layers 64 -k 1536 -n 256 -p 8 --once`, verified bit-exact, compute
+included): 64 layers x 393 KB = **25.2 MB streamed in 1.015 ms total (16 us/layer, 24.9 GB/s)**,
+with or without the broadcast activation stream. That is the ResNet-50 weight volume moved at
+Vitis-AI-like layer granularity in *less* than Vitis AI's whole 1.55 ms, so a layer-sequential
+engine's floor is ~1.0 ms and the remaining budget (~0.5 ms) is the real per-layer compute
+(3x3 im2col gather, residual adds, stem/pool). Design constraints found while sizing it: a core
+program unrolled over 53 different layers overflows program memory by 4.6 KB (a per-layer
+acquire/release sequence is ~300 B), so jobs must be uniform (loop over identical jobs, layer
+shape from the descriptor) or grouped per stage with `range_`; and FIFO objects are fixed-size,
+so a layer's per-core weight slice must be split into passes of at most one slot (K-split with an
+accumulator kept across jobs for the widest 3x3 layers).
+
 Projection for a full layer-sequential ResNet-50 engine: 55 conv layers x ~16 us sync (~0.9 ms)
-+ streaming (~0.75 ms, partly overlapped) + compute + launch, roughly 2-2.5 ms versus ~3.5 ms
-now, i.e. a ~1.5x gain that still trails Vitis' 1.55 ms. It needs runtime-shaped kernels (per-
-shape code does not fit 16 KB of program memory across all block kinds), a generic 3x3/1x1/skip/
-residual engine and a per-layer parameter header, so it is a substantial rewrite; not started.
++ streaming (~0.75 ms, partly overlapped) + compute + launch, roughly 2-2.5 ms. It was built (next
+section) and came out better than projected.
+
+### Layer-sequential engine (`layer_engine_design.py`, `kernels/layer_engine.cc`)
+
+Vitis-style: every conv layer of layer1..layer4 is one *job* spread over all 32 cores (8 columns x 4
+rows); layers run one after the other, activations round-trip through a small DDR arena.
+
+- **Work split.** A layer's output channel blocks (8 channels) are dealt to cores in order; core `s` owns
+  `nbc = ceil(NB/32)` consecutive blocks, so narrow layers simply leave cores idle. Each core writes its
+  blocks to a fixed 512-byte *region* of the layer's arena slot (32 regions = 16 KB), so the next layer's
+  input is "NCP regions of NBP blocks of P pixels" and the packed weights follow that reduction order.
+- **Kernel.** One runtime-shaped function (`layer_chunk`) serves every layer: a 192-byte descriptor at the
+  start of each per-core weight chunk carries the geometry, taps, K-chunk range, shifts, residual mode
+  and the (tap, region) decomposition of the chunk start (no divide on the core). Weights that do not
+  fit one 4 KB slot are K-split over several chunks with the int32 partial sums kept in core memory.
+  Paths: direct GEMM (1x1), a zero-padded-copy path for stride-1 3x3 (the copy is built once, in each input
+  region's unused bytes or the activation object's tail; a tile is then 1/2/4 contiguous row segments), and
+  a masked 8-row gather for strided 1x1/3x3.
+- **Data movement.** One broadcast activation stream (a residual map is queued as a second object one job
+  early), one weight stream per column carrying its four cores' chunks (each core keeps its own; all
+  weights issued once), one output drain per column. Program memory (16 KB) rules out a per-layer
+  unrolled core program (~450 B per job), so the core runs 4 stages x (projection block + `nid[s]`
+  identity blocks) as `range_` loops whose chunk counts come from a small table in core memory: 7 job
+  bodies for 52 jobs.
+- **Arena.** 4 reused slots (64 KB): `assign_slots` reuses a slot once its last reader (a residual is read a
+  job early) has run.
+
+Results (32x32 quicktest model; weights come from the model's block bindings via
+`layer_engine_net.jobs_from_bindings`, the artifact only needs the job structure):
+
+| configuration | pooled map -> layer4 | notes |
+|---|---|---|
+| stage-column body (previous best) | ~2.4 ms | one active column per stage |
+| engine, broadcast weights (`--net bodyr --looped`) | 1.60 ms | 0.97 ms with every kernel call skipped |
+| engine, memtile-staged weights (`--l2 2`) | **1.03 ms** | 0.82 ms with every kernel call skipped |
+| engine + stem/pool jobs (`--net full --looped --l2 2`) | **1.11 ms image -> layer4** | pooled map and all 16 blocks bit-exact vs ORT |
+
+Through the graph runner (`--layer-engine XCLBIN INSTS STAGES_JSON --layer-engine-stem`, RPC
+`resnet_engine` / `layer_engine`) the full graph takes **1.65 ms** (1.7-2.0 ms in noisier windows), logits
+identical to ORT (max abs error 0.0; `--dump-output` saves them), versus 3.55-3.84 ms for the best
+stage-column network and 1.55 ms for Vitis AI. Device call ~1.2 ms; the host part is image quantize +
+im2col (~0.1 ms) and the classifier tail (~0.15 ms) plus Python.
+
+What made the difference, and what did not:
+- **Memtile staging with per-core distribution (`--l2`) was the biggest single win (1.59 -> 1.03 ms).**
+  With broadcast, every core received all four cores' slices and looped over four acquires per chunk
+  round; now the shim streams whole 4-slice objects into the column's memtile and the memtile hands each
+  core only its own slice (`ObjectFifoLink` with destination offsets). Streaming is ~40 GB/s, the
+  per-round core loop is 4x shorter, and compute overlaps with streaming (kernel time went from +0.63 ms
+  to +0.2 ms over the floor). L2 depth 4 needs too many memtile BDs (24 per channel); depth 2 is best.
+- The first 3x3 version gathered every 8-pixel tile per (tap, input block) with 64-bit copies: ~290
+  cycles per tile, 1.03 ms for the 3x3 layers. The padded-copy segment path cut stride-1 3x3 layers from
+  ~60 us to a few us each. Masks were not the cost (removing them changed nothing); the per-tile scalar
+  loop control was.
+- Loops over (tap, region) steps pay ~60-100 cycles of scalar control per step on this core; making the inner
+  loop a uniform-stride pointer walk (`run` blocks of one tap) lets the compiler emit a zero-overhead loop.
+- With broadcast weights, more FIFO depth (3, 4) did not help (depth 3 was 15% slower: acquire index
+  rotation); slots above 4 KB do not fit the data banks once the L2 distribution FIFOs are added.
+- Memory is bank-structured: two 16 KB activation objects take two of the four 16 KB data banks, the rest
+  (weights, out, partial sums, stack) shares the remainder; the padded 3x3 copy therefore lives inside the
+  activation objects' unused bytes.
+- Host: the runner's `_max_pool` looped per output pixel in Python (0.5 ms); one strided slice per kernel
+  tap is 0.08 ms. With the stem and pool on the device nothing but quantize + im2col remains before the
+  device call.
+- Stem and pool as jobs: the 7x7 stem is four 1x1 GEMM jobs (host im2col chunks of 64 pixels, K padded to
+  152) draining into one dense 64 KB stem map with a strided output pattern (block `s`, chunk `c` at
+  `s*2048 + c*512`), then a pool job (mode 2 in the kernel) over that map; slots 0-8 are reserved for
+  these, the body reuses 4.
+
+Not done yet: fusing conv1 and the skip conv of projection blocks (same input, fewer jobs), a faster
+stride-2 gather (phase-split copies), a second weight channel per column (the activation stream currently
+takes one shim MM2S channel), keeping activations in L2 between layers instead of round-tripping DDR.
 
 ### Runtime-shaped kernels (`kernels/fused_bottleneck_rt.cc`, `resnet_body_design.py --rt`)
 
