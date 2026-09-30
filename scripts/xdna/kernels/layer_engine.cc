@@ -118,7 +118,11 @@ inline void gather_region(int8_t *scratch, const int8_t *region, int nbp, int p_
   for (int l = 0; l < nbp; ++l) {
     const int8_t *base = region + l * p_in * 8;
     _Pragma("clang loop unroll(full)")
+#ifdef ENG_GATHER_NOMASK
+    for (int r = 0; r < 8; ++r) dst[l * 8 + r] = *(const uint64_t *)(base + offs[r] * 8);
+#else
     for (int r = 0; r < 8; ++r) dst[l * 8 + r] = *(const uint64_t *)(base + offs[r] * 8) & mask[r];
+#endif
   }
 }
 
