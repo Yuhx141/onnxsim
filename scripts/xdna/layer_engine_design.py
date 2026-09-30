@@ -39,6 +39,7 @@ def engine(
     depth: CompileTime[int] = 2,
     compute: CompileTime[int] = 0xFFFFFF,
     looped: CompileTime[int] = 0,
+    l2: CompileTime[int] = 0,
     kflags: CompileTime[str] = "",
 ):
     jobs, _ = layer_engine_nets.build(net)
@@ -66,11 +67,17 @@ def engine(
                 r = a
             o = out.acquire(1)
             for _ in range_(nch[j]):
-                for c in range(ROWS):
+                if l2:  # memtile distributes every chunk round, so only this core's slice arrives
                     wc = w.acquire(1)
-                    if c == index and (compute >> j) & 1:
+                    if (compute >> j) & 1:
                         kern(a, wc, o, r)
                     w.release(1)
+                else:
+                    for c in range(ROWS):
+                        wc = w.acquire(1)
+                        if c == index and (compute >> j) & 1:
+                            kern(a, wc, o, r)
+                        w.release(1)
             out.release(1)
             act.release(2 if job.res_slot is not None else 1)
 
@@ -100,11 +107,17 @@ def engine(
                 r = a
             o = out.acquire(1)
             for _ in range_(sched[kind, stage]):
-                for c in range(ROWS):
+                if l2:
                     wc = w.acquire(1)
-                    if c == index and (compute >> kind) & 1:
+                    if (compute >> kind) & 1:
                         kern(a, wc, o, r)
                     w.release(1)
+                else:
+                    for c in range(ROWS):
+                        wc = w.acquire(1)
+                        if c == index and (compute >> kind) & 1:
+                            kern(a, wc, o, r)
+                        w.release(1)
             out.release(1)
             act.release(2 if res else 1)
 
@@ -131,13 +144,19 @@ def engine(
             sched_tab[7, st] = repeat
     wfs, outs, workers = [], [], []
     for col in range(COLS):
-        wf = ObjectFifo(w_ty, depth=depth, name=f"c{col}_w")
+        if l2:
+            wf = ObjectFifo(np.ndarray[(ROWS * slot,), np.dtype[np.uint8]], depth=l2, name=f"c{col}_w")
+            core_ws = [ObjectFifo(w_ty, depth=depth, name=f"c{col}_w{i}") for i in range(ROWS)]
+            ObjectFifoLink(wf.cons(), [f.prod() for f in core_ws], dst_offsets=[i * slot for i in range(ROWS)])
+        else:
+            wf = ObjectFifo(w_ty, depth=depth, name=f"c{col}_w")
+            core_ws = None
         core_outs = [ObjectFifo(out_ty, depth=1, name=f"c{col}_o{i}") for i in range(ROWS)]
         col_out = ObjectFifo(col_out_ty, depth=1, name=f"c{col}_out")
         for i in range(ROWS):
             workers.append(Worker(
                 core_looped if looped else core_fn,
-                fn_args=[act_all.cons(), wf.cons(), core_outs[i].prod(), kernel, i]
+                fn_args=[act_all.cons(), core_ws[i].cons() if l2 else wf.cons(), core_outs[i].prod(), kernel, i]
                 + ([Buffer(np.ndarray[(8, 4), np.dtype[np.int32]], initial_value=sched_tab)] if looped else []),
                 tile=Tile(col, 2 + i), stack_size=0x1300))
         ObjectFifoLink([o.cons() for o in core_outs], col_out.prod(), src_offsets=[i * REGION_BYTES for i in range(ROWS)])
@@ -183,6 +202,7 @@ def _parser():
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--nocompute", action="store_true")
     parser.add_argument("--kflags", default="", help="extra kernel compile flags (profiling)")
+    parser.add_argument("--l2", type=int, default=0, help="stage weights in memtile L2 (this many 4-slice objects deep) and distribute one slice per core")
     parser.add_argument("--looped", action="store_true", help="stage-looped core program (body net)")
     parser.add_argument("--compute", type=lambda v: int(v, 0), default=0xFFFFFF, help="bitmask of jobs that run their kernel (profiling)")
     return parser
@@ -192,7 +212,7 @@ def main() -> None:
     opts = _parser().parse_args()
     run_design_cli(
         engine, opts,
-        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0, "kflags": o.kflags},
+        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0, "kflags": o.kflags, "l2": o.l2},
         device=lambda value: device_from_args(value, n_cols=8),
     )
 
