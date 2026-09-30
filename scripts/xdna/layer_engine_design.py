@@ -57,6 +57,7 @@ def engine(
 ):
     jobs, _ = layer_engine_nets.build(net, 0, arch)
     segments = layer_engine_nets.segments_for(net, jobs, arch)
+    resnet_like = net in ("full", "body", "bodyr", "l1proj", "l1id", "l2proj", "l3id", "l4id")  # no table/movement/depthwise code: 16 KB program memory
     generic = net.startswith(
         ("onnx:", "gen:")
     )  # graph-compiled jobs: one table-driven loop, every job takes two act objects
@@ -77,7 +78,7 @@ def engine(
         source_file=str(_KERNEL),
         arg_types=[act_ty, w_ty, out_ty, act_ty],
         compile_flags=[f"-DENG_REGION_BYTES={REGION_BYTES}"]
-        + (["-DENG_NO_G4"] if generic else [])
+        + (["-DENG_NO_G4"] if generic else (["-DENG_NO_MOVE", "-DENG_NO_LUT", "-DENG_NO_DW"] if resnet_like else []))
         + kflags.split(),
     )
 

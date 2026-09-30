@@ -165,6 +165,7 @@ inline void tiled_gemm(const Layer &L, int nt, ABase a_base, int a_stride, Epi e
 }
 }  // namespace
 
+#ifndef ENG_NO_MOVE
 // Round-half-to-even arithmetic right shift (k >= 0), the rounding the QuantizeLinear after a mean / product uses.
 static inline int rshift_even(int v, int k) {
   if (k == 0) return v;
@@ -207,6 +208,8 @@ __attribute__((noinline)) static void add_bytes(uint8_t *dst, const uint8_t *a, 
   }
 }
 
+#endif  // ENG_NO_MOVE
+
 extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out, const int8_t *resid) {
   ::aie::set_rounding(aie::rounding_mode::conv_even);
   ::aie::set_saturation(aie::saturation_mode::saturate);
@@ -218,6 +221,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     // is optionally re-scaled by 2^D_EA (the Q after the op has its own scale).
     const int n = L.op * 8;
     uint8_t *dst0 = (uint8_t *)out;
+#ifndef ENG_NO_MOVE
     if (L.mode == 6) {
       const int32_t *tab = (const int32_t *)L.weights;
       for (int ol = 0; ol < L.nb; ++ol) {
@@ -242,7 +246,9 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
           if (++ry == f) { ry = 0; ++iy; }
         }
       }
-    } else {
+    } else
+#endif
+    {
       const int k = L.ntaps, pad = (k - 1) / 2;
       for (int ol = 0; ol < L.nb; ++ol) {
         const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * L.w * L.h * 8;
@@ -264,9 +270,12 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
           }
       }
     }
+#ifndef ENG_NO_MOVE
     if (L.mode != 6 && L.ea != 0) requant_bytes(dst0, L.nb * n, L.ea);
+#endif
     return;
   }
+#ifndef ENG_NO_MOVE
   if (L.mode == 10) {
     // Global average pool of this core's blocks (pixel count a power of two): out = sat(rshift_even(sum, D_SHIFT)).
     const int n = L.w * L.h;
@@ -307,6 +316,8 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
                 (const uint8_t *)resid + L.core * L.tt0 + ol * n, n, L.ea, L.eb);
     return;
   }
+#endif  // ENG_NO_MOVE
+#ifndef ENG_NO_LUT
   if (L.mode == 5) {
     // Unary lookup table over this core's blocks (same layout in and out): out byte = table[in byte]. Any
     // elementwise activation (SiLU, HardSwish, Sigmoid, GELU, Tanh, ...) that was quantized to 8 bits reduces to
@@ -318,6 +329,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     for (int i = 0; i < n; ++i) dst[i] = tab[src[i]];
     return;
   }
+#endif  // ENG_NO_LUT
   const int p_in = L.w * L.h;
   const v64 zero = aie::zeros<int8, 64>();
 
@@ -351,6 +363,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     store_rows(out + (ocl * L.op + t * 8) * 8, q, L.op - t * 8);
   };
 
+#ifndef ENG_NO_DW
   if (L.mode == 4) {
     // Depthwise 3x3 / strided: every output block reads only its own input block (input regions and output
     // regions belong to the same core), one elementwise multiply-accumulate per tap with the channel weights
@@ -386,6 +399,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
       }
     return;
   }
+#endif  // ENG_NO_DW
   if (L.mode == 0) {
     // Direct: tile t of every input block is the 64 contiguous bytes at t*64; regions are REGION_BYTES apart.
     auto a_base = [&](int t, int tt) { return act + tt * L.reg + t * 64; };
