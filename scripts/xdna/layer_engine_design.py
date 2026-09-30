@@ -46,6 +46,9 @@ def engine(
 ):
     jobs, _ = layer_engine_nets.build(net, 0, arch)
     segments = layer_engine_nets.segments_for(net, jobs, arch)
+    generic = net.startswith("onnx:")  # graph-compiled jobs: one table-driven loop, every job takes two act objects
+    if generic:
+        has_res = True
     basic = arch.startswith("basic:")
     stem = net == "full"  # jobs[:5] are the stem GEMM chunks + pool; the rest is the looped body
     nch = [n_chunks(j, slot - 192) for j in jobs]
@@ -181,9 +184,30 @@ def engine(
                 run(4, False, stage)
                 run(5, True, stage)
 
+    def core_generic(act, w, out, kern, index, sched):
+        for j in range_(len(jobs)):
+            both = act.acquire(2)
+            r, a = both[0], both[1]
+            o = out.acquire(1)
+            for _ in range_(sched[0, j]):
+                if l2:
+                    wc = w.acquire(1)
+                    kern(a, wc, o, r)
+                    w.release(1)
+                else:
+                    for c in range(ROWS):
+                        wc = w.acquire(1)
+                        if c == index:
+                            kern(a, wc, o, r)
+                        w.release(1)
+            out.release(1)
+            act.release(2)
+
     act_all = ObjectFifo(act_ty, depth=2 if has_res else 1, name="act_all")
     sched_tab = None
-    if looped and basic:
+    if generic:
+        sched_tab = np.array([nch], dtype=np.int32)
+    elif looped and basic:
         sched_tab = np.zeros((8, 3), dtype=np.int32)
         rest = segments[1:]
         for st in range(3):
@@ -215,9 +239,9 @@ def engine(
         col_out = ObjectFifo(col_out_ty, depth=1, name=f"c{col}_out")
         for i in range(ROWS):
             workers.append(Worker(
-                (core_basic if basic else core_looped) if looped else core_fn,
+                core_generic if generic else ((core_basic if basic else core_looped) if looped else core_fn),
                 fn_args=[act_all.cons(), core_ws[i].cons() if l2 else wf.cons(), core_outs[i].prod(), kernel, i]
-                + ([Buffer(np.ndarray[sched_tab.shape, np.dtype[np.int32]], initial_value=sched_tab)] if looped else []),
+                + ([Buffer(np.ndarray[sched_tab.shape, np.dtype[np.int32]], initial_value=sched_tab)] if (looped or generic) else []),
                 tile=Tile(col, 2 + i), stack_size=0x1300))
         ObjectFifoLink([o.cons() for o in core_outs], col_out.prod(), src_offsets=[i * REGION_BYTES for i in range(ROWS)])
         wfs.append(wf)
@@ -234,14 +258,18 @@ def engine(
         for col in range(COLS):
             wprods[col].fill(params, group=weights_group, offset=col * per_col, sizes=[1, 1, 1, per_col],
                              strides=[0, 0, 0, 1], transfer_len=per_col)
+        res_of = (lambda k: jobs[k].res_slot if jobs[k].res_slot is not None else jobs[k].in_slot) if generic else (lambda k: jobs[k].res_slot)
         for j, job in enumerate(jobs):
             group = TaskGroup()
+            if generic and j == 0:  # the first job's residual object goes first (later ones ride behind the previous job's input)
+                aprod.fill(a_in, group=group, offset=res_of(0) * SLOT_BYTES, sizes=[1, 1, 1, SLOT_BYTES], strides=[0, 0, 0, 1],
+                           transfer_len=SLOT_BYTES)
             aprod.fill(a_in, group=group, offset=job.in_slot * SLOT_BYTES, sizes=[1, 1, 1, SLOT_BYTES],
                        strides=[0, 0, 0, 1], transfer_len=SLOT_BYTES)
-            if j + 1 < len(jobs) and jobs[j + 1].res_slot is not None:
+            if j + 1 < len(jobs) and res_of(j + 1) is not None:
                 # The next job's residual map already exists: queue it behind this job's input now so its
                 # transfer overlaps this job's compute (the core takes it first, then the input).
-                aprod.fill(a_in, group=group, offset=jobs[j + 1].res_slot * SLOT_BYTES, sizes=[1, 1, 1, SLOT_BYTES],
+                aprod.fill(a_in, group=group, offset=res_of(j + 1) * SLOT_BYTES, sizes=[1, 1, 1, SLOT_BYTES],
                            strides=[0, 0, 0, 1], transfer_len=SLOT_BYTES)
             for col, oc in enumerate(ocons):
                 if job.stem_chunk is not None:

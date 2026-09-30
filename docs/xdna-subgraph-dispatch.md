@@ -481,6 +481,33 @@ export through the generator (SqueezeNet: shared bias initializers; EfficientNet
 DenseNet: standalone BatchNorm; ShuffleNet: Split/Transpose; AlexNet/VGG at 32x32: too small / huge FC) have no
 numbers.
 
+#### Operator expansion through tinygrad lowering (`tinygrad_lower.py`, `layer_engine_graph.py`)
+
+The engine used to stop at ResNet-shaped graphs. Three additions widen it, and tinygrad supplies the semantics
+for everything the engine has no kernel of its own for:
+
+- **Table jobs (`kind="lut"`)**: activations are 8-bit, so any pointwise unary op (HardSwish, Sigmoid, Tanh, GELU,
+  Erf, Softplus, Mish, LeakyRelu, ...) is one 256-entry byte table. The table is built by executing the op's
+  single-node ONNX model through tinygrad's ONNX frontend (`OnnxRunner`, pure-Python device, no host compiler)
+  on the 256 dequantized inputs and requantizing; `is_pointwise_unary` finds such ops *by execution* (permuting
+  the input must permute the output), so no per-op list is needed (Softmax is correctly rejected). The core
+  runs the table over its own blocks; cost is negligible.
+- **Depthwise 3x3 (`kind="dw"`, kernel mode 4)**: every output block reads only its own input block, so it is
+  one elementwise multiply-accumulate per tap with the channel weights replicated over the tile's eight pixel
+  rows (masked gather of the shifted tile, stride 1 or 2), plus the usual bias/requant epilogue.
+- **ReLU6 as an int8 clamp** (`clamp` field in the epilogue), and a **graph compiler** for straight-line QDQ
+  graphs: Conv 1x1/3x3/depthwise + Relu/Clip + QuantizeLinear, an Add of a conv result and an earlier tensor
+  fused into the conv's residual epilogue (MobileNet's linear bottleneck), and unary ops as table jobs. The core
+  program for such nets is one table-driven loop over jobs (`--net onnx:MODEL.onnx`).
+
+Result: a MobileNetV3-style mini network (8x8 maps; six pointwise+ReLU6/HardSwish layers, three depthwise
+layers including stride 2, two fused residual adds; 20 jobs) is **bit-exact against ONNX Runtime** on the
+NPU (0 of 1024 output bytes differ) in 0.45 ms for the engine part (Vitis AI runs the whole model, tail
+included, in 1.50 ms and differs from CPU logits by up to 0.14). The 256-entry-table approach relies on the
+activation being 8-bit; 16-bit activations would need interpolation. Still missing for real MobileNet/EfficientNet
+inputs: maps larger than 64 pixels / 16 KB (pixel tiling), Concat, grouped convs other than depthwise,
+Squeeze-and-Excite (a GAP -> FC -> Sigmoid -> broadcast Mul: needs a reduce job and a broadcast multiply job).
+
 - Host findings worth keeping: OpenBLAS defaulted to one thread per core, and a 2048x1000 Gemm took 2.9 ms on
   this 64-thread host versus 0.05-0.1 ms with 1-2 threads (the runner now sets `OPENBLAS_NUM_THREADS=2`
   before numpy loads); a 1000-class head made the runner 3x slower before that fix.

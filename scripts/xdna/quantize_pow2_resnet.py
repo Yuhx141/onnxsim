@@ -52,14 +52,15 @@ def quantize(fp32_path: Path, out_path: Path, size: int, seed: int, samples: int
     # Calibration: absmax of every activation tensor over random inputs.
     probe = onnx.ModelProto()
     probe.CopyFrom(model)
-    exposed = sorted({o for n in graph.node for o in n.output if n.op_type in ("Conv", "Relu", "Clip", "MaxPool", "AveragePool", "Concat", "Add", "GlobalAveragePool", "Flatten", "Gemm")})
+    exposed = sorted({o for n in graph.node for o in n.output if n.op_type in ("Conv", "Relu", "Clip", "HardSwish", "HardSigmoid", "Sigmoid", "Tanh", "MaxPool", "AveragePool", "Concat", "Add", "GlobalAveragePool", "Flatten", "Gemm")})
     for name in exposed:
         probe.graph.output.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, None))
     session = ort.InferenceSession(probe.SerializeToString(), providers=["CPUExecutionProvider"])
+    in_channels = int(graph.input[0].type.tensor_type.shape.dim[1].dim_value)
     rng = np.random.default_rng(seed)
     absmax: dict[str, float] = {"input": 1.0}
     for _ in range(samples):
-        outputs = session.run(exposed, {"input": rng.random((1, 3, size, size), dtype=np.float32)})
+        outputs = session.run(exposed, {"input": rng.random((1, in_channels, size, size), dtype=np.float32)})
         for name, value in zip(exposed, outputs):
             absmax[name] = max(absmax.get(name, 0.0), float(np.abs(value).max()))
 
@@ -114,6 +115,9 @@ def quantize(fp32_path: Path, out_path: Path, size: int, seed: int, samples: int
         elif node.op_type in ("Relu", "Clip"):
             new_nodes.append(node)  # Clip = ReLU6: min/max stay float constants
             qdq(node.output[0], act_scale(node.output[0]), False)
+        elif node.op_type in ("HardSwish", "HardSigmoid", "Sigmoid", "Tanh"):
+            new_nodes.append(helper.make_node(node.op_type, [dq_of[node.input[0]]], list(node.output), name=node.name))
+            qdq(node.output[0], act_scale(node.output[0]), True)  # signed-range unary: a table job on the engine
         elif node.op_type == "Concat":
             cat = helper.make_node("Concat", [dq_of[i] for i in node.input], list(node.output), name=node.name)
             cat.attribute.extend(node.attribute)

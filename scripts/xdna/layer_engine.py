@@ -25,8 +25,8 @@ TILE = 8
 # Descriptor word indices: keep in sync with the enum in kernels/layer_engine.cc.
 D_NBP, D_NCP, D_W, D_H, D_OW, D_OH, D_S, D_MODE, D_NTAPS, D_TAP0 = range(10)
 D_NB = D_TAP0 + 9
-(D_TT0, D_TTN, D_FIRST, D_LAST, D_SHIFT, D_RELU, D_IN_FLIP, D_OUT_FLIP, D_RES, D_EA, D_EB, D_BIAS, D_CORE, D_TI0, D_CP0) = range(
-    D_NB + 1, D_NB + 16
+(D_TT0, D_TTN, D_FIRST, D_LAST, D_SHIFT, D_RELU, D_IN_FLIP, D_OUT_FLIP, D_RES, D_EA, D_EB, D_BIAS, D_CORE, D_TI0, D_CP0, D_CLAMP) = range(
+    D_NB + 1, D_NB + 17
 )
 
 
@@ -93,7 +93,9 @@ class Job:
     res_mode: int = 0  # 1 int8 residual, 2 uint8 residual
     ea: int = 0
     eb: int = 0
-    kind: str = "conv"  # "conv" | "pool" (3x3 stride-2 pad-1 max pool over a dense uint8 map)
+    kind: str = "conv"  # "conv" | "pool" (3x3 stride-2 pad-1 max pool) | "dw" (depthwise 3x3) | "lut" (unary table)
+    clamp: int = 127  # upper bound of the int8 result before the output flip (ReLU6 = 6 / output scale)
+    table: np.ndarray | None = None  # "lut": 256 output bytes indexed by the input byte
     stem_chunk: int | None = None  # stem GEMM chunk: its output block is drained into a shared 64 KB map
     out_span_slots: int = 1  # arena slots the job's output occupies (the stem map spans 4)
     out_layout: Layout = field(init=False)
@@ -106,8 +108,14 @@ class Job:
         oh = (self.in_layout.h - 1) // s + 1
         if self.kind == "pool":
             ow, oh = self.in_layout.w // 2, self.in_layout.h // 2
+        if self.kind == "lut":
+            ow, oh = self.in_layout.w, self.in_layout.h
         self.out_layout = layout_for(oc, ow, oh)
-        if kh == 3:
+        if self.kind in ("dw", "lut") and self.out_layout.nbc != self.in_layout.nbc:
+            raise ValueError(f"{self.name}: depthwise/table jobs need the same channel blocking in and out")
+        if self.kind == "lut":
+            self.taps = [0]
+        elif kh == 3:
             self.taps = valid_taps(self.in_layout.h, self.in_layout.w, oh, ow, s)
         else:
             self.taps = [4] if s > 1 else [0]  # 1x1: direct mode ignores the tap id; strided uses the centre tap
@@ -146,7 +154,7 @@ def plan_chunks(job: Job, payload: int) -> int:
 
 
 def n_chunks(job: Job, payload: int) -> int:
-    if job.kind == "pool":
+    if job.kind in ("pool", "dw", "lut"):
         return 1
     steps = len(job.taps) * job.in_layout.ncp
     return math.ceil(steps / plan_chunks(job, payload))
@@ -156,6 +164,42 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
     """Weight stream of one job: uint8 [column][chunk][row][slot_bytes]."""
     payload = slot_bytes - DESC_BYTES
     lay_in, lay_out = job.in_layout, job.out_layout
+    if job.kind in ("dw", "lut"):
+        out = np.zeros((COLS, 1, ROWS, slot_bytes), dtype=np.uint8)
+        for core in range(CORES):
+            col, row = divmod(core, ROWS)
+            blocks = _blocks(job, core)
+            desc = np.zeros(DESC_BYTES // 4, dtype=np.int32)
+            desc[D_W], desc[D_H], desc[D_OW], desc[D_OH] = lay_in.w, lay_in.h, lay_out.w, lay_out.h
+            desc[D_S], desc[D_NB], desc[D_CORE] = job.stride, len(blocks), core
+            desc[D_FIRST], desc[D_LAST] = 1, 1
+            desc[D_SHIFT], desc[D_RELU] = job.shift, int(job.relu)
+            desc[D_IN_FLIP], desc[D_OUT_FLIP], desc[D_CLAMP] = int(job.in_flip), int(job.out_flip), job.clamp
+            slot = out[col, 0, row]
+            if job.kind == "lut":
+                desc[D_MODE] = 5
+                slot[:DESC_BYTES] = desc.view(np.uint8)
+                slot[DESC_BYTES : DESC_BYTES + 256] = job.table.astype(np.uint8)
+                continue
+            desc[D_MODE], desc[D_NTAPS] = 4, len(job.taps)
+            desc[D_TAP0 : D_TAP0 + len(job.taps)] = job.taps
+            nb = len(blocks)
+            tiles = nb * len(job.taps) * 64
+            desc[D_BIAS] = (tiles + 3) & ~3
+            if (desc[D_BIAS] + nb * TILE * 4) > payload:
+                raise ValueError(f"{job.name}: depthwise weights of {nb} blocks do not fit a {slot_bytes} B slot")
+            slot[:DESC_BYTES] = desc.view(np.uint8)
+            body = np.zeros(desc[D_BIAS] + nb * TILE * 4, dtype=np.uint8)
+            vec = np.zeros((nb, len(job.taps), 64), dtype=np.int8)
+            for ol, g in enumerate(blocks):
+                for ti, tap in enumerate(job.taps):
+                    ky, kx = divmod(tap, 3)
+                    vec[ol, ti] = np.tile(job.weight[g * TILE : (g + 1) * TILE, 0, ky, kx], 8)  # lane = row * 8 + channel
+            if nb:
+                body[:tiles] = vec.view(np.uint8).reshape(-1)
+                body[desc[D_BIAS] :] = job.bias[blocks[0] * TILE : (blocks[-1] + 1) * TILE].astype(np.int32).view(np.uint8)
+            slot[DESC_BYTES : DESC_BYTES + body.size] = body
+        return out
     if job.kind == "pool":
         out = np.zeros((COLS, 1, ROWS, slot_bytes), dtype=np.uint8)
         for core in range(CORES):
@@ -197,6 +241,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
             desc[D_BIAS] = (tiles + 3) & ~3
             desc[D_CORE] = core
             desc[D_TI0], desc[D_CP0] = divmod(tt0, ncp)
+            desc[D_CLAMP] = job.clamp
             slot = out[col, chunk, row]
             slot[:DESC_BYTES] = desc.view(np.uint8)
             body = np.zeros(desc[D_BIAS] + nb * TILE * 4, dtype=np.uint8)
@@ -226,6 +271,25 @@ def _rse(v: np.ndarray, s: int) -> np.ndarray:
 def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray:
     """dense [pixel][cin] uint8/int8 -> dense [pixel][cout] (uint8 view when out_flip else int8 view)."""
     lay = job.in_layout
+    if job.kind == "lut":
+        return job.table.astype(np.uint8)[act.astype(np.uint8)]
+    if job.kind == "dw":
+        x = (act.astype(np.int64) - 128) if job.in_flip else act.view(np.int8).astype(np.int64)
+        x = x.reshape(lay.h, lay.w, -1)
+        s = job.stride
+        xp = np.pad(x, ((1, 1), (1, 1), (0, 0)))
+        oh, ow = job.out_layout.h, job.out_layout.w
+        acc = np.zeros((oh, ow, x.shape[2]), dtype=np.int64)
+        for ky in range(3):
+            for kx in range(3):
+                sub = xp[ky : ky + (oh - 1) * s + 1 : s, kx : kx + (ow - 1) * s + 1 : s, :]
+                acc += sub * job.weight[:, 0, ky, kx].astype(np.int64)
+        acc += job.bias.astype(np.int64)
+        q = np.clip(_rse(acc, job.shift), -128, 127).astype(np.int64).reshape(oh * ow, -1)
+        if job.relu:
+            q = np.maximum(q, 0)
+        q = np.minimum(q, job.clamp)
+        return (q + 128).astype(np.uint8) if job.out_flip else q.astype(np.int8).view(np.uint8)
     if job.kind == "pool":
         fmap = act.reshape(lay.h, lay.w, -1)
         padded = np.pad(fmap, ((1, 1), (1, 1), (0, 0)), constant_values=0)  # post-ReLU bytes are >= 128: 0 never wins
@@ -260,6 +324,7 @@ def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray
         q = np.clip(_rse(total, common), -128, 127).astype(np.int64)
     if job.relu:
         q = np.maximum(q, 0)
+    q = np.minimum(q, job.clamp)
     if job.out_flip:
         return (q + 128).astype(np.uint8)
     return q.astype(np.int8).view(np.uint8)

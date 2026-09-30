@@ -83,6 +83,13 @@ def run_reference(jobs, x_dense: np.ndarray):
 
 def build(name: str, seed: int = 0, arch: str = "3,4,6,3"):
     rng = np.random.default_rng(seed)
+    if name.startswith("onnx:"):  # any QDQ graph the graph compiler accepts (structure only matters to the design)
+        import onnx
+
+        from layer_engine_graph import compile_graph
+
+        jobs, *_ = compile_graph(onnx.load(name[5:]), reuse_slots=True)
+        return jobs, None
     if name == "full":
         jobs, _segments, _stem = full(seed, arch)
         return jobs, None
@@ -99,6 +106,8 @@ def build(name: str, seed: int = 0, arch: str = "3,4,6,3"):
         jobs = bottleneck("l2", 256, 128, 512, 8, 8, 2, rng, project=True)
     elif name == "l3id":
         jobs = bottleneck("l3", 1024, 256, 1024, 2, 2, 1, rng, project=False)
+    elif name == "dwchain":
+        return dwchain(rng)
     elif name == "l4id":
         jobs = bottleneck("l4", 2048, 512, 2048, 1, 1, 1, rng, project=False)
     else:
@@ -180,3 +189,26 @@ def basic_body(seed: int = 0, counts=(2, 2, 2, 2), hw: int = 8):
                     segments.append((first, len(block), 1))
     x = rng.integers(128, 256, (hw * hw, 64), dtype=np.uint8)
     return jobs, segments, x
+
+
+def silu_table(scale_in: float = 1 / 16, scale_out: float = 1 / 16) -> np.ndarray:
+    """Byte table of an int8 -> int8 SiLU (the reference definition of a lookup-table job)."""
+    x = np.arange(256, dtype=np.uint8).view(np.int8).astype(np.float64) * scale_in
+    y = x / (1.0 + np.exp(-x))
+    q = np.clip(np.rint(y / scale_out), -128, 127).astype(np.int8)
+    return q.view(np.uint8)
+
+
+def dwchain(rng):
+    """MobileNet-style chain: pointwise (ReLU6) -> depthwise -> SiLU table -> depthwise stride 2 -> pointwise (linear)."""
+    lay = layout_for(32, 8, 8)
+    rw = lambda o, i, k: rng.integers(-24, 24, (o, i, k, k), dtype=np.int8)
+    rb = lambda n: rng.integers(-800, 800, n, dtype=np.int32)
+    j0 = Job("pw", rw(96, 32, 1), rb(96), 0, 1, lay, in_flip=True, shift=8, clamp=95)
+    j1 = Job("dw", rw(96, 1, 3), rb(96), 1, 2, j0.out_layout, shift=7, clamp=95, kind="dw")
+    j2 = Job("silu", np.zeros((96, 1, 1, 1), dtype=np.int8), np.zeros(96, dtype=np.int32), 2, 3, j1.out_layout, kind="lut", table=silu_table())
+    j3 = Job("dw2", rw(96, 1, 3), rb(96), 3, 4, j2.out_layout, stride=2, shift=7, kind="dw")
+    j4 = Job("pwl", rw(32, 96, 1), rb(32), 4, 5, j3.out_layout, shift=8, relu=False)
+    jobs = [j0, j1, j2, j3, j4]
+    x = rng.integers(128, 256, (lay.pixels, lay.nb * 8), dtype=np.uint8)
+    return jobs, x

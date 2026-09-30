@@ -56,6 +56,7 @@ enum {
   D_CORE,     // global core index (region index of this core's output/residual)
   D_TI0,      // (tap index, region) decomposition of tt0, computed by the host (no divide on the core)
   D_CP0,
+  D_CLAMP,    // upper bound of the int8 result (127 = none): ReLU6 in the quantized domain
 };
 
 constexpr int pos(int v) { return v > 0 ? v : 0; }
@@ -89,7 +90,7 @@ struct Layer {
   const int32_t *d;
   const int8_t *weights;
   const int32_t *bias;
-  int nbp, ncp, w, h, ow, oh, s, mode, ntaps, nb, tt0, ttn, first, last, shift, relu, in_flip, out_flip, res, ea, eb, core, ti0, cp0;
+  int nbp, ncp, w, h, ow, oh, s, mode, ntaps, nb, tt0, ttn, first, last, shift, relu, in_flip, out_flip, res, ea, eb, core, ti0, cp0, clamp;
   int op, t_out;
   int taps[9];
 };
@@ -104,7 +105,7 @@ inline Layer load(const uint8_t *slot) {
   for (int i = 0; i < 9; ++i) l.taps[i] = d[D_TAP0 + i];
   l.nb = d[D_NB]; l.tt0 = d[D_TT0]; l.ttn = d[D_TTN]; l.first = d[D_FIRST]; l.last = d[D_LAST];
   l.shift = pos(d[D_SHIFT]); l.relu = d[D_RELU]; l.in_flip = d[D_IN_FLIP]; l.out_flip = d[D_OUT_FLIP];
-  l.res = d[D_RES]; l.ea = d[D_EA]; l.eb = d[D_EB]; l.core = d[D_CORE]; l.ti0 = d[D_TI0]; l.cp0 = d[D_CP0];
+  l.res = d[D_RES]; l.ea = d[D_EA]; l.eb = d[D_EB]; l.core = d[D_CORE]; l.ti0 = d[D_TI0]; l.cp0 = d[D_CP0]; l.clamp = d[D_CLAMP];
   l.bias = (const int32_t *)((const uint8_t *)l.weights + d[D_BIAS]);
   l.op = l.ow * l.oh;
   l.t_out = (l.op + 7) / 8;
@@ -167,6 +168,17 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
   ::aie::set_saturation(aie::saturation_mode::saturate);
   const Layer L = load(slot);
   if (L.nb == 0) return;
+  if (L.mode == 5) {
+    // Unary lookup table over this core's blocks (same layout in and out): out byte = table[in byte]. Any
+    // elementwise activation (SiLU, HardSwish, Sigmoid, GELU, Tanh, ...) that was quantized to 8 bits reduces to
+    // one 256-entry table built on the host from the op's float definition.
+    const uint8_t *tab = (const uint8_t *)L.weights;
+    const uint8_t *src = (const uint8_t *)act + L.core * ENG_REGION_BYTES;
+    uint8_t *dst = (uint8_t *)out;
+    const int n = L.nb * L.w * L.h * 8;
+    for (int i = 0; i < n; ++i) dst[i] = tab[src[i]];
+    return;
+  }
   if (L.mode == 2) {
     // 3x3 stride-2 pad-1 max pool of this core's channel block over the dense stem map (uint8, one block
     // = W*H*8 bytes). Padding never wins: post-ReLU bytes are >= 128, so the pad value 0 is a valid -inf.
@@ -217,10 +229,44 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
       q = sum.to_vector<int8>(common);
     }
     if (L.relu) q = aie::max(q, zero);
+    if (L.clamp < 127) q = aie::min(q, aie::broadcast<int8, 64>((int8_t)L.clamp));
     if (L.out_flip) q = aie::bit_xor(q, aie::broadcast<int8, 64>((int8_t)-128));
     store_rows(out + (ocl * L.op + t * 8) * 8, q, L.op - t * 8);
   };
 
+  if (L.mode == 4) {
+    // Depthwise 3x3 / strided: every output block reads only its own input block (input regions and output
+    // regions belong to the same core), one elementwise multiply-accumulate per tap with the channel weights
+    // replicated across the 8 pixel rows of the tile. Tiles are gathered per tap (masked, flip-before-mask).
+    const uint64_t flip64 = L.in_flip ? 0x8080808080808080ull : 0ull;
+    int offs[8];
+    uint64_t mask[8];
+    for (int t = 0; t < L.t_out; ++t)
+      for (int ol = 0; ol < L.nb; ++ol) {
+        aie::accum<acc32, 64> acc;
+        acc.from_vector(bias_tile(L.bias + ol * 8), 0);
+        const int8_t *blk = act + L.core * ENG_REGION_BYTES + ol * p_in * 8;
+        for (int ti = 0; ti < L.ntaps; ++ti) {
+          const int tap = L.taps[ti], ky = tap >= 6 ? 2 : (tap >= 3 ? 1 : 0), kx = tap - ky * 3;
+          for (int r = 0; r < 8; ++r) {
+            const int o = t * 8 + r;
+            const int oo = o < L.op ? o : 0;
+            const int iy = py[oo] * L.s + ky - 1;
+            const int ix = px[oo] * L.s + kx - 1;
+            const bool ok = iy >= 0 && iy < L.h && ix >= 0 && ix < L.w;
+            offs[r] = ok ? iy * L.w + ix : 0;
+            mask[r] = ok ? ~0ull : 0ull;
+          }
+          uint64_t *dst = (uint64_t *)scratch_tiles;
+          _Pragma("clang loop unroll(full)")
+          for (int r = 0; r < 8; ++r) dst[r] = (*(const uint64_t *)(blk + offs[r] * 8) ^ flip64) & mask[r];
+          acc = aie::mac(acc, aie::load_v<64>(scratch_tiles), aie::load_v<64>(L.weights + (ol * L.ntaps + ti) * 64));
+        }
+        MMUL c(acc.to_vector<int32>(0));
+        epi(ol, t, c);
+      }
+    return;
+  }
   if (L.mode == 0) {
     // Direct: tile t of every input block is the 64 contiguous bytes at t*64; regions are REGION_BYTES apart.
     auto a_base = [&](int t, int tt) { return act + tt * ENG_REGION_BYTES + t * 64; };
