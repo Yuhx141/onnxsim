@@ -295,6 +295,9 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             if res(node.output[0]) not in tensors:
                 mark_host(node)
             continue
+        if op in ("Conv", "ConvTranspose") and res(node.input[1]) in init:
+            mark_host(node)  # float weights (not quantized): stays in the float host tail
+            continue
         if not engine_inputs(
             node, [0] if op in ("Split", "Resize", "MaxPool", "Conv", "Slice", "AveragePool", "ConvTranspose") else None
         ):
