@@ -488,3 +488,20 @@ equal float; Adam's normalization amplifies small gradient errors), loss 17.004
 against 17.058. The three nodes still planned on the host are two Muls whose
 zero points match no template class and `Sub_32` (no template at its shape).
 Eight 16-bit segments still miss their gate and run as float on the host.
+
+### The last 16-bit misses
+
+`--u16-margin REGEX` calibrates the matching segments on their data and a copy
+scaled by 1.3 (`--u16-margin-factor`): the replay's inputs come from upstream
+16-bit segments and can leave the float run's range. It fixed `dense0_fwd`,
+`Softmax_9` and two `ReduceSum` segments, and made `MatMul_471` and
+`ReduceSum_472` (the stem convolution's weight and bias gradients) worse, so
+those are not listed. A 16-bit model built at the full batch also has to reset
+the plan's `batch_split`: `MatMul_325` had an 8-bit template built at batch 4 and
+failed with a chunk-sized input until it did. `--u16-fp32 REGEX` builds the
+matching segments with FP32 layers instead of U16 (isolated on the float
+inputs: `ReduceSum_368` 8e-8, `MatMul_471` 7e-7).
+
+With those, AX8850 replay (1,098 of 1,102 nodes in 907 segments, health 0 LSB,
+no NaN, gradient cosine 0.9973): only `Log_10` (a zero probability), `MatMul_471`
+and `ReduceSum_472` still miss their gate and run as float.

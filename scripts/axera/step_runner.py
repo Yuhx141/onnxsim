@@ -2306,6 +2306,9 @@ def build_u16_segments(
     cache_dir: str,
     kinds: Sequence[str] = ("matmul_chain",),
     splits: Sequence[int] = (),
+    margin_pattern: str = "",
+    margin: float = 1.3,
+    fp32_pattern: str = "",
 ) -> dict[str, bytes]:
     """Move the 8-bit segments of ``kinds`` whose name matches ``pattern`` to
     16-bit axmodels built on the reference batch's real tensors. Returns the
@@ -2328,6 +2331,11 @@ def build_u16_segments(
     blobs: dict[str, bytes] = {}
     for k, seg in enumerate(targets):
         data = {t: np.asarray(outs[t], np.float32) for t in seg.inputs}
+        if margin_pattern and re.search(margin_pattern, seg.name):
+            # the replay's inputs come from upstream 16-bit segments and can
+            # leave the float run's range (clipped in a MinMax calibration):
+            # calibrate on the data and a copy scaled by ``margin`` as well
+            data = {t: [a, a * np.float32(margin)] for t, a in data.items()}
         full = utils.Extractor(model).extract_model(seg.inputs, seg.outputs)
         batch = u16_chain.split_batch(full)
         done = None
@@ -2343,17 +2351,22 @@ def build_u16_segments(
                     flags = u16_chain.split_flags(full.graph.input, batch)
                     chunk = {
                         t: [
-                            np.array_split(a, split)[j] if f else a
+                            np.array_split(x, split)[j] if f else x
                             for j in range(split)
+                            for x in (a if isinstance(a, list) else [a])
                         ]
                         for (t, a), f in zip(data.items(), flags)
                     }
+                precision = (
+                    "FP32" if fp32_pattern and re.search(fp32_pattern, seg.name) else "U16"
+                )
                 blob = u16_chain.cached_chain_axmodel(
                     cache_dir,
                     work,
                     seg.name if split == 1 else f"{seg.name}_s{split}",
                     sub,
                     chunk,
+                    precision,
                 )
             except Exception as exc:  # smaller batch, or stays 8-bit
                 print(
@@ -2374,6 +2387,9 @@ def build_u16_segments(
         if split > 1:
             seg.batch_split = split
             seg.split = u16_chain.split_flags(full.graph.input, batch)
+        else:  # the plan's 8-bit template may have run in batch chunks
+            seg.batch_split = 1
+            seg.split = []
         print(
             f"  16-bit {seg.name} ({k + 1}/{len(targets)})"
             + (f" split {split}" if split > 1 else ""),
@@ -2681,6 +2697,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "runs the smaller model once per chunk",
     )
     p.add_argument(
+        "--u16-margin",
+        default="",
+        metavar="REGEX",
+        help="calibrate the matching 16-bit segments on their data and a copy "
+        "scaled by --u16-margin-factor (headroom for upstream segments' error)",
+    )
+    p.add_argument("--u16-margin-factor", type=float, default=1.3)
+    p.add_argument(
+        "--u16-fp32",
+        default="",
+        metavar="REGEX",
+        help="build the matching --u16-matmul segments with layer_configs FP32 "
+        "instead of U16",
+    )
+    p.add_argument(
         "--u16-cache-dir",
         default=os.path.join(tempfile.gettempdir(), "axera-u16-chain-cache"),
         help="cache of 16-bit segment builds",
@@ -2810,6 +2841,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.u16_cache_dir,
                 args.u16_kinds.split(","),
                 [int(x) for x in args.u16_splits.split(",") if x],
+                args.u16_margin,
+                args.u16_margin_factor,
+                args.u16_fp32,
             )
         )
     grad_names = gradient_tensors(model, ref["state_map"])
