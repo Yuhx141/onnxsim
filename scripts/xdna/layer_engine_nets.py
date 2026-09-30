@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from layer_engine import SLOT_BYTES, Job, layout_for, reference, to_arena, from_arena
+from layer_engine import SLOT_BYTES, Job, assign_slots, layout_for, reference, to_arena, from_arena
 
 
 def bottleneck(name: str, cin: int, mid: int, out: int, w: int, h: int, stride: int, rng, *, project: bool):
@@ -83,8 +83,10 @@ def run_reference(jobs, x_dense: np.ndarray):
 
 def build(name: str, seed: int = 0):
     rng = np.random.default_rng(seed)
-    if name == "body":
+    if name in ("body", "bodyr"):
         jobs, _, x = body(seed)
+        if name == "bodyr":  # reused arena slots (production layout)
+            assign_slots(jobs)
         return jobs, x
     if name == "l1proj":
         jobs = bottleneck("l1", 64, 64, 256, 8, 8, 1, rng, project=True)
@@ -105,6 +107,6 @@ def build(name: str, seed: int = 0):
 
 def segments_for(name: str, jobs):
     """Core-program segments (first_job, jobs_per_iteration, repeat) for a named net."""
-    if name == "body":
+    if name in ("body", "bodyr"):
         return body()[1]
     return [(0, len(jobs), 1)]

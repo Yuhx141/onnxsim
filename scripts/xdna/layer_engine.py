@@ -234,3 +234,41 @@ def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray
     if job.out_flip:
         return (q + 128).astype(np.uint8)
     return q.astype(np.int8).view(np.uint8)
+
+
+def assign_slots(jobs: list[Job], pinned: dict[int, int] | None = None) -> int:
+    """Rewrite the jobs' logical slot ids to a small set of reused arena slots; returns the slot count.
+
+    Slot 0 (the network input) stays 0. A slot is live from the job that writes it until the last job
+    that reads it (a residual is read one job early: its fill is queued during the previous job).
+    """
+    last_use: dict[int, int] = {}
+    for index, job in enumerate(jobs):
+        last_use[job.in_slot] = max(last_use.get(job.in_slot, -1), index)
+        if job.res_slot is not None:
+            last_use[job.res_slot] = max(last_use.get(job.res_slot, -1), index)
+    physical: dict[int, int] = {0: 0}
+    free: list[int] = []
+    count = 1
+    busy_until: dict[int, int] = {0: last_use.get(0, -1)}  # physical slot -> last job that reads it
+    for index, job in enumerate(jobs):
+        for logical in (job.in_slot, job.res_slot):
+            if logical is not None and logical not in physical:
+                raise ValueError("slot read before it is written")
+        # a slot is reusable once its last reader is strictly before this job (writes land after job start)
+        for p, until in list(busy_until.items()):
+            if until < index and p not in free and p != 0:
+                free.append(p)
+        if free:
+            p = free.pop(0)
+        else:
+            p = count
+            count += 1
+        physical[job.out_slot] = p
+        busy_until[p] = last_use.get(job.out_slot, index)
+    for job in jobs:
+        job.in_slot = physical[job.in_slot]
+        job.out_slot = physical[job.out_slot]
+        if job.res_slot is not None:
+            job.res_slot = physical[job.res_slot]
+    return count

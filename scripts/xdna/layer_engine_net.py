@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from layer_engine import Job, layout_for, valid_taps
+from layer_engine import Job, assign_slots, layout_for, valid_taps
 
 
 def _full_3x3(weight: np.ndarray, taps) -> np.ndarray:
@@ -17,7 +17,7 @@ def _full_3x3(weight: np.ndarray, taps) -> np.ndarray:
     return full
 
 
-def jobs_from_bindings(stage_bindings):
+def jobs_from_bindings(stage_bindings, reuse_slots=False):
     """stage_bindings: [[binding, ...] per stage] -> (jobs, block_output_slots).
 
     Slot 0 holds the network input (the pooled map). Every job writes its own slot.
@@ -56,6 +56,8 @@ def jobs_from_bindings(stage_bindings):
             slot += 1
             block.append(c3)
             jobs += block
-            block_outputs[b["block"].prefix] = c3.out_slot
+            block_outputs[b["block"].prefix] = c3
             block_in, lay = c3.out_slot, c3.out_layout
-    return jobs, block_outputs
+    if reuse_slots:
+        assign_slots(jobs)
+    return jobs, {prefix: job.out_slot for prefix, job in block_outputs.items()}
