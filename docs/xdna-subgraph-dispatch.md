@@ -461,6 +461,26 @@ bit-exact against ONNX Runtime CPU (max abs logit error 0.0):
   weight channel per column cannot help while the floor is per-job bound and the activation stream already
   takes the 16th shim MM2S channel (17 would be needed). None is worth its complexity next to the host
   overhead (~0.5 ms on ResNet-50) or a design that keeps activations in L2 between layers.
+#### Non-ResNet vision models (same generator, 32x32, Vitis AI only)
+
+`quantize_pow2_resnet.py` also handles ReLU6 (`Clip`), `Concat`, `AveragePool` and linear residual Adds, so
+a few other torchvision families were built and timed on the Vitis AI EP (random weights):
+
+| model | Vitis AI ms | vs CPU logits | what the engine / codegen would still need |
+|---|---|---|---|
+| GoogLeNet | 1.12 | exact | branch outputs concatenated along channels (jobs writing block ranges of one slot), 5x5/3x3 branches, stride-1 max pool; the generic per-conv codegen plans it (82 dispatches) |
+| RegNet-X 400MF | 1.74 | exact | grouped 3x3 (group width 16: a 2-block reduction per output block instead of all input blocks), a 3x3 stride-2 stem, and 16x16 maps (the kernel assumes <= 64 pixels per layer); the generic codegen plans it (118 dispatches) |
+| MobileNetV2 | 3.08 | argmax differs (max abs 0.105) | depthwise 3x3 (vector MACs, not MMUL), ReLU6 clamp in the epilogue, add-only jobs, and 16x16..96-channel maps (24 KB > the 16 KB activation object); the generic codegen rejects `Clip` |
+
+The engine stops at ResNet-style nets for three structural reasons rather than one missing kernel: activation
+maps are limited to 16 KB / 64 pixels per layer (larger maps need pixel tiling, which changes the region
+layout), there is no grouped/depthwise reduction (per-output-block input ranges), and no channel-range
+placement for Concat. Each is a design change to the arena layout, so they were not attempted here; Vitis AI
+handles all of these models and shows that the same NPU sustains ~1-3 ms on them at 32x32. Models that did not
+export through the generator (SqueezeNet: shared bias initializers; EfficientNet/MobileNetV3: SiLU/HardSwish;
+DenseNet: standalone BatchNorm; ShuffleNet: Split/Transpose; AlexNet/VGG at 32x32: too small / huge FC) have no
+numbers.
+
 - Host findings worth keeping: OpenBLAS defaulted to one thread per core, and a 2048x1000 Gemm took 2.9 ms on
   this 64-thread host versus 0.05-0.1 ms with 1-2 threads (the runner now sets `OPENBLAS_NUM_THREADS=2`
   before numpy loads); a 1000-class head made the runner 3x slower before that fix.

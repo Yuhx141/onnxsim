@@ -52,7 +52,7 @@ def quantize(fp32_path: Path, out_path: Path, size: int, seed: int, samples: int
     # Calibration: absmax of every activation tensor over random inputs.
     probe = onnx.ModelProto()
     probe.CopyFrom(model)
-    exposed = sorted({o for n in graph.node for o in n.output if n.op_type in ("Conv", "Relu", "MaxPool", "Add", "GlobalAveragePool", "Flatten", "Gemm")})
+    exposed = sorted({o for n in graph.node for o in n.output if n.op_type in ("Conv", "Relu", "Clip", "MaxPool", "AveragePool", "Concat", "Add", "GlobalAveragePool", "Flatten", "Gemm")})
     for name in exposed:
         probe.graph.output.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, None))
     session = ort.InferenceSession(probe.SerializeToString(), providers=["CPUExecutionProvider"])
@@ -109,10 +109,20 @@ def quantize(fp32_path: Path, out_path: Path, size: int, seed: int, samples: int
             new_nodes.append(conv)
             out = node.output[0]
             following = consumers.get(out, [])
-            if not (len(following) == 1 and following[0].op_type == "Relu"):
+            if not (len(following) == 1 and following[0].op_type in ("Relu", "Clip")):
                 qdq(out, act_scale(out), True)  # conv3 / downsample: Q/DQ straight after the Conv
-        elif node.op_type == "Relu":
-            new_nodes.append(node)
+        elif node.op_type in ("Relu", "Clip"):
+            new_nodes.append(node)  # Clip = ReLU6: min/max stay float constants
+            qdq(node.output[0], act_scale(node.output[0]), False)
+        elif node.op_type == "Concat":
+            cat = helper.make_node("Concat", [dq_of[i] for i in node.input], list(node.output), name=node.name)
+            cat.attribute.extend(node.attribute)
+            new_nodes.append(cat)
+            qdq(node.output[0], act_scale(node.output[0]), True)
+        elif node.op_type == "AveragePool":
+            pooled = helper.make_node("AveragePool", [dq_of[node.input[0]]], list(node.output), name=node.name)
+            pooled.attribute.extend(node.attribute)
+            new_nodes.append(pooled)
             qdq(node.output[0], act_scale(node.output[0]), False)
         elif node.op_type == "MaxPool":
             pooled = helper.make_node("MaxPool", [dq_of[node.input[0]]], list(node.output), name=node.name)
@@ -121,6 +131,14 @@ def quantize(fp32_path: Path, out_path: Path, size: int, seed: int, samples: int
             qdq(node.output[0], scale_of[node.input[0]], False)  # same scale/zero point as its input
         elif node.op_type == "Add":
             new_nodes.append(helper.make_node("Add", [dq_of[i] for i in node.input], list(node.output), name=node.name))
+            following = consumers.get(node.output[0], [])
+            if not (len(following) == 1 and following[0].op_type in ("Relu", "Clip")):
+                qdq(node.output[0], act_scale(node.output[0]), True)  # linear residual (MobileNet-style)
+        elif node.op_type == "Constant":
+            new_nodes.append(node)
+        elif node.op_type == "Identity":
+            dq_of[node.output[0]] = dq_of[node.input[0]]
+            scale_of[node.output[0]] = scale_of[node.input[0]]
         elif node.op_type in ("GlobalAveragePool", "Flatten"):
             copy = helper.make_node(node.op_type, [dq_of[node.input[0]]], list(node.output), name=node.name)
             copy.attribute.extend(node.attribute)
@@ -159,7 +177,8 @@ def quantize(fp32_path: Path, out_path: Path, size: int, seed: int, samples: int
     del out.graph.node[:]
     del out.graph.initializer[:]
     out.graph.node.extend(new_nodes)
-    out.graph.initializer.extend(new_init)
+    consumed = {i for n in graph.node if n.op_type in ("Conv", "Gemm") for i in n.input[1:]}
+    out.graph.initializer.extend(new_init + [i for i in graph.initializer if i.name not in consumed])
     out = onnx.shape_inference.infer_shapes(out)  # the XDNA planner needs static shapes on every edge
     onnx.checker.check_model(out)
     onnx.save(out, str(out_path))
