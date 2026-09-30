@@ -204,6 +204,7 @@ def test_pool_job_descriptors_only_activate_the_eight_channel_blocks():
             desc[le.D_MODE] == 8  # the stem pool is a k=3, stride-2 max-pool job
             and desc[le.D_NTAPS] == 3
             and desc[le.D_S] == 2
+            and desc[le.D_KSZ] == 1  # the kernel reads the max-pool padding from here
             and desc[le.D_NB] == (1 if core < 8 else 0)
             and desc[le.D_CORE] == core
         )

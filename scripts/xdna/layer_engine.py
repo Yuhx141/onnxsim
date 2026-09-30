@@ -352,7 +352,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
                 lay_out.w,
                 lay_out.h,
             )
-            desc[D_MODE], desc[D_NTAPS], desc[D_S] = 8, 3, 2
+            desc[D_MODE], desc[D_NTAPS], desc[D_S], desc[D_KSZ] = 8, 3, 2, 1
             desc[D_NB] = 1 if core < lay_out.nb else 0
             desc[D_CORE], desc[D_REG] = core, lay_in.region_bytes
             out[col, 0, row, :DESC_BYTES] = desc.view(np.uint8)
