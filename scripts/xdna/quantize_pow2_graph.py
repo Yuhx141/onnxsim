@@ -92,6 +92,7 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
     dq_of: dict[str, str] = {}
     scale_of: dict[str, float] = {}
     silu_sigmoid: set[str] = set()
+    raw_conv: set[str] = set()  # Conv outputs left unquantized because a Relu/Clip follows
 
     def const(name, array):
         inits.append(numpy_helper.from_array(np.asarray(array), name))
@@ -195,6 +196,11 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
             after = consumers.get(node.output[0], [])
             if not (len(after) == 1 and after[0].op_type in ("Relu", "Clip")):
                 qdq(node.output[0])
+            else:
+                raw_conv.add(node.output[0])
+        elif op in ("Relu", "Clip") and node.input[0] in raw_conv:
+            nodes.append(node)  # the conv/add output stays float into this activation, then one Q/DQ
+            qdq(node.output[0])
         elif (
             op == "Sigmoid"
             and node.input[0] in dq_of
@@ -209,6 +215,9 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
         elif op == "Mul" and any(i in silu_sigmoid for i in node.input):
             emit(node, [dq_of.get(i, i) for i in node.input])
             qdq(node.output[0])
+        elif op == "Mul" and all_quantized(node):
+            emit(node, q_in(node))  # squeeze-excite: activation x per-channel gate
+            qdq(node.output[0])
         elif op in UNARY and node.input[0] in dq_of:
             emit(node, [dq_of[node.input[0]]] + list(node.input[1:]))
             qdq(node.output[0])
@@ -217,6 +226,8 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
             after = consumers.get(node.output[0], [])
             if not (len(after) == 1 and after[0].op_type in ("Relu", "Clip")):
                 qdq(node.output[0])
+            else:
+                raw_conv.add(node.output[0])
         elif op == "Concat" and all_quantized(node):
             emit(node, q_in(node))
             qdq(node.output[0])

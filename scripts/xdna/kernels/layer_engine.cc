@@ -58,6 +58,7 @@ enum {
   D_CP0,
   D_REG,      // bytes between the input map's producing-core regions (512 unless the host wrote a wider layout)
   D_CLAMP,    // upper bound of the int8 result (127 = none): ReLU6 in the quantized domain
+  D_KSZ,      // depthwise kernel size K (all K*K tap vectors are packed; padding (K-1)/2)
 };
 
 constexpr int pos(int v) { return v > 0 ? v : 0; }
@@ -91,7 +92,7 @@ struct Layer {
   const int32_t *d;
   const int8_t *weights;
   const int32_t *bias;
-  int nbp, ncp, w, h, ow, oh, s, mode, ntaps, nb, tt0, ttn, first, last, shift, relu, in_flip, out_flip, res, ea, eb, core, ti0, cp0, clamp, reg;
+  int nbp, ncp, w, h, ow, oh, s, mode, ntaps, nb, tt0, ttn, first, last, shift, relu, in_flip, out_flip, res, ea, eb, core, ti0, cp0, clamp, reg, ksz;
   int op, t_out;
   int taps[9];
 };
@@ -106,7 +107,7 @@ inline Layer load(const uint8_t *slot) {
   for (int i = 0; i < 9; ++i) l.taps[i] = d[D_TAP0 + i];
   l.nb = d[D_NB]; l.tt0 = d[D_TT0]; l.ttn = d[D_TTN]; l.first = d[D_FIRST]; l.last = d[D_LAST];
   l.shift = pos(d[D_SHIFT]); l.relu = d[D_RELU]; l.in_flip = d[D_IN_FLIP]; l.out_flip = d[D_OUT_FLIP];
-  l.res = d[D_RES]; l.ea = d[D_EA]; l.eb = d[D_EB]; l.core = d[D_CORE]; l.ti0 = d[D_TI0]; l.cp0 = d[D_CP0]; l.clamp = d[D_CLAMP]; l.reg = d[D_REG];
+  l.res = d[D_RES]; l.ea = d[D_EA]; l.eb = d[D_EB]; l.core = d[D_CORE]; l.ti0 = d[D_TI0]; l.cp0 = d[D_CP0]; l.clamp = d[D_CLAMP]; l.reg = d[D_REG]; l.ksz = d[D_KSZ];
   l.bias = (const int32_t *)((const uint8_t *)l.weights + d[D_BIAS]);
   l.op = l.ow * l.oh;
   l.t_out = (l.op + 7) / 8;
@@ -163,6 +164,13 @@ inline void tiled_gemm(const Layer &L, int nt, ABase a_base, int a_stride, Epi e
   }
 }
 }  // namespace
+
+// Round-half-to-even arithmetic right shift (k >= 0), the rounding the QuantizeLinear after a mean / product uses.
+static inline int rshift_even(int v, int k) {
+  if (k == 0) return v;
+  const int r = v >> k, rem = v - (r << k), half = 1 << (k - 1);
+  return (rem > half || (rem == half && (r & 1))) ? r + 1 : r;
+}
 
 // Scale `n` uint8-with-zero-point-128 bytes (n multiple of 8) by 2^e in place, saturating, 8 bytes at a time.
 __attribute__((noinline)) static void requant_bytes(uint8_t *p, int n, int e) {
@@ -259,6 +267,38 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     if (L.mode != 6 && L.ea != 0) requant_bytes(dst0, L.nb * n, L.ea);
     return;
   }
+  if (L.mode == 10) {
+    // Global average pool of this core's blocks (pixel count a power of two): out = sat(rshift_even(sum, D_SHIFT)).
+    const int n = L.w * L.h;
+    for (int ol = 0; ol < L.nb; ++ol) {
+      const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * n * 8;
+      int sum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      for (int p = 0; p < n; ++p)
+        for (int c = 0; c < 8; ++c) sum[c] += (int)blk[p * 8 + c] - 128;
+      for (int c = 0; c < 8; ++c) {
+        int q = rshift_even(sum[c], L.shift);
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        ((uint8_t *)out)[ol * 8 + c] = (uint8_t)(q + 128);
+      }
+    }
+    return;
+  }
+  if (L.mode == 11) {
+    // Broadcast multiply (squeeze-excite): out = sat(rshift_even((a - 128) * (b_c - 128), D_SHIFT)), b = 1x1 map in resid.
+    const int n = L.w * L.h;
+    for (int ol = 0; ol < L.nb; ++ol) {
+      const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * n * 8;
+      const uint8_t *scale = (const uint8_t *)resid + L.core * L.tt0 + ol * 8;
+      uint8_t *dst = (uint8_t *)out + ol * n * 8;
+      for (int p = 0; p < n; ++p)
+        for (int c = 0; c < 8; ++c) {
+          int q = rshift_even(((int)blk[p * 8 + c] - 128) * ((int)scale[c] - 128), L.shift);
+          q = q > 127 ? 127 : (q < -128 ? -128 : q);
+          dst[p * 8 + c] = (uint8_t)(q + 128);
+        }
+    }
+    return;
+  }
   if (L.mode == 9) {
     // Add of two activations (same channel blocking): A = act, B = resid with region size D_TT0.
     const int n = L.w * L.h * 8;
@@ -323,22 +363,24 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
         aie::accum<acc32, 64> acc;
         acc.from_vector(bias_tile(L.bias + ol * 8), 0);
         const int8_t *blk = act + L.core * L.reg + ol * p_in * 8;
-        for (int ti = 0; ti < L.ntaps; ++ti) {
-          const int tap = L.taps[ti], ky = tap >= 6 ? 2 : (tap >= 3 ? 1 : 0), kx = tap - ky * 3;
-          for (int r = 0; r < 8; ++r) {
-            const int o = t * 8 + r;
-            const int oo = o < L.op ? o : 0;
-            const int iy = py[oo] * L.s + ky - 1;
-            const int ix = px[oo] * L.s + kx - 1;
-            const bool ok = iy >= 0 && iy < L.h && ix >= 0 && ix < L.w;
-            offs[r] = ok ? iy * L.w + ix : 0;
-            mask[r] = ok ? ~0ull : 0ull;
+        const int K = L.ksz, padk = (K - 1) / 2;
+        int ti = 0;
+        for (int ky = 0; ky < K; ++ky)
+          for (int kx = 0; kx < K; ++kx, ++ti) {
+            for (int r = 0; r < 8; ++r) {
+              const int o = t * 8 + r;
+              const int oo = o < L.op ? o : 0;
+              const int iy = py[oo] * L.s + ky - padk;
+              const int ix = px[oo] * L.s + kx - padk;
+              const bool ok = iy >= 0 && iy < L.h && ix >= 0 && ix < L.w;
+              offs[r] = ok ? iy * L.w + ix : 0;
+              mask[r] = ok ? ~0ull : 0ull;
+            }
+            uint64_t *dst = (uint64_t *)scratch_tiles;
+            _Pragma("clang loop unroll(full)")
+            for (int r = 0; r < 8; ++r) dst[r] = (*(const uint64_t *)(blk + offs[r] * 8) ^ flip64) & mask[r];
+            acc = aie::mac(acc, aie::load_v<64>(scratch_tiles), aie::load_v<64>(L.weights + (ol * K * K + ti) * 64));
           }
-          uint64_t *dst = (uint64_t *)scratch_tiles;
-          _Pragma("clang loop unroll(full)")
-          for (int r = 0; r < 8; ++r) dst[r] = (*(const uint64_t *)(blk + offs[r] * 8) ^ flip64) & mask[r];
-          acc = aie::mac(acc, aie::load_v<64>(scratch_tiles), aie::load_v<64>(L.weights + (ol * L.ntaps + ti) * 64));
-        }
         MMUL c(acc.to_vector<int32>(0));
         epi(ol, t, c);
       }

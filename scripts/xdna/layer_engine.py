@@ -43,7 +43,8 @@ D_NB = D_TAP0 + 9
     D_CP0,
     D_REG,
     D_CLAMP,
-) = range(D_NB + 1, D_NB + 18)
+    D_KSZ,
+) = range(D_NB + 1, D_NB + 19)
 
 
 @dataclass(frozen=True)
@@ -109,7 +110,7 @@ class Job:
     res_mode: int = 0  # 1 int8 residual, 2 uint8 residual
     ea: int = 0
     eb: int = 0
-    kind: str = "conv"  # "conv" | "pool" | "dw" (depthwise 3x3) | "lut" (unary table) | "copy" | "up" | "maxpool" | "add"
+    kind: str = "conv"  # "conv" | "pool" | "dw" (depthwise 3x3) | "lut" (unary table) | "copy" | "up" | "maxpool" | "add" | "gap" | "bmul"
     copy_spec: list | None = (
         None  # "copy": per output block (source 0/1, source block, scale exponent)
     )
@@ -142,8 +143,10 @@ class Job:
         oh = (self.in_layout.h + 2 * pad - kh) // s + 1
         if self.kind == "pool":
             ow, oh = self.in_layout.w // 2, self.in_layout.h // 2
-        if self.kind in ("lut", "copy", "add"):
+        if self.kind in ("lut", "copy", "add", "bmul"):
             ow, oh = self.in_layout.w, self.in_layout.h
+        if self.kind == "gap":
+            ow, oh = 1, 1
         if self.kind == "up":
             ow, oh = self.in_layout.w * self.factor, self.in_layout.h * self.factor
         if self.kind == "maxpool":
@@ -156,7 +159,7 @@ class Job:
             raise ValueError(
                 f"{self.name}: depthwise/table jobs need the same channel blocking in and out"
             )
-        if self.kind in ("lut", "copy", "up", "maxpool", "add"):
+        if self.kind in ("lut", "copy", "up", "maxpool", "add", "gap", "bmul"):
             self.taps = [0]
         elif kh == 3:
             self.taps = valid_taps(self.in_layout.h, self.in_layout.w, oh, ow, s)
@@ -209,7 +212,7 @@ def plan_chunks(job: Job, payload: int) -> int:
 
 
 def n_chunks(job: Job, payload: int) -> int:
-    if job.kind in ("pool", "dw", "lut", "copy", "up", "maxpool", "add"):
+    if job.kind in ("pool", "dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul"):
         return 1
     steps = len(job.taps) * job.in_layout.ncp
     return math.ceil(steps / plan_chunks(job, payload))
@@ -219,7 +222,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
     """Weight stream of one job: uint8 [column][chunk][row][slot_bytes]."""
     payload = slot_bytes - DESC_BYTES
     lay_in, lay_out = job.in_layout, job.out_layout
-    if job.kind in ("dw", "lut", "copy", "up", "maxpool", "add"):
+    if job.kind in ("dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul"):
         out = np.zeros((COLS, 1, ROWS, slot_bytes), dtype=np.uint8)
         for core in range(CORES):
             col, row = divmod(core, ROWS)
@@ -241,6 +244,12 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
             )
             desc[D_REG] = lay_in.region_bytes
             slot = out[col, 0, row]
+            if job.kind in ("gap", "bmul"):
+                desc[D_MODE] = 10 if job.kind == "gap" else 11
+                if job.kind == "bmul":
+                    desc[D_TT0] = job.b_layout.region_bytes
+                slot[:DESC_BYTES] = desc.view(np.uint8)
+                continue
             if job.kind == "add":
                 desc[D_MODE], desc[D_EA], desc[D_EB] = 9, job.ea, job.eb
                 desc[D_TT0] = job.b_layout.region_bytes
@@ -275,10 +284,10 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
                 slot[:DESC_BYTES] = desc.view(np.uint8)
                 slot[DESC_BYTES : DESC_BYTES + 256] = job.table.astype(np.uint8)
                 continue
-            desc[D_MODE], desc[D_NTAPS] = 4, len(job.taps)
-            desc[D_TAP0 : D_TAP0 + len(job.taps)] = job.taps
+            ksz = job.weight.shape[2]
+            desc[D_MODE], desc[D_NTAPS], desc[D_KSZ] = 4, ksz * ksz, ksz
             nb = len(blocks)
-            tiles = nb * len(job.taps) * 64
+            tiles = nb * ksz * ksz * 64
             desc[D_BIAS] = (tiles + 3) & ~3
             if (desc[D_BIAS] + nb * TILE * 4) > payload:
                 raise ValueError(
@@ -286,10 +295,10 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
                 )
             slot[:DESC_BYTES] = desc.view(np.uint8)
             body = np.zeros(desc[D_BIAS] + nb * TILE * 4, dtype=np.uint8)
-            vec = np.zeros((nb, len(job.taps), 64), dtype=np.int8)
+            vec = np.zeros((nb, ksz * ksz, 64), dtype=np.int8)
             for ol, g in enumerate(blocks):
-                for ti, tap in enumerate(job.taps):
-                    ky, kx = divmod(tap, 3)
+                for ti in range(ksz * ksz):
+                    ky, kx = divmod(ti, ksz)
                     vec[ol, ti] = np.tile(
                         job.weight[g * TILE : (g + 1) * TILE, 0, ky, kx], 8
                     )  # lane = row * 8 + channel
@@ -407,6 +416,12 @@ def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray
             src = b if which else a
             parts.append(rescale(src[:, block * TILE : (block + 1) * TILE], exp))
         return np.concatenate(parts, axis=1)
+    if job.kind == "gap":
+        v = act.astype(np.int64).reshape(lay.pixels, -1) - 128
+        return (np.clip(_rse(v.sum(axis=0) / (2.0**job.shift), 0), -128, 127) + 128).astype(np.uint8).reshape(1, -1)
+    if job.kind == "bmul":
+        prod = (act.astype(np.int64) - 128) * (resid.astype(np.int64).reshape(1, -1) - 128)
+        return (np.clip(_rse(prod / (2.0**job.shift), 0), -128, 127) + 128).astype(np.uint8)
     if job.kind == "add":
         c = max(-job.ea, 0) if job.ea < job.eb else max(-job.eb, 0)
         total = ((act.astype(np.int64) - 128) << (job.ea + c)) + (
@@ -441,11 +456,13 @@ def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray
         )
         x = x.reshape(lay.h, lay.w, -1)
         s = job.stride
-        xp = np.pad(x, ((1, 1), (1, 1), (0, 0)))
+        k = job.weight.shape[2]
+        padk = (k - 1) // 2
+        xp = np.pad(x, ((padk, padk), (padk, padk), (0, 0)))
         oh, ow = job.out_layout.h, job.out_layout.w
         acc = np.zeros((oh, ow, x.shape[2]), dtype=np.int64)
-        for ky in range(3):
-            for kx in range(3):
+        for ky in range(k):
+            for kx in range(k):
                 sub = xp[
                     ky : ky + (oh - 1) * s + 1 : s, kx : kx + (ow - 1) * s + 1 : s, :
                 ]
@@ -490,12 +507,14 @@ def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray
     pad = (kh // 2) if job.pad is None else job.pad
     xp = np.pad(x, ((pad, pad), (pad, pad), (0, 0)))
     oh, ow = job.out_layout.h, job.out_layout.w
-    acc = np.zeros((oh, ow, oc), dtype=np.int64)
+    # float64 BLAS is exact for these integer sums (|acc| < 2^53) and far faster than an int64 matmul
+    acc = np.zeros((oh, ow, oc), dtype=np.float64)
+    xf = xp.astype(np.float64)
     for ky in range(kh):
         for kx in range(kw):
-            sub = xp[ky : ky + (oh - 1) * s + 1 : s, kx : kx + (ow - 1) * s + 1 : s, :]
-            acc += sub @ job.weight[:, :, ky, kx].astype(np.int64).T
-    acc += job.bias.astype(np.int64)
+            sub = xf[ky : ky + (oh - 1) * s + 1 : s, kx : kx + (ow - 1) * s + 1 : s, :]
+            acc += sub @ job.weight[:, :, ky, kx].astype(np.float64).T
+    acc += job.bias.astype(np.float64)
     q = np.clip(_rse(acc, job.shift), -128, 127).astype(np.int64).reshape(oh * ow, oc)
     if job.res_mode:
         r = (

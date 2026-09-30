@@ -508,6 +508,55 @@ activation being 8-bit; 16-bit activations would need interpolation. Still missi
 inputs: maps larger than 64 pixels / 16 KB (pixel tiling), Concat, grouped convs other than depthwise,
 Squeeze-and-Excite (a GAP -> FC -> Sigmoid -> broadcast Mul: needs a reduce job and a broadcast multiply job).
 
+#### YOLO and more operators (`layer_engine_graph.py`, `quantize_pow2_graph.py`)
+
+The graph compiler was generalized from a chain to a DAG and grew the data-movement operators a YOLO
+backbone/neck/head needs. New job kinds (all runtime-shaped, one kernel):
+
+| job | operator | notes |
+|---|---|---|
+| `copy` | Split, Concat (channel axis) | per-output-block source (object A or B), block and scale exponent in the payload; a Concat of n tensors is n-1 pairwise jobs with each source re-scaled to the output's power-of-two scale |
+| `up` | Resize nearest x N | pixel replication, optional re-scale |
+| `maxpool` | MaxPool k x k "same" | any odd k / stride (SPPF's k=5, the stem's k=3 stride 2 replaces the old pool mode) |
+| `add` | Add of two activations | the residual epilogue arithmetic on two objects (YOLO's bottleneck Add sits after the SiLU, so it cannot fuse into the conv) |
+| `gap` | GlobalAveragePool | power-of-two pixel counts, round-half-even shift |
+| `bmul` | Mul by a 1x1 gate | squeeze-and-excite: activation x per-channel gate |
+| `dw` | depthwise 3x3 and 5x5 | all K*K tap vectors packed |
+
+- **SiLU** is `Sigmoid -> Mul` in ONNX: `quantize_pow2_graph.py` leaves the pair unquantized between one Q/DQ
+  pair, and the compiler collects *any pointwise chain* between a DequantizeLinear and a QuantizeLinear into one
+  table job built by running the chain through tinygrad (`tinygrad_lower.subgraph_table`).
+- **Large early maps run on the host.** A job whose output map does not fit a core's 512-byte region (the first
+  high-resolution layers, YOLOv5's 6x6 stride-2 stem) is marked host: the compiler emits it separately, the
+  harness runs it with the same numpy reference the tests use (float64 BLAS, exact for these integer sums) and
+  writes the result into the arena with a wide-region layout (`D_REG`) that the first engine job reads.
+- **Host tail**: everything after the last engine operator (Reshape, Softmax, the box decode) consumes the
+  *boundary* tensors the engine leaves in the arena (`Compiled.boundaries`).
+- A residual/second operand is prefetched a job early unless the previous job produces it (then it is queued
+  right before the job's input); the generic core program takes two act objects per job and loops over a table
+  of chunk counts.
+
+Results (32x32 input, Ultralytics YAML models with random weights and unit-variance init, quantized to power-of-two
+QDQ; all engine outputs **bit-exact against ONNX Runtime** on the detection-head Conv outputs, and the decoded
+detections from the host tail equal ORT's exactly):
+
+| model | engine jobs (host jobs) | engine call | prefix + engine + read-back | host tail (ORT) | Vitis AI |
+|---|---|---|---|---|---|
+| YOLOv8n | 170 (2) | 1.71 ms | 2.02 ms | 0.05 ms | 3.29 ms |
+| YOLOv5nu | 169 (2) | 1.69 ms | 2.44 ms | 0.05 ms | 4.42 ms |
+| YOLOv8n at 64x64 | 155 (17) | 1.83 ms | 2.96 ms | 0.06 ms | 3.75 ms |
+| MobileNetV3-style with 5x5 depthwise + SE (8x8) | 35 (0) | 0.54 ms | 0.55 ms | - | (mini model: 1.5 ms class) |
+
+Vitis AI's outputs differ from CPU on these models (decoded coordinates by up to 10 px at 32x32 and 148 at 64x64,
+argmax flips), so it is faster only when it is also less accurate; our numbers are for exactly ORT's arithmetic.
+Engine time per job is ~10 us, so a 170-job network is bound by per-job synchronization, not by compute.
+
+Not supported yet: YOLO11 (its C2PSA attention needs Reshape/Transpose/MatMul/Softmax in the middle of the
+network, i.e. a host round trip between two engine launches - a second xclbin costs ~1.8 ms of context switch),
+and real detector resolutions (640x640): maps of hundreds of pixels need pixel-split layouts and larger output
+objects, which is the "activation-tiled" engine this weight-streaming design deliberately is not. At 64x64 the
+host already computes 17 of 172 jobs.
+
 - Host findings worth keeping: OpenBLAS defaulted to one thread per core, and a 2048x1000 Gemm took 2.9 ms on
   this 64-thread host versus 0.05-0.1 ms with 1-2 threads (the runner now sets `OPENBLAS_NUM_THREADS=2`
   before numpy loads); a 1000-class head made the runner 3x slower before that fix.

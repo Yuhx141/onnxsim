@@ -288,3 +288,53 @@ def test_subgraph_table_runs_a_sigmoid_mul_chain_through_tinygrad():
     x = (np.arange(256) - 128) / 16.0
     want = np.clip(np.rint(x / (1 + np.exp(-x)) / (1 / 16)) + 128, 0, 255)
     assert np.abs(table.astype(int) - want).max() <= 1  # SiLU
+
+
+def test_gap_bmul_and_depthwise_5x5_references():
+    rng = np.random.default_rng(6)
+    lay = le.layout_for(16, 4, 4)
+    x = rng.integers(0, 256, (16, 16), dtype=np.uint8)
+    zero = (np.zeros((16, 1, 1, 1), dtype=np.int8), np.zeros(16, dtype=np.int32))
+    gap = le.Job(
+        "gap", *zero, 0, 1, lay, kind="gap", shift=4
+    )  # 16 pixels -> mean = sum / 2^4
+    pooled = le.reference(gap, x, None)
+    mean = (x.astype(np.int64) - 128).sum(axis=0) / 16.0
+    assert np.array_equal(
+        pooled[0].astype(int) - 128, np.clip(np.rint(mean), -128, 127)
+    )
+    gate = rng.integers(100, 200, (1, 16), dtype=np.uint8)
+    mul = le.Job(
+        "mul",
+        *zero,
+        0,
+        2,
+        lay,
+        kind="bmul",
+        res_slot=1,
+        b_layout=le.layout_for(16, 1, 1),
+        shift=6,
+    )
+    got = le.reference(mul, x, gate).astype(int) - 128
+    want = np.clip(
+        np.rint(((x.astype(np.int64) - 128) * (gate.astype(np.int64) - 128)) / 64.0),
+        -128,
+        127,
+    )
+    assert np.array_equal(got, want)
+    dw5 = le.Job(
+        "dw5",
+        rng.integers(-4, 4, (16, 1, 5, 5), dtype=np.int8),
+        np.zeros(16, dtype=np.int32),
+        0,
+        3,
+        lay,
+        shift=6,
+        kind="dw",
+    )
+    out = le.reference(dw5, x, None)
+    assert out.shape == (16, 16)
+    packed = le.pack_job(dw5, le.ENGINE_SLOT_BYTES)
+    assert packed[
+        0, 0, 0, le.DESC_BYTES : le.DESC_BYTES + 25 * 64
+    ].any()  # all 25 tap vectors are packed

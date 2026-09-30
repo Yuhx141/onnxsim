@@ -313,8 +313,8 @@ def compile_graph(model: Any, reuse_slots: bool = False) -> Compiled:
             )
             slot = new_slot()
             if group > 1 and group == oc == weight.shape[0] and icg == 1:
-                if (kh, kw) != (3, 3):
-                    raise ValueError(f"{node.name}: only 3x3 depthwise is supported")
+                if kh != kw or kh not in (3, 5):
+                    raise ValueError(f"{node.name}: only 3x3 and 5x5 depthwise are supported")
                 job = Job(
                     node.name,
                     weight,
@@ -484,6 +484,43 @@ def compile_graph(model: Any, reuse_slots: bool = False) -> Compiled:
             add_job(job)
             register(qnode.output[0], job, out_scale, out_zero)
             handled.add(qnode.name)
+        elif op == "GlobalAveragePool":
+            src = dq_source(node.input[0])
+            (qnode,) = consumers[res(node.output[0])]
+            out_scale, out_zero = qp(qnode)
+            pixels = src.layout.pixels
+            if pixels & (pixels - 1):
+                raise ValueError(f"{node.name}: the engine averages a power-of-two pixel count (got {pixels})")
+            shift = int(math.log2(pixels)) + _exp2(out_scale / src.scale, "average pool rescale")
+            if shift < 0:
+                raise ValueError(f"{node.name}: average pool output scale is finer than its input")
+            channels = src.layout.nb * 8
+            job = Job(node.name, np.zeros((channels, 1, 1, 1), dtype=np.int8), np.zeros(channels, dtype=np.int32), src.slot, new_slot(),
+                      src.layout, kind="gap", shift=shift)
+            add_job(job)
+            register(qnode.output[0], job, out_scale, out_zero)
+            handled.update({node.name, qnode.name})
+        elif (
+            op == "Mul"
+            and all(res(i) in producers and producers[res(i)].op_type == "DequantizeLinear" for i in node.input)
+            and dq_source(node.input[0]).slot != dq_source(node.input[1]).slot
+        ):
+            a_t, b_t = dq_source(node.input[0]), dq_source(node.input[1])
+            if a_t.layout.pixels == 1 and b_t.layout.pixels > 1:
+                a_t, b_t = b_t, a_t
+            if b_t.layout.pixels != 1:
+                raise ValueError(f"{node.name}: only a broadcast multiply by a 1x1 map (squeeze-excite) is supported")
+            (qnode,) = consumers[res(node.output[0])]
+            out_scale, out_zero = qp(qnode)
+            k = -_exp2(a_t.scale * b_t.scale / out_scale, "broadcast multiply rescale")
+            if k < 0:
+                raise ValueError(f"{node.name}: multiply output scale is finer than the product scale")
+            channels = a_t.layout.nb * 8
+            job = Job(node.name, np.zeros((channels, 1, 1, 1), dtype=np.int8), np.zeros(channels, dtype=np.int32), a_t.slot, new_slot(),
+                      a_t.layout, kind="bmul", res_slot=b_t.slot, b_layout=b_t.layout, shift=k)
+            add_job(job)
+            register(qnode.output[0], job, out_scale, out_zero)
+            handled.update({node.name, qnode.name})
         elif op == "Add" and all(
             res(i) in producers and producers[res(i)].op_type == "DequantizeLinear"
             for i in node.input
