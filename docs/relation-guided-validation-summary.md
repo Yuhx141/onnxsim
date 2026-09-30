@@ -33,12 +33,14 @@ not reported as optimizer defects.
 
 ## Included fix
 
-This branch includes one independently reviewable change for #1997. A legal
-`Shape` range beyond the input rank previously reached invalid iterator
-arithmetic in `eliminate_shape_op` and terminated the process. The replacement
-pass normalizes the range before reading the input dimensions. The original
-reproducer now produces a checker-valid empty `int64` initializer. One new
-regression test for this boundary and 18 existing related tests pass.
+This branch contains a fork-local candidate fix for #1997 in
+[`21d635f6`](https://github.com/Yuhx141/onnxsim/commit/21d635f601768047aa1ed97a27a199c88e7d7ced);
+it has not been merged upstream. A legal `Shape` range beyond the input rank
+previously reached invalid iterator arithmetic in `eliminate_shape_op` and
+terminated the process. The replacement pass normalizes the range before
+reading the input dimensions. The original reproducer now produces a
+checker-valid empty `int64` initializer. One new regression test for this
+boundary and 18 existing related tests pass.
 
 ## Ongoing work
 
@@ -49,6 +51,11 @@ fix, its new regression test, and the same 18 existing related tests were also
 run locally with the repository's address/alignment sanitizer instrumentation
 and produced no invalid-access or alignment report. This focused check is not
 sanitizer coverage of the full 120-seed batch.
+
+For future experiments, sanitizer diagnostics are a useful additional signal
+alongside graph validity, pass isolation, and output comparison. We plan to
+start with sanitizer replay of high-risk cases and evaluate its runtime cost
+and diagnostic noise before using it more broadly.
 
 This public branch is an interim record rather than a complete artifact
 release. It intentionally contains aggregate results and the independently
