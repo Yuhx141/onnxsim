@@ -31,26 +31,49 @@ mask interpretation and formula-matching tolerance. ReferenceEvaluator and
 ONNX Runtime differences were measured separately so backend limitations were
 not reported as optimizer defects.
 
-## Included fix
+## Fork fixes
 
-This branch contains a fork-local candidate fix for #1997 in
-[`21d635f6`](https://github.com/Yuhx141/onnxsim/commit/21d635f601768047aa1ed97a27a199c88e7d7ced);
-it has not been merged upstream. A legal `Shape` range beyond the input rank
-previously reached invalid iterator arithmetic in `eliminate_shape_op` and
-terminated the process. The replacement pass normalizes the range before
-reading the input dimensions. The original reproducer now produces a
-checker-valid empty `int64` initializer. One new regression test for this
-boundary and 18 existing related tests pass.
+The branch now has fork-local fixes for the reported cases. These changes have
+not been merged upstream.
+
+| Report | Fork behavior |
+| --- | --- |
+| #1995 | reshape a singleton-rank Conv output scale to rank one before folding it into the bias |
+| #1996 | decline the reshape-family fusion when `allowzero=1` would combine `0` and `-1` |
+| #1997 | normalize the `Shape` range before reading input dimensions |
+| #1998 | keep matched RoPE values that are also graph outputs |
+| #1999 | decline constant-trip unrolling when the body has nested graph attributes |
+| #2000 | decline Attention/GQA fusion when the source scale would become the target operator's zero sentinel |
+| #2001 | decline normalization fusion when a DOUBLE epsilon is not exactly representable by the float attribute |
+| #2002 | only treat negative infinity, rather than a finite penalty, as an exact hard causal mask |
+| #2003 | match GELU and LayerNorm formula constants exactly in their source tensor precision |
+
+The #1997 change is in
+[`21d635f6`](https://github.com/Yuhx141/onnxsim/commit/21d635f601768047aa1ed97a27a199c88e7d7ced).
+The remaining changes and their regression tests are in
+[`fd4951d0`](https://github.com/Yuhx141/onnxsim/commit/fd4951d07e12cd2621111a647c8aa4ccb1ae049c).
+
+The eight public reproducer directories for #1995, #1996, and #1998--#2003
+were replayed against this build. Every optimized graph passed the ONNX checker
+and executed. The numerical cases were exact after the affected fusion
+declined. The RoPE case no longer aborts and preserves its public embedding;
+its fused output differs from the decomposed output by at most
+`1.1920929e-7`, the existing floating-point rounding of that valid rewrite.
+
+Ten new regression tests and 41 neighboring existing tests pass on the regular
+build. The ten new regressions also pass with the repository's
+address/alignment sanitizer flags, with leak checking disabled to exclude the
+known Python/NumPy shutdown allocation.
 
 ## Ongoing work
 
 The relation-guided method is still being extended across model sources and
 optimizer families. The original 120-seed comparison used a regular build; it
-was not an AddressSanitizer or Valgrind run. After the comparison, the included
-fix, its new regression test, and the same 18 existing related tests were also
-run locally with the repository's address/alignment sanitizer instrumentation
-and produced no invalid-access or alignment report. This focused check is not
-sanitizer coverage of the full 120-seed batch.
+was not an AddressSanitizer or Valgrind run. After the comparison, the #1997
+regression and 18 existing related tests were run locally with the repository's
+address/alignment sanitizer instrumentation. The ten later issue regressions
+were checked the same way. These focused checks produced no invalid-access or
+alignment report; they are not sanitizer coverage of the full 120-seed batch.
 
 For future experiments, sanitizer diagnostics are a useful additional signal
 alongside graph validity, pass isolation, and output comparison. We plan to
@@ -58,8 +81,8 @@ start with sanitizer replay of high-risk cases and evaluate its runtime cost
 and diagnostic noise before using it more broadly.
 
 This public branch is an interim record rather than a complete artifact
-release. It intentionally contains aggregate results and the independently
-testable crash fix, but not the full mutation strategy or research tooling.
+release. It intentionally contains aggregate results and independently
+testable fixes, but not the full mutation strategy or research tooling.
 The method and experimental design are still being developed as part of a
 paper. We plan to release a fuller implementation and reproducibility package
 with a preprint or paper once the method and evaluation have stabilized.
