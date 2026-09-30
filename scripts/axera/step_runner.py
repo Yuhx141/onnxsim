@@ -2690,6 +2690,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "single-node models, one per (operator, shapes) signature",
     )
     p.add_argument(
+        "--fp32-refused",
+        action="store_true",
+        help="also build the nodes the plan refuses (no template class or shape) "
+        "as Pulsar2 FP32 single-node models",
+    )
+    p.add_argument(
         "--u16-splits",
         default="",
         help="comma-separated batch split factors to retry with (e.g. 4,16) "
@@ -2826,6 +2832,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         segs = [*segs, *extra]
         blobs.update(extra_blobs)
+    if args.fp32_refused:
+        extra, extra_blobs = build_fp32_node_segments(
+            model, host, "refused", args.u16_cache_dir
+        )
+        segs = [*segs, *extra]
+        blobs.update(extra_blobs)
+        print(f"  {len(extra)} refused nodes built as FP32; host: {sorted(host)}", flush=True)
     if args.exact_fp32_io:
         for sg in segs:
             if sg.quantize_device_io:
