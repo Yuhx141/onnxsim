@@ -396,7 +396,7 @@ def resnet_stages(
     return Program(iron.get_current_device(), runtime, workers=workers).resolve_program()
 
 
-def stage_specs(model, stages, caps=None, first_column=0):
+def stage_specs(model, stages, caps=None, first_column=0, engine=False):
     """Bind every stage's blocks and build the per-column compile-time spec (shared with the runner)."""
     try:
         from .benchmark_fused_bottleneck import bind_fused_bottleneck
@@ -412,12 +412,12 @@ def stage_specs(model, stages, caps=None, first_column=0):
         binds = []
         cap = caps[ci] if caps and caps[ci] else None
         for j, prefix in enumerate(prefixes):
-            binding = bind_fused_bottleneck(model, plans[prefix], blocked=True, max_chunk=cap)
+            binding = bind_fused_bottleneck(model, plans[prefix], blocked=True, max_chunk=cap, engine=engine)
             if j == 0 and len(prefixes) > 1 and not cap:
                 # identity blocks adopt the first block's slot as their chunk cap, so the stage's
                 # common slot is not larger than what its first block needs
                 cap = int(binding["chunk_slot_bytes"])
-            if not blocked_supported(binding):
+            if not engine and not blocked_supported(binding):
                 raise ValueError(f"{prefix}: shape not supported by the blocked kernels")
             binds.append(binding)
         outs = {tuple(b["output_shape"]) for b in binds}
@@ -428,6 +428,9 @@ def stage_specs(model, stages, caps=None, first_column=0):
         if previous_output is not None and previous_output != binds[0]["input_shape"]:
             raise ValueError(f"stage {prefixes}: input shape does not match the previous stage's output")
         previous_output = binds[-1]["output_shape"]
+        if engine:  # the layer engine needs only the bindings (raw weights, shifts), not the column spec
+            bindings.append(binds)
+            continue
         mid = int(binds[0]["raw_weights"]["w1"].shape[0])
         out_c, oh, ow = binds[0]["output_shape"][1:4]
         kinds, act_bytes, stage1, col_bytes, skipx, slot = [], [], 0, 64, 64, 0

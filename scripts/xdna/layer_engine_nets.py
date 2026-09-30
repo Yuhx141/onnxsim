@@ -81,10 +81,10 @@ def run_reference(jobs, x_dense: np.ndarray):
     return maps, layouts
 
 
-def build(name: str, seed: int = 0):
+def build(name: str, seed: int = 0, arch: str = "3,4,6,3"):
     rng = np.random.default_rng(seed)
     if name == "full":
-        jobs, _segments, _stem = full(seed)
+        jobs, _segments, _stem = full(seed, arch)
         return jobs, None
     if name in ("body", "bodyr"):
         jobs, _, x = body(seed)
@@ -108,10 +108,10 @@ def build(name: str, seed: int = 0):
     return jobs, x
 
 
-def segments_for(name: str, jobs):
+def segments_for(name: str, jobs, arch: str = "3,4,6,3"):
     """Core-program segments (first_job, jobs_per_iteration, repeat) for a named net."""
     if name == "full":
-        return full()[1]
+        return full(0, arch)[1]
     if name in ("body", "bodyr"):
         return body()[1]
     return [(0, len(jobs), 1)]
@@ -125,9 +125,17 @@ def synthetic_stem(seed: int = 0):
     }
 
 
-def full(seed: int = 0):
+def arch_stages(arch: str = "3,4,6,3"):
+    """``"3,4,6,3"`` or ``"3,4,6,3:2"`` (bottleneck counts per stage, optional width multiplier of the 3x3 width)."""
+    counts, _, width = arch.partition(":")
+    mult = int(width or 1)
+    n1, n2, n3, n4 = (int(v) for v in counts.split(","))
+    return ((n1, 64 * mult, 256, 1), (n2, 128 * mult, 512, 2), (n3, 256 * mult, 1024, 2), (n4, 512 * mult, 2048, 2))
+
+
+def full(seed: int = 0, arch: str = "3,4,6,3"):
     """Stem + pool + layer1..4 (random weights) in one arena. Returns (jobs, segments, stem)."""
-    body_jobs, segments, _ = body(seed)
+    body_jobs, segments, _ = body(seed, stages=arch_stages(arch))
     assign_slots(body_jobs)
     stem = synthetic_stem(seed)
     jobs = assemble_full(stem, body_jobs)

@@ -42,9 +42,10 @@ def engine(
     looped: CompileTime[int] = 0,
     l2: CompileTime[int] = 0,
     kflags: CompileTime[str] = "",
+    arch: CompileTime[str] = "3,4,6,3",
 ):
-    jobs, _ = layer_engine_nets.build(net)
-    segments = layer_engine_nets.segments_for(net, jobs)
+    jobs, _ = layer_engine_nets.build(net, 0, arch)
+    segments = layer_engine_nets.segments_for(net, jobs, arch)
     stem = net == "full"  # jobs[:5] are the stem GEMM chunks + pool; the rest is the looped body
     nch = [n_chunks(j, slot - 192) for j in jobs]
     slots_used = layer_engine.arena_slots(jobs)
@@ -216,6 +217,7 @@ def _parser():
     parser.add_argument("--nocompute", action="store_true")
     parser.add_argument("--kflags", default="", help="extra kernel compile flags (profiling)")
     parser.add_argument("--l2", type=int, default=0, help="stage weights in memtile L2 (this many 4-slice objects deep) and distribute one slice per core")
+    parser.add_argument("--arch", default="3,4,6,3", help="bottleneck counts per stage, optional ':W' 3x3 width multiplier (full net)")
     parser.add_argument("--looped", action="store_true", help="stage-looped core program (body net)")
     parser.add_argument("--compute", type=lambda v: int(v, 0), default=0xFFFFFF, help="bitmask of jobs that run their kernel (profiling)")
     return parser
@@ -225,7 +227,7 @@ def main() -> None:
     opts = _parser().parse_args()
     run_design_cli(
         engine, opts,
-        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0, "kflags": o.kflags, "l2": o.l2},
+        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0, "kflags": o.kflags, "l2": o.l2, "arch": o.arch},
         device=lambda value: device_from_args(value, n_cols=8),
     )
 

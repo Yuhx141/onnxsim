@@ -227,7 +227,10 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     if (L.nb % 4 == 0) tiled_gemm<4>(L, L.t_out, a_base, p_in * 8, epi);
     else tiled_gemm<2>(L, L.t_out, a_base, p_in * 8, epi);
   } else {
-    if (L.s == 1) {
+    const int pad_w = L.w + 2, pad_bytes = (L.h + 2) * pad_w * 8;
+    const bool pad_fits = L.nbp * (L.w * L.h * 8 + pad_bytes) <= ENG_REGION_BYTES ||
+                          L.ncp * ENG_REGION_BYTES + L.nbp * L.ncp * pad_bytes <= ENG_ACT_BYTES;
+    if (L.s == 1 && pad_fits) {
       // Stride-1 3x3: a zero-padded copy of every input block is built once (first chunk); an A tile is
       // then 1/2/4 contiguous row segments of that copy, so no per-row gather is needed. The copy sits
       // in the unused bytes of each input region when it fits there, else in the activation object's tail.

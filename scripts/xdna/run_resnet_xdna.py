@@ -12,6 +12,12 @@ import json
 import math
 import os
 import time
+
+# The host tail (Gemm, average pool) is tiny: with the default one BLAS thread per core a 2048x1000 Gemm
+# took 3 ms on a 64-thread host (thread start-up dominates); one or two threads take 0.05-0.1 ms.
+# Must be set before numpy loads OpenBLAS.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -418,7 +424,7 @@ class XDNAResNetRunner:
             prepared_blocks[prefix] = (block, binding, set(binding["covered_nodes"]), str(xclbin), str(insts))
 
         for prefixes, xclbin, insts in stage_specs:
-            if not 1 <= len(prefixes) <= 16:
+            if not 1 <= len(prefixes) <= (1024 if self.layer_engine else 16):
                 raise ValueError("linked fused stage requires one to sixteen block prefixes")
             if not Path(xclbin).is_file() or not Path(insts).is_file():
                 raise ValueError("fused stage xclbin and instruction stream must exist")
@@ -438,6 +444,7 @@ class XDNAResNetRunner:
                 binding = bind_fused_bottleneck(
                     model, block, blocked=self.fused_stage_blocked,
                     max_chunk=self.fused_body_chunk_caps.get(prefix) or None,
+                    engine=self.layer_engine,
                 )
                 if previous_binding is not None and (
                     previous_binding["output_shape"] != binding["input_shape"]
@@ -455,6 +462,7 @@ class XDNAResNetRunner:
         self.context_cache_limit = min(16, max(1, int(os.environ.get("XRT_CONTEXT_CACHE_SIZE", "16"))))
         self.context_budget_fallback_blocks: list[str] = []
         self._forced_cpu_convs: set[int] = set()
+        self._gemm_weights: dict[int, tuple[Any, np.ndarray]] = {}
         active_prefixes = set(prepared_blocks)
         active_stages = set(prepared_stages)
         pool_contexts = {
@@ -1578,7 +1586,7 @@ class XDNAResNetRunner:
             from . import layer_engine as le
             from .layer_engine_net import jobs_from_bindings
             from .resnet_stage_design import stage_specs
-        _cols, binds = stage_specs(model, self.device_network_stages)
+        _cols, binds = stage_specs(model, self.device_network_stages, engine=True)
         jobs, _outs = jobs_from_bindings(binds, reuse_slots=True)
         stem = None
         if self.layer_engine_stem:
@@ -1911,7 +1919,18 @@ class XDNAResNetRunner:
                 result = args[0].reshape(math.prod(args[0].shape[:axis]), math.prod(args[0].shape[axis:]))
             elif op == "Gemm":
                 a = args[0].T if int(attrs.get("transA", 0)) else args[0]
-                b = args[1].T if int(attrs.get("transB", 0)) else args[1]
+                if int(attrs.get("transB", 0)):
+                    # constant weights: transpose once into a contiguous float32 matrix (a strided
+                    # view made this Gemm 10x slower than the whole device call on 1000-class heads)
+                    cached = self._gemm_weights.get(index)
+                    if cached is None or cached[0] is not args[1]:
+                        cached = (args[1], np.ascontiguousarray(np.asarray(args[1], dtype=np.float32).T))
+                        self._gemm_weights[index] = cached
+                    b = cached[1]
+                else:
+                    b = args[1]
+                if a.dtype != b.dtype and a.dtype == np.float64 and b.dtype == np.float32:
+                    a = a.astype(np.float32)  # keep the matmul in float32 (a float64 view promoted the whole weight matrix per call)
                 result = float(attrs.get("alpha", 1.0)) * (a @ b)
                 if len(args) > 2:
                     result = result + float(attrs.get("beta", 1.0)) * args[2]
