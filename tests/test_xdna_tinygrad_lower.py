@@ -338,3 +338,38 @@ def test_gap_bmul_and_depthwise_5x5_references():
     assert packed[
         0, 0, 0, le.DESC_BYTES : le.DESC_BYTES + 25 * 64
     ].any()  # all 25 tap vectors are packed
+
+
+def test_graph_compiler_keeps_the_add_after_a_depthwise_conv_a_separate_job():
+    # the depthwise kernel ignores a fused residual, so the compiler must not fuse an Add into a dw job
+    from onnx import numpy_helper, parser
+
+    text = """
+    <ir_version: 8, opset_import: ["" : 19]>
+    g (float[1, 8, 4, 4] input) => (float[1, 8, 4, 4] y_dq) <
+      float s = {0.0078125}, float s2 = {0.00006103515625}, uint8 z = {128}, int8 wz = {0}, float ws = {0.0078125},
+      int8[8] bq = {0, 0, 0, 0, 0, 0, 0, 0}
+    > {
+      xq = QuantizeLinear(input, s, z)
+      xd = DequantizeLinear(xq, s, z)
+      wd = DequantizeLinear(wq, ws, wz)
+      bd = DequantizeLinear(bq, s2, wz)
+      c = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1], group = 8>(xd, wd, bd)
+      cq = QuantizeLinear(c, s, z)
+      cd = DequantizeLinear(cq, s, z)
+      sum = Add(xd, cd)
+      yq = QuantizeLinear(sum, s, z)
+      y_dq = DequantizeLinear(yq, s, z)
+    }
+    """
+    model = parser.parse_model(text)
+    for i, node in enumerate(model.graph.node):  # the compiler tracks nodes by name; the text format leaves them empty
+        node.name = f"n{i}"
+    model.graph.initializer.append(
+        numpy_helper.from_array(np.ones((8, 1, 3, 3), dtype=np.int8), "wq")
+    )
+    from layer_engine_graph import compile_graph
+
+    compiled = compile_graph(model, simplify=False)
+    assert [job.kind for job in compiled.jobs] == ["dw", "add"]
+    assert compiled.jobs[0].res_slot is None
