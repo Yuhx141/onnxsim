@@ -38,6 +38,7 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="compare the boundary tensors with ONNX Runtime")
     parser.add_argument("--json", type=Path)
     parser.add_argument("--dump-boundaries", type=Path)
+    parser.add_argument("--dump-arena", type=Path, help="save the raw arena bytes after the last launch (debugging slot reuse)")
     parser.add_argument("--dump-outputs", type=Path, help="save the model outputs computed through the host tail (npz)")
     args = parser.parse_args()
 
@@ -53,7 +54,7 @@ def main() -> int:
     channels, height, width = q.shape
     image = np.full((height * width, plan.input_layout.nb * 8), 128, dtype=np.uint8)
     image[:, :channels] = q.transpose(1, 2, 0).reshape(height * width, channels)
-    slots = max(le.arena_slots(plan.jobs), 1 + max([j.out_slot for j in plan.host_jobs] + [0]))
+    slots = max(le.arena_slots(plan.jobs), 1 + max([j.out_slot for j in plan.host_jobs] + [0])) + int(os.environ.get("ENGINE_PAD_SLOTS", "0"))
     packs = [le.pack_job(job, le.ENGINE_SLOT_BYTES) for job in plan.jobs]
     params = np.concatenate([np.concatenate([p[col].reshape(-1) for p in packs]) for col in range(le.COLS)])
     kernel = NPUKernel(str(args.xclbin), str(args.insts))
@@ -63,6 +64,7 @@ def main() -> int:
         with arena.overwrite() as host:
             host.view(np.uint8)[: le.SLOT_BYTES] = le.to_arena(image, plan.input_layout)
 
+    engine_reads = {j.in_slot for j in plan.jobs} | {j.res_slot for j in plan.jobs if j.res_slot is not None}
     read_ms: list[float] = []
     host_runner = HostRunner(plan)
 
@@ -72,6 +74,8 @@ def main() -> int:
         for job in plan.host_jobs:
             resid = dense.get(job.res_slot) if job.res_slot is not None else None
             dense[job.out_slot] = le.reference(job, dense[job.in_slot], resid)
+            if job.out_slot not in engine_reads:
+                continue  # only host maps an engine job reads go through the arena (larger ones never fit a slot)
             with arena.overwrite() as host:
                 host.view(np.uint8)[job.out_slot * le.SLOT_BYTES : (job.out_slot + 1) * le.SLOT_BYTES] = le.to_arena(
                     dense[job.out_slot], job.out_layout
@@ -96,7 +100,10 @@ def main() -> int:
             with arena.overwrite() as host:
                 host.view(np.uint8)[slot * le.SLOT_BYTES : (slot + 1) * le.SLOT_BYTES] = data
 
-        found, floats = run_levels(plan, launch, write_slot, host_runner)
+        if os.environ.get("ENGINE_KEEP_ALL") or os.environ.get("ENGINE_KEEP_EVERY") or os.environ.get("ENGINE_MAX_JOBS"):  # debugging: every job output is a boundary, no host tail
+            found, floats = launch(), {}
+        else:
+            found, floats = run_levels(plan, launch, write_slot, host_runner)
         run_once.floats = floats
         return found, prefix_ms, engine_ms
 
@@ -115,6 +122,8 @@ def main() -> int:
         "launches": plan.levels, "min_ms": min(totals), "median_ms": float(np.median(totals)),
         "host_prefix_ms": float(np.median(prefix)), "engine_call_ms": float(np.median(engine)), "arena_readback_ms": float(np.median(read_ms)),
     }
+    if args.dump_arena:
+        np.save(args.dump_arena, arena.numpy().view(np.uint8))
     if args.dump_boundaries:
         np.savez(args.dump_boundaries, **{k.replace("/", "|"): v for k, v in boundaries.items()})
     if args.dump_outputs:

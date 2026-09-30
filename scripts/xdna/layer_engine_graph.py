@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 from onnx import numpy_helper
 
+import layer_engine as le
 from layer_engine import REGION_BYTES, Job, Layout, assign_slots, layout_for
 
 POINTWISE = frozenset(
@@ -219,6 +220,8 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
     def add_job(job: Job, host: bool = False) -> Job:
         if job.out_layout.nbc * job.out_layout.pixels * 8 > REGION_BYTES:
             host = True
+        if any(l is not None and l.nb * l.w * l.h * 8 > le.SLOT_BYTES for l in (job.in_layout, job.b_layout)):
+            host = True  # an input map larger than an arena slot cannot be read by the engine: its consumers stay on the host until maps shrink
         if host:
             slots_on_host = {j.out_slot for j in host_jobs} | {0}
             if (
@@ -237,6 +240,32 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
         else:
             jobs.append(job)
         return job
+
+    def split_dw(job: Job, name: str, weight, bias) -> Job:
+        """Add a depthwise job; one whose per-core weights overflow a slot becomes channel-block parts (slice, dw, concat)."""
+        k = weight.shape[2]
+        max_nbc = (le.ENGINE_SLOT_BYTES - le.DESC_BYTES) // (k * k * 64 + le.TILE * 4)
+        nb = job.in_layout.nb
+        parts = -(-(-(-nb // le.CORES)) // max_nbc)
+        if parts <= 1:
+            return add_job(job)
+        per = -(-nb // parts)
+        outs = []
+        for lo in range(0, nb, per):
+            hi = min(lo + per, nb)
+            spec = [(0, g, 0) for g in range(lo, hi)]
+            sl = add_job(Job(f"{name}:slice{lo}", np.zeros(((hi - lo) * 8, 1, 1, 1), dtype=np.int8), np.zeros((hi - lo) * 8, dtype=np.int32),
+                             job.in_slot, new_slot(), job.in_layout, kind="copy", copy_spec=spec))
+            part = Job(f"{name}:{lo}", weight[lo * 8 : hi * 8], bias[lo * 8 : hi * 8], sl.out_slot, new_slot(), sl.out_layout,
+                       stride=job.stride, kind="dw", shift=job.shift, relu=job.relu, in_flip=True, out_flip=True, clamp=job.clamp)
+            outs.append(add_job(part))
+        cur = outs[0]
+        for nxt in outs[1:]:
+            spec = [(0, g, 0) for g in range(cur.out_layout.nb)] + [(1, g, 0) for g in range(nxt.out_layout.nb)]
+            channels = (cur.out_layout.nb + nxt.out_layout.nb) * 8
+            cur = add_job(Job(f"{name}:cat{len(spec)}", np.zeros((channels, 1, 1, 1), dtype=np.int8), np.zeros(channels, dtype=np.int32),
+                              cur.out_slot, new_slot(), cur.out_layout, kind="copy", copy_spec=spec, res_slot=nxt.out_slot, b_layout=nxt.out_layout))
+        return cur
 
     def register(q_out: str, job: Job, scale: float, zero: int = 128) -> None:
         reads = {job.in_slot, job.res_slot}
@@ -316,6 +345,13 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             a = attrs_of(node)
             group, strides = a.get("group", 1), a.get("strides", [1, 1])
             oc, icg, kh, kw = weight.shape
+            if group > 1 and not (group == oc and icg == 1):
+                # grouped (not depthwise): a dense conv with a block-diagonal weight (extra MACs, exact result)
+                dense = np.zeros((oc, icg * group, kh, kw), dtype=weight.dtype)
+                per = oc // group
+                for gi in range(group):
+                    dense[gi * per : (gi + 1) * per, gi * icg : (gi + 1) * icg] = weight[gi * per : (gi + 1) * per]
+                weight, icg, group = dense, icg * group, 1
             if (
                 icg * group < src.layout.nb * 8
             ):  # padded input channels (e.g. RGB -> 8): extra weights are zero
@@ -455,7 +491,10 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                 raise ValueError(
                     f"{node.name}: grouped convolution (group={group}) has no kernel"
                 )
-            add_job(job)
+            if job.kind == "dw":
+                job = split_dw(job, node.name, weight, bias)
+            else:
+                add_job(job)
             register(out_name, job, job_scale)
             handled.update({node.name, qnode.name} | ({act.name} if act else set()))
         elif op == "Split":
@@ -798,6 +837,15 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
     ):  # debugging: never reuse a slot and expose every job output as a boundary
         keep = [j.out_slot for j in jobs]
         boundaries = {j.name: Tensor(j.out_slot, j.out_layout, 1.0, 128) for j in jobs}
+    if os.environ.get("ENGINE_KEEP_EVERY"):  # debugging: keep and expose every Nth job output but still reuse the other slots
+        spec = os.environ["ENGINE_KEEP_EVERY"]
+        wanted = (lambda i: i in {int(v) for v in spec[1:].split(",")}) if spec.startswith("@") else (lambda i: i % int(spec) == 0)
+        extra = {j.name: Tensor(j.out_slot, j.out_layout, 1.0, 128) for i, j in enumerate(jobs) if wanted(i)}
+        keep = keep + [t.slot for t in extra.values()]
+        boundaries = {**boundaries, **extra}
+    if os.environ.get("ENGINE_MAX_JOBS"):  # debugging: truncate the job list (no host tail)
+        del jobs[int(os.environ["ENGINE_MAX_JOBS"]) :]
+        keep, boundaries = [jobs[-1].out_slot], {}
     pinned = sorted({j.out_slot for j in host_jobs} | {0} | {e.slot for e in entries})
     mapping: dict[int, int] = {}
     count = assign_slots(jobs, pinned=pinned, keep=keep, mapping=mapping)

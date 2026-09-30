@@ -401,7 +401,8 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
                             ky,
                             kx,
                         ]
-                        tile_view[ol, i, l] = blk.T
+                        if blk.shape[1]:  # input blocks past the last real one (uneven split over cores) keep zero weights
+                            tile_view[ol, i, l] = blk.T
             if nb:
                 body[:tiles] = tile_view.view(np.uint8).reshape(-1)
                 body[desc[D_BIAS] :] = (
