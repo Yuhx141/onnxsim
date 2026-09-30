@@ -363,7 +363,8 @@ def test_graph_compiler_keeps_the_add_after_a_depthwise_conv_a_separate_job():
     }
     """
     model = parser.parse_model(text)
-    for i, node in enumerate(model.graph.node):  # the compiler tracks nodes by name; the text format leaves them empty
+    # the compiler tracks nodes by name; the text format leaves them empty
+    for i, node in enumerate(model.graph.node):
         node.name = f"n{i}"
     model.graph.initializer.append(
         numpy_helper.from_array(np.ones((8, 1, 3, 3), dtype=np.int8), "wq")
