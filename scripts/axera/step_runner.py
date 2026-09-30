@@ -2690,6 +2690,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "single-node models, one per (operator, shapes) signature",
     )
     p.add_argument(
+        "--no-check",
+        action="store_true",
+        help="timing run: no per-segment simulation or float check (segment "
+        "outputs are not validated)",
+    )
+    p.add_argument(
         "--fp32-refused",
         action="store_true",
         help="also build the nodes the plan refuses (no template class or shape) "
@@ -2895,6 +2901,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 outs, stats = runner.run(
                     feeds,
                     "npu",
+                    check=not args.no_check,
                     keep=list(grad_names.values()),
                     progress=True,
                     stats_out=(stats := []),
