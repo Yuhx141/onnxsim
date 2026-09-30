@@ -632,14 +632,15 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             out_scale, out_zero = qp(qnode)
             a = attrs_of(node)
             k, s = a["kernel_shape"][0], a.get("strides", [1, 1])[0]
+            pads = list(a.get("pads", [0] * 4))
             if (
                 a["kernel_shape"][0] != a["kernel_shape"][1]
-                or k % 2 == 0
-                or list(a.get("pads", [0] * 4)) != [(k - 1) // 2] * 4
+                or a.get("strides", [s, s])[0] != a.get("strides", [s, s])[1]
+                or len(set(pads[:2] + pads[2:])) > 1
+                or any(d != 1 for d in a.get("dilations", [1, 1]))
+                or pads[0] >= k
             ):
-                raise ValueError(
-                    f"{node.name}: only square odd 'same'-padded max pools are supported"
-                )
+                raise ValueError(f"{node.name}: only square, symmetrically padded max pools are supported")
             channels = src.layout.nb * 8
             job = Job(
                 node.name,
@@ -651,6 +652,8 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                 stride=s,
                 kind="maxpool",
                 factor=k,
+                pad=pads[0],
+                ceil_pool=bool(a.get("ceil_mode", 0)),
                 exp=_exp2(src.scale / out_scale, "pool rescale"),
             )
             add_job(job)

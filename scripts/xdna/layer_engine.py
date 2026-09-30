@@ -123,6 +123,7 @@ class Job:
     factor: int = (
         1  # "up": nearest upsample factor; "maxpool": window; stride is `stride`
     )
+    ceil_pool: bool = False  # "maxpool": ONNX ceil_mode (partial windows on the right/bottom edge are kept)
     exp: int = 0  # "up"/"maxpool": result scaled by 2^exp (the Q after the op has its own scale)
     clamp: int = 127  # upper bound of the int8 result before the output flip (ReLU6 = 6 / output scale)
     table: np.ndarray | None = None  # "lut": 256 output bytes indexed by the input byte
@@ -154,7 +155,13 @@ class Job:
         if self.kind == "up":
             ow, oh = self.in_layout.w * self.factor, self.in_layout.h * self.factor
         if self.kind == "maxpool":
-            ow, oh = (self.in_layout.w - 1) // s + 1, (self.in_layout.h - 1) // s + 1
+            mp = (self.factor - 1) // 2 if self.pad is None else self.pad
+
+            def pooled(n: int) -> int:
+                o = (n + 2 * mp - self.factor + (s - 1 if self.ceil_pool else 0)) // s + 1
+                return o - 1 if self.ceil_pool and (o - 1) * s >= n + mp else o
+
+            ow, oh = pooled(self.in_layout.w), pooled(self.in_layout.h)
         self.out_layout = layout_for(oc, ow, oh)
         if (
             self.kind in ("dw", "lut", "up", "maxpool", "add")
@@ -281,6 +288,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
                     desc[D_S] = job.factor
                 if job.kind == "maxpool":
                     desc[D_NTAPS], desc[D_S] = job.factor, job.stride
+                    desc[D_KSZ] = (job.factor - 1) // 2 if job.pad is None else job.pad
                 desc[D_EA] = job.exp
                 slot[:DESC_BYTES] = desc.view(np.uint8)
                 if job.kind == "copy" and blocks:
@@ -473,9 +481,11 @@ def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray
         return rescale(out.reshape(-1, out.shape[2]), job.exp)
     if job.kind == "maxpool":
         fmap = act.reshape(lay.h, lay.w, -1)
-        k, s, pad = job.factor, job.stride, (job.factor - 1) // 2
-        padded = np.pad(fmap, ((pad, pad), (pad, pad), (0, 0)), constant_values=0)
+        k, s = job.factor, job.stride
+        pad = (k - 1) // 2 if job.pad is None else job.pad
         oh, ow = job.out_layout.h, job.out_layout.w
+        after_y, after_x = max((oh - 1) * s + k - pad - lay.h, 0), max((ow - 1) * s + k - pad - lay.w, 0)
+        padded = np.pad(fmap, ((pad, after_y), (pad, after_x), (0, 0)), constant_values=0)
         out = np.zeros((oh, ow, fmap.shape[2]), dtype=np.uint8)
         for oy in range(oh):
             for ox in range(ow):

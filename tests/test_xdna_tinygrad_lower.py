@@ -406,3 +406,138 @@ def test_fast_host_conv_transpose_matches_the_reference_evaluator(
     (got,) = ReferenceEvaluator(model, new_ops=_fast_ops()).run(None, feeds)
     assert got.shape == want.shape
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+def _name_nodes(model):
+    # the compiler tracks nodes by name; the text format leaves them empty
+    for i, node in enumerate(model.graph.node):
+        node.name = f"n{i}"
+    return model
+
+
+def _chain_matches_evaluator(model, x, out_scale):
+    """Run compile_graph's jobs with the numpy references and compare with onnx's evaluator on the float model."""
+    from onnx.reference import ReferenceEvaluator
+
+    from layer_engine_graph import compile_graph
+
+    compiled = compile_graph(model, simplify=False)
+    n, c, h, w = x.shape
+    q = np.clip(np.rint(x / compiled.input_scale) + 128, 0, 255).astype(np.uint8)[0]
+    dense = np.full((h * w, compiled.input_layout.nb * 8), 128, dtype=np.uint8)
+    dense[:, :c] = q.transpose(1, 2, 0).reshape(h * w, c)
+    maps = {0: dense}
+    for job in compiled.jobs:
+        res = maps[job.res_slot] if job.res_slot is not None else None
+        maps[job.out_slot] = le.reference(job, maps[job.in_slot], res)
+    (want,) = ReferenceEvaluator(model).run(None, {"input": x})
+    last = compiled.jobs[-1]
+    got = (maps[last.out_slot].astype(np.float32) - 128) * out_scale
+    oc, oh, ow = want.shape[1:]
+    np.testing.assert_allclose(
+        got[:, :oc].reshape(oh, ow, oc).transpose(2, 0, 1), want[0], atol=1e-6
+    )
+    return compiled
+
+
+@pytest.mark.parametrize(
+    "k,s,pads,ceil", [(3, 2, 0, 1), (3, 2, 1, 0), (2, 2, 0, 0), (3, 1, 1, 0)]
+)
+def test_graph_compiler_max_pool_padding_and_ceil_mode(k, s, pads, ceil):
+    from onnx import parser
+
+    model = _name_nodes(
+        parser.parse_model(
+            f"""
+            <ir_version: 8, opset_import: ["" : 19]>
+            g (float[1, 8, 7, 7] input) => (float[1, 8, 1, 1] y_dq) <float sc = {{0.0625}}, uint8 zp = {{128}}> {{
+              xq = QuantizeLinear(input, sc, zp)
+              xd = DequantizeLinear(xq, sc, zp)
+              p = MaxPool<kernel_shape = [{k}, {k}], strides = [{s}, {s}], pads = [{pads}, {pads}, {pads}, {pads}], ceil_mode = {ceil}>(xd)
+              pq = QuantizeLinear(p, sc, zp)
+              y_dq = DequantizeLinear(pq, sc, zp)
+            }}
+            """
+        )
+    )
+    x = np.random.default_rng(1).uniform(-4, 4, (1, 8, 7, 7)).astype(np.float32)
+    compiled = _chain_matches_evaluator(model, x, 0.0625)
+    assert [job.kind for job in compiled.jobs] == ["maxpool"]
+
+
+def test_graph_compiler_grouped_conv_becomes_a_block_diagonal_dense_conv():
+    from onnx import numpy_helper, parser
+
+    model = _name_nodes(
+        parser.parse_model(
+            """
+            <ir_version: 8, opset_import: ["" : 19]>
+            g (float[1, 16, 4, 4] input) => (float[1, 16, 4, 4] y_dq) <
+              float sc = {0.0625}, float ws = {0.03125}, float bs = {0.001953125}, uint8 zp = {128}, int8 wz = {0},
+              int8[16] bq = {1, -2, 3, -4, 5, -6, 7, -8, 1, -2, 3, -4, 5, -6, 7, -8}
+            > {
+              xq = QuantizeLinear(input, sc, zp)
+              xd = DequantizeLinear(xq, sc, zp)
+              wd = DequantizeLinear(wq, ws, wz)
+              bd = DequantizeLinear(bq, bs, wz)
+              c = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1], group = 2>(xd, wd, bd)
+              cq = QuantizeLinear(c, sc, zp)
+              y_dq = DequantizeLinear(cq, sc, zp)
+            }
+            """
+        )
+    )
+    rng = np.random.default_rng(2)
+    model.graph.initializer.append(
+        numpy_helper.from_array(
+            rng.integers(-20, 20, (16, 8, 3, 3), dtype=np.int8), "wq"
+        )
+    )
+    x = rng.uniform(-3, 3, (1, 16, 4, 4)).astype(np.float32)
+    compiled = _chain_matches_evaluator(model, x, 0.0625)
+    (job,) = compiled.jobs
+    assert job.kind == "conv" and job.weight.shape == (16, 16, 3, 3)
+    assert (
+        not job.weight[:8, 8:].any() and not job.weight[8:, :8].any()
+    )  # zero outside the two groups
+
+
+def test_oversized_depthwise_weights_are_split_into_channel_block_parts():
+    from onnx import numpy_helper, parser
+
+    channels = (
+        32 * 8 * 3
+    )  # three blocks per core: 5x5 taps of that many blocks overflow a 4 KB weight slot
+    model = _name_nodes(
+        parser.parse_model(
+            f"""
+            <ir_version: 8, opset_import: ["" : 19]>
+            g (float[1, {channels}, 1, 1] input) => (float[1, {channels}, 1, 1] y_dq) <
+              float sc = {{0.0625}}, float ws = {{0.03125}}, float bs = {{0.001953125}}, uint8 zp = {{128}}, int8 wz = {{0}}
+            > {{
+              xq = QuantizeLinear(input, sc, zp)
+              xd = DequantizeLinear(xq, sc, zp)
+              wd = DequantizeLinear(wq, ws, wz)
+              bd = DequantizeLinear(bq, bs, wz)
+              c = Conv<kernel_shape = [5, 5], pads = [2, 2, 2, 2], group = {channels}>(xd, wd, bd)
+              cq = QuantizeLinear(c, sc, zp)
+              y_dq = DequantizeLinear(cq, sc, zp)
+            }}
+            """
+        )
+    )
+    rng = np.random.default_rng(3)
+    model.graph.initializer.extend(
+        [
+            numpy_helper.from_array(
+                rng.integers(-20, 20, (channels, 1, 5, 5), dtype=np.int8), "wq"
+            ),
+            numpy_helper.from_array(rng.integers(-8, 8, channels, dtype=np.int8), "bq"),
+        ]
+    )
+    x = rng.uniform(-3, 3, (1, channels, 1, 1)).astype(np.float32)
+    compiled = _chain_matches_evaluator(model, x, 0.0625)
+    kinds = [job.kind for job in compiled.jobs]
+    assert kinds.count("dw") >= 2 and "copy" in kinds
+    for job in compiled.jobs:
+        le.pack_job(job, le.ENGINE_SLOT_BYTES)  # every part fits a slot

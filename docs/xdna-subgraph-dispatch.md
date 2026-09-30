@@ -575,6 +575,34 @@ host already computes 17 of 172 jobs.
 - Host findings worth keeping: OpenBLAS defaulted to one thread per core, and a 2048x1000 Gemm took 2.9 ms on
   this 64-thread host versus 0.05-0.1 ms with 1-2 threads (the runner now sets `OPENBLAS_NUM_THREADS=2`
   before numpy loads); a 1000-class head made the runner 3x slower before that fix.
+#### More vision models through the graph compiler (32x32 inputs, bit-exact vs ORT on every engine boundary)
+
+`run_graph_engine.py MODEL.onnx` (quantize with `quantize_pow2_graph.py` / `quantize_pow2_resnet.py`); device
+call + host prefix/tail, median of 10-50 runs on a busy host (+-0.2 ms):
+
+| model | engine jobs (host jobs) | ours | Vitis AI |
+|---|---|---|---|
+| ResNet-18 / 34 / 50 through `compile_graph` | 21 / 37 / 54 (1) | 1.5 / 1.7 / 2.2-2.8 ms | 0.83 / 1.42 / 1.63 ms |
+| MobileNetV2 | 48 (5) | 1.65 ms | 3.08 ms |
+| RegNetX-400MF (group-16 convs) | 70 (2) | 1.6-2.0 ms | 1.74 ms |
+| GoogLeNet | 97 (1) | 2.4 ms | 1.12 ms |
+| SqueezeNet 1.1 | 37 (1) | 1.03 ms | - |
+| MnasNet 1.0 (5x5 depthwise) | 73 (4) | 2.3 ms | - |
+| MobileNetV3-Small (SE, hard-swish) | 104 (2) | 2.2 ms | - |
+
+What these needed: grouped (non-depthwise) convs run as dense convs with a block-diagonal weight; a depthwise
+job whose per-core weights overflow the 4 KB slot is split into channel-block slice / dw / concat parts; maps
+larger than an arena slot keep their producers *and* consumers on the host until they shrink (MobileNetV2's first
+layers); max pools take any kernel/padding/`ceil_mode` (GoogLeNet, SqueezeNet); residual blocks `Add -> ReLU` fuse
+into the conv and a downsample skip fuses the Add itself; 3x3 convs on maps whose width is not 1/2/4/multiple of 8
+(SqueezeNet's 7x7) use the gather path (the padded-copy path assumed whole 8-pixel row segments).
+
+Not supported: ShuffleNet (channel shuffle = Reshape/Transpose on unaligned channel counts, 14 host round trips),
+DenseNet (BatchNorm not folded into a conv: 66), EfficientNet / ConvNeXt (maps over 64 pixels per channel block
+in the middle of the network: the SE / LayerNorm ops would need the host to read engine outputs back in the same
+launch), and any 224x224 input (needs the pixel-tiled layouts noted above). GoogLeNet is where Vitis AI is ahead
+(9 inception blocks of 1x1/3x3/5x5 branches: 97 sequential jobs at ~10 us each versus Vitis's fused subgraphs).
+
 ### Runtime-shaped kernels (`kernels/fused_bottleneck_rt.cc`, `resnet_body_design.py --rt`)
 
 The compile-time kernels bake a block's geometry in through `-D` macros, so every block kind

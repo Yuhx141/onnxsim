@@ -254,7 +254,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
 #endif
 #endif
     {
-      const int k = L.ntaps, pad = (k - 1) / 2;
+      const int k = L.ntaps, pad = L.ksz;  // max pool: D_KSZ carries the (left/top) padding
       for (int ol = 0; ol < L.nb; ++ol) {
         const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * L.w * L.h * 8;
         uint8_t *dst = dst0 + ol * n;
@@ -468,7 +468,8 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     const int pad_w = L.w + 2, pad_bytes = (L.h + 2) * pad_w * 8;
     const bool pad_fits = L.nbp * (L.w * L.h * 8 + pad_bytes) <= L.reg ||
                           L.ncp * L.reg + L.nbp * L.ncp * pad_bytes <= ENG_ACT_BYTES;
-    if (L.s == 1 && pad_fits) {
+    const bool tile_rows = (L.w & 7) == 0 || L.w == 4 || L.w == 2 || L.w == 1;  // an 8-pixel tile is 1/2/4 whole row segments
+    if (L.s == 1 && pad_fits && tile_rows) {
       // Stride-1 3x3: a zero-padded copy of every input block is built once (first chunk); an A tile is
       // then 1/2/4 contiguous row segments of that copy, so no per-row gather is needed. The copy sits
       // in the unused bytes of each input region when it fits there, else in the activation object's tail.
