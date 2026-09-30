@@ -135,6 +135,7 @@ class XDNAResNetRunner:
         fused_body_rt: bool = False,
         device_network_stages: list[list[str]] | None = None,
         layer_engine: bool = False,
+        layer_engine_stem: bool = False,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
         maxpool_uint8_artifact: tuple[str, str] | None = None,
         maxpool_runtime: str = "iron",
@@ -387,6 +388,7 @@ class XDNAResNetRunner:
         self.fused_body_rt = fused_body_rt
         self.device_network_stages = device_network_stages
         self.layer_engine = layer_engine
+        self.layer_engine_stem = layer_engine_stem
         self.fused_body_chunk_caps = fused_body_chunk_caps or {}
         stage_specs = list(fused_stages or ())
         parallel_specs = list(parallel_projection_blocks or ())
@@ -1578,12 +1580,20 @@ class XDNAResNetRunner:
             from .resnet_stage_design import stage_specs
         _cols, binds = stage_specs(model, self.device_network_stages)
         jobs, _outs = jobs_from_bindings(binds, reuse_slots=True)
+        stem = None
+        if self.layer_engine_stem:
+            try:
+                import stem_pool
+            except ImportError:
+                from . import stem_pool
+            stem = stem_pool.extract_stem(model)
+            jobs = le.assemble_full(stem, jobs)
+            covered = set(covered) | stem_pool.stem_nodes(model, binds[0][0]["input_raw_name"])
         packs = [le.pack_job(job, le.ENGINE_SLOT_BYTES) for job in jobs]
         params = np.concatenate([np.concatenate([pack[col].reshape(-1) for pack in packs]) for col in range(le.COLS)])
-        slots = 1 + max(job.out_slot for job in jobs)
-        arena = iron.zeros(slots * le.SLOT_BYTES, dtype=np.int8, device="npu")
+        arena = iron.zeros(le.arena_slots(jobs) * le.SLOT_BYTES, dtype=np.int8, device="npu")
         return {
-            "covered": set(covered), "engine": {"jobs": jobs, "le": le}, "binds": binds,
+            "covered": set(covered), "engine": {"jobs": jobs, "le": le, "stem": stem}, "binds": binds,
             "input": arena, "output": arena, "parameters": iron.tensor(params, dtype=np.uint8, device="npu"),
             "scratch": None,
         }
@@ -1594,11 +1604,23 @@ class XDNAResNetRunner:
         le, jobs = engine["le"], engine["jobs"]
         first, last = stage["bindings"][0], stage["bindings"][-1]
         started = time.perf_counter()
-        _, cin, height, width = first["input_shape"]
-        raw = np.asarray(values[first["input_raw_name"]]).reshape(cin, height * width)
         arena = stage["input"]
-        with arena.overwrite() as host:
-            host.view(np.uint8)[: le.SLOT_BYTES] = le.to_arena(raw.T.copy(), jobs[0].in_layout)
+        if engine["stem"] is not None:
+            try:
+                import stem_pool
+            except ImportError:
+                from . import stem_pool
+            chunks = stem_pool.im2col_chunks(np.asarray(values[engine["stem"]["input_name"]], dtype=np.float32), engine["stem"])
+            per = chunks.size // 4
+            with arena.overwrite() as host:
+                flat = host.view(np.uint8)
+                for c in range(4):
+                    flat[c * le.SLOT_BYTES : c * le.SLOT_BYTES + per] = chunks[c * per : (c + 1) * per]
+        else:
+            _, cin, height, width = first["input_shape"]
+            raw = np.asarray(values[first["input_raw_name"]]).reshape(cin, height * width)
+            with arena.overwrite() as host:
+                host.view(np.uint8)[: le.SLOT_BYTES] = le.to_arena(raw.T.copy(), jobs[0].in_layout)
         self._profile["device_network_prepare_ms"] = self._profile.get("device_network_prepare_ms", 0.0) + (time.perf_counter() - started) * 1000.0
         launch = time.perf_counter()
         stage["kernel"](arena, stage["parameters"], arena)
@@ -1964,6 +1986,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         "--layer-engine", nargs=3, metavar=("XCLBIN", "INSTS", "STAGES_JSON"),
         help="run every bottleneck block through ONE layer-sequential engine artifact (layer_engine_design.py --net bodyr --looped); stem/MaxPool stay on the host",
     )
+    parser.add_argument("--layer-engine-stem", action="store_true", help="the --layer-engine artifact was compiled with --net full: it also runs the stem Conv and MaxPool")
     parser.add_argument("--fused-body-rt", action="store_true", help="the --fused-body artifact was compiled with resnet_body_design.py --rt (runtime-shaped kernels)")
     parser.add_argument("--host-maxpool", action="store_true", help="run MaxPool on the host instead of an XDNA artifact")
     parser.add_argument("--fused-stage-blocked", action="store_true", help="fused stages were compiled with --blocked (vectorized layout)")
@@ -2028,6 +2051,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         fused_body_rt=args.fused_body_rt,
         device_network_stages=network_stages,
         layer_engine=bool(args.layer_engine),
+        layer_engine_stem=bool(args.layer_engine_stem),
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
         ],

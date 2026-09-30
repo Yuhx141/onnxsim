@@ -250,6 +250,19 @@ report = remote.xdna_run_resnet(model, build["manifest"], {
 })   # ~3.6-3.8 ms end to end on the quicktest ResNet, logits identical to ONNX Runtime CPU
 ```
 
+The layer-sequential engine (`kind="resnet_engine"`) is faster still: every conv layer, plus the stem
+Conv and MaxPool, runs as a job spread over all 32 cores (Vitis-AI style), with weights streamed through
+the memtiles. The artifact depends only on the ResNet-50 structure; `options["stem"] = False` compiles the
+variant that leaves stem/MaxPool to the host:
+
+```python
+eng = remote.xdna_compile_resnet(model, "resnet_engine", {})
+report = remote.xdna_run_resnet(model, build["manifest"], {
+    "layer_engine": {"xclbin": eng["xclbin"], "insts": eng["insts"], "stages": stages},
+    "warmup": 5, "iters": 30,
+})   # ~1.7 ms end to end on the quicktest ResNet, logits identical to ONNX Runtime CPU
+```
+
 All blocks of a group must share shapes and weight chunking (they differ only in
 weights and requantization scales). `fused_stage` compiles also accept
 `options["blocked"]` (1-8 blocks, vectorized kernels; pass `"blocked": True` on the

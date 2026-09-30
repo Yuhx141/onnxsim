@@ -162,3 +162,65 @@ def test_body_segments_repeat_identical_blocks():
             assert again == pattern
         covered += count * repeat
     assert covered == len(jobs) == 52
+
+
+def test_stem_and_pool_jobs_match_the_stem_pool_emulation():
+    import stem_pool
+
+    stem = nets.synthetic_stem()
+    image = np.random.default_rng(1).random((1, 3, 32, 32), dtype=np.float32)
+    chunks = stem_pool.im2col_chunks(image, stem)
+    per = chunks.size // 4
+    jobs = le.stem_jobs(stem, [0, 1, 2, 3], 4, 8)
+    conv = []
+    for index, job in enumerate(jobs[:4]):
+        dense = (
+            chunks[index * per : (index + 1) * per]
+            .reshape(19, 64, 8)
+            .transpose(1, 0, 2)
+            .reshape(64, 152)
+        )
+        got = le.reference(job, dense, None)
+        assert np.array_equal(
+            _emulate(job, 4096, dense, None), got
+        )  # the packed chunks compute the same thing
+        conv.append(got)
+    pooled = le.reference(jobs[4], np.concatenate(conv), None)
+    assert np.array_equal(
+        pooled.reshape(8, 8, 64).transpose(2, 0, 1)[None],
+        stem_pool.emulate(image, stem),
+    )
+
+
+def test_pool_job_descriptors_only_activate_the_eight_channel_blocks():
+    stem = nets.synthetic_stem()
+    pool = le.stem_jobs(stem, [0, 1, 2, 3], 4, 8)[4]
+    packed = le.pack_job(pool, le.ENGINE_SLOT_BYTES)
+    assert packed.shape == (le.COLS, 1, le.ROWS, le.ENGINE_SLOT_BYTES)
+    for core in range(le.CORES):
+        col, row = divmod(core, le.ROWS)
+        desc = packed[col, 0, row, : le.DESC_BYTES].view(np.int32)
+        assert (
+            desc[le.D_MODE] == 2
+            and desc[le.D_NB] == (1 if core < 8 else 0)
+            and desc[le.D_CORE] == core
+        )
+
+
+def test_full_net_uses_disjoint_stem_slots_and_a_small_arena():
+    jobs, segments, _stem = nets.full()
+    assert [job.name for job in jobs[:5]] == [
+        "stem0",
+        "stem1",
+        "stem2",
+        "stem3",
+        "pool",
+    ]
+    assert (
+        jobs[4].out_slot == jobs[5].in_slot == le.STEM_SLOTS - 1
+    )  # the pooled map feeds the first block
+    assert le.arena_slots(jobs) <= le.STEM_SLOTS + 4
+    assert (
+        sum(count * repeat for _first, count, repeat in segments)
+        == len(jobs) - le.STEM_JOBS
+    )
