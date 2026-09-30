@@ -102,15 +102,16 @@ def _max_pool(x: np.ndarray, attrs: dict[str, Any]) -> np.ndarray:
     padded = np.pad(x, ((0, 0), (0, 0), (pt, pb), (pl, pr)), constant_values=-np.inf)
     out_h = (h + pt + pb - dilations[0] * (kernel[0] - 1) - 1) // strides[0] + 1
     out_w = (w + pl + pr - dilations[1] * (kernel[1] - 1) - 1) // strides[1] + 1
-    output = np.empty((n, c, out_h, out_w), dtype=x.dtype)
-    for oh in range(out_h):
-        for ow in range(out_w):
-            window = padded[
+    # One strided slice per kernel tap, reduced with an elementwise maximum (no per-pixel Python loop).
+    output = None
+    for ky in range(kernel[0]):
+        for kx in range(kernel[1]):
+            tap = padded[
                 :, :,
-                oh * strides[0] : oh * strides[0] + dilations[0] * (kernel[0] - 1) + 1 : dilations[0],
-                ow * strides[1] : ow * strides[1] + dilations[1] * (kernel[1] - 1) + 1 : dilations[1],
+                ky * dilations[0] : ky * dilations[0] + (out_h - 1) * strides[0] + 1 : strides[0],
+                kx * dilations[1] : kx * dilations[1] + (out_w - 1) * strides[1] + 1 : strides[1],
             ]
-            output[:, :, oh, ow] = np.max(window, axis=(2, 3))
+            output = np.array(tap, dtype=x.dtype) if output is None else np.maximum(output, tap, out=output)
     return output
 
 
