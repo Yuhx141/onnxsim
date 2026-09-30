@@ -24,8 +24,8 @@ TILE = 8
 # Descriptor word indices: keep in sync with the enum in kernels/layer_engine.cc.
 D_NBP, D_NCP, D_W, D_H, D_OW, D_OH, D_S, D_MODE, D_NTAPS, D_TAP0 = range(10)
 D_NB = D_TAP0 + 9
-(D_TT0, D_TTN, D_FIRST, D_LAST, D_SHIFT, D_RELU, D_IN_FLIP, D_OUT_FLIP, D_RES, D_EA, D_EB, D_BIAS, D_CORE) = range(
-    D_NB + 1, D_NB + 14
+(D_TT0, D_TTN, D_FIRST, D_LAST, D_SHIFT, D_RELU, D_IN_FLIP, D_OUT_FLIP, D_RES, D_EA, D_EB, D_BIAS, D_CORE, D_TI0, D_CP0) = range(
+    D_NB + 1, D_NB + 16
 )
 
 
@@ -107,6 +107,9 @@ class Job:
 
     @property
     def gather(self) -> bool:
+        """Spatial (non-direct) kernel path. A 3x3 over a 1x1 map only ever uses the centre tap: direct."""
+        if self.weight.shape[2] == 3 and self.stride == 1 and self.taps == [4]:
+            return False
         return self.weight.shape[2] == 3 or self.stride > 1
 
 
@@ -136,7 +139,7 @@ def plan_chunks(job: Job, payload: int) -> int:
 
 
 def n_chunks(job: Job, payload: int) -> int:
-    steps = len(job.taps) * job.in_layout.ncp if job.gather else job.in_layout.ncp
+    steps = len(job.taps) * job.in_layout.ncp
     return math.ceil(steps / plan_chunks(job, payload))
 
 
@@ -145,7 +148,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
     payload = slot_bytes - DESC_BYTES
     lay_in, lay_out = job.in_layout, job.out_layout
     nbp, ncp = lay_in.nbc, lay_in.ncp
-    ntaps = len(job.taps) if job.gather else 1
+    ntaps = len(job.taps)
     steps = ntaps * ncp
     per = plan_chunks(job, payload)
     nch = math.ceil(steps / per)
@@ -163,7 +166,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
             desc[D_OW], desc[D_OH] = lay_out.w, lay_out.h
             desc[D_S], desc[D_MODE] = job.stride, 1 if job.gather else 0
             desc[D_NTAPS] = ntaps
-            desc[D_TAP0 : D_TAP0 + len(job.taps)] = job.taps if job.gather else [0]
+            desc[D_TAP0 : D_TAP0 + len(job.taps)] = job.taps
             desc[D_NB] = nb
             desc[D_TT0], desc[D_TTN] = tt0, ttn
             desc[D_FIRST], desc[D_LAST] = int(chunk == 0), int(chunk == nch - 1)
@@ -173,6 +176,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
             tiles = nb * ttn * nbp * 64
             desc[D_BIAS] = (tiles + 3) & ~3
             desc[D_CORE] = core
+            desc[D_TI0], desc[D_CP0] = divmod(tt0, ncp)
             slot = out[col, chunk, row]
             slot[:DESC_BYTES] = desc.view(np.uint8)
             body = np.zeros(desc[D_BIAS] + nb * TILE * 4, dtype=np.uint8)
@@ -180,8 +184,8 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
             for ol, g in enumerate(blocks):
                 for i in range(ttn):
                     tt = tt0 + i
-                    ti, cp = divmod(tt, ncp) if job.gather else (0, tt)
-                    ky, kx = divmod(job.taps[ti], 3) if (job.gather and kh == 3) else (0, 0)
+                    ti, cp = divmod(tt, ncp)
+                    ky, kx = divmod(job.taps[ti], 3) if kh == 3 else (0, 0)
                     for l in range(nbp):
                         icb = cp * nbp + l
                         # B[k][n] = W[oc = g*8+n][ic = icb*8+k]

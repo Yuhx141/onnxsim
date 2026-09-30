@@ -39,6 +39,7 @@ def engine(
     depth: CompileTime[int] = 2,
     compute: CompileTime[int] = 0xFFFFFF,
     looped: CompileTime[int] = 0,
+    kflags: CompileTime[str] = "",
 ):
     jobs, _ = layer_engine_nets.build(net)
     segments = layer_engine_nets.segments_for(net, jobs)
@@ -52,7 +53,7 @@ def engine(
     col_out_ty = np.ndarray[(ROWS * REGION_BYTES,), np.dtype[np.int8]]
     kernel = ExternalFunction(
         "layer_chunk", source_file=str(_KERNEL),
-        arg_types=[act_ty, w_ty, out_ty, act_ty], compile_flags=[f"-DENG_REGION_BYTES={REGION_BYTES}"],
+        arg_types=[act_ty, w_ty, out_ty, act_ty], compile_flags=[f"-DENG_REGION_BYTES={REGION_BYTES}"] + kflags.split(),
     )
 
     def core_fn(act, w, out, kern, index):
@@ -101,7 +102,7 @@ def engine(
             for _ in range_(sched[kind, stage]):
                 for c in range(ROWS):
                     wc = w.acquire(1)
-                    if c == index and compute:
+                    if c == index and (compute >> kind) & 1:
                         kern(a, wc, o, r)
                     w.release(1)
             out.release(1)
@@ -179,6 +180,7 @@ def _parser():
     parser.add_argument("--slot", type=int, default=8192)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--nocompute", action="store_true")
+    parser.add_argument("--kflags", default="", help="extra kernel compile flags (profiling)")
     parser.add_argument("--looped", action="store_true", help="stage-looped core program (body net)")
     parser.add_argument("--compute", type=lambda v: int(v, 0), default=0xFFFFFF, help="bitmask of jobs that run their kernel (profiling)")
     return parser
@@ -188,7 +190,7 @@ def main() -> None:
     opts = _parser().parse_args()
     run_design_cli(
         engine, opts,
-        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0},
+        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0, "kflags": o.kflags},
         device=lambda value: device_from_args(value, n_cols=8),
     )
 

@@ -54,6 +54,8 @@ enum {
   D_EB,
   D_BIAS,     // byte offset of the int32 bias inside the payload
   D_CORE,     // global core index (region index of this core's output/residual)
+  D_TI0,      // (tap index, region) decomposition of tt0, computed by the host (no divide on the core)
+  D_CP0,
 };
 
 constexpr int pos(int v) { return v > 0 ? v : 0; }
@@ -87,7 +89,7 @@ struct Layer {
   const int32_t *d;
   const int8_t *weights;
   const int32_t *bias;
-  int nbp, ncp, w, h, ow, oh, s, mode, ntaps, nb, tt0, ttn, first, last, shift, relu, in_flip, out_flip, res, ea, eb, core;
+  int nbp, ncp, w, h, ow, oh, s, mode, ntaps, nb, tt0, ttn, first, last, shift, relu, in_flip, out_flip, res, ea, eb, core, ti0, cp0;
   int op, t_out;
   int taps[9];
 };
@@ -102,7 +104,7 @@ inline Layer load(const uint8_t *slot) {
   for (int i = 0; i < 9; ++i) l.taps[i] = d[D_TAP0 + i];
   l.nb = d[D_NB]; l.tt0 = d[D_TT0]; l.ttn = d[D_TTN]; l.first = d[D_FIRST]; l.last = d[D_LAST];
   l.shift = pos(d[D_SHIFT]); l.relu = d[D_RELU]; l.in_flip = d[D_IN_FLIP]; l.out_flip = d[D_OUT_FLIP];
-  l.res = d[D_RES]; l.ea = d[D_EA]; l.eb = d[D_EB]; l.core = d[D_CORE];
+  l.res = d[D_RES]; l.ea = d[D_EA]; l.eb = d[D_EB]; l.core = d[D_CORE]; l.ti0 = d[D_TI0]; l.cp0 = d[D_CP0];
   l.bias = (const int32_t *)((const uint8_t *)l.weights + d[D_BIAS]);
   l.op = l.ow * l.oh;
   l.t_out = (l.op + 7) / 8;
@@ -199,57 +201,141 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     if (L.nb % 4 == 0) tiled_gemm<4>(L, L.t_out, a_base, p_in * 8, epi);
     else tiled_gemm<2>(L, L.t_out, a_base, p_in * 8, epi);
   } else {
-    const bool row_tiles = (L.s == 1 && L.w % 8 == 0 && L.ntaps > 1 && L.ncp * ENG_REGION_BYTES + L.nbp * L.ncp * (L.h + 2) * (L.w + 2) * 8 <= ENG_ACT_BYTES);
-    if (row_tiles) {
-      // Padded copy of the input built once (first chunk); each A tile is then one unaligned row load.
-      const int pw = L.w + 2, padp = (L.h + 2) * pw, nblk = L.nbp * L.ncp;
-      int8_t *pad_buf = (int8_t *)act + L.ncp * ENG_REGION_BYTES;  // the object is ours while held; its tail is unused
+    if (L.s == 1) {
+      // Stride-1 3x3: a zero-padded copy of every input block is built once (first chunk); an A tile is
+      // then 1/2/4 contiguous row segments of that copy, so no per-row gather is needed. The copy sits
+      // in the unused bytes of each input region when it fits there, else in the activation object's tail.
+      const int pw = L.w + 2, padp = (L.h + 2) * pw, lps = padp * 8;
+      const bool in_region = L.nbp * (p_in + padp) * 8 <= ENG_REGION_BYTES;
+      int8_t *pad0 = (int8_t *)act + (in_region ? L.nbp * p_in * 8 : L.ncp * ENG_REGION_BYTES);
+      const int cps = in_region ? ENG_REGION_BYTES : L.nbp * lps;
       if (L.first) {
-        const v64 z = aie::zeros<int8, 64>();
-        for (int i = 0; i < nblk * padp * 8; i += 64) aie::store_v(pad_buf + i, z);
         for (int cp = 0; cp < L.ncp; ++cp)
           for (int l = 0; l < L.nbp; ++l) {
+            uint64_t *z = (uint64_t *)(pad0 + cp * cps + l * lps);
+            for (int i = 0; i < padp; ++i) z[i] = 0;
             const int8_t *src = act + cp * ENG_REGION_BYTES + l * p_in * 8;
-            int8_t *dst = pad_buf + (cp * L.nbp + l) * padp * 8;
-            for (int y = 0; y < L.h; ++y)
-              for (int x = 0; x < L.w; ++x)
-                *(uint64_t *)(dst + ((y + 1) * pw + x + 1) * 8) = *(const uint64_t *)(src + (y * L.w + x) * 8);
+            int8_t *dst = pad0 + cp * cps + l * lps;
+            for (int y = 0; y < L.h; ++y) {
+              int8_t *d = dst + ((y + 1) * pw + 1) * 8;
+              const int8_t *sp = src + y * L.w * 8;
+              if (L.w >= 8) {
+                for (int x = 0; x < L.w; x += 8) aie::store_unaligned_v(d + x * 8, aie::load_unaligned_v<64>(sp + x * 8));
+              } else if (L.w == 4) {
+                aie::store_unaligned_v(d, aie::load_unaligned_v<32>(sp));
+              } else if (L.w == 2) {
+                aie::store_unaligned_v(d, aie::load_unaligned_v<16>(sp));
+              } else {
+                *(uint64_t *)d = *(const uint64_t *)sp;
+              }
+            }
           }
       }
-      auto a_base = [&](int t, int tt) {
-        int ti = 0, cp = tt;
-        while (cp >= L.ncp) { cp -= L.ncp; ++ti; }
-        const int tap = L.taps[ti], ky = tap >= 6 ? 2 : (tap >= 3 ? 1 : 0), kx = tap - ky * 3;
-        return (const int8_t *)pad_buf + (cp * L.nbp * padp + (py[t * 8] + ky) * pw + px[t * 8] + kx) * 8;
-      };
-      tiled_gemm<2>(L, L.t_out, a_base, padp * 8, epi);  // 3x3 layers own at most 2 output blocks per core: one instantiation saves program memory
-      return;
-    }
-    // Gather: step tt = tap_index * NCP + region. The eight source offsets/masks depend only on
-    // (tap, pixel tile), so they are recomputed only when that pair changes (tt runs region-fastest).
-    int offs[8];
-    uint64_t mask[8];
-    int cache_ti = -1, cache_t = -1;
-    int8_t *scratch = scratch_tiles;
-    auto a_base = [&](int t, int tt) {
-      int ti = 0, cp = tt;
-      while (cp >= L.ncp) { cp -= L.ncp; ++ti; }  // tiny loop: at most 8 iterations, no divide
-      if (ti != cache_ti || t != cache_t) {
-        cache_ti = ti; cache_t = t;
-        const int tap = L.taps[ti], ky = tap >= 6 ? 2 : (tap >= 3 ? 1 : 0), kx = tap - ky * 3;
-        for (int r = 0; r < 8; ++r) {
-          const int o = t * 8 + r;
-          const int oo = o < L.op ? o : 0;
-          const int iy = py[oo] * L.s + ky - 1;  // 3x3 pad 1; a strided 1x1 is the centre tap (4)
-          const int ix = px[oo] * L.s + kx - 1;
-          const bool ok = iy >= 0 && iy < L.h && ix >= 0 && ix < L.w;
-          offs[r] = ok ? iy * L.w + ix : 0;
-          mask[r] = ok ? ~0ull : 0ull;
+      const int seg = L.w >= 8 ? 1 : (L.w == 4 ? 2 : (L.w == 2 ? 4 : 1));
+      const v64 fm = aie::broadcast<int8, 64>(L.in_flip ? (int8_t)-128 : (int8_t)0);
+      const int rowb = pw * 8;
+      for (int t = 0; t < L.t_out; ++t) {
+        const int trow = (py[t * 8] * pw + px[t * 8]) * 8;
+        for (int og = 0; og < L.nb; og += 2) {
+          const int og1 = og + 1 < L.nb ? og + 1 : og;
+          MMUL c0, c1;
+          if (L.first) {
+            c0 = MMUL(bias_tile(L.bias + og * 8));
+            c1 = MMUL(bias_tile(L.bias + og1 * 8));
+          } else {
+            c0 = MMUL(aie::load_v<64>(acc_buf + (og * L.t_out + t) * 64));
+            c1 = MMUL(aie::load_v<64>(acc_buf + (og1 * L.t_out + t) * 64));
+          }
+          const int8_t *wb0 = L.weights + (size_t)og * L.ttn * L.nbp * 64, *wb1 = L.weights + (size_t)og1 * L.ttn * L.nbp * 64;
+          int ti = L.ti0, cp = L.cp0, remaining = L.ttn, done = 0;
+          while (remaining > 0) {
+            const int run = (L.ncp - cp) < remaining ? (L.ncp - cp) : remaining;
+            const int tap = L.taps[ti], ky = tap >= 6 ? 2 : (tap >= 3 ? 1 : 0), kx = tap - ky * 3;
+            const int8_t *base = pad0 + cp * cps + (ky * pw + kx) * 8 + trow;
+            for (int l = 0; l < L.nbp; ++l) {
+              const int8_t *ap = base + l * lps;
+              const int8_t *w0 = wb0 + ((size_t)done * L.nbp + l) * 64, *w1 = wb1 + ((size_t)done * L.nbp + l) * 64;
+              const int wstride = L.nbp * 64;
+              if (seg == 1) {
+                for (int i = 0; i < run; ++i) {
+                  v64 a = aie::bit_xor(aie::load_unaligned_v<64>(ap), fm);
+                  ap += cps;
+                  c0.mac(a, aie::load_v<64>(w0)); w0 += wstride;
+                  c1.mac(a, aie::load_v<64>(w1)); w1 += wstride;
+                }
+              } else if (seg == 2) {
+                for (int i = 0; i < run; ++i) {
+                  v64 a = aie::concat(aie::load_unaligned_v<32>(ap), aie::load_unaligned_v<32>(ap + rowb));
+                  a = aie::bit_xor(a, fm);
+                  ap += cps;
+                  c0.mac(a, aie::load_v<64>(w0)); w0 += wstride;
+                  c1.mac(a, aie::load_v<64>(w1)); w1 += wstride;
+                }
+              } else {
+                for (int i = 0; i < run; ++i) {
+                  v64 a = aie::concat(aie::concat(aie::load_unaligned_v<16>(ap), aie::load_unaligned_v<16>(ap + rowb)),
+                                      aie::concat(aie::load_unaligned_v<16>(ap + 2 * rowb), aie::load_unaligned_v<16>(ap + 3 * rowb)));
+                  a = aie::bit_xor(a, fm);
+                  ap += cps;
+                  c0.mac(a, aie::load_v<64>(w0)); w0 += wstride;
+                  c1.mac(a, aie::load_v<64>(w1)); w1 += wstride;
+                }
+              }
+            }
+            remaining -= run;
+            done += run;
+            cp = 0;
+            ++ti;
+          }
+          epi(og, t, c0);
+          if (og + 1 < L.nb) epi(og + 1, t, c1);
         }
       }
-      gather_region(scratch, act + cp * ENG_REGION_BYTES, L.nbp, p_in, offs, mask);
-      return (const int8_t *)scratch;
-    };
-    tiled_gemm<2>(L, L.t_out, a_base, 64, epi);
+      return;
+    }
+    // Gather: reduction step tt = tap_index * NCP + region, region fastest. The eight source
+    // offsets/masks depend only on (tap, pixel tile) so they are rebuilt when the tap changes.
+    const v64 fm = aie::broadcast<int8, 64>(L.in_flip ? (int8_t)-128 : (int8_t)0);
+    int offs[8];
+    uint64_t mask[8];
+    for (int t = 0; t < L.t_out; ++t) {
+      for (int og = 0; og < L.nb; og += 2) {
+      const int og1 = og + 1 < L.nb ? og + 1 : og;
+      MMUL c0, c1;
+      if (L.first) {
+        c0 = MMUL(bias_tile(L.bias + og * 8));
+        c1 = MMUL(bias_tile(L.bias + og1 * 8));
+      } else {
+        c0 = MMUL(aie::load_v<64>(acc_buf + (og * L.t_out + t) * 64));
+        c1 = MMUL(aie::load_v<64>(acc_buf + (og1 * L.t_out + t) * 64));
+      }
+      const int8_t *w0 = L.weights + (size_t)og * L.ttn * L.nbp * 64, *w1 = L.weights + (size_t)og1 * L.ttn * L.nbp * 64;
+      int ti = L.ti0, cp = L.cp0, cur = -1;
+      for (int tt = 0; tt < L.ttn; ++tt) {
+        if (ti != cur) {
+          cur = ti;
+          const int tap = L.taps[ti], ky = tap >= 6 ? 2 : (tap >= 3 ? 1 : 0), kx = tap - ky * 3;
+          for (int r = 0; r < 8; ++r) {
+            const int o = t * 8 + r;
+            const int oo = o < L.op ? o : 0;
+            const int iy = py[oo] * L.s + ky - 1;  // 3x3 pad 1; a strided 1x1 is the centre tap (4)
+            const int ix = px[oo] * L.s + kx - 1;
+            const bool ok = iy >= 0 && iy < L.h && ix >= 0 && ix < L.w;
+            offs[r] = ok ? iy * L.w + ix : 0;
+            mask[r] = ok ? ~0ull : 0ull;
+          }
+        }
+        gather_region(scratch_tiles, act + cp * ENG_REGION_BYTES, L.nbp, p_in, offs, mask);
+        for (int l = 0; l < L.nbp; ++l) {
+          v64 a = aie::bit_xor(aie::load_v<64>(scratch_tiles + l * 64), fm);
+          c0.mac(a, aie::load_v<64>(w0)); w0 += 64;
+          c1.mac(a, aie::load_v<64>(w1)); w1 += 64;
+        }
+        if (++cp == L.ncp) { cp = 0; ++ti; }
+      }
+      epi(og, t, c0);
+      if (og + 1 < L.nb) epi(og + 1, t, c1);
+      }
+    }
   }
 }
