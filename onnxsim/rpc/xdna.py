@@ -92,6 +92,7 @@ _KINDS = (
     "resnet_body",
     "resnet_network",
     "resnet_engine",
+    "graph_engine",
     "maxpool_u8",
 )
 
@@ -230,6 +231,25 @@ def _compile_command(
             "--slot",
             "4096",  # must match layer_engine.ENGINE_SLOT_BYTES, which the runner packs with
             "--looped",
+            "--l2",
+            str(int(options.get("l2", 2))),
+            "--xclbin-path",
+            str(xclbin),
+            "--insts-path",
+            str(insts),
+        ]
+    elif kind == "graph_engine":
+        # Layer engine for an arbitrary QDQ CNN (YOLO, MobileNet-style, ...): the job structure is compiled from the
+        # model itself (layer_engine_graph.compile_graph), so the artifact is model specific.
+        command = [
+            _xdna_python(header),
+            str(_script("layer_engine_design.py")),
+            "--dev",
+            str(options.get("device", "npu2")),
+            "--net",
+            f"onnx:{model_path}",
+            "--slot",
+            "4096",
             "--l2",
             str(int(options.get("l2", 2))),
             "--xclbin-path",
@@ -462,6 +482,36 @@ def run_resnet(header: Dict[str, Any], blobs: list[bytes], work_dir: str):
     )
     model_path.write_bytes(blobs[0])
     manifest_path.write_bytes(blobs[1])
+    graph_engine = options.get("graph_engine")
+    if graph_engine is not None:
+        if not isinstance(graph_engine, dict) or not all(
+            key in graph_engine for key in ("xclbin", "insts")
+        ):
+            raise proto.RPCError("graph_engine needs xclbin and insts")
+        command = [
+            _xdna_python(header),
+            str(_script("run_graph_engine.py")),
+            str(model_path),
+            str(graph_engine["xclbin"]),
+            str(graph_engine["insts"]),
+            "--warmup",
+            str(max(int(options.get("warmup", 3)), 0)),
+            "--iters",
+            str(max(int(options.get("iters", 20)), 1)),
+            "--seed",
+            str(int(options.get("seed", 0))),
+            "--json",
+            str(report_path),
+        ]
+        if options.get("check"):
+            command.append("--check")
+        _run(command)
+        try:
+            return {"report": json.loads(report_path.read_text(encoding="utf-8"))}, []
+        except (OSError, json.JSONDecodeError) as error:
+            raise proto.RPCError(
+                f"graph engine runner did not produce a valid JSON report: {error}"
+            ) from error
     command = [
         _xdna_python(header),
         str(_script("run_resnet_xdna.py")),
