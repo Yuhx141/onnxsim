@@ -250,7 +250,8 @@ class Session:
         xclbin, one core column per stage; needs ``options["stages"]``: block-prefix lists, projection
         block first), ``"resnet_engine"`` (the layer-sequential engine: stem Conv + MaxPool + every conv
         layer as jobs over all 32 cores; needs no options, ``options["stem"] = False`` leaves the stem
-        to the host), or ``"maxpool_u8"``.
+        to the host), ``"graph_engine"`` (the same engine for an arbitrary QDQ CNN such as YOLO: the job structure
+        is compiled from the model), or ``"maxpool_u8"``.
         Returned artifact paths are on the RPC server and can be passed to
         :meth:`xdna_run_resnet` on the same server.
 
@@ -267,6 +268,7 @@ class Session:
             "resnet_body",
             "resnet_network",
             "resnet_engine",
+            "graph_engine",
             "maxpool_u8",
         ):
             raise ValueError(f"unsupported XDNA compile kind {kind!r}")
