@@ -212,7 +212,7 @@ def compile_graph(model: Any, reuse_slots: bool = False) -> Compiled:
             node, [0] if op in ("Split", "Resize", "MaxPool", "Conv") else None
         ):
             continue  # float input: host tail
-        if op in ("Split", "Concat", "MaxPool", "Resize", "Add"):
+        if op in ("Split", "Concat", "MaxPool", "Resize", "Add", "Slice"):
             handled.add(
                 node.name
             )  # consumed by the engine (its Q nodes are added below)
@@ -386,6 +386,24 @@ def compile_graph(model: Any, reuse_slots: bool = False) -> Compiled:
                 register(qnode.output[0], job, out_scale, out_zero)
                 handled.add(qnode.name)
                 offset += size
+        elif op == "Slice":
+            src = dq_source(node.input[0])
+            starts, ends = init[res(node.input[1])], init[res(node.input[2])]
+            axes = init[res(node.input[3])] if len(node.input) > 3 and node.input[3] else np.arange(len(starts))
+            steps = init[res(node.input[4])] if len(node.input) > 4 and node.input[4] else np.ones(len(starts), dtype=np.int64)
+            (qnode,) = consumers[res(node.output[0])]
+            out_scale, out_zero = qp(qnode)
+            channels = src.layout.nb * 8
+            begin, end = int(starts[0]), min(int(ends[0]), channels)
+            if list(axes) != [1] or list(steps) != [1] or begin % 8 or end % 8:
+                raise ValueError(f"{node.name}: only a channel Slice on multiples of 8 channels is supported")
+            e = _exp2(src.scale / out_scale, "slice rescale")
+            spec = [(0, begin // 8 + g, e) for g in range((end - begin) // 8)]
+            job = Job(node.name, np.zeros((end - begin, 1, 1, 1), dtype=np.int8), np.zeros(end - begin, dtype=np.int32), src.slot,
+                      new_slot(), src.layout, kind="copy", copy_spec=spec)
+            add_job(job)
+            register(qnode.output[0], job, out_scale, out_zero)
+            handled.add(qnode.name)
         elif op == "Concat":
             srcs = [dq_source(i) for i in node.input]
             (qnode,) = consumers[res(node.output[0])]

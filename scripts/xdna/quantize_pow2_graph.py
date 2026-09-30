@@ -231,6 +231,9 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
         elif op == "Concat" and all_quantized(node):
             emit(node, q_in(node))
             qdq(node.output[0])
+        elif op == "Slice" and all_quantized(node, [0]):
+            emit(node, [dq_of[node.input[0]]] + list(node.input[1:]))
+            qdq(node.output[0])
         elif op == "Split" and all_quantized(node, [0]):
             emit(node, [dq_of[node.input[0]]] + list(node.input[1:]))
             for out in node.output:

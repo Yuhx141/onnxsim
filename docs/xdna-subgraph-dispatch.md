@@ -551,6 +551,17 @@ Vitis AI's outputs differ from CPU on these models (decoded coordinates by up to
 argmax flips), so it is faster only when it is also less accurate; our numbers are for exactly ORT's arithmetic.
 Engine time per job is ~10 us, so a 170-job network is bound by per-job synchronization, not by compute.
 
+Other Ultralytics families at 32x32, compile coverage (engine jobs before the first unsupported operator):
+
+| model | engine jobs | verdict |
+|---|---|---|
+| YOLOv8n-seg | 187 (10 boundaries incl. the mask prototype head) | runs on the device, bit-exact, 2.1 ms |
+| YOLOv10n | 89 | stops at the PSA attention (Reshape/MatMul/Softmax) |
+| YOLO11n | 99 | stops at C2PSA attention |
+| YOLOv6n | 27 | `ConvTranspose` upsampling has no kernel |
+| YOLOv9t | 4 | ADown builds Slice bounds from `Shape` nodes: a constant-folding pass (onnxsim) would fold them, the standalone compiler does not |
+| YOLOv3-tiny | 0 | MaxPool k=2 (even kernel) is not a "same"-padded odd pool |
+
 Not supported yet: YOLO11 (its C2PSA attention needs Reshape/Transpose/MatMul/Softmax in the middle of the
 network, i.e. a host round trip between two engine launches - a second xclbin costs ~1.8 ms of context switch),
 and real detector resolutions (640x640): maps of hundreds of pixels need pixel-split layouts and larger output
