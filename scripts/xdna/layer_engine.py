@@ -110,7 +110,7 @@ class Job:
     res_mode: int = 0  # 1 int8 residual, 2 uint8 residual
     ea: int = 0
     eb: int = 0
-    kind: str = "conv"  # "conv" | "pool" | "dw" (depthwise 3x3) | "lut" (unary table) | "copy" | "up" | "maxpool" | "add" | "gap" | "bmul" | "avgpool" | "d2s"
+    kind: str = "conv"  # "conv" | "pool" | "dw" (depthwise 3x3) | "lut" (unary table) | "copy" | "up" | "maxpool" | "add" | "gap" | "bmul" | "avgpool" | "d2s" | "amm"
     copy_spec: list | None = (
         None  # "copy": per output block (source 0/1, source block, scale exponent)
     )
@@ -123,6 +123,8 @@ class Job:
     factor: int = (
         1  # "up": nearest upsample factor; "maxpool": window; stride is `stride`
     )
+    heads: int = 1  # "amm": attention heads (channels of every operand / output are head-major)
+    amm_t: bool = False  # "amm": B is used transposed (scores = K^T Q); else natural (context = V P)
     ceil_pool: bool = False  # "maxpool": ONNX ceil_mode (partial windows on the right/bottom edge are kept)
     exp: int = 0  # "up"/"maxpool": result scaled by 2^exp (the Q after the op has its own scale)
     clamp: int = 127  # upper bound of the int8 result before the output flip (ReLU6 = 6 / output scale)
@@ -144,7 +146,7 @@ class Job:
         oh = (self.in_layout.h + 2 * pad - kh) // s + 1
         if self.kind == "pool":
             ow, oh = self.in_layout.w // 2, self.in_layout.h // 2
-        if self.kind in ("lut", "copy", "add", "bmul"):
+        if self.kind in ("lut", "copy", "add", "bmul", "amm"):
             ow, oh = self.in_layout.w, self.in_layout.h
         if self.kind == "gap":
             ow, oh = 1, 1
@@ -170,7 +172,7 @@ class Job:
             raise ValueError(
                 f"{self.name}: depthwise/table jobs need the same channel blocking in and out"
             )
-        if self.kind in ("lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s"):
+        if self.kind in ("lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm"):
             self.taps = [0]
         elif kh == 3:
             self.taps = valid_taps(self.in_layout.h, self.in_layout.w, oh, ow, s)
@@ -223,7 +225,7 @@ def plan_chunks(job: Job, payload: int) -> int:
 
 
 def n_chunks(job: Job, payload: int) -> int:
-    if job.kind in ("pool", "dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s"):
+    if job.kind in ("pool", "dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm"):
         return 1
     steps = len(job.taps) * job.in_layout.ncp
     return math.ceil(steps / plan_chunks(job, payload))
@@ -233,7 +235,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
     """Weight stream of one job: uint8 [column][chunk][row][slot_bytes]."""
     payload = slot_bytes - DESC_BYTES
     lay_in, lay_out = job.in_layout, job.out_layout
-    if job.kind in ("dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s"):
+    if job.kind in ("dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm"):
         out = np.zeros((COLS, 1, ROWS, slot_bytes), dtype=np.uint8)
         for core in range(CORES):
             col, row = divmod(core, ROWS)
@@ -271,10 +273,19 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
                             tab[ol, tap] = cp * lay_in.region_bytes + local * lay_in.pixels * TILE
                     slot[DESC_BYTES : DESC_BYTES + tab.nbytes] = tab.view(np.uint8).reshape(-1)
                 continue
+            if job.kind == "amm":
+                a_ch, oc_total = lay_in.nb * 8, lay_out.nb * 8
+                kb, obh = a_ch // job.heads // 8, oc_total // job.heads // 8
+                desc[D_MODE], desc[D_NTAPS], desc[D_S] = 15, kb, obh
+                desc[D_NBP], desc[D_NCP], desc[D_TT0] = lay_in.nbc, job.b_layout.nbc, job.b_layout.region_bytes
+                desc[D_EA], desc[D_EB], desc[D_TTN] = (kb if job.amm_t else obh), int(job.amm_t), lay_out.nbc
+                slot[:DESC_BYTES] = desc.view(np.uint8)
+                continue
             if job.kind in ("gap", "bmul"):
                 desc[D_MODE] = 10 if job.kind == "gap" else 11
                 if job.kind == "bmul":
                     desc[D_TT0] = job.b_layout.region_bytes
+                    desc[D_EB] = int(job.b_layout.pixels == lay_in.pixels and lay_in.pixels > 1)  # elementwise product
                 slot[:DESC_BYTES] = desc.view(np.uint8)
                 continue
             if job.kind == "add":
@@ -463,11 +474,25 @@ def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray
             ky, kx = divmod(tap, f)
             out[ky::f, kx::f] = fmap[:, :, tap * nb_out * TILE : (tap + 1) * nb_out * TILE]
         return out.reshape(-1, nb_out * TILE)
+    if job.kind == "amm":
+        a = act.astype(np.int64) - 128
+        b = resid.astype(np.int64) - 128
+        heads, oc = job.heads, job.weight.shape[0]
+        dh_a = a.shape[1] // heads
+        out = np.zeros((a.shape[0], oc), dtype=np.int64)
+        per = oc // heads
+        for h in range(heads):
+            if job.amm_t:  # scores[t][h*S + s] = sum_c a[t][h*dh + c] * b[s][h*dh + c]
+                out[:, h * per : (h + 1) * per] = a[:, h * dh_a : (h + 1) * dh_a] @ b[:, h * dh_a : (h + 1) * dh_a].T
+            else:  # ctx[t][h*dh + c] = sum_s a[t][h*S + s] * b[s][h*dh + c]
+                out[:, h * per : (h + 1) * per] = a[:, h * dh_a : (h + 1) * dh_a] @ b[:, h * per : (h + 1) * per]
+        return (np.clip(_rse(out / (2.0**job.shift), 0), -128, 127) + 128).astype(np.uint8)
     if job.kind == "gap":
         v = act.astype(np.int64).reshape(lay.pixels, -1) - 128
         return (np.clip(_rse(v.sum(axis=0) / (2.0**job.shift), 0), -128, 127) + 128).astype(np.uint8).reshape(1, -1)
     if job.kind == "bmul":
-        prod = (act.astype(np.int64) - 128) * (resid.astype(np.int64).reshape(1, -1) - 128)
+        b = resid.astype(np.int64)
+        prod = (act.astype(np.int64) - 128) * ((b if b.shape == act.shape else b.reshape(1, -1)) - 128)
         return (np.clip(_rse(prod / (2.0**job.shift), 0), -128, 127) + 128).astype(np.uint8)
     if job.kind == "add":
         c = max(-job.ea, 0) if job.ea < job.eb else max(-job.eb, 0)

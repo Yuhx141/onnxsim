@@ -606,25 +606,39 @@ launch), and any 224x224 input (needs the pixel-tiled layouts noted above). Goog
 #### Transformers: layer engine vs Vitis AI vs Hexagon HTP
 
 `tiny_transformer.py` builds a pre-LN encoder as a power-of-two QDQ graph in "tokens are pixels" form
-(`[1, hidden, 1, tokens]`): every Linear is a 1x1 Conv job, GELU is a table job (tinygrad-lowered), and LayerNorm,
-attention (MatMul/Softmax) and the residual stream stay float host nodes. `compile_graph` accepts a float network
-input (no leading Q), so every attention / residual block is one host round trip = one more full launch of the
-same xclbin (`layer_engine_host.run_levels`). Bit-exact against ONNX Runtime on every boundary (0 differing bytes)
-for 1-6 layers; `tests/test_xdna_tinygrad_lower.py::test_tiny_transformer_...` runs the whole multi-launch flow on
-the numpy references.
+(`[1, hidden, 1, tokens]`), every operator of which is an engine job, so a whole encoder is **one launch**:
 
-Same graphs (32 tokens, hidden 128, 4 heads, FFN 512), ms per inference:
+| transformer op | engine jobs |
+|---|---|
+| Linear (Q/K/V/O, FFN) | 1x1 conv; LayerNorm's gamma/beta and the 1/sqrt(d) are folded into the next conv |
+| residual Add | fused into the o-proj / FFN2 conv epilogue (the residual stream is a uint8 tensor) |
+| LayerNorm | `x - mean` = one dense conv with `I - 1/C`; `d*d` = elementwise product job (`bmul`, same-shape mode); variance = conv of `1/C`; rsqrt = table job; `d * rsqrt` = product job |
+| GELU, exp, reciprocal | table jobs (tinygrad-lowered pointwise chains) |
+| attention scores `K^T Q` and context `V P` | new `amm` job (kernel mode 15): per-head int8 tile matmul of two activation maps; B is transposed in-kernel for the scores |
+| softmax | exp table, per-head key sum (block-diagonal ones conv), reciprocal table, product job |
 
-| layers | engine launches | our engine (int8, bit-exact) | Vitis AI EP (bf16, XDNA2) | Hexagon HTP V69 (fp16, QNN burst) |
-|---|---|---|---|---|
-| 1 | 4 | 1.8 | 2.35 | 0.23 |
-| 2 | 7 | 3.7 | 4.25 | 0.31 |
-| 4 | 13 | 9.0 | 7.75 | 0.45 |
-| 6 | 19 | 15.9 | 11.3 | 0.61 |
+The previous version of this section kept LayerNorm, attention and the residual stream in float on the host
+(3 launches per layer); `--ln host --attn host` still builds that form. A network input that is float (no leading
+Q) and a network output that is an engine tensor are both supported now. The C = power of two requirement keeps
+the `1/C` conv weights exact in int8; other widths run but the mean/variance are then approximate.
 
-The real MiniLM-L6 (`scripts/android/llm_tinygrad`, seq 128, hidden 384; ~1.4 GMAC) cannot run on the engine at all:
+Same model (32 tokens, hidden 128, 4 heads, FFN 512), ms per inference, all bit-exact on the engine against ORT on
+the quantized graph:
+
+| layers | engine launches | our engine (host LN/attention, before) | **our engine (all ops on device)** | Vitis AI EP (bf16) | Hexagon HTP V69 (fp16) |
+|---|---|---|---|---|---|
+| 1 | 1 | 1.8 (4 launches) | **0.58** | 2.35 | 0.23 |
+| 2 | 1 | 3.7 (7) | **0.76** | 4.25 | 0.31 |
+| 4 | 1 | 9.0 (13) | **1.56** | 7.75 | 0.45 |
+| 6 | 1 | 15.9 (19) | **2.08** | 11.3 | 0.61 |
+
+Accuracy of the int8 power-of-two graph (activations uint8, per-tensor weights, no calibration tuning, 8-bit
+softmax/LayerNorm statistics) against the fp32 graph with the same weights: token cosine 0.998 / 0.994 / 0.989 /
+0.980 for 1 / 2 / 4 / 6 layers; Vitis AI's bf16 is 0.999 and Hexagon fp16 0.999998.
+
+The real MiniLM-L6 (`scripts/android/llm_tinygrad`, seq 128, hidden 384; ~1.4 GMAC) still cannot run on the engine:
 a channel block's tokens must fit one 512 B core region (<= 64 tokens at the narrowest width, 32 at the 4x FFN
-width). Same weights, encoder body only (embeddings and the mask bias fed in), measured today:
+width). Same weights, encoder body only (embeddings and the mask bias fed in), measured:
 
 | | ms / inference | accuracy vs fp32 |
 |---|---|---|
@@ -633,19 +647,11 @@ width). Same weights, encoder body only (embeddings and the mask bias fed in), m
 | this host's CPU, ORT fp32 | 12.9 | exact |
 | phone CPU, ORT fp32 4 threads (busy phone; README's quiet-phone number was 24.7) | 86 | exact |
 
-Reading it: Hexagon wins on transformers by 3-25x. Its per-model cost is a few tenths of a millisecond even for
-the tiny stack (one fused graph, fp16 vector/HMX matmuls, softmax and layernorm on the DSP), and MiniLM-128 is
-1.4 GMAC in 1.9 ms = 0.7 TMAC/s. XDNA2's int8 conv engine reaches several TMAC/s on ResNet bodies, but a
-transformer is the opposite workload: activation x activation matmuls the engine does not have, softmax/layernorm
-on the host, and a launch (~0.25 ms fixed + ~10 us per job) per host round trip. Our engine's time is also
-quadratic in depth because each launch re-runs every job (earlier levels just recompute); per-level job ranges
-(a second instruction stream and core loop bound) would cut the 6-layer engine time from 11.6 ms to roughly 4-5 ms,
-still far from Hexagon. The Vitis numbers use the same non-standard `[1, C, 1, T]` layout, so its tiny-model
-column is not its best case; its MiniLM row is the fair one.
-
-Changes this needed in the compiler/runtime: a float network input (`compile_graph`, `run_graph_engine`), a host
-Add is never fused into an engine conv, boundaries are decoded only by the launch that completes them (a 30-boundary
-model spent 12 of 26 ms in `from_arena`), and the host tail uses onnxruntime when it is installed.
+Reading it: with every op on the device, the engine is 4-5x faster than Vitis AI on the small encoder and within
+2.5-3.5x of Hexagon, whose per-model cost is a fixed few tenths of a millisecond (fp16 vector/HMX matmuls, one fused
+graph). Remaining engine cost is ~10 us per job (143 jobs for 6 layers) plus one launch, so it scales with depth;
+fewer, wider jobs (fusing the LayerNorm chain into the next conv, a per-head softmax kernel) are the next levers.
+The size limit (tokens per channel block) and int8 accuracy (vs fp16/bf16) are what keep it from MiniLM-scale models.
 
 ### Runtime-shaped kernels (`kernels/fused_bottleneck_rt.cc`, `resnet_body_design.py --rt`)
 

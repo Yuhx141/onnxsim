@@ -382,10 +382,9 @@ def test_graph_compiler_keeps_the_add_after_a_depthwise_conv_a_separate_job():
 def test_fast_host_conv_transpose_matches_the_reference_evaluator(
     kernel, stride, pads, extra
 ):
+    from layer_engine_host import _fast_ops
     from onnx import parser
     from onnx.reference import ReferenceEvaluator
-
-    from layer_engine_host import _fast_ops
 
     model = parser.parse_model(
         f"""
@@ -417,9 +416,8 @@ def _name_nodes(model):
 
 def _chain_matches_evaluator(model, x, out_scale):
     """Run compile_graph's jobs with the numpy references and compare with onnx's evaluator on the float model."""
-    from onnx.reference import ReferenceEvaluator
-
     from layer_engine_graph import compile_graph
+    from onnx.reference import ReferenceEvaluator
 
     compiled = compile_graph(model, simplify=False)
     n, c, h, w = x.shape
@@ -553,7 +551,9 @@ def test_tiny_transformer_compiles_to_multi_launch_and_matches_ort(tmp_path):
     from layer_engine_host import HostRunner, run_levels
     from tiny_transformer import build
 
-    args = types.SimpleNamespace(tokens=32, hidden=128, heads=4, layers=1, seed=0)
+    args = types.SimpleNamespace(
+        tokens=32, hidden=128, heads=4, layers=1, seed=0, ln="host", attn="host"
+    )
     fmodel, taps = build(False, {}, args)
     probe = onnx.ModelProto()
     probe.CopyFrom(fmodel)
@@ -609,3 +609,113 @@ def test_tiny_transformer_compiles_to_multi_launch_and_matches_ort(tmp_path):
         0
     ]  # the graph output is an Identity alias of the last LayerNorm
     np.testing.assert_allclose(floats[final], want, atol=1e-4)
+
+
+def _tiny_transformer_model(ln, attn, layers=1):
+    import types
+
+    import onnx
+    import onnxruntime as ort
+    from tiny_transformer import build
+
+    args = types.SimpleNamespace(
+        tokens=32, hidden=128, heads=4, layers=layers, seed=0, ln=ln, attn=attn
+    )
+    fmodel, taps = build(False, {}, args)
+    probe = onnx.ModelProto()
+    probe.CopyFrom(fmodel)
+    for tap in dict.fromkeys(taps):
+        probe.graph.output.append(
+            onnx.helper.make_tensor_value_info(tap, onnx.TensorProto.FLOAT, None)
+        )
+    names = [o.name for o in probe.graph.output][1:]
+    session = ort.InferenceSession(
+        probe.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    x = np.random.default_rng(1).standard_normal((1, 128, 1, 32)).astype(np.float32)
+    absmax = {
+        n: float(np.abs(v).max())
+        for n, v in zip(names, session.run(names, {"input": x}))
+    }
+    scales = {n: 2.0 ** np.ceil(np.log2(m / 127.0)) for n, m in absmax.items()}
+    return onnx.shape_inference.infer_shapes(build(True, scales, args)[0]), x
+
+
+def test_engine_layernorm_and_attention_compile_to_one_launch_and_match_ort():
+    """LayerNorm (conv / product / table jobs) and attention (amm jobs) leave no host round trip."""
+    import onnx
+    import onnxruntime as ort
+    from layer_engine_graph import compile_graph
+
+    model, x = _tiny_transformer_model("engine", "engine", layers=2)
+    compiled = compile_graph(model, simplify=False)
+    kinds = [job.kind for job in compiled.jobs]
+    assert compiled.levels == 1 and not compiled.entries and not compiled.host_jobs
+    assert (
+        kinds.count("amm") == 4
+        and kinds.count("lut") >= 10
+        and kinds.count("bmul") >= 12
+    )
+    assert {job.heads for job in compiled.jobs if job.kind == "amm"} == {4}
+    assert [job.amm_t for job in compiled.jobs if job.kind == "amm"] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+
+    # every job chain on the numpy references, compared with ORT on the final (engine) output tensor
+    q = np.clip(np.rint(x / compiled.input_scale) + 128, 0, 255).astype(np.uint8)[0]
+    maps = {0: q.transpose(1, 2, 0).reshape(32, 128)}
+    for job in compiled.jobs:
+        res = maps[job.res_slot] if job.res_slot is not None else None
+        maps[job.out_slot] = le.reference(job, maps[job.in_slot], res)
+    (name,) = compiled.boundaries
+    out_q = maps[compiled.boundaries[name].slot]
+    probe = onnx.ModelProto()
+    probe.CopyFrom(model)
+    probe.graph.output.append(
+        onnx.helper.make_tensor_value_info(name, onnx.TensorProto.UINT8, None)
+    )
+    want = ort.InferenceSession(
+        probe.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {"input": x})[-1]
+    np.testing.assert_array_equal(out_q, want[0].transpose(1, 2, 0).reshape(32, 128))
+
+
+def test_activation_matmul_reference_is_a_per_head_int8_matmul():
+    rng = np.random.default_rng(7)
+    heads, dh, tokens = 4, 16, 16
+    qa = rng.integers(0, 256, (tokens, heads * dh), dtype=np.uint8)
+    kb = rng.integers(0, 256, (tokens, heads * dh), dtype=np.uint8)
+    layout = le.layout_for(heads * dh, tokens, 1)
+    scores = le.Job(
+        "qk",
+        np.zeros((heads * tokens, 1, 1, 1), dtype=np.int8),
+        np.zeros(heads * tokens, dtype=np.int32),
+        0,
+        2,
+        layout,
+        kind="amm",
+        res_slot=1,
+        b_layout=layout,
+        shift=10,
+        heads=heads,
+        amm_t=True,
+    )
+    got = le.reference(scores, qa, kb)
+    a, b = qa.astype(np.int64) - 128, kb.astype(np.int64) - 128
+    for h in range(heads):
+        want = a[:, h * dh : (h + 1) * dh] @ b[:, h * dh : (h + 1) * dh].T  # [t][s]
+        rounded = np.clip(np.rint(want / 2.0**10), -128, 127) + 128
+        np.testing.assert_array_equal(
+            got[:, h * tokens : (h + 1) * tokens], rounded.astype(np.uint8)
+        )
+    packed = le.pack_job(scores, le.ENGINE_SLOT_BYTES)
+    desc = packed[0, 0, 0, : le.DESC_BYTES].view(np.int32)
+    assert (
+        desc[le.D_MODE] == 15
+        and desc[le.D_NTAPS] == dh // 8
+        and desc[le.D_S] == tokens // 8
+        and desc[le.D_EB] == 1
+    )

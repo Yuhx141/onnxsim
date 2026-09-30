@@ -130,7 +130,10 @@ def main() -> int:
     if args.dump_boundaries:
         np.savez(args.dump_boundaries, **{k.replace("/", "|"): v for k, v in boundaries.items()})
     if args.dump_outputs:
-        floats = getattr(run_once, "floats", {})
+        floats = dict(getattr(run_once, "floats", {}))
+        for node in model.graph.node:  # a graph output that is an Identity alias of a computed tensor
+            if node.op_type == "Identity" and node.input[0] in floats:
+                floats[node.output[0]] = floats[node.input[0]]
         np.savez(args.dump_outputs, **{o.name.replace("/", "|"): floats[o.name] for o in model.graph.output if o.name in floats})
     if args.check:
         import onnxruntime as ort

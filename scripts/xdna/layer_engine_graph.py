@@ -312,11 +312,59 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             hlevel[res(o)] = lvl
         host_nodes.append((node, lvl))
 
+    def back(name: str):
+        """Follow Reshape/Transpose producers back to a DequantizeLinear: (its output, chain nodes, transposed, dims)."""
+        chain, transposed, dims = [], False, None
+        while True:
+            p = producers.get(res(name))
+            if p is None:
+                return None
+            if p.op_type == "DequantizeLinear":
+                return p.output[0], chain, transposed, dims
+            if p.op_type == "Reshape" and res(p.input[1]) in init:
+                dims = dims or [int(v) for v in init[res(p.input[1])]]
+            elif p.op_type != "Transpose":
+                return None
+            transposed = transposed or p.op_type == "Transpose"
+            chain.append(p)
+            name = p.input[0]
+
+    # attention matmuls between two quantized tensors: MatMul(Transpose(Reshape(K)), Reshape(Q)) -> Reshape -> Q  is
+    # scores = K^T Q per head, MatMul(Reshape(V), Reshape(P)) -> Reshape -> Q  is context = V P (engine "amm" jobs)
+    pending_amm: dict[str, dict] = {}
+    for node in nodes:
+        if node.op_type != "MatMul":
+            continue
+        outs = consumers.get(res(node.output[0]), [])
+        if len(outs) != 1 or outs[0].op_type != "Reshape":
+            continue
+        tails = consumers.get(res(outs[0].output[0]), [])
+        a, b = back(node.input[0]), back(node.input[1])
+        if len(tails) != 1 or tails[0].op_type != "QuantizeLinear" or a is None or b is None or not b[1] or b[2] or not a[1]:
+            continue
+        pending_amm[node.name] = dict(qk=a[2], a_dq=b[0], b_dq=a[0], heads=(b[3] or [1])[0], reshape=outs[0], q=tails[0])
+        handled.update({n.name for n in a[1] + b[1]} | {outs[0].name})
+
     for node in nodes:
         cur[0] = 0
         if node.name in handled:
             continue
         op = node.op_type
+        if op == "MatMul" and node.name in pending_amm:
+            info = pending_amm[node.name]
+            a_t, b_t = dq_source(info["a_dq"]), dq_source(info["b_dq"])
+            out_scale, out_zero = qp(info["q"])
+            k = -_exp2(a_t.scale * b_t.scale / out_scale, "attention matmul rescale")
+            heads = info["heads"]
+            if k < 0 or a_t.layout.pixels % 8 or a_t.layout.pixels != b_t.layout.pixels:
+                raise ValueError(f"{node.name}: attention matmul needs a multiple of 8 tokens and a coarser output scale")
+            oc = heads * b_t.layout.pixels if info["qk"] else b_t.layout.nb * 8
+            job = Job(node.name, np.zeros((oc, 1, 1, 1), dtype=np.int8), np.zeros(oc, dtype=np.int32), a_t.slot, new_slot(), a_t.layout,
+                      kind="amm", res_slot=b_t.slot, b_layout=b_t.layout, shift=k, heads=heads, amm_t=info["qk"])
+            add_job(job)
+            register(info["q"].output[0], job, out_scale, out_zero)
+            handled.add(info["q"].name)
+            continue
         if op == "DequantizeLinear":
             if res(node.input[0]) in tensors:
                 hlevel[res(node.output[0])] = tensors[res(node.input[0])].level
@@ -717,13 +765,12 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
         elif (
             op == "Mul"
             and all(res(i) in producers and producers[res(i)].op_type == "DequantizeLinear" for i in node.input)
-            and dq_source(node.input[0]).slot != dq_source(node.input[1]).slot
         ):
             a_t, b_t = dq_source(node.input[0]), dq_source(node.input[1])
             if a_t.layout.pixels == 1 and b_t.layout.pixels > 1:
                 a_t, b_t = b_t, a_t
-            if b_t.layout.pixels != 1:
-                raise ValueError(f"{node.name}: only a broadcast multiply by a 1x1 map (squeeze-excite) is supported")
+            if b_t.layout.pixels != 1 and (b_t.layout.pixels != a_t.layout.pixels or b_t.layout.nb != a_t.layout.nb):
+                raise ValueError(f"{node.name}: only a broadcast multiply by a 1x1 map (squeeze-excite) or a same-shape product is supported")
             (qnode,) = consumers[res(node.output[0])]
             out_scale, out_zero = qp(qnode)
             k = -_exp2(a_t.scale * b_t.scale / out_scale, "broadcast multiply rescale")
@@ -840,6 +887,10 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                 and res(p.input[0]) in tensors
             ):
                 boundaries[res(p.input[0])] = tensors[res(p.input[0])]
+    for o in graph.output:  # a network output that is itself an engine tensor (DequantizeLinear of an engine result)
+        p = producers.get(res(o.name))
+        if p is not None and p.op_type == "DequantizeLinear" and res(p.input[0]) in tensors:
+            boundaries[res(p.input[0])] = tensors[res(p.input[0])]
     keep = [t.slot for t in boundaries.values()]
     if os.environ.get(
         "ENGINE_KEEP_ALL"

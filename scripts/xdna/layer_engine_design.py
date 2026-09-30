@@ -59,7 +59,7 @@ def engine(
     segments = layer_engine_nets.segments_for(net, jobs, arch)
     kinds = {j.kind for j in jobs}
     scratch_blocks = max([j.in_layout.nbc for j in jobs if j.kind == "conv" and j.gather] + [1])  # gather scratch tiles = input blocks per region
-    absent = [m for m, kind in (("COPY", "copy"), ("UP", "up"), ("ADD", "add"), ("GAP", "gap"), ("BMUL", "bmul"), ("AVG", "avgpool"), ("D2S", "d2s"), ("LUT", "lut"), ("DW", "dw")) if kind not in kinds]
+    absent = [m for m, kind in (("COPY", "copy"), ("UP", "up"), ("ADD", "add"), ("GAP", "gap"), ("BMUL", "bmul"), ("AMM", "amm"), ("AVG", "avgpool"), ("D2S", "d2s"), ("LUT", "lut"), ("DW", "dw")) if kind not in kinds]
     resnet_like = net in ("full", "body", "bodyr", "l1proj", "l1id", "l2proj", "l3id", "l4id")  # no table/movement/depthwise code: 16 KB program memory
     generic = net.startswith(
         ("onnx:", "gen:")
