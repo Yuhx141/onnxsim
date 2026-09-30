@@ -133,6 +133,7 @@ class XDNAResNetRunner:
         host_maxpool: bool = False,
         fused_body_rt: bool = False,
         device_network_stages: list[list[str]] | None = None,
+        layer_engine: bool = False,
         parallel_projection_blocks: list[tuple[str, str, str]] | None = None,
         maxpool_uint8_artifact: tuple[str, str] | None = None,
         maxpool_runtime: str = "iron",
@@ -384,6 +385,7 @@ class XDNAResNetRunner:
         self.fused_body_groups = fused_body_groups
         self.fused_body_rt = fused_body_rt
         self.device_network_stages = device_network_stages
+        self.layer_engine = layer_engine
         self.fused_body_chunk_caps = fused_body_chunk_caps or {}
         stage_specs = list(fused_stages or ())
         parallel_specs = list(parallel_projection_blocks or ())
@@ -618,7 +620,10 @@ class XDNAResNetRunner:
             input_tensor = iron.tensor(np.zeros(input_count, dtype=np.int8), dtype=np.int8, device="npu")
             network = None
             if self.device_network_stages:
-                network = self._prepare_device_network(model, first_prefix, covered)
+                network = (
+                    self._prepare_layer_engine(model, first_prefix, covered)
+                    if self.layer_engine else self._prepare_device_network(model, first_prefix, covered)
+                )
                 covered = network["covered"]
                 input_tensor, output_tensor = network["input"], network["output"]
                 parameter_tensor, extra_tensor = network["parameters"], network["scratch"]
@@ -1558,6 +1563,63 @@ class XDNAResNetRunner:
             "scratch": iron.zeros(scratch, dtype=np.int8, device="npu"),
         }
 
+    def _prepare_layer_engine(self, model: Any, first_prefix: str, covered: set[int]) -> dict[str, Any]:
+        """Tensors + packing for the layer-sequential engine artifact (layer_engine_design.py --net bodyr --looped)."""
+        import aie.iron as iron
+
+        try:
+            import layer_engine as le
+            from layer_engine_net import jobs_from_bindings
+            from resnet_stage_design import stage_specs
+        except ImportError:
+            from . import layer_engine as le
+            from .layer_engine_net import jobs_from_bindings
+            from .resnet_stage_design import stage_specs
+        _cols, binds = stage_specs(model, self.device_network_stages)
+        jobs, _outs = jobs_from_bindings(binds, reuse_slots=True)
+        packs = [le.pack_job(job, le.ENGINE_SLOT_BYTES) for job in jobs]
+        params = np.concatenate([np.concatenate([pack[col].reshape(-1) for pack in packs]) for col in range(le.COLS)])
+        slots = 1 + max(job.out_slot for job in jobs)
+        arena = iron.zeros(slots * le.SLOT_BYTES, dtype=np.int8, device="npu")
+        return {
+            "covered": set(covered), "engine": {"jobs": jobs, "le": le}, "binds": binds,
+            "input": arena, "output": arena, "parameters": iron.tensor(params, dtype=np.uint8, device="npu"),
+            "scratch": None,
+        }
+
+    def _run_layer_engine(self, values: dict[str, Any], stage: dict[str, Any]) -> None:
+        """Pooled map in -> every bottleneck block through the layer-sequential engine -> last block output."""
+        engine = stage["network"]["engine"]
+        le, jobs = engine["le"], engine["jobs"]
+        first, last = stage["bindings"][0], stage["bindings"][-1]
+        started = time.perf_counter()
+        _, cin, height, width = first["input_shape"]
+        raw = np.asarray(values[first["input_raw_name"]]).reshape(cin, height * width)
+        arena = stage["input"]
+        with arena.overwrite() as host:
+            host.view(np.uint8)[: le.SLOT_BYTES] = le.to_arena(raw.T.copy(), jobs[0].in_layout)
+        self._profile["device_network_prepare_ms"] = self._profile.get("device_network_prepare_ms", 0.0) + (time.perf_counter() - started) * 1000.0
+        launch = time.perf_counter()
+        stage["kernel"](arena, stage["parameters"], arena)
+        elapsed_ms = (time.perf_counter() - launch) * 1000.0
+        self._profile["fused_stage_kernel_call_ms"] = self._profile.get("fused_stage_kernel_call_ms", 0.0) + elapsed_ms
+        final = jobs[-1]
+        slot = arena.numpy().view(np.uint8)[final.out_slot * le.SLOT_BYTES : (final.out_slot + 1) * le.SLOT_BYTES]
+        dense = le.from_arena(slot, final.out_layout)
+        _, channels, out_h, out_w = last["output_shape"]
+        out = dense.reshape(out_h, out_w, channels).transpose(2, 0, 1)[None].copy()
+        values[last["output_raw_name"]] = out
+        values[last["output_dequant_name"]] = (
+            (out.astype(np.float32) - float(last["output_zero_point"])) * np.float32(last["output_scale"])
+        )
+        self._fused_times.append({
+            "prefix": "layer_engine", "input_shape": list(first["input_shape"]), "output_shape": list(last["output_shape"]),
+            "device_resident_input": False, "linked_blocks": len(stage["bindings"]), "elapsed_ms": elapsed_ms,
+        })
+        self._executed["fused_stage"] = self._executed.get("fused_stage", 0) + 1
+        self._executed["fused_bottleneck"] += len(stage["bindings"])
+        self._executed["layer_engine"] = self._executed.get("layer_engine", 0) + 1
+
     def _run_device_network(self, values: dict[str, Any], stage: dict[str, Any]) -> None:
         """Image in -> (stem Conv, MaxPool, all bottleneck stages) on the NPU -> last block output."""
         network = stage["network"]
@@ -1595,7 +1657,10 @@ class XDNAResNetRunner:
 
     def _run_fused_stage(self, values: dict[str, np.ndarray], stage: dict[str, Any]) -> None:
         if stage.get("network") is not None:
-            self._run_device_network(values, stage)
+            if stage["network"].get("engine") is not None:
+                self._run_layer_engine(values, stage)
+            else:
+                self._run_device_network(values, stage)
             return
         """Launch a linked multi-block stage once and expose only its final edge."""
         bindings = stage["bindings"]
@@ -1858,6 +1923,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
     parser.add_argument("model", type=Path)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dump-output", type=Path, help="save the first output tensor (.npy) for an external comparison")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument(
@@ -1892,6 +1958,10 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
     parser.add_argument(
         "--device-network", nargs=3, metavar=("XCLBIN", "INSTS", "STAGES_JSON"),
         help="run stem Conv + MaxPool + every bottleneck stage as ONE resnet_stage_design.py --stem artifact; STAGES_JSON lists the block prefixes of each stage",
+    )
+    parser.add_argument(
+        "--layer-engine", nargs=3, metavar=("XCLBIN", "INSTS", "STAGES_JSON"),
+        help="run every bottleneck block through ONE layer-sequential engine artifact (layer_engine_design.py --net bodyr --looped); stem/MaxPool stay on the host",
     )
     parser.add_argument("--fused-body-rt", action="store_true", help="the --fused-body artifact was compiled with resnet_body_design.py --rt (runtime-shaped kernels)")
     parser.add_argument("--host-maxpool", action="store_true", help="run MaxPool on the host instead of an XDNA artifact")
@@ -1931,6 +2001,11 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         network_stages = _json.loads(args.device_network[2])
         body_stages = [(tuple(p for stage in network_stages for p in stage), args.device_network[0], args.device_network[1])]
 
+    if args.layer_engine:
+        import json as _json
+        network_stages = _json.loads(args.layer_engine[2])
+        body_stages = [(tuple(p for stage in network_stages for p in stage), args.layer_engine[0], args.layer_engine[1])]
+
     runner = XDNAResNetRunner(
         model,
         manifest,
@@ -1951,6 +2026,7 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         host_maxpool=args.host_maxpool,
         fused_body_rt=args.fused_body_rt,
         device_network_stages=network_stages,
+        layer_engine=bool(args.layer_engine),
         parallel_projection_blocks=[
             (prefix, xclbin, insts) for prefix, xclbin, insts in (args.parallel_projection_block or [])
         ],
@@ -2060,6 +2136,8 @@ def main(argv: list[str] | None = None, emit_json: bool = True) -> int:
         "fps": 1000.0 / avg_ms,
         "output_shapes": {name: list(value.shape) for name, value in outputs.items()},
     }
+    if args.dump_output:
+        np.save(args.dump_output, np.asarray(next(iter(outputs.values()))))
     if args.capture_npz:
         result["capture_npz"] = str(args.capture_npz)
     try:

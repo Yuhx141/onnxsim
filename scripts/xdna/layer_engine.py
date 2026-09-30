@@ -18,6 +18,7 @@ REGION_BYTES = 512
 CORES = 32
 COLS, ROWS = 8, 4
 SLOT_BYTES = CORES * REGION_BYTES
+ENGINE_SLOT_BYTES = 4096  # weight object size of the shipped engine artifact (layer_engine_design.py --slot)
 DESC_BYTES = 192
 TILE = 8
 
