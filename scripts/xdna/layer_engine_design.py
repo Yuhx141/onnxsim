@@ -42,9 +42,11 @@ def engine(
     looped: CompileTime[int] = 0,
     l2: CompileTime[int] = 0,
     kflags: CompileTime[str] = "",
+    arch: CompileTime[str] = "3,4,6,3",
 ):
-    jobs, _ = layer_engine_nets.build(net)
-    segments = layer_engine_nets.segments_for(net, jobs)
+    jobs, _ = layer_engine_nets.build(net, 0, arch)
+    segments = layer_engine_nets.segments_for(net, jobs, arch)
+    basic = arch.startswith("basic:")
     stem = net == "full"  # jobs[:5] are the stem GEMM chunks + pool; the rest is the looped body
     nch = [n_chunks(j, slot - 192) for j in jobs]
     slots_used = layer_engine.arena_slots(jobs)
@@ -137,9 +139,61 @@ def engine(
                 run(5, False, stage)
                 run(6, True, stage)
 
+    def core_basic(act, w, out, kern, index, sched):
+        """Basic-block (ResNet-18/34) core program: stage 1 is identity blocks only; stages 2-4 each start
+        with a projection block [skip, conv a, conv b + residual] followed by `nid` identity blocks [a, b + residual]."""
+
+        def run(kind, res, stage, count=None):
+            a = act.acquire(2 if res else 1)
+            if res:
+                r, a = a[0], a[1]
+            else:
+                r = a
+            o = out.acquire(1)
+            for _ in range_(sched[kind, stage] if count is None else count):
+                if l2:
+                    wc = w.acquire(1)
+                    if (compute >> kind) & 1:
+                        kern(a, wc, o, r)
+                    w.release(1)
+                else:
+                    for c in range(ROWS):
+                        wc = w.acquire(1)
+                        if c == index and (compute >> kind) & 1:
+                            kern(a, wc, o, r)
+                        w.release(1)
+            out.release(1)
+            act.release(2 if res else 1)
+
+        if stem:
+            for _ in range_(4):
+                run(7, False, None, count=nch[0])
+            run(8, False, None, count=nch[4])
+        first, count, repeat = segments[0]  # stage 1: identity blocks [a, b]
+        for _ in range_(repeat):
+            run(9, False, None, count=nch[first])
+            run(10, True, None, count=nch[first + 1])
+        for stage in range_(3):
+            run(0, False, stage)
+            run(1, False, stage)
+            run(2, True, stage)
+            for _ in range_(sched[7, stage]):
+                run(4, False, stage)
+                run(5, True, stage)
+
     act_all = ObjectFifo(act_ty, depth=2 if has_res else 1, name="act_all")
     sched_tab = None
-    if looped:
+    if looped and basic:
+        sched_tab = np.zeros((8, 3), dtype=np.int32)
+        rest = segments[1:]
+        for st in range(3):
+            (pf, _pc, _pr), (idf, _ic, ir) = rest[2 * st], rest[2 * st + 1]
+            for k in range(3):
+                sched_tab[k, st] = nch[pf + k]
+            for k in range(2):
+                sched_tab[4 + k, st] = nch[idf + k]
+            sched_tab[7, st] = ir
+    elif looped:
         sched_tab = np.zeros((8, 4), dtype=np.int32)
         for st, (first, count, repeat) in enumerate([sg for sg in segments if sg[1] == 4]):
             for k in range(4):
@@ -161,9 +215,9 @@ def engine(
         col_out = ObjectFifo(col_out_ty, depth=1, name=f"c{col}_out")
         for i in range(ROWS):
             workers.append(Worker(
-                core_looped if looped else core_fn,
+                (core_basic if basic else core_looped) if looped else core_fn,
                 fn_args=[act_all.cons(), core_ws[i].cons() if l2 else wf.cons(), core_outs[i].prod(), kernel, i]
-                + ([Buffer(np.ndarray[(8, 4), np.dtype[np.int32]], initial_value=sched_tab)] if looped else []),
+                + ([Buffer(np.ndarray[sched_tab.shape, np.dtype[np.int32]], initial_value=sched_tab)] if looped else []),
                 tile=Tile(col, 2 + i), stack_size=0x1300))
         ObjectFifoLink([o.cons() for o in core_outs], col_out.prod(), src_offsets=[i * REGION_BYTES for i in range(ROWS)])
         wfs.append(wf)
@@ -216,6 +270,7 @@ def _parser():
     parser.add_argument("--nocompute", action="store_true")
     parser.add_argument("--kflags", default="", help="extra kernel compile flags (profiling)")
     parser.add_argument("--l2", type=int, default=0, help="stage weights in memtile L2 (this many 4-slice objects deep) and distribute one slice per core")
+    parser.add_argument("--arch", default="3,4,6,3", help="bottleneck counts per stage, optional ':W' 3x3 width multiplier (full net)")
     parser.add_argument("--looped", action="store_true", help="stage-looped core program (body net)")
     parser.add_argument("--compute", type=lambda v: int(v, 0), default=0xFFFFFF, help="bitmask of jobs that run their kernel (profiling)")
     return parser
@@ -225,7 +280,7 @@ def main() -> None:
     opts = _parser().parse_args()
     run_design_cli(
         engine, opts,
-        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0, "kflags": o.kflags, "l2": o.l2},
+        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0, "kflags": o.kflags, "l2": o.l2, "arch": o.arch},
         device=lambda value: device_from_args(value, n_cols=8),
     )
 

@@ -12,6 +12,12 @@ import json
 import math
 import os
 import time
+
+# The host tail (Gemm, average pool) is tiny: with the default one BLAS thread per core a 2048x1000 Gemm
+# took 3 ms on a 64-thread host (thread start-up dominates); one or two threads take 0.05-0.1 ms.
+# Must be set before numpy loads OpenBLAS.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -88,6 +94,30 @@ def _centered_int8(raw: np.ndarray, zero: int, label: str) -> np.ndarray:
     if np.any((centered < -128) | (centered > 127)):
         raise ValueError(f"{label} cannot be represented as signed int8")
     return centered.astype(np.int8)
+
+
+def _basic_prefixes(model: Any) -> list[str]:
+    try:
+        from layer_engine_basic import basic_block_prefixes
+    except ImportError:
+        from .layer_engine_basic import basic_block_prefixes
+    return basic_block_prefixes(model)
+
+
+def _bind_basic_block(model: Any, prefix: str) -> dict[str, Any]:
+    try:
+        from layer_engine_basic import bind_basic_block
+    except ImportError:
+        from .layer_engine_basic import bind_basic_block
+    return bind_basic_block(model, prefix)
+
+
+def _basic_jobs(binds, reuse_slots=False):
+    try:
+        from layer_engine_net import basic_jobs_from_bindings
+    except ImportError:
+        from .layer_engine_net import basic_jobs_from_bindings
+    return basic_jobs_from_bindings(binds, reuse_slots=reuse_slots)
 
 
 def _max_pool(x: np.ndarray, attrs: dict[str, Any]) -> np.ndarray:
@@ -418,7 +448,7 @@ class XDNAResNetRunner:
             prepared_blocks[prefix] = (block, binding, set(binding["covered_nodes"]), str(xclbin), str(insts))
 
         for prefixes, xclbin, insts in stage_specs:
-            if not 1 <= len(prefixes) <= 16:
+            if not 1 <= len(prefixes) <= (1024 if self.layer_engine else 16):
                 raise ValueError("linked fused stage requires one to sixteen block prefixes")
             if not Path(xclbin).is_file() or not Path(insts).is_file():
                 raise ValueError("fused stage xclbin and instruction stream must exist")
@@ -433,12 +463,17 @@ class XDNAResNetRunner:
                 ):
                     raise ValueError(f"fused stage block {prefix!r} overlaps another fused artifact")
                 block = bottleneck_plans.get(prefix)
-                if block is None:
+                if block is None and self.layer_engine and prefix in _basic_prefixes(model):
+                    binding = _bind_basic_block(model, prefix)  # ResNet-18/34 basic block
+                    block = binding["block"]
+                elif block is None:
                     raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
-                binding = bind_fused_bottleneck(
-                    model, block, blocked=self.fused_stage_blocked,
-                    max_chunk=self.fused_body_chunk_caps.get(prefix) or None,
-                )
+                else:
+                    binding = bind_fused_bottleneck(
+                        model, block, blocked=self.fused_stage_blocked,
+                        max_chunk=self.fused_body_chunk_caps.get(prefix) or None,
+                        engine=self.layer_engine,
+                    )
                 if previous_binding is not None and (
                     previous_binding["output_shape"] != binding["input_shape"]
                     or previous_binding["output_raw_name"] != binding["input_raw_name"]
@@ -455,6 +490,7 @@ class XDNAResNetRunner:
         self.context_cache_limit = min(16, max(1, int(os.environ.get("XRT_CONTEXT_CACHE_SIZE", "16"))))
         self.context_budget_fallback_blocks: list[str] = []
         self._forced_cpu_convs: set[int] = set()
+        self._gemm_weights: dict[int, tuple[Any, np.ndarray]] = {}
         active_prefixes = set(prepared_blocks)
         active_stages = set(prepared_stages)
         pool_contexts = {
@@ -1578,8 +1614,13 @@ class XDNAResNetRunner:
             from . import layer_engine as le
             from .layer_engine_net import jobs_from_bindings
             from .resnet_stage_design import stage_specs
-        _cols, binds = stage_specs(model, self.device_network_stages)
-        jobs, _outs = jobs_from_bindings(binds, reuse_slots=True)
+        basic = set(_basic_prefixes(model))
+        if basic and all(p in basic for stage in self.device_network_stages for p in stage):
+            binds = [[_bind_basic_block(model, p) for p in stage] for stage in self.device_network_stages]
+            jobs, _outs = _basic_jobs(binds, reuse_slots=True)
+        else:
+            _cols, binds = stage_specs(model, self.device_network_stages, engine=True)
+            jobs, _outs = jobs_from_bindings(binds, reuse_slots=True)
         stem = None
         if self.layer_engine_stem:
             try:
@@ -1911,7 +1952,18 @@ class XDNAResNetRunner:
                 result = args[0].reshape(math.prod(args[0].shape[:axis]), math.prod(args[0].shape[axis:]))
             elif op == "Gemm":
                 a = args[0].T if int(attrs.get("transA", 0)) else args[0]
-                b = args[1].T if int(attrs.get("transB", 0)) else args[1]
+                if int(attrs.get("transB", 0)):
+                    # constant weights: transpose once into a contiguous float32 matrix (a strided
+                    # view made this Gemm 10x slower than the whole device call on 1000-class heads)
+                    cached = self._gemm_weights.get(index)
+                    if cached is None or cached[0] is not args[1]:
+                        cached = (args[1], np.ascontiguousarray(np.asarray(args[1], dtype=np.float32).T))
+                        self._gemm_weights[index] = cached
+                    b = cached[1]
+                else:
+                    b = args[1]
+                if a.dtype != b.dtype and a.dtype == np.float64 and b.dtype == np.float32:
+                    a = a.astype(np.float32)  # keep the matmul in float32 (a float64 view promoted the whole weight matrix per call)
                 result = float(attrs.get("alpha", 1.0)) * (a @ b)
                 if len(args) > 2:
                     result = result + float(attrs.get("beta", 1.0)) * args[2]

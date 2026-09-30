@@ -81,10 +81,10 @@ def run_reference(jobs, x_dense: np.ndarray):
     return maps, layouts
 
 
-def build(name: str, seed: int = 0):
+def build(name: str, seed: int = 0, arch: str = "3,4,6,3"):
     rng = np.random.default_rng(seed)
     if name == "full":
-        jobs, _segments, _stem = full(seed)
+        jobs, _segments, _stem = full(seed, arch)
         return jobs, None
     if name in ("body", "bodyr"):
         jobs, _, x = body(seed)
@@ -108,10 +108,10 @@ def build(name: str, seed: int = 0):
     return jobs, x
 
 
-def segments_for(name: str, jobs):
+def segments_for(name: str, jobs, arch: str = "3,4,6,3"):
     """Core-program segments (first_job, jobs_per_iteration, repeat) for a named net."""
     if name == "full":
-        return full()[1]
+        return full(0, arch)[1]
     if name in ("body", "bodyr"):
         return body()[1]
     return [(0, len(jobs), 1)]
@@ -125,10 +125,58 @@ def synthetic_stem(seed: int = 0):
     }
 
 
-def full(seed: int = 0):
-    """Stem + pool + layer1..4 (random weights) in one arena. Returns (jobs, segments, stem)."""
-    body_jobs, segments, _ = body(seed)
+def arch_stages(arch: str = "3,4,6,3"):
+    """``"3,4,6,3"`` or ``"3,4,6,3:2"`` (bottleneck counts per stage, optional width multiplier of the 3x3 width)."""
+    counts, _, width = arch.partition(":")
+    mult = int(width or 1)
+    n1, n2, n3, n4 = (int(v) for v in counts.split(","))
+    return ((n1, 64 * mult, 256, 1), (n2, 128 * mult, 512, 2), (n3, 256 * mult, 1024, 2), (n4, 512 * mult, 2048, 2))
+
+
+def full(seed: int = 0, arch: str = "3,4,6,3"):
+    """Stem + pool + layer1..4 (random weights) in one arena. Returns (jobs, segments, stem).
+
+    ``arch`` is ``"3,4,6,3[:W]"`` (bottleneck) or ``"basic:2,2,2,2"`` (basic blocks).
+    """
+    if arch.startswith("basic:"):
+        body_jobs, segments, _ = basic_body(seed, tuple(int(v) for v in arch[6:].split(",")))
+    else:
+        body_jobs, segments, _ = body(seed, stages=arch_stages(arch))
     assign_slots(body_jobs)
     stem = synthetic_stem(seed)
     jobs = assemble_full(stem, body_jobs)
     return jobs, [(first + 5, count, repeat) for first, count, repeat in segments], stem
+
+
+def basic_body(seed: int = 0, counts=(2, 2, 2, 2), hw: int = 8):
+    """ResNet-18/34 style layer1..4 (basic blocks, random weights). Returns (jobs, segments, x)."""
+    from layer_engine_net import basic_block_jobs
+
+    rng = np.random.default_rng(seed)
+    jobs, segments = [], []
+    lay, cin, slot, block_in = layout_for(64, hw, hw), 64, 1, 0
+    widths, strides = (64, 128, 256, 512), (1, 2, 2, 2)
+    for stage, (n, width, stride) in enumerate(zip(counts, widths, strides)):
+        for b in range(n):
+            proj = b == 0 and stage > 0
+            st = stride if b == 0 else 1
+            raw = {
+                "w1": rng.integers(-24, 24, (width, cin, 3, 3), dtype=np.int8), "b1": rng.integers(-800, 800, width, dtype=np.int32),
+                "w2": rng.integers(-24, 24, (width, width, 3, 3), dtype=np.int8), "b2": rng.integers(-800, 800, width, dtype=np.int32),
+                "skip_weight": rng.integers(-24, 24, (width, cin, 1, 1), dtype=np.int8) if proj else None,
+                "skip_bias": rng.integers(-800, 800, width, dtype=np.int32) if proj else None,
+            }
+            first = len(jobs)
+            block, slot, lay = basic_block_jobs(raw, st, (9, 8), 8, -1, 0, block_in, slot, lay)
+            jobs += block
+            block_in, cin = block[-1].out_slot, width
+            if proj or (stage == 0 and b == 0):
+                segments.append((first, len(block), 1))
+            else:
+                last = segments[-1]
+                if last[1] == len(block) and last[0] + last[1] * last[2] == first:
+                    segments[-1] = (last[0], last[1], last[2] + 1)
+                else:
+                    segments.append((first, len(block), 1))
+    x = rng.integers(128, 256, (hw * hw, 64), dtype=np.uint8)
+    return jobs, segments, x

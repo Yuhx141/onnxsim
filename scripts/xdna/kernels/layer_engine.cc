@@ -113,15 +113,15 @@ inline Layer load(const uint8_t *slot) {
 
 // One 8-pixel A tile per input block of one region, gathered from per-row source pixel offsets
 // (invalid rows are zeroed by a mask, so the copy is branch-free) into scratch_tiles.
-inline void gather_region(int8_t *scratch, const int8_t *region, int nbp, int p_in, const int *offs, const uint64_t *mask) {
+inline void gather_region(int8_t *scratch, const int8_t *region, int nbp, int p_in, const int *offs, const uint64_t *mask, uint64_t flip) {
   uint64_t *dst = (uint64_t *)scratch;
   for (int l = 0; l < nbp; ++l) {
     const int8_t *base = region + l * p_in * 8;
     _Pragma("clang loop unroll(full)")
 #ifdef ENG_GATHER_NOMASK
-    for (int r = 0; r < 8; ++r) dst[l * 8 + r] = *(const uint64_t *)(base + offs[r] * 8);
+    for (int r = 0; r < 8; ++r) dst[l * 8 + r] = *(const uint64_t *)(base + offs[r] * 8) ^ flip;
 #else
-    for (int r = 0; r < 8; ++r) dst[l * 8 + r] = *(const uint64_t *)(base + offs[r] * 8) & mask[r];
+    for (int r = 0; r < 8; ++r) dst[l * 8 + r] = (*(const uint64_t *)(base + offs[r] * 8) ^ flip) & mask[r];  // re-centre uint8 inputs before masking: padding must stay 0
 #endif
   }
 }
@@ -227,7 +227,10 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     if (L.nb % 4 == 0) tiled_gemm<4>(L, L.t_out, a_base, p_in * 8, epi);
     else tiled_gemm<2>(L, L.t_out, a_base, p_in * 8, epi);
   } else {
-    if (L.s == 1) {
+    const int pad_w = L.w + 2, pad_bytes = (L.h + 2) * pad_w * 8;
+    const bool pad_fits = L.nbp * (L.w * L.h * 8 + pad_bytes) <= ENG_REGION_BYTES ||
+                          L.ncp * ENG_REGION_BYTES + L.nbp * L.ncp * pad_bytes <= ENG_ACT_BYTES;
+    if (L.s == 1 && pad_fits) {
       // Stride-1 3x3: a zero-padded copy of every input block is built once (first chunk); an A tile is
       // then 1/2/4 contiguous row segments of that copy, so no per-row gather is needed. The copy sits
       // in the unused bytes of each input region when it fits there, else in the activation object's tail.
@@ -235,6 +238,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
       const bool in_region = L.nbp * (p_in + padp) * 8 <= ENG_REGION_BYTES;
       int8_t *pad0 = (int8_t *)act + (in_region ? L.nbp * p_in * 8 : L.ncp * ENG_REGION_BYTES);
       const int cps = in_region ? ENG_REGION_BYTES : L.nbp * lps;
+      const int8_t fl = L.in_flip ? (int8_t)-128 : (int8_t)0;  // uint8 inputs are re-centred while copying, so the zero border stays 0
       if (L.first) {
         for (int cp = 0; cp < L.ncp; ++cp)
           for (int l = 0; l < L.nbp; ++l) {
@@ -246,19 +250,18 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
               int8_t *d = dst + ((y + 1) * pw + 1) * 8;
               const int8_t *sp = src + y * L.w * 8;
               if (L.w >= 8) {
-                for (int x = 0; x < L.w; x += 8) aie::store_unaligned_v(d + x * 8, aie::load_unaligned_v<64>(sp + x * 8));
+                for (int x = 0; x < L.w; x += 8) aie::store_unaligned_v(d + x * 8, aie::bit_xor(aie::load_unaligned_v<64>(sp + x * 8), aie::broadcast<int8, 64>(fl)));
               } else if (L.w == 4) {
-                aie::store_unaligned_v(d, aie::load_unaligned_v<32>(sp));
+                aie::store_unaligned_v(d, aie::bit_xor(aie::load_unaligned_v<32>(sp), aie::broadcast<int8, 32>(fl)));
               } else if (L.w == 2) {
-                aie::store_unaligned_v(d, aie::load_unaligned_v<16>(sp));
+                aie::store_unaligned_v(d, aie::bit_xor(aie::load_unaligned_v<16>(sp), aie::broadcast<int8, 16>(fl)));
               } else {
-                *(uint64_t *)d = *(const uint64_t *)sp;
+                *(uint64_t *)d = *(const uint64_t *)sp ^ (L.in_flip ? 0x8080808080808080ull : 0ull);
               }
             }
           }
       }
       const int seg = L.w >= 8 ? 1 : (L.w == 4 ? 2 : (L.w == 2 ? 4 : 1));
-      const v64 fm = aie::broadcast<int8, 64>(L.in_flip ? (int8_t)-128 : (int8_t)0);
       const int rowb = pw * 8;
       for (int t = 0; t < L.t_out; ++t) {
         const int trow = (py[t * 8] * pw + px[t * 8]) * 8;
@@ -284,7 +287,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
               const int wstride = L.nbp * 64;
               if (seg == 1) {
                 for (int i = 0; i < run; ++i) {
-                  v64 a = aie::bit_xor(aie::load_unaligned_v<64>(ap), fm);
+                  v64 a = aie::load_unaligned_v<64>(ap);
                   ap += cps;
                   c0.mac(a, aie::load_v<64>(w0)); w0 += wstride;
                   c1.mac(a, aie::load_v<64>(w1)); w1 += wstride;
@@ -292,7 +295,6 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
               } else if (seg == 2) {
                 for (int i = 0; i < run; ++i) {
                   v64 a = aie::concat(aie::load_unaligned_v<32>(ap), aie::load_unaligned_v<32>(ap + rowb));
-                  a = aie::bit_xor(a, fm);
                   ap += cps;
                   c0.mac(a, aie::load_v<64>(w0)); w0 += wstride;
                   c1.mac(a, aie::load_v<64>(w1)); w1 += wstride;
@@ -301,7 +303,6 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
                 for (int i = 0; i < run; ++i) {
                   v64 a = aie::concat(aie::concat(aie::load_unaligned_v<16>(ap), aie::load_unaligned_v<16>(ap + rowb)),
                                       aie::concat(aie::load_unaligned_v<16>(ap + 2 * rowb), aie::load_unaligned_v<16>(ap + 3 * rowb)));
-                  a = aie::bit_xor(a, fm);
                   ap += cps;
                   c0.mac(a, aie::load_v<64>(w0)); w0 += wstride;
                   c1.mac(a, aie::load_v<64>(w1)); w1 += wstride;
@@ -321,7 +322,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     }
     // Gather: reduction step tt = tap_index * NCP + region, region fastest. The eight source
     // offsets/masks depend only on (tap, pixel tile) so they are rebuilt when the tap changes.
-    const v64 fm = aie::broadcast<int8, 64>(L.in_flip ? (int8_t)-128 : (int8_t)0);
+    const uint64_t flip64 = L.in_flip ? 0x8080808080808080ull : 0ull;
     int offs[8];
     uint64_t mask[8];
     for (int t = 0; t < L.t_out; ++t) {
@@ -351,9 +352,9 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
             mask[r] = ok ? ~0ull : 0ull;
           }
         }
-        gather_region(scratch_tiles, act + cp * ENG_REGION_BYTES, L.nbp, p_in, offs, mask);
+        gather_region(scratch_tiles, act + cp * ENG_REGION_BYTES, L.nbp, p_in, offs, mask, flip64);
         for (int l = 0; l < L.nbp; ++l) {
-          v64 a = aie::bit_xor(aie::load_v<64>(scratch_tiles + l * 64), fm);
+          v64 a = aie::load_v<64>(scratch_tiles + l * 64);
           c0.mac(a, aie::load_v<64>(w0)); w0 += 64;
           c1.mac(a, aie::load_v<64>(w1)); w1 += 64;
         }

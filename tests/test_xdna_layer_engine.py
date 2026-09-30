@@ -224,3 +224,49 @@ def test_full_net_uses_disjoint_stem_slots_and_a_small_arena():
         sum(count * repeat for _first, count, repeat in segments)
         == len(jobs) - le.STEM_JOBS
     )
+
+
+def test_basic_blocks_pack_and_match_the_reference():
+    # ResNet-18/34 style blocks: conv3x3 (stride 2 + uint8 input on the projection block) + conv3x3 + residual.
+    jobs, segments, x = nets.basic_body(0, counts=(1, 2, 1, 1), hw=8)
+    assert [job.name for job in jobs[:5]] == [
+        "a",
+        "b",
+        "sk",
+        "a",
+        "b",
+    ]  # stage 1 identity, then the stage-2 projection block
+    maps, _ = nets.run_reference(jobs, x)
+    for job in jobs:
+        resid = maps[job.res_slot] if job.res_slot is not None else None
+        got = _emulate(job, 4096, maps[job.in_slot], resid)
+        assert np.array_equal(got, maps[job.out_slot]), job.name
+
+
+def test_basic_body_segments_cover_every_job():
+    jobs, segments, _x = nets.basic_body(0, counts=(3, 4, 6, 3))
+    assert sum(count * repeat for _first, count, repeat in segments) == len(jobs)
+    assert (
+        segments[0][1] == 2 and segments[0][2] == 3
+    )  # stage 1: three identity blocks [a, b]
+    assert [seg[1] for seg in segments[1:]] == [
+        3,
+        2,
+        3,
+        2,
+        3,
+        2,
+    ]  # projection [sk, a, b] + identity [a, b] per stage
+
+
+def test_pow2_zero_padding_stays_zero_for_uint8_inputs():
+    # A 3x3 over a uint8-with-zero-point-128 input pads with the *value* zero, i.e. byte 128.
+    rng = np.random.default_rng(3)
+    lay = le.layout_for(64, 4, 4)
+    weight = rng.integers(-8, 8, (64, 64, 3, 3), dtype=np.int8)
+    job = le.Job(
+        "t", weight, np.zeros(64, dtype=np.int32), 0, 1, lay, in_flip=True, shift=6
+    )
+    dense = rng.integers(128, 256, (16, 64), dtype=np.uint8)
+    got = _emulate(job, 4096, dense, None)
+    assert np.array_equal(got, le.reference(job, dense, None))

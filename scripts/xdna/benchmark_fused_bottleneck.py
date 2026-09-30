@@ -64,7 +64,7 @@ def _quantizer_after(value: str, nodes: list[Any], consumers: dict[str, list[int
 
 def bind_fused_bottleneck(
     model: Any, block: BottleneckBlockPlan, *, conv1_mmul: bool = True, blocked: bool = False,
-    max_chunk: int | None = None,
+    max_chunk: int | None = None, engine: bool = False,
 ) -> dict[str, Any]:
     nodes = list(model.graph.node)
     edges = dict(qdq_edge_map(model))
@@ -293,6 +293,8 @@ def bind_fused_bottleneck(
         conv2_live = padded1 + conv2_im2col + out_pixels * mid_channels // 2
         live_tensor_bytes = max(conv1_live, conv2_live) + 4096
     max_chunk_bytes = min((max_chunk or int(os.environ.get("XDNA_BLOCKED_MAX_CHUNK", "49152"))) if blocked else 36864, tile_memory_bytes - worker_stack_bytes - live_tensor_bytes)
+    if engine:  # the layer engine only reads the raw weights: no per-tile weight slots to fit
+        max_chunk_bytes = 1 << 30
     if max_chunk_bytes <= 0:
         raise ValueError(
             f"{block.prefix}: full-tensor producer buffers need {live_tensor_bytes} bytes; "
