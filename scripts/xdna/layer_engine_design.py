@@ -60,7 +60,7 @@ def engine(
         def run_job(j, job):
             if job.res_slot is not None:  # residual map = a second broadcast object right after the input
                 both = act.acquire(2)
-                a, r = both[0], both[1]
+                r, a = both[0], both[1]  # the residual is filled first (a job early)
             else:
                 a = act.acquire(1)
                 r = a
@@ -95,7 +95,7 @@ def engine(
         def run(kind, res, stage):
             a = act.acquire(2 if res else 1)
             if res:
-                a, r = a[0], a[1]
+                r, a = a[0], a[1]  # the residual is filled first (a job early)
             else:
                 r = a
             o = out.acquire(1)
@@ -159,8 +159,10 @@ def engine(
             group = TaskGroup()
             aprod.fill(a_in, group=group, offset=job.in_slot * SLOT_BYTES, sizes=[1, 1, 1, SLOT_BYTES],
                        strides=[0, 0, 0, 1], transfer_len=SLOT_BYTES)
-            if job.res_slot is not None:
-                aprod.fill(a_in, group=group, offset=job.res_slot * SLOT_BYTES, sizes=[1, 1, 1, SLOT_BYTES],
+            if j + 1 < len(jobs) and jobs[j + 1].res_slot is not None:
+                # The next job's residual map already exists: queue it behind this job's input now so its
+                # transfer overlaps this job's compute (the core takes it first, then the input).
+                aprod.fill(a_in, group=group, offset=jobs[j + 1].res_slot * SLOT_BYTES, sizes=[1, 1, 1, SLOT_BYTES],
                            strides=[0, 0, 0, 1], transfer_len=SLOT_BYTES)
             for col, oc in enumerate(ocons):
                 oc.drain(a_out, wait=True, group=group, offset=job.out_slot * SLOT_BYTES + col * ROWS * REGION_BYTES,

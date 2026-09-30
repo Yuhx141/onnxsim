@@ -46,16 +46,16 @@ def body(seed: int = 0, stages=((3, 64, 256, 1), (4, 128, 512, 2), (6, 256, 1024
             rw = lambda o, i, k: rng.integers(-24, 24, (o, i, k, k), dtype=np.int8)
             rb = lambda c: rng.integers(-800, 800, c, dtype=np.int32)
             c1 = Job(f"c1", rw(mid, cin, 1), rb(mid), block_in, slot, lay, in_flip=True, shift=9); slot += 1
-            c2 = Job(f"c2", rw(mid, mid, 3), rb(mid), c1.out_slot, slot, c1.out_layout, stride=st, shift=9); slot += 1
-            blk = [c1, c2]
+            blk = [c1]
             res_slot, res_mode = block_in, 2
-            if proj:
+            if proj:  # the skip conv runs before conv2 so its output (the residual) is ready a job early
                 sk = Job("sk", rw(out, cin, 1), rb(out), block_in, slot, lay, stride=st, in_flip=True, shift=8, relu=False); slot += 1
                 blk.append(sk)
                 res_slot, res_mode = sk.out_slot, 1
+            c2 = Job(f"c2", rw(mid, mid, 3), rb(mid), c1.out_slot, slot, c1.out_layout, stride=st, shift=9); slot += 1
             c3 = Job("c3", rw(out, mid, 1), rb(out), c2.out_slot, slot, c2.out_layout, shift=8, res_slot=res_slot,
                      res_mode=res_mode, out_flip=True, ea=-1, eb=0); slot += 1
-            blk.append(c3)
+            blk += [c2, c3]
             jobs += blk
             block_in = c3.out_slot
             cin = out
