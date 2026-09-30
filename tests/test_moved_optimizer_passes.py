@@ -94,6 +94,28 @@ def test_fuse_mul_into_conv_scalar():
     assert not _conv_out_feeds_mul(sim)
 
 
+def test_fuse_mul_into_conv_singleton_rank_scale_keeps_bias_rank_one():
+    w = _f32(np.arange(2, dtype=np.float32).reshape(2, 1, 1, 1) + 1, "W")
+    b = _f32(np.array([0.5, -0.5]), "B")
+    s = _f32(np.array([[[[2.0]]]]), "S")
+    model = _model(
+        """
+        g (float[1,1,2,2] X) => (float[1,2,2,2] Y)
+        {
+          Z = Conv(X, W, B)
+          Y = Mul(Z, S)
+        }
+        """,
+        initializer=[w, b, s],
+    )
+    sim, ops = _simplify(model)
+    onnx.checker.check_model(sim)
+    assert ops["Conv"] == 1
+    conv = next(n for n in sim.graph.node if n.op_type == "Conv")
+    bias = next(t for t in sim.graph.initializer if t.name == conv.input[2])
+    assert list(bias.dims) == [2]
+
+
 # --------------------------------------------------------------------------- #
 # fuse_preceding_mul_into_conv
 # --------------------------------------------------------------------------- #

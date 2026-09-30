@@ -906,7 +906,9 @@ def _rope_slice_inits(half):
     """
 
 
-def _rope_model(B=2, NH=4, S=6, Dh=8, share_angle=True, opset=23):
+def _rope_model(
+    B=2, NH=4, S=6, Dh=8, share_angle=True, opset=23, expose_embedding=False
+):
     half = Dh // 2
     angle2 = "angle" if share_angle else "angle2"
     inputs = f"float[{B},{NH},{S},{Dh}] q, float[{B},{NH},{S},{Dh}] k, float[{B},{S},{half}] angle"
@@ -916,8 +918,14 @@ def _rope_model(B=2, NH=4, S=6, Dh=8, share_angle=True, opset=23):
         # inputs are then genuinely different, so fuse_rope must decline
         # rather than assume this is duplication.
         inputs += f", float[{B},{S},{half}] angle2"
+    outputs = (
+        f"float[{B},{NH},{S},{Dh}] q_embed, "
+        f"float[{B},{NH},{S},{Dh}] k_embed"
+    )
+    if expose_embedding:
+        outputs += f", float[{B},{S},{Dh}] emb"
     body = f"""
-        g ({inputs}) => (float[{B},{NH},{S},{Dh}] q_embed, float[{B},{NH},{S},{Dh}] k_embed)
+        g ({inputs}) => ({outputs})
         <{_rope_slice_inits(half)}>
         {{
           emb = Concat<axis = -1>(angle, {angle2})
@@ -945,6 +953,15 @@ def test_fuse_rope():
     assert ops["Unsqueeze"] == 0
     assert ops["Mul"] == 0
     assert ops["Add"] == 0
+
+
+def test_fuse_rope_preserves_public_shared_embedding():
+    model = _rope_model(expose_embedding=True)
+    simplified, ops = _simplify(model)
+    onnx.checker.check_model(simplified)
+    assert ops["RotaryEmbedding"] == 2
+    assert ops["Concat"] == 1
+    assert any(output.name == "emb" for output in simplified.graph.output)
 
 
 def test_fuse_rope_below_opset_23_untouched():
@@ -1155,6 +1172,88 @@ def test_fuse_reshape_family_declines_unresolved_output_shape():
     assert ops["Flatten"] == 1
     assert ops["Unsqueeze"] == 1
     assert ops["Reshape"] == 0
+
+
+def test_fuse_reshape_family_declines_zero_with_inferred_dimension():
+    model = _model(
+        """
+        g (float[0,N,3,4] X) => (float[0,M] Y)
+        <int64[1] axes = {1}>
+        {
+          expanded = Unsqueeze(X, axes)
+          Y = Flatten<axis = 1>(expanded)
+        }
+        """,
+        opset=14,
+    )
+    onnx.checker.check_model(model)
+    simplified, _ = onnxsim.simplify(model, check_n=0)
+    onnx.checker.check_model(simplified)
+    ops = collections.Counter(n.op_type for n in simplified.graph.node)
+    assert ops["Unsqueeze"] == 1
+    assert ops["Flatten"] == 1
+    assert ops["Reshape"] == 0
+
+
+def test_loop_with_nested_capture_is_not_unrolled():
+    def branch(name):
+        one = onnx.helper.make_tensor("one", onnx.TensorProto.FLOAT, [1], [1.0])
+        return onnx.helper.make_graph(
+            [onnx.helper.make_node("Add", ["v_in", "one"], [f"{name}_out"])],
+            name,
+            [],
+            [
+                onnx.helper.make_tensor_value_info(
+                    f"{name}_out", onnx.TensorProto.FLOAT, [1]
+                )
+            ],
+            [one],
+        )
+
+    body = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node(
+                "If",
+                ["cond_in"],
+                ["v_out"],
+                then_branch=branch("then"),
+                else_branch=branch("else"),
+            )
+        ],
+        "loop_body",
+        [
+            onnx.helper.make_tensor_value_info("iter", onnx.TensorProto.INT64, []),
+            onnx.helper.make_tensor_value_info("cond_in", onnx.TensorProto.BOOL, []),
+            onnx.helper.make_tensor_value_info("v_in", onnx.TensorProto.FLOAT, [1]),
+        ],
+        [
+            onnx.helper.make_tensor_value_info("cond_in", onnx.TensorProto.BOOL, []),
+            onnx.helper.make_tensor_value_info("v_out", onnx.TensorProto.FLOAT, [1]),
+        ],
+    )
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node(
+                "Loop", ["trip_count", "cond", "x"], ["y"], body=body
+            )
+        ],
+        "g",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])],
+        [
+            onnx.helper.make_tensor("trip_count", onnx.TensorProto.INT64, [], [2]),
+            onnx.helper.make_tensor("cond", onnx.TensorProto.BOOL, [], [True]),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    simplified, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(simplified)
+    assert any(n.op_type == "Loop" for n in simplified.graph.node)
 
 
 # --------------------------------------------------------------------------- #
@@ -1534,6 +1633,26 @@ def test_fuse_gelu_skips_old_opset():
     assert ops["Erf"] == 1
 
 
+def test_fuse_gelu_declines_nearby_formula_constant():
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <float half = {0.5009}, float one = {1.0}, float sqrt2 = {1.4142135623730951}>
+        {
+          t0 = Div(X, sqrt2)
+          t1 = Erf(t0)
+          t2 = Add(t1, one)
+          t3 = Mul(X, t2)
+          Y = Mul(t3, half)
+        }
+        """,
+        opset=20,
+    )
+    _, ops = _simplify(model)
+    assert ops["Gelu"] == 0
+    assert ops["Erf"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # LayerNorm subgraph fusion: onnxsim recognizes the textbook last-axis
 # decomposition (mean/var via ReduceMean, either Mul(diff,diff) or
@@ -1617,6 +1736,72 @@ def test_fuse_layer_norm_skips_mismatched_scale_shape():
     )
     _, ops = _simplify(model)
     assert ops["LayerNormalization"] == 0
+
+
+def test_fuse_layer_norm_declines_nearby_exponent():
+    inits = _layer_norm_inits()
+    inits[1] = _f32(np.array([2.0005]), "two")
+    model = _model(
+        f"""
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        {{
+          {_layer_norm_body("Pow")}
+        }}
+        """,
+        initializer=inits,
+        opset=17,
+    )
+    simplified, _ = onnxsim.simplify(model, check_n=0)
+    onnx.checker.check_model(simplified)
+    ops = collections.Counter(n.op_type for n in simplified.graph.node)
+    assert ops["LayerNormalization"] == 0
+
+
+def test_normalization_fusions_decline_unrepresentable_double_epsilon():
+    layer_model = _model(
+        f"""
+        g (double[2,4,8] X) => (double[2,4,8] Y)
+        {{
+          {_layer_norm_body("Mul")}
+        }}
+        """,
+        initializer=[
+            _f64(np.array([1e-300]), "eps"),
+            _f64(np.array([2.0]), "two"),
+            _f64(np.ones(8), "scale"),
+            _f64(np.zeros(8), "bias"),
+        ],
+        opset=17,
+    )
+    rms_model = _model(
+        """
+        g (double[2,4,8] X) => (double[2,4,8] Y)
+        <int64[1] axes = {-1}>
+        {
+          sq = Pow(X, two)
+          var = ReduceMean<keepdims = 1>(sq, axes)
+          var_eps = Add(var, eps)
+          rms = Sqrt(var_eps)
+          normed = Div(X, rms)
+          Y = Mul(weight, normed)
+        }
+        """,
+        initializer=[
+            _f64(np.array(2.0), "two"),
+            _f64(np.array(1e-300), "eps"),
+            _f64(np.ones(8), "weight"),
+        ],
+        opset=23,
+        ir_version=11,
+    )
+    for model, fused_op in (
+        (layer_model, "LayerNormalization"),
+        (rms_model, "RMSNormalization"),
+    ):
+        onnx.checker.check_model(model)
+        simplified, _ = onnxsim.simplify(model, check_n=0)
+        onnx.checker.check_model(simplified)
+        assert all(n.op_type != fused_op for n in simplified.graph.node)
 
 
 # --------------------------------------------------------------------------- #
