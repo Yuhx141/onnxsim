@@ -47,7 +47,7 @@ from typing import Any
 
 import numpy as np
 import onnx
-from onnx import helper, numpy_helper, shape_inference
+from onnx import utils, helper, numpy_helper, shape_inference
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -2305,6 +2305,7 @@ def build_u16_segments(
     pattern: str,
     cache_dir: str,
     kinds: Sequence[str] = ("matmul_chain",),
+    splits: Sequence[int] = (),
 ) -> dict[str, bytes]:
     """Move the 8-bit segments of ``kinds`` whose name matches ``pattern`` to
     16-bit axmodels built on the reference batch's real tensors. Returns the
@@ -2326,19 +2327,58 @@ def build_u16_segments(
     work = os.path.join(cache_dir, "work")
     blobs: dict[str, bytes] = {}
     for k, seg in enumerate(targets):
-        try:
-            sub, post = u16_chain.chain_model(model, seg.inputs, seg.outputs)
-            data = {t: np.asarray(outs[t], np.float32) for t in seg.inputs}
-            blobs[seg.name] = u16_chain.cached_chain_axmodel(
-                cache_dir, work, seg.name, sub, data
-            )
-        except Exception as exc:  # stays 8-bit
-            print(f"  16-bit {seg.name}: {type(exc).__name__}: {exc}", flush=True)
+        data = {t: np.asarray(outs[t], np.float32) for t in seg.inputs}
+        full = utils.Extractor(model).extract_model(seg.inputs, seg.outputs)
+        batch = u16_chain.split_batch(full)
+        done = None
+        for split in (1, *splits):
+            try:
+                sub, post = u16_chain.chain_model(
+                    model, seg.inputs, seg.outputs, split
+                )
+                chunk: Mapping = data
+                if split > 1:
+                    # one calibration sample per chunk, so MinMax covers the
+                    # whole batch and every chunk fits the range
+                    flags = u16_chain.split_flags(full.graph.input, batch)
+                    chunk = {
+                        t: [
+                            np.array_split(a, split)[j] if f else a
+                            for j in range(split)
+                        ]
+                        for (t, a), f in zip(data.items(), flags)
+                    }
+                blob = u16_chain.cached_chain_axmodel(
+                    cache_dir,
+                    work,
+                    seg.name if split == 1 else f"{seg.name}_s{split}",
+                    sub,
+                    chunk,
+                )
+            except Exception as exc:  # smaller batch, or stays 8-bit
+                print(
+                    f"  16-bit {seg.name} split {split}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+            done = (split, blob, post, chunk)
+            break
+        if done is None:
             continue
+        split, blob, post, _ = done
+        blobs[seg.name] = blob
         seg.kind = "u16_chain"
         seg.in_q, seg.out_q = [], []
         seg.output_transform = post
-        print(f"  16-bit {seg.name} ({k + 1}/{len(targets)})", flush=True)
+        if split > 1:
+            seg.batch_split = split
+            seg.split = u16_chain.split_flags(full.graph.input, batch)
+        print(
+            f"  16-bit {seg.name} ({k + 1}/{len(targets)})"
+            + (f" split {split}" if split > 1 else ""),
+            flush=True,
+        )
     return blobs
 
 
@@ -2549,6 +2589,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "(e.g. matmul_chain,misc,relu,elementwise,reducesum_flatten)",
     )
     p.add_argument(
+        "--u16-splits",
+        default="",
+        help="comma-separated batch split factors to retry with (e.g. 4,16) "
+        "when a 16-bit chain does not compile at the full batch; the segment "
+        "runs the smaller model once per chunk",
+    )
+    p.add_argument(
         "--u16-cache-dir",
         default=os.path.join(tempfile.gettempdir(), "axera-u16-chain-cache"),
         help="cache of 16-bit segment builds",
@@ -2671,6 +2718,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.u16_matmul,
                 args.u16_cache_dir,
                 args.u16_kinds.split(","),
+                [int(x) for x in args.u16_splits.split(",") if x],
             )
         )
     grad_names = gradient_tensors(model, ref["state_map"])

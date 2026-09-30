@@ -443,3 +443,26 @@ errors, health 0 LSB, no runtime fallback. Five 16-bit segments failed their
 gate or build (`ReduceSum_460` exceeded the 30 minute build timeout) and ran as
 float. The rest of the gradient error is the 34 backward MatMul chains still at
 8 bits (12 of them beyond 2 LSB of their simulation).
+
+### All MatMul and Conv chains at 16 bits, `--u16-splits`
+
+`--u16-splits 4,16` retries a 16-bit chain that does not compile at the step's
+batch (Pulsar2 build cap `U16_BUILD_TIMEOUT`, default 1800 s) at a smaller
+batch: the chain is rebuilt with every batch-leading input shrunk by the
+factor, calibrated on all the chunks together, and the segment runs the small
+model once per chunk (`batch_split`). `conv0_fwd` does not build at batch 16
+(it exceeded 3 hours) but builds at batch 4 and runs four times. A failed build
+leaves a `.failed` marker in `--u16-cache-dir`, so it is not retried unless
+`U16_RETRY_FAILED` is set.
+
+AX8850 replay, `--stable-softmax-grad --host-optimizer --exact-fp32-io
+--u16-kinds matmul_chain,misc --u16-splits 4` (95 segments at U16, none of the
+step's MatMul or Conv chains left at 8 bits; zero device errors, health 0
+LSB): median gradient cosine **0.9974** (was 0.839 at 8 bits), minimum
+0.021 (was 0), median update cosine 0.82, loss 17.004 against 17.058 float.
+`MatMul_121` (bare MatMul, 1.8e-4) and `conv0_fwd` (9e-4) were the last two
+8-bit chains and accounted for most of the remaining gradient error. Eight
+16-bit segments miss their gate and run as float: `dense0_fwd` (1.3e-2),
+`Softmax_9`, `Log_10` (zero probabilities), `MatMul_471` (9.8e-3), three
+`ReduceSum` (0.6-1.2e-2), and `MatMul_325` (input shape mismatch). `ReduceSum_460`
+does not build within 40 minutes even at batch 1.
