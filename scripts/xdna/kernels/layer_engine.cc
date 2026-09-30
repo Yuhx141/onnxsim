@@ -222,6 +222,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     const int n = L.op * 8;
     uint8_t *dst0 = (uint8_t *)out;
 #ifndef ENG_NO_MOVE
+#ifndef ENG_NO_COPY
     if (L.mode == 6) {
       const int32_t *tab = (const int32_t *)L.weights;
       for (int ol = 0; ol < L.nb; ++ol) {
@@ -231,7 +232,10 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
         const int e = tab[ol * 3 + 2];
         if (e != 0) requant_bytes(dst, n, e);
       }
-    } else if (L.mode == 7) {
+    } else
+#endif
+#ifndef ENG_NO_UP
+    if (L.mode == 7) {
       const int f = L.s;
       for (int ol = 0; ol < L.nb; ++ol) {
         const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * L.w * L.h * 8;
@@ -247,6 +251,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
         }
       }
     } else
+#endif
 #endif
     {
       const int k = L.ntaps, pad = (k - 1) / 2;
@@ -276,6 +281,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     return;
   }
 #ifndef ENG_NO_MOVE
+#ifndef ENG_NO_GAP
   if (L.mode == 10) {
     // Global average pool of this core's blocks (pixel count a power of two): out = sat(rshift_even(sum, D_SHIFT)).
     const int n = L.w * L.h;
@@ -292,6 +298,8 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     }
     return;
   }
+#endif  // ENG_NO_GAP
+#ifndef ENG_NO_BMUL
   if (L.mode == 11) {
     // Broadcast multiply (squeeze-excite): out = sat(rshift_even((a - 128) * (b_c - 128), D_SHIFT)), b = 1x1 map in resid.
     const int n = L.w * L.h;
@@ -308,6 +316,53 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     }
     return;
   }
+#endif  // ENG_NO_BMUL
+#ifndef ENG_NO_AVG
+  if (L.mode == 12) {
+    // Average pool without padding (window K = D_NTAPS, stride D_S, K*K a power of two): out = sat(rshift_even(sum, D_SHIFT)).
+    const int k = L.ntaps, n = L.op * 8;
+    for (int ol = 0; ol < L.nb; ++ol) {
+      const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * L.w * L.h * 8;
+      uint8_t *dst = (uint8_t *)out + ol * n;
+      for (int oy = 0; oy < L.oh; ++oy)
+        for (int ox = 0; ox < L.ow; ++ox) {
+          int sum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+          for (int ky = 0; ky < k; ++ky)
+            for (int kx = 0; kx < k; ++kx) {
+              const uint8_t *p = blk + ((oy * L.s + ky) * L.w + ox * L.s + kx) * 8;
+              for (int c = 0; c < 8; ++c) sum[c] += (int)p[c] - 128;
+            }
+          for (int c = 0; c < 8; ++c) {
+            int q = rshift_even(sum[c], L.shift);
+            dst[(oy * L.ow + ox) * 8 + c] = (uint8_t)((q > 127 ? 127 : (q < -128 ? -128 : q)) + 128);
+          }
+        }
+    }
+    return;
+  }
+#endif  // ENG_NO_AVG
+#ifndef ENG_NO_D2S
+  if (L.mode == 13) {
+    // Depth-to-space by D_S: output block ob, pixel (oy, ox) <- source block table[ob][(oy % f) * f + ox % f] at pixel (oy / f, ox / f).
+    const int f = L.s, n = L.op * 8;
+    const int32_t *tab = (const int32_t *)L.weights;  // [nb][f*f] byte offsets of the source blocks (within the act object)
+    for (int ol = 0; ol < L.nb; ++ol) {
+      uint8_t *dst = (uint8_t *)out + ol * n;
+      int iy = 0, ry = 0;
+      for (int oy = 0; oy < L.oh; ++oy) {
+        int ix = 0, rx = 0;
+        for (int ox = 0; ox < L.ow; ++ox) {
+          const uint8_t *src = (const uint8_t *)act + tab[ol * f * f + ry * f + rx];
+          *(uint64_t *)(dst + (oy * L.ow + ox) * 8) = *(const uint64_t *)(src + (iy * (L.ow / f) + ix) * 8);
+          if (++rx == f) { rx = 0; ++ix; }
+        }
+        if (++ry == f) { ry = 0; ++iy; }
+      }
+    }
+    return;
+  }
+#endif  // ENG_NO_D2S
+#ifndef ENG_NO_ADD
   if (L.mode == 9) {
     // Add of two activations (same channel blocking): A = act, B = resid with region size D_TT0.
     const int n = L.w * L.h * 8;
@@ -316,6 +371,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
                 (const uint8_t *)resid + L.core * L.tt0 + ol * n, n, L.ea, L.eb);
     return;
   }
+#endif  // ENG_NO_ADD
 #endif  // ENG_NO_MOVE
 #ifndef ENG_NO_LUT
   if (L.mode == 5) {

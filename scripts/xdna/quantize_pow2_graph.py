@@ -150,6 +150,16 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
         elif op == "Identity" and node.input[0] in dq_of:
             dq_of[node.output[0]] = dq_of[node.input[0]]
             scale_of[node.output[0]] = scale_of[node.input[0]]
+        elif op == "ConvTranspose" and node.input[0] in dq_of:
+            x, w = node.input[0], init[node.input[1]]  # weights [ic][oc][kh][kw]
+            b = init[node.input[2]] if len(node.input) > 2 else np.zeros(w.shape[1], dtype=np.float32)
+            w_scale = _pow2_up(float(np.abs(w).max()) / 127.0)
+            bias_scale = max(_pow2_up(float(np.abs(b).max()) / 127.0), scale_of[x] * w_scale)
+            n = node.name
+            nodes.append(helper.make_node("DequantizeLinear", [const(f"{n}_wq", np.clip(np.rint(w / w_scale), -128, 127).astype(np.int8)), const(f"{n}_ws", np.float32(w_scale)), const(f"{n}_wz", np.int8(0))], [f"{n}_w"], name=f"{n}_wDQ"))
+            nodes.append(helper.make_node("DequantizeLinear", [const(f"{n}_bq", np.clip(np.rint(b / bias_scale), -128, 127).astype(np.int8)), const(f"{n}_bs", np.float32(bias_scale)), const(f"{n}_bz", np.int8(0))], [f"{n}_b"], name=f"{n}_bDQ"))
+            emit(node, [dq_of[x], f"{n}_w", f"{n}_b"])
+            qdq(node.output[0])
         elif op == "Conv" and node.input[0] in dq_of:
             x, w, b = (
                 node.input[0],

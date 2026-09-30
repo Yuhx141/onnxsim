@@ -76,6 +76,7 @@ class Compiled:
         default_factory=dict
     )  # Q-output name -> tensor (after slot assignment)
     pinned: list[int] = field(default_factory=list)
+    model: Any = None  # the (onnxsim-folded) model the jobs were compiled from
 
 
 def _shift(ratio: float, label: str) -> int:
@@ -94,9 +95,32 @@ def _exp2(ratio: float, label: str) -> int:
     return exponent
 
 
-def compile_graph(model: Any, reuse_slots: bool = False) -> Compiled:
+def prepare_model(model: Any) -> Any:
+    """Constant-fold the graph with onnxsim before codegen (Shape/Gather-derived Slice bounds, Reshape shapes, ...).
+
+    onnxsim is optional: without it (or if it fails) the model is compiled as given. Set ``ONNXSIM_PATH`` to a
+    directory holding a built ``onnxsim`` package if it is not installed.
+    """
+    import os
+    import sys
+
+    root = os.environ.get("ONNXSIM_PATH")
+    if root and root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        import onnxsim
+
+        simplified, ok = onnxsim.simplify(model)
+    except Exception:
+        return model
+    return simplified if ok else model
+
+
+def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) -> Compiled:
     from tinygrad_lower import subgraph_table
 
+    if simplify:
+        model = prepare_model(model)
     graph = model.graph
     init = {i.name: numpy_helper.to_array(i) for i in graph.initializer}
     alias: dict[str, str] = {}
@@ -209,10 +233,10 @@ def compile_graph(model: Any, reuse_slots: bool = False) -> Compiled:
         if op in ("QuantizeLinear", "DequantizeLinear"):
             continue
         if not engine_inputs(
-            node, [0] if op in ("Split", "Resize", "MaxPool", "Conv") else None
+            node, [0] if op in ("Split", "Resize", "MaxPool", "Conv", "Slice", "AveragePool", "ConvTranspose") else None
         ):
             continue  # float input: host tail
-        if op in ("Split", "Concat", "MaxPool", "Resize", "Add", "Slice"):
+        if op in ("Split", "Concat", "MaxPool", "Resize", "Add", "Slice", "AveragePool", "ConvTranspose"):
             handled.add(
                 node.name
             )  # consumed by the engine (its Q nodes are added below)
@@ -403,6 +427,51 @@ def compile_graph(model: Any, reuse_slots: bool = False) -> Compiled:
                       new_slot(), src.layout, kind="copy", copy_spec=spec)
             add_job(job)
             register(qnode.output[0], job, out_scale, out_zero)
+            handled.add(qnode.name)
+        elif op == "AveragePool":
+            src = dq_source(node.input[0])
+            (qnode,) = consumers[res(node.output[0])]
+            out_scale, out_zero = qp(qnode)
+            a = attrs_of(node)
+            k, st = a["kernel_shape"][0], a.get("strides", [1, 1])[0]
+            if a["kernel_shape"][0] != a["kernel_shape"][1] or any(a.get("pads", [0] * 4)) or (k * k) & (k * k - 1):
+                raise ValueError(f"{node.name}: only unpadded square average pools with a power-of-two window area are supported")
+            shift = int(math.log2(k * k)) + _exp2(out_scale / src.scale, "average pool rescale")
+            if shift < 0:
+                raise ValueError(f"{node.name}: average pool output scale is finer than its input")
+            channels = src.layout.nb * 8
+            job = Job(node.name, np.zeros((channels, 1, 1, 1), dtype=np.int8), np.zeros(channels, dtype=np.int32), src.slot, new_slot(),
+                      src.layout, stride=st, kind="avgpool", factor=k, shift=shift)
+            add_job(job)
+            register(qnode.output[0], job, out_scale, out_zero)
+            handled.add(qnode.name)
+        elif op == "ConvTranspose":
+            src = dq_source(node.input[0])
+            w_scale, _ = qp(producers[res(node.input[1])])
+            weight = init[res(producers[res(node.input[1])].input[0])]  # [ic][oc][kh][kw]
+            b_scale, _ = qp(producers[res(node.input[2])])
+            bias_q = init[res(producers[res(node.input[2])].input[0])]
+            a = attrs_of(node)
+            ic, oc, kh, kw = weight.shape
+            f = a.get("strides", [1, 1])[0]
+            if (kh, kw) != (f, f) or f < 2 or oc % 8 or a.get("group", 1) != 1 or any(a.get("pads", [0] * 4)):
+                raise ValueError(f"{node.name}: only ConvTranspose with kernel == stride and 8-multiple output channels is supported")
+            (qnode,) = consumers[res(node.output[0])]
+            out_scale, out_zero = qp(qnode)
+            product = src.scale * w_scale
+            bias = np.rint(bias_q.astype(np.float64) * b_scale / product).astype(np.int32)
+            # kernel == stride: every input pixel writes a disjoint f x f patch = 1x1 conv to f*f*oc channels, then depth-to-space
+            wt = np.zeros((f * f * oc, ic, 1, 1), dtype=weight.dtype)
+            for tap in range(f * f):
+                ky, kx = divmod(tap, f)
+                wt[tap * oc : (tap + 1) * oc, :, 0, 0] = weight[:, :, ky, kx].T
+            conv = Job(node.name + ":pw", wt, np.tile(bias, f * f), src.slot, new_slot(), src.layout, shift=_shift(out_scale / product, node.name),
+                       relu=False, in_flip=True, out_flip=True)
+            add_job(conv)
+            d2s = Job(node.name + ":d2s", np.zeros((oc, 1, 1, 1), dtype=np.int8), np.zeros(oc, dtype=np.int32), conv.out_slot, new_slot(),
+                      conv.out_layout, kind="d2s", factor=f)
+            add_job(d2s)
+            register(qnode.output[0], d2s, out_scale, out_zero)
             handled.add(qnode.name)
         elif op == "Concat":
             srcs = [dq_source(i) for i in node.input]
@@ -661,5 +730,5 @@ def compile_graph(model: Any, reuse_slots: bool = False) -> Compiled:
             j.res_slot = mapping.get(j.res_slot, j.res_slot)
     del handled_outputs, count
     return Compiled(
-        host_jobs, jobs, first_q.output[0], in_layout, s0, channels, boundaries, pinned
+        host_jobs, jobs, first_q.output[0], in_layout, s0, channels, boundaries, pinned, model
     )

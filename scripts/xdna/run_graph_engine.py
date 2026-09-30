@@ -44,6 +44,7 @@ def main() -> int:
 
     model = onnx.load(str(args.model))
     plan = compile_graph(model)
+    model = plan.model or model  # the onnxsim-folded model the jobs came from
     shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
     x = np.random.default_rng(args.seed).random(shape, dtype=np.float32)
     q = np.clip(np.rint(x / plan.input_scale) + 128, 0, 255).astype(np.uint8)[0]

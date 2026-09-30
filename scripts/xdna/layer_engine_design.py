@@ -57,6 +57,9 @@ def engine(
 ):
     jobs, _ = layer_engine_nets.build(net, 0, arch)
     segments = layer_engine_nets.segments_for(net, jobs, arch)
+    kinds = {j.kind for j in jobs}
+    scratch_blocks = max([j.in_layout.nbc for j in jobs if j.kind == "conv" and j.gather] + [1])  # gather scratch tiles = input blocks per region
+    absent = [m for m, kind in (("COPY", "copy"), ("UP", "up"), ("ADD", "add"), ("GAP", "gap"), ("BMUL", "bmul"), ("AVG", "avgpool"), ("D2S", "d2s"), ("LUT", "lut"), ("DW", "dw")) if kind not in kinds]
     resnet_like = net in ("full", "body", "bodyr", "l1proj", "l1id", "l2proj", "l3id", "l4id")  # no table/movement/depthwise code: 16 KB program memory
     generic = net.startswith(
         ("onnx:", "gen:")
@@ -78,7 +81,7 @@ def engine(
         source_file=str(_KERNEL),
         arg_types=[act_ty, w_ty, out_ty, act_ty],
         compile_flags=[f"-DENG_REGION_BYTES={REGION_BYTES}"]
-        + (["-DENG_NO_G4"] if generic else (["-DENG_NO_MOVE", "-DENG_NO_LUT", "-DENG_NO_DW"] if resnet_like else []))
+        + (["-DENG_NO_G4"] + [f"-DENG_NO_{m}" for m in absent] + (["-DENG_ACC_TILES=1"] if all(n == 1 for n in nch) else []) + [f"-DENG_SCRATCH_BLOCKS={max(scratch_blocks, 1)}"] if generic else (["-DENG_NO_MOVE", "-DENG_NO_LUT", "-DENG_NO_DW"] if resnet_like else []))
         + kflags.split(),
     )
 
@@ -205,12 +208,12 @@ def engine(
                 run(4, False, stage)
                 run(5, True, stage)
 
-    def core_generic(act, w, out, kern, index, sched):
+    def core_generic(act, w, out, kern, index, sched=None):
         for j in range_(len(jobs)):
             both = act.acquire(2)
             r, a = both[0], both[1]
             o = out.acquire(1)
-            for _ in range_(sched[0, j]):
+            for _ in range_(1 if uniform else sched[0, j]):
                 if l2:
                     wc = w.acquire(1)
                     kern(a, wc, o, r)
@@ -227,7 +230,8 @@ def engine(
     act_all = ObjectFifo(act_ty, depth=2 if has_res else 1, name="act_all")
     sched_tab = None
     if generic:
-        sched_tab = np.array([nch], dtype=np.int16)
+        sched_tab = np.array([nch], dtype=np.int8)
+        uniform = all(n == 1 for n in nch)  # every job is one chunk round: no table needed
     elif looped and basic:
         sched_tab = np.zeros((8, 3), dtype=np.int32)
         rest = segments[1:]
@@ -294,7 +298,7 @@ def engine(
                             Buffer(
                                 np.ndarray[
                                     sched_tab.shape,
-                                    np.dtype[np.int16 if generic else np.int32],
+                                    np.dtype[np.int8 if generic else np.int32],
                                 ],
                                 initial_value=sched_tab,
                             )
