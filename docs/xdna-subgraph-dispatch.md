@@ -556,7 +556,7 @@ Other Ultralytics families at 32x32, compile coverage (engine jobs before the fi
 | model | engine jobs | verdict |
 |---|---|---|
 | YOLOv8n-seg | 187 (10 boundaries incl. the mask prototype head) | runs on the device, bit-exact, 2.1 ms |
-| YOLOv10n | - | PSA attention has the same shape as C2PSA's; not yet run on the device |
+| YOLOv10n | 206 (2) | two launches like YOLO11n; bit-exact boundaries, decoded output within 1e-7 of ORT, 5.8 ms |
 | YOLO11n | 223 (2) | runs on the device in **two launches** (host C2PSA attention between them), bit-exact boundaries, decoded output within 1e-7 of ORT, 7.0 ms total (4.6 ms engine) |
 | YOLOv6n | 27+ | `ConvTranspose` as conv + depth-to-space jobs; exact, 1.19 ms (Vitis AI 1.955 ms) |
 | YOLOv9t | 4+ | ADown slices folded by onnxsim before codegen; exact, 4.6 ms (Vitis AI 11.06 ms) |

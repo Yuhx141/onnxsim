@@ -375,8 +375,19 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                     other = next(
                         i for i in add.input if res(i) != res(dqs[0].output[0])
                     )
+                    skip_src = producers.get(res(other))
+                    if (
+                        skip_src is not None
+                        and skip_src.op_type == "DequantizeLinear"
+                        and res(skip_src.input[0]) not in tensors
+                        and res(skip_src.input[0]) in producers
+                    ):
+                        adds = []  # the skip branch (e.g. a ResNet downsample conv) compiles later and fuses the Add itself
+                if adds:
                     skip = dq_source(other)
-                    (final_q,) = consumers[res(add.output[0])]
+                    after = consumers[res(add.output[0])]
+                    post_relu = len(after) == 1 and after[0].op_type == "Relu"  # residual block: Add -> ReLU -> Q
+                    (final_q,) = consumers[res(after[0].output[0])] if post_relu else after
                     final_scale, final_zero = qp(final_q)
                     if final_zero != 128 or skip.zero != 128 or relu:
                         raise ValueError(
@@ -386,7 +397,8 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                     eb = _exp2(skip.scale / final_scale, "skip branch scale ratio")
                     res_slot, res_mode = skip.slot, 2
                     job_scale, out_name = final_scale, final_q.output[0]
-                    handled.update({dqs[0].name, add.name, final_q.name})
+                    handled.update({dqs[0].name, add.name, final_q.name} | ({after[0].name} if post_relu else set()))
+                    relu = post_relu
             shift = _shift(out_scale / product, node.name)
             common = dict(
                 shift=shift,
