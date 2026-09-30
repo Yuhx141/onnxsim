@@ -24,7 +24,7 @@
 #define ENG_ACT_BYTES 16384  // size of one activation object; its unused tail hosts the padded copy of a row-tiled 3x3 input
 #endif
 #ifndef ENG_SCRATCH_BLOCKS
-#define ENG_SCRATCH_BLOCKS 8
+#define ENG_SCRATCH_BLOCKS 4
 #endif
 
 namespace {
@@ -61,6 +61,7 @@ constexpr int pos(int v) { return v > 0 ? v : 0; }
 using MMUL = aie::mmul<8, 8, 8, int8, int8>;
 using v64 = aie::vector<int8, 64>;
 
+alignas(64) static int8_t scratch_tiles[ENG_SCRATCH_BLOCKS * 64];
 alignas(64) static int32_t acc_buf[ENG_ACC_TILES * 64];
 
 inline aie::vector<int32, 64> bias_tile(const int32_t *b) {
@@ -221,8 +222,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
         const int tap = L.taps[ti], ky = tap >= 6 ? 2 : (tap >= 3 ? 1 : 0), kx = tap - ky * 3;
         return (const int8_t *)pad_buf + (cp * L.nbp * padp + (py[t * 8] + ky) * pw + px[t * 8] + kx) * 8;
       };
-      if (L.nb % 4 == 0) tiled_gemm<4>(L, L.t_out, a_base, padp * 8, epi);
-      else tiled_gemm<2>(L, L.t_out, a_base, padp * 8, epi);
+      tiled_gemm<2>(L, L.t_out, a_base, padp * 8, epi);  // 3x3 layers own at most 2 output blocks per core: one instantiation saves program memory
       return;
     }
     // Gather: step tt = tap_index * NCP + region. The eight source offsets/masks depend only on
@@ -230,7 +230,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     int offs[8];
     uint64_t mask[8];
     int cache_ti = -1, cache_t = -1;
-    int8_t *scratch = (int8_t *)act + L.ncp * ENG_REGION_BYTES;  // the unused tail of the activation object
+    int8_t *scratch = scratch_tiles;
     auto a_base = [&](int t, int tt) {
       int ti = 0, cp = tt;
       while (cp >= L.ncp) { cp -= L.ncp; ++ti; }  // tiny loop: at most 8 iterations, no divide
@@ -250,7 +250,6 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
       gather_region(scratch, act + cp * ENG_REGION_BYTES, L.nbp, p_in, offs, mask);
       return (const int8_t *)scratch;
     };
-    if (L.nb % 4 == 0) tiled_gemm<4>(L, L.t_out, a_base, 64, epi);
-    else tiled_gemm<2>(L, L.t_out, a_base, 64, epi);
+    tiled_gemm<2>(L, L.t_out, a_base, 64, epi);
   }
 }

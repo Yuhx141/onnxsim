@@ -14,7 +14,7 @@ from pathlib import Path
 
 import aie.iron as iron
 import numpy as np
-from aie.iron import CompileTime, ExternalFunction, In, InOut, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron import Buffer, CompileTime, ExternalFunction, In, InOut, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
 from aie.iron.dataflow import ObjectFifoLink
 from aie.iron.device import Tile
@@ -38,8 +38,10 @@ def engine(
     slot: CompileTime[int],
     depth: CompileTime[int] = 2,
     compute: CompileTime[int] = 0xFFFFFF,
+    looped: CompileTime[int] = 0,
 ):
     jobs, _ = layer_engine_nets.build(net)
+    segments = layer_engine_nets.segments_for(net, jobs)
     nch = [n_chunks(j, slot - 192) for j in jobs]
     slots_used = 1 + max(j.out_slot for j in jobs)
     has_res = any(j.res_slot is not None for j in jobs)
@@ -54,7 +56,7 @@ def engine(
     )
 
     def core_fn(act, w, out, kern, index):
-        for j, job in enumerate(jobs):
+        def run_job(j, job):
             if job.res_slot is not None:  # residual map = a second broadcast object right after the input
                 both = act.acquire(2)
                 a, r = both[0], both[1]
@@ -71,7 +73,61 @@ def engine(
             out.release(1)
             act.release(2 if job.res_slot is not None else 1)
 
+        for first, count, repeat in segments:
+            def body():
+                for j in range(first, first + count):
+                    run_job(j, jobs[j])
+
+            if repeat > 1:
+                for _ in range_(repeat):
+                    body()
+            else:
+                body()
+
+    def core_looped(act, w, out, kern, index, sched):
+        """Whole-network core program: 4 stages x (projection block + `nid[s]` identity blocks).
+
+        The per-job chunk counts come from a small table in core memory (indexed by the stage loop
+        variable), so the program is 7 job bodies instead of one per layer.
+        """
+
+        def run(kind, res, stage):
+            a = act.acquire(2 if res else 1)
+            if res:
+                a, r = a[0], a[1]
+            else:
+                r = a
+            o = out.acquire(1)
+            for _ in range_(sched[kind, stage]):
+                for c in range(ROWS):
+                    wc = w.acquire(1)
+                    if c == index and compute:
+                        kern(a, wc, o, r)
+                    w.release(1)
+            out.release(1)
+            act.release(2 if res else 1)
+
+        for stage in range_(4):
+            run(0, False, stage)
+            run(1, False, stage)
+            run(2, False, stage)
+            run(3, True, stage)
+            for _ in range_(sched[7, stage]):
+                run(4, False, stage)
+                run(5, False, stage)
+                run(6, True, stage)
+
     act_all = ObjectFifo(act_ty, depth=2 if has_res else 1, name="act_all")
+    sched_tab = None
+    if looped:
+        sched_tab = np.zeros((8, 4), dtype=np.int32)
+        for st, (first, count, repeat) in enumerate([sg for sg in segments if sg[1] == 4]):
+            for k in range(4):
+                sched_tab[k, st] = nch[first + k]
+        for st, (first, count, repeat) in enumerate([sg for sg in segments if sg[1] == 3]):
+            for k in range(3):
+                sched_tab[4 + k, st] = nch[first + k]
+            sched_tab[7, st] = repeat
     wfs, outs, workers = [], [], []
     for col in range(COLS):
         wf = ObjectFifo(w_ty, depth=depth, name=f"c{col}_w")
@@ -79,8 +135,10 @@ def engine(
         col_out = ObjectFifo(col_out_ty, depth=1, name=f"c{col}_out")
         for i in range(ROWS):
             workers.append(Worker(
-                core_fn, fn_args=[act_all.cons(), wf.cons(), core_outs[i].prod(), kernel, i],
-                tile=Tile(col, 2 + i), stack_size=0x1500))
+                core_looped if looped else core_fn,
+                fn_args=[act_all.cons(), wf.cons(), core_outs[i].prod(), kernel, i]
+                + ([Buffer(np.ndarray[(8, 4), np.dtype[np.int32]], initial_value=sched_tab)] if looped else []),
+                tile=Tile(col, 2 + i), stack_size=0x1300))
         ObjectFifoLink([o.cons() for o in core_outs], col_out.prod(), src_offsets=[i * REGION_BYTES for i in range(ROWS)])
         wfs.append(wf)
         outs.append(col_out)
@@ -121,6 +179,7 @@ def _parser():
     parser.add_argument("--slot", type=int, default=8192)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--nocompute", action="store_true")
+    parser.add_argument("--looped", action="store_true", help="stage-looped core program (body net)")
     parser.add_argument("--compute", type=lambda v: int(v, 0), default=0xFFFFFF, help="bitmask of jobs that run their kernel (profiling)")
     return parser
 
@@ -129,7 +188,7 @@ def main() -> None:
     opts = _parser().parse_args()
     run_design_cli(
         engine, opts,
-        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute},
+        compile_kwargs=lambda o: {"net": o.net, "slot": o.slot, "depth": o.depth, "compute": 0 if o.nocompute else o.compute, "looped": 1 if o.looped else 0},
         device=lambda value: device_from_args(value, n_cols=8),
     )
 

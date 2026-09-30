@@ -24,6 +24,52 @@ def bottleneck(name: str, cin: int, mid: int, out: int, w: int, h: int, stride: 
     return jobs
 
 
+def body(seed: int = 0, stages=((3, 64, 256, 1), (4, 128, 512, 2), (6, 256, 1024, 2), (3, 512, 2048, 2)), hw: int = 8):
+    """ResNet-50 layer1..layer4 (random weights). Returns (jobs, segments, input dense map).
+
+    ``segments`` = [(first_job, jobs_per_iteration, repeat)]: consecutive identical identity blocks
+    are one segment so the core program loops over them instead of unrolling every job.
+    """
+    rng = np.random.default_rng(seed)
+    jobs, segments = [], []
+    cin, w = 64, hw
+    lay_in = layout_for(cin, w, w)
+    slot = 1  # slot 0 = network input
+    block_in = 0
+    for n, mid, out, stride in stages:
+        for b in range(n):
+            st = stride if b == 0 else 1
+            proj = b == 0
+            first = len(jobs)
+            cur_w = jobs[-1].out_layout.w if jobs else w
+            lay = jobs[-1].out_layout if jobs else lay_in
+            rw = lambda o, i, k: rng.integers(-24, 24, (o, i, k, k), dtype=np.int8)
+            rb = lambda c: rng.integers(-800, 800, c, dtype=np.int32)
+            c1 = Job(f"c1", rw(mid, cin, 1), rb(mid), block_in, slot, lay, in_flip=True, shift=9); slot += 1
+            c2 = Job(f"c2", rw(mid, mid, 3), rb(mid), c1.out_slot, slot, c1.out_layout, stride=st, shift=9); slot += 1
+            blk = [c1, c2]
+            res_slot, res_mode = block_in, 2
+            if proj:
+                sk = Job("sk", rw(out, cin, 1), rb(out), block_in, slot, lay, stride=st, in_flip=True, shift=8, relu=False); slot += 1
+                blk.append(sk)
+                res_slot, res_mode = sk.out_slot, 1
+            c3 = Job("c3", rw(out, mid, 1), rb(out), c2.out_slot, slot, c2.out_layout, shift=8, res_slot=res_slot,
+                     res_mode=res_mode, out_flip=True, ea=-1, eb=0); slot += 1
+            blk.append(c3)
+            jobs += blk
+            block_in = c3.out_slot
+            cin = out
+            if proj:
+                segments.append((first, len(blk), 1))
+            elif segments and segments[-1][0] + segments[-1][1] * segments[-1][2] == first and segments[-1][1] == len(blk) and b > 1:
+                f, c, r = segments[-1]
+                segments[-1] = (f, c, r + 1)
+            else:
+                segments.append((first, len(blk), 1))
+    x = rng.integers(128, 256, (w * w, 64), dtype=np.uint8)
+    return jobs, segments, x
+
+
 def run_reference(jobs, x_dense: np.ndarray):
     """Returns {slot: dense uint8 map} after running every job."""
     maps = {0: x_dense}
@@ -37,6 +83,9 @@ def run_reference(jobs, x_dense: np.ndarray):
 
 def build(name: str, seed: int = 0):
     rng = np.random.default_rng(seed)
+    if name == "body":
+        jobs, _, x = body(seed)
+        return jobs, x
     if name == "l1proj":
         jobs = bottleneck("l1", 64, 64, 256, 8, 8, 1, rng, project=True)
     elif name == "l1id":
@@ -52,3 +101,10 @@ def build(name: str, seed: int = 0):
     lay0 = jobs[0].in_layout
     x = rng.integers(128, 256, (lay0.pixels, lay0.nb * 8), dtype=np.uint8)
     return jobs, x
+
+
+def segments_for(name: str, jobs):
+    """Core-program segments (first_job, jobs_per_iteration, repeat) for a named net."""
+    if name == "body":
+        return body()[1]
+    return [(0, len(jobs), 1)]
