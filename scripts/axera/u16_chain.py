@@ -268,3 +268,51 @@ def signature_data(node: onnx.NodeProto, shapes: Mapping[str, Sequence[int]]):
     return {
         t: np.ones(list(shapes[t]) or [1], np.float32) for t in node.input if t
     }
+
+
+def predict_scales16(
+    quant_json: str | Mapping, sub: onnx.ModelProto, data: Mapping[str, np.ndarray]
+) -> dict[str, tuple[float, float]]:
+    """``{tensor: (scale, zero point)}`` Pulsar2 would assign a 16-bit chain
+    calibrated on ``data``, without building it.
+
+    The rule, checked against native U16 builds of a bare MatMul and a forward
+    Conv chain at two calibrations: a tensor that is (or shares a quantization
+    with) a live MatMul operand is symmetric int16, ``scale = max|x| / 32767.5``;
+    every other tensor is unsigned 16-bit over its range widened to include 0,
+    ``scale = f32((hi - lo) / 65535)``, ``zero point = round(-lo / scale)``. Tensors
+    that Pulsar2 marks OVERLAPPED share their dominator's quantization, taken
+    over the union of the group's ranges. ``quant_json`` is a template build's
+    ``quant_axmodel.json`` (path or parsed), which says which tensors are
+    symmetric and which are grouped."""
+    import json
+
+    import step_calibration
+
+    if not isinstance(quant_json, Mapping):
+        with open(quant_json) as f:
+            quant_json = json.load(f)
+    info: dict[str, Mapping] = {}
+    for per_op in quant_json["tensor_configs"].values():
+        for t, v in per_op.items():
+            if t not in info or v["state"] != "OVERLAPPED":
+                info[t] = v
+    ranges = step_calibration.collect_ranges(sub, {t: [v] for t, v in data.items()})
+    group: dict[int, list[float]] = {}
+    for t, v in info.items():
+        if t in ranges:
+            lo, hi = ranges[t]
+            g = group.setdefault(v["dominator"], [lo, hi])
+            g[0], g[1] = min(g[0], lo), max(g[1], hi)
+    out: dict[str, tuple[float, float]] = {}
+    for t, v in info.items():
+        if v["dominator"] not in group or v["bit_width"] != 16:
+            continue
+        lo, hi = group[v["dominator"]]
+        if v["quant_min"] < 0:
+            out[t] = (max(abs(lo), abs(hi)) / 32767.5, 0.0)
+        else:
+            lo0, hi0 = min(lo, 0.0), max(hi, 0.0)
+            s = float(np.float32((hi0 - lo0) / 65535))
+            out[t] = (s, float(round(-lo0 / s)))
+    return out

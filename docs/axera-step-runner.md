@@ -531,3 +531,50 @@ Costs to know: the 16-bit MatMul chains take about 2.5x the device time of
 their 8-bit templates, and calibration uses the reference batch the replay
 runs on, so a training loop needs per-step recalibration (the record emitter
 covers a bare MatMul, not these chains yet).
+
+### Latency: the NPU is fast, the staging is not
+
+`--no-check --health-every 0` times the replay with no per-segment simulation,
+float check or health check. AX8850, whole step (1,101 nodes in 910 segments),
+AXCL VM: **58.4 s wall against 6.6 s for the host-only float run of the same
+step**, about 9x slower. `axclrtEngineExecute` totals only **4.1 s over 1,152
+runs** (3.6 ms per run), below the host total; the other ~54 s is per-segment
+overhead of 63 ms on average. `profile_session_overhead.py` times one 16-bit
+segment (`stage2_conv2_fwd`, 12.9 MB in and 6.4 MB out): engine 2.4 ms, model
+load 5.3 ms, input write 4.1 ms, and 58.5 ms for the whole `run` call. Every
+segment stages its tensors through the file share to the VM (about 350 MB/s)
+and loads and unloads its model per call, so the step is a correctness harness
+and not a speedup. Keeping intermediates on the device (the session's
+`resident_pairs` mechanism) or compiling the step as one graph would leave about
+the engine time, which is 1.6x under the host run now and roughly doubles for
+the 16-bit chains.
+
+### Per-step recalibration of the 16-bit chains
+
+The 16-bit chains are built on the reference batch, but a training step's
+tensor ranges move every step. `probe_u16_recalibrate.py` builds a real step
+node at U16 at two calibrations (the second with every input scaled by a
+different factor, so every scale and zero point moves) and checks
+`matmul_record_emit.check` both ways. A bare MatMul (`dX_MatMul_240`) and the
+forward Conv chain (Transpose, Slice, Reshape, MatMul, bias Add; stage2_conv2)
+recalibrate exactly, with zero record and `npu_params` differences in both
+directions. No Pulsar2 build is needed to move a chain to a new calibration.
+
+`u16_chain.predict_scales16` gives the scales Pulsar2 would assign, from the
+chain's tensor ranges on the new step's data and a template's
+`quant_axmodel.json`: a tensor that is (or shares a quantization with) a live
+MatMul operand is symmetric int16 (`max|x| / 32767.5`); every other tensor is
+unsigned 16-bit over its range widened to include 0 (`f32((hi - lo) / 65535)`,
+zero point `round(-lo / scale)`); tensors Pulsar2 marks OVERLAPPED (Transpose,
+Slice, Reshape) share their dominator's quantization over the group's union
+range. Prediction matches every tensor of both builds at both calibrations.
+Recalibrating template A onto the predicted B scales reproduces the native B
+build with zero differences, and on the AX8850 the emitted model's output is
+bit-identical to the native B build's (and differs from template A's).
+`tests/test_axera_matmul_record_emit.py` covers both chains in both directions.
+
+Scope: this covers the MatMul and Conv chains (62 of the 95 16-bit segments).
+The Softmax, Log, Neg and ReduceSum 16-bit segments need their own record
+roles. The ranges of a chain's intermediates (its MatMul output) depend on
+the step's data, so a loop applies them with delayed scaling (the previous
+step's ranges with headroom), as `--u16-margin` does for one step.

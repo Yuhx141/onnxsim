@@ -224,3 +224,28 @@ def test_u16_matmul_recalibrates_to_the_native_build(src, dst):
     diff = mre.compare(out, U16[dst][0])
     assert diff["record_diffs"] == []
     assert diff["params_diff_bytes"] == 0
+
+
+# Real step chains at layer precision U16, each built at two calibrations
+# (``probe_u16_recalibrate.py``): a bare MatMul (dX_MatMul_240) and the forward
+# Conv chain (Transpose, Slice, Reshape, MatMul, bias Add) of stage2_conv2.
+U16_CHAINS = {
+    chain: {
+        name: _build(
+            os.path.join(HERE, f"u16chain_{chain}_{name}.axmodel.gz"),
+            os.path.join(HERE, f"u16chain_{chain}_{name}.quant.json.gz"),
+        )
+        for name in ("A", "B")
+    }
+    for chain in ("dx240", "convfwd")
+}
+
+
+@pytest.mark.parametrize("chain", ["dx240", "convfwd"])
+@pytest.mark.parametrize("src,dst", [("A", "B"), ("B", "A")])
+def test_u16_step_chain_recalibrates_to_the_native_build(chain, src, dst):
+    builds = U16_CHAINS[chain]
+    out, _ = mre.recalibrate(builds[src][0], builds[src][1], builds[dst][1])
+    diff = mre.compare(out, builds[dst][0])
+    assert diff["record_diffs"] == []
+    assert diff["params_diff_bytes"] == 0
