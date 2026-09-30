@@ -34,6 +34,7 @@
 #include "passes/eliminate_reshape_family_on_constant.h"
 #include "passes/eliminate_sequence_at_construct.h"
 #include "passes/eliminate_sequence_length_construct.h"
+#include "passes/eliminate_shape_op.h"
 #include "passes/eliminate_slice_after_shape.h"
 #include "passes/explicit_auto_pad.h"
 #include "passes/explicit_conv_padding.h"
@@ -306,6 +307,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateCommonSubexpression>(registry);
     RegisterOrReplace<p::EliminateNopDropout>(registry);
     RegisterOrReplace<p::ExtractConstantToInitializer>(registry);
+    RegisterOrReplace<p::EliminateShapeOp>(registry);
     RegisterOrReplace<p::EliminateSliceAfterShape>(registry);
     RegisterOrReplace<p::FuseAddBiasIntoConv>(registry);
     RegisterOrReplace<p::FuseBNIntoConv>(registry);
