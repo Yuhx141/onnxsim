@@ -556,15 +556,19 @@ Other Ultralytics families at 32x32, compile coverage (engine jobs before the fi
 | model | engine jobs | verdict |
 |---|---|---|
 | YOLOv8n-seg | 187 (10 boundaries incl. the mask prototype head) | runs on the device, bit-exact, 2.1 ms |
-| YOLOv10n | 89 | stops at the PSA attention (Reshape/MatMul/Softmax) |
-| YOLO11n | 99 | stops at C2PSA attention |
-| YOLOv6n | 27 | `ConvTranspose` upsampling has no kernel |
-| YOLOv9t | 4 | ADown builds Slice bounds from `Shape` nodes: a constant-folding pass (onnxsim) would fold them, the standalone compiler does not |
+| YOLOv10n | - | PSA attention has the same shape as C2PSA's; not yet run on the device |
+| YOLO11n | 223 (2) | runs on the device in **two launches** (host C2PSA attention between them), bit-exact boundaries, decoded output within 1e-7 of ORT, 7.0 ms total (4.6 ms engine) |
+| YOLOv6n | 27+ | `ConvTranspose` as conv + depth-to-space jobs; exact, 1.19 ms (Vitis AI 1.955 ms) |
+| YOLOv9t | 4+ | ADown slices folded by onnxsim before codegen; exact, 4.6 ms (Vitis AI 11.06 ms) |
 | YOLOv3-tiny | 0 | MaxPool k=2 (even kernel) is not a "same"-padded odd pool |
 
-Not supported yet: YOLO11 (its C2PSA attention needs Reshape/Transpose/MatMul/Softmax in the middle of the
-network, i.e. a host round trip between two engine launches - a second xclbin costs ~1.8 ms of context switch),
-and real detector resolutions (640x640): maps of hundreds of pixels need pixel-split layouts and larger output
+Float regions in the middle of a network (YOLO11's C2PSA attention: Reshape/Transpose/MatMul/Softmax) run on the
+host between engine launches (`layer_engine_host.py`): each level is one full launch of the same xclbin and arena
+(earlier levels just recompute identical values, so no xclbin switch), the host evaluates the float nodes with onnx's
+reference evaluator and quantizes the re-entering tensors into pinned arena slots. The depthwise kernel has no fused
+residual, so an Add after a depthwise conv stays a separate `add` job.
+
+Not supported yet: real detector resolutions (640x640): maps of hundreds of pixels need pixel-split layouts and larger output
 objects, which is the "activation-tiled" engine this weight-streaming design deliberately is not. At 64x64 the
 host already computes 17 of 172 jobs.
 

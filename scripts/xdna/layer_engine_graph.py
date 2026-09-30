@@ -239,8 +239,10 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
         return job
 
     def register(q_out: str, job: Job, scale: float, zero: int = 128) -> None:
+        reads = {job.in_slot, job.res_slot}
+        level = max([cur[0]] + [t.level for t in tensors.values() if t.slot in reads])  # depends on whatever its inputs do
         tensors[res(q_out)] = Tensor(
-            job.out_slot, job.out_layout, scale, zero, host=job in host_jobs, level=cur[0]
+            job.out_slot, job.out_layout, scale, zero, host=job in host_jobs, level=level
         )
 
     def attrs_of(node):
@@ -565,7 +567,7 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                 )
                 add_job(job)
                 current, cur_scale = (
-                    Tensor(job.out_slot, job.out_layout, out_scale, out_zero),
+                    Tensor(job.out_slot, job.out_layout, out_scale, out_zero, level=max(t.level for t in srcs)),
                     out_scale,
                 )
             tensors[res(qnode.output[0])] = current

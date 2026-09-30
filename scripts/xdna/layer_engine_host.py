@@ -47,8 +47,16 @@ class HostRunner:
                 init[n.output[0]] = numpy_helper.to_array(n.attribute[0].t)
         self.plan = plan
         self.levels = {}
+        host = [n for n, _ in plan.host_nodes if n.op_type != "Constant"]
+        constant = set()  # nodes fed only by initializers (weight DequantizeLinear...) run once, not per launch
+        for n in host:
+            if n.input and all((not i) or i in init for i in n.input):
+                constant.add(id(n))
+                model, _, outputs = _level_model(plan.model, [n], init)
+                for name, value in zip(outputs, ReferenceEvaluator(model).run(None, {})):
+                    init[name] = value
         for level in range(plan.levels):
-            nodes = [n for n, lvl in plan.host_nodes if lvl == level and n.op_type != "Constant"]
+            nodes = [n for n, lvl in plan.host_nodes if lvl == level and n.op_type != "Constant" and id(n) not in constant]
             if not nodes:
                 continue
             model, external, outputs = _level_model(plan.model, nodes, init)
@@ -86,9 +94,9 @@ class HostRunner:
         return out
 
 
-def run_levels(plan, launch: Callable[[], dict[str, np.ndarray]], write_slot: Callable[[int, np.ndarray], None]):
+def run_levels(plan, launch: Callable[[], dict[str, np.ndarray]], write_slot: Callable[[int, np.ndarray], None], runner: HostRunner | None = None):
     """Run ``plan.levels`` launches; returns (last boundaries, floats including every host tensor)."""
-    runner = HostRunner(plan)
+    runner = runner or HostRunner(plan)  # building it folds constants: callers that run repeatedly pass one in
     floats: dict[str, np.ndarray] = {}
     boundaries = {}
     for level in range(plan.levels):

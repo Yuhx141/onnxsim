@@ -24,7 +24,7 @@ import onnx
 
 import layer_engine as le
 from layer_engine_graph import compile_graph
-from layer_engine_host import run_levels
+from layer_engine_host import HostRunner, run_levels
 
 
 def main() -> int:
@@ -63,6 +63,9 @@ def main() -> int:
         with arena.overwrite() as host:
             host.view(np.uint8)[: le.SLOT_BYTES] = le.to_arena(image, plan.input_layout)
 
+    read_ms: list[float] = []
+    host_runner = HostRunner(plan)
+
     def run_once() -> tuple[dict[str, np.ndarray], float, float]:
         started = time.perf_counter()
         dense = {0: image}
@@ -81,7 +84,9 @@ def main() -> int:
             started_launch = time.perf_counter()
             kernel(arena, params_t, arena)
             engine_ms += (time.perf_counter() - started_launch) * 1000.0
+            started_read = time.perf_counter()
             data = arena.numpy().view(np.uint8)
+            read_ms.append((time.perf_counter() - started_read) * 1000.0)
             return {
                 name: le.from_arena(data[t.slot * le.SLOT_BYTES : (t.slot + 1) * le.SLOT_BYTES], t.layout)
                 for name, t in plan.boundaries.items()
@@ -91,7 +96,7 @@ def main() -> int:
             with arena.overwrite() as host:
                 host.view(np.uint8)[slot * le.SLOT_BYTES : (slot + 1) * le.SLOT_BYTES] = data
 
-        found, floats = run_levels(plan, launch, write_slot)
+        found, floats = run_levels(plan, launch, write_slot, host_runner)
         run_once.floats = floats
         return found, prefix_ms, engine_ms
 
@@ -108,7 +113,7 @@ def main() -> int:
         "model": str(args.model), "engine_jobs": len(plan.jobs), "host_jobs": len(plan.host_jobs),
         "boundaries": {n: list(v.shape) for n, v in boundaries.items()},
         "launches": plan.levels, "min_ms": min(totals), "median_ms": float(np.median(totals)),
-        "host_prefix_ms": float(np.median(prefix)), "engine_call_ms": float(np.median(engine)),
+        "host_prefix_ms": float(np.median(prefix)), "engine_call_ms": float(np.median(engine)), "arena_readback_ms": float(np.median(read_ms)),
     }
     if args.dump_boundaries:
         np.savez(args.dump_boundaries, **{k.replace("/", "|"): v for k, v in boundaries.items()})
