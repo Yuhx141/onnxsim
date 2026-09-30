@@ -68,6 +68,31 @@ def _fast_ops():
     return [ConvTranspose]
 
 
+def _evaluator(model):
+    """onnxruntime (one thread: these are tiny tensors) when installed, else onnx's reference evaluator."""
+    import os
+
+    if not os.environ.get("ENGINE_HOST_REFERENCE"):
+        try:
+            import onnxruntime as ort
+
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads, opts.log_severity_level = 1, 3
+            session = ort.InferenceSession(model.SerializeToString(), opts, providers=["CPUExecutionProvider"])
+            names = [o.name for o in session.get_outputs()]
+
+            class Ort:
+                def run(self, _, feeds):
+                    return session.run(names, feeds)
+
+            return Ort()
+        except Exception:  # noqa: BLE001 - fall back to the reference evaluator
+            pass
+    from onnx.reference import ReferenceEvaluator
+
+    return ReferenceEvaluator(model, new_ops=_fast_ops())
+
+
 class HostRunner:
     def __init__(self, plan) -> None:
         from onnx.reference import ReferenceEvaluator
@@ -91,7 +116,7 @@ class HostRunner:
             if not nodes:
                 continue
             model, external, outputs = _level_model(plan.model, nodes, init)
-            self.levels[level] = (ReferenceEvaluator(model, new_ops=_fast_ops()), external, outputs)
+            self.levels[level] = (_evaluator(model), external, outputs)
 
     def boundary_floats(self, boundaries: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         """Dequantize engine boundary tensors ([P][C] uint8) to NCHW float32 under their DQ output names."""
@@ -125,14 +150,15 @@ class HostRunner:
         return out
 
 
-def run_levels(plan, launch: Callable[[], dict[str, np.ndarray]], write_slot: Callable[[int, np.ndarray], None], runner: HostRunner | None = None):
+def run_levels(plan, launch: Callable[[int], dict[str, np.ndarray]], write_slot: Callable[[int, np.ndarray], None], runner: HostRunner | None = None, inputs: dict[str, np.ndarray] | None = None):
     """Run ``plan.levels`` launches; returns (last boundaries, floats including every host tensor)."""
     runner = runner or HostRunner(plan)  # building it folds constants: callers that run repeatedly pass one in
-    floats: dict[str, np.ndarray] = {}
+    floats: dict[str, np.ndarray] = dict(inputs or {})
     boundaries = {}
     for level in range(plan.levels):
-        boundaries = launch()
-        floats.update(runner.boundary_floats(boundaries))
+        fresh = launch(level)  # only the boundaries this launch completes (level == its level) need decoding
+        boundaries.update(fresh)
+        floats.update(runner.boundary_floats(fresh))
         runner.run_level(level, floats)
         for slot, data in runner.entry_slots(level + 1, floats):
             write_slot(slot, data)

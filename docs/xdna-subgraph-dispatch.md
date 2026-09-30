@@ -603,6 +603,50 @@ in the middle of the network: the SE / LayerNorm ops would need the host to read
 launch), and any 224x224 input (needs the pixel-tiled layouts noted above). GoogLeNet is where Vitis AI is ahead
 (9 inception blocks of 1x1/3x3/5x5 branches: 97 sequential jobs at ~10 us each versus Vitis's fused subgraphs).
 
+#### Transformers: layer engine vs Vitis AI vs Hexagon HTP
+
+`tiny_transformer.py` builds a pre-LN encoder as a power-of-two QDQ graph in "tokens are pixels" form
+(`[1, hidden, 1, tokens]`): every Linear is a 1x1 Conv job, GELU is a table job (tinygrad-lowered), and LayerNorm,
+attention (MatMul/Softmax) and the residual stream stay float host nodes. `compile_graph` accepts a float network
+input (no leading Q), so every attention / residual block is one host round trip = one more full launch of the
+same xclbin (`layer_engine_host.run_levels`). Bit-exact against ONNX Runtime on every boundary (0 differing bytes)
+for 1-6 layers; `tests/test_xdna_tinygrad_lower.py::test_tiny_transformer_...` runs the whole multi-launch flow on
+the numpy references.
+
+Same graphs (32 tokens, hidden 128, 4 heads, FFN 512), ms per inference:
+
+| layers | engine launches | our engine (int8, bit-exact) | Vitis AI EP (bf16, XDNA2) | Hexagon HTP V69 (fp16, QNN burst) |
+|---|---|---|---|---|
+| 1 | 4 | 1.8 | 2.35 | 0.23 |
+| 2 | 7 | 3.7 | 4.25 | 0.31 |
+| 4 | 13 | 9.0 | 7.75 | 0.45 |
+| 6 | 19 | 15.9 | 11.3 | 0.61 |
+
+The real MiniLM-L6 (`scripts/android/llm_tinygrad`, seq 128, hidden 384; ~1.4 GMAC) cannot run on the engine at all:
+a channel block's tokens must fit one 512 B core region (<= 64 tokens at the narrowest width, 32 at the 4x FFN
+width). Same weights, encoder body only (embeddings and the mask bias fed in), measured today:
+
+| | ms / inference | accuracy vs fp32 |
+|---|---|---|
+| Hexagon HTP fp16 (full graph incl. embeddings + pooling, phone) | **1.92** | cos 0.999998 |
+| Vitis AI EP on XDNA2 (bf16 kernels, 197-node body) | 5.30 | token cos 0.9991 (min 0.9986) |
+| this host's CPU, ORT fp32 | 12.9 | exact |
+| phone CPU, ORT fp32 4 threads (busy phone; README's quiet-phone number was 24.7) | 86 | exact |
+
+Reading it: Hexagon wins on transformers by 3-25x. Its per-model cost is a few tenths of a millisecond even for
+the tiny stack (one fused graph, fp16 vector/HMX matmuls, softmax and layernorm on the DSP), and MiniLM-128 is
+1.4 GMAC in 1.9 ms = 0.7 TMAC/s. XDNA2's int8 conv engine reaches several TMAC/s on ResNet bodies, but a
+transformer is the opposite workload: activation x activation matmuls the engine does not have, softmax/layernorm
+on the host, and a launch (~0.25 ms fixed + ~10 us per job) per host round trip. Our engine's time is also
+quadratic in depth because each launch re-runs every job (earlier levels just recompute); per-level job ranges
+(a second instruction stream and core loop bound) would cut the 6-layer engine time from 11.6 ms to roughly 4-5 ms,
+still far from Hexagon. The Vitis numbers use the same non-standard `[1, C, 1, T]` layout, so its tiny-model
+column is not its best case; its MiniLM row is the fair one.
+
+Changes this needed in the compiler/runtime: a float network input (`compile_graph`, `run_graph_engine`), a host
+Add is never fused into an engine conv, boundaries are decoded only by the launch that completes them (a 30-boundary
+model spent 12 of 26 ms in `from_arena`), and the host tail uses onnxruntime when it is installed.
+
 ### Runtime-shaped kernels (`kernels/fused_bottleneck_rt.cc`, `resnet_body_design.py --rt`)
 
 The compile-time kernels bake a block's geometry in through `-D` macros, so every block kind

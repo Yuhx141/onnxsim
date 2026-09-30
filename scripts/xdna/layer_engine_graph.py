@@ -84,7 +84,7 @@ class Compiled:
     host_jobs: list[Job]
     jobs: list[Job]
     input_name: str
-    input_layout: Layout
+    input_layout: Layout | None  # None: the network input is a float host tensor
     input_scale: float
     input_channels: int
     boundaries: dict[str, Tensor] = field(
@@ -163,24 +163,28 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
         return float(init[res(node.input[1])]), int(init[res(node.input[2])])
 
     first_q = next(
-        n
-        for n in nodes
-        if n.op_type == "QuantizeLinear" and res(n.input[0]) == graph.input[0].name
+        (
+            n
+            for n in nodes
+            if n.op_type == "QuantizeLinear" and res(n.input[0]) == graph.input[0].name
+        ),
+        None,
     )
     shape = [d.dim_value for d in graph.input[0].type.tensor_type.shape.dim]
     _, channels, height, width = shape
     padded_channels = -(-channels // 8) * 8
-    s0, z0 = qp(first_q)
-    in_layout = layout_for(padded_channels, width, height)
-    tensors: dict[str, Tensor] = {
-        first_q.output[0]: Tensor(0, in_layout, s0, z0, host=True)
-    }
+    if first_q is not None:
+        s0, z0 = qp(first_q)
+        in_layout = layout_for(padded_channels, width, height)
+        tensors: dict[str, Tensor] = {first_q.output[0]: Tensor(0, in_layout, s0, z0, host=True)}
+    else:  # the input is a float host tensor (a transformer's residual stream): everything starts on the host
+        s0, in_layout, tensors = 1.0, None, {}
     jobs: list[Job] = []
     host_jobs: list[Job] = []
     counter = [1]
-    handled: set[str] = {first_q.name}
+    handled: set[str] = {first_q.name} if first_q is not None else set()
     cur = [0]  # level of the node being compiled (max over the tensors it reads)
-    hlevel: dict[str, int] = {}  # float host tensor -> level
+    hlevel: dict[str, int] = {} if first_q is not None else {graph.input[0].name: 0}  # float host tensor -> level
     entries: list[Entry] = []
     host_nodes: list = []
     from onnx import shape_inference
@@ -415,7 +419,9 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                         i for i in add.input if res(i) != res(dqs[0].output[0])
                     )
                     skip_src = producers.get(res(other))
-                    if (
+                    if skip_src is None or skip_src.op_type != "DequantizeLinear":
+                        adds = []  # the other operand is a float host tensor: the Add stays a host node
+                    elif (
                         skip_src is not None
                         and skip_src.op_type == "DequantizeLinear"
                         and res(skip_src.input[0]) not in tensors
@@ -868,5 +874,5 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             dequant.setdefault(res(n.input[0]), (n.output[0], float(init[res(n.input[1])])))
     levels = max([e.level for e in entries] + [0]) + 1
     return Compiled(
-        host_jobs, jobs, first_q.output[0], in_layout, s0, channels, boundaries, pinned, model, entries, levels, dequant, host_nodes
+        host_jobs, jobs, first_q.output[0] if first_q is not None else graph.input[0].name, in_layout, s0, channels, boundaries, pinned, model, entries, levels, dequant, host_nodes
     )

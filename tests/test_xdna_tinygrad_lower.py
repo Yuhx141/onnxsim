@@ -541,3 +541,71 @@ def test_oversized_depthwise_weights_are_split_into_channel_block_parts():
     assert kinds.count("dw") >= 2 and "copy" in kinds
     for job in compiled.jobs:
         le.pack_job(job, le.ENGINE_SLOT_BYTES)  # every part fits a slot
+
+
+def test_tiny_transformer_compiles_to_multi_launch_and_matches_ort(tmp_path):
+    """Linear layers are 1x1 conv jobs, GELU a table job; LayerNorm/attention run on the host between launches."""
+    import types
+
+    import onnx
+    import onnxruntime as ort
+    from layer_engine_graph import compile_graph
+    from layer_engine_host import HostRunner, run_levels
+    from tiny_transformer import build
+
+    args = types.SimpleNamespace(tokens=32, hidden=128, heads=4, layers=1, seed=0)
+    fmodel, taps = build(False, {}, args)
+    probe = onnx.ModelProto()
+    probe.CopyFrom(fmodel)
+    for tap in dict.fromkeys(taps):
+        probe.graph.output.append(
+            onnx.helper.make_tensor_value_info(tap, onnx.TensorProto.FLOAT, None)
+        )
+    names = [o.name for o in probe.graph.output][1:]
+    session = ort.InferenceSession(
+        probe.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((1, 128, 1, 32)).astype(np.float32)
+    absmax = {
+        n: float(np.abs(v).max())
+        for n, v in zip(names, session.run(names, {"input": x}))
+    }
+    scales = {n: 2.0 ** np.ceil(np.log2(m / 127.0)) for n, m in absmax.items()}
+    model = onnx.shape_inference.infer_shapes(build(True, scales, args)[0])
+
+    compiled = compile_graph(model, simplify=False)
+    kinds = [job.kind for job in compiled.jobs]
+    assert kinds.count("lut") == 1 and kinds.count("conv") == 6
+    assert (
+        compiled.input_layout is None and compiled.levels == 4
+    )  # qkv | o | ffn | final norm (host)
+
+    # numpy-reference "device": every launch recomputes all jobs from the arena-slot dict
+    layouts = {e.slot: e.layout for e in compiled.entries}
+    maps = {
+        e.slot: np.full((e.layout.w * e.layout.h, e.layout.nb * 8), 128, dtype=np.uint8)
+        for e in compiled.entries
+    }
+
+    def launch(level):
+        for job in compiled.jobs:
+            res = maps[job.res_slot] if job.res_slot is not None else None
+            maps[job.out_slot] = le.reference(job, maps[job.in_slot], res)
+        return {
+            n: maps[t.slot] for n, t in compiled.boundaries.items() if t.level == level
+        }
+
+    def write_slot(slot, data):
+        maps[slot] = le.from_arena(data, layouts[slot])
+
+    _, floats = run_levels(
+        compiled, launch, write_slot, HostRunner(compiled), {"input": x}
+    )
+    (want,) = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {"input": x})
+    final = compiled.host_nodes[-1][0].output[
+        0
+    ]  # the graph output is an Identity alias of the last LayerNorm
+    np.testing.assert_allclose(floats[final], want, atol=1e-4)

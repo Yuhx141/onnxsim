@@ -50,17 +50,19 @@ def main() -> int:
     model = plan.model or model  # the onnxsim-folded model the jobs came from
     shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
     x = np.random.default_rng(args.seed).random(shape, dtype=np.float32)
-    q = np.clip(np.rint(x / plan.input_scale) + 128, 0, 255).astype(np.uint8)[0]
-    channels, height, width = q.shape
-    image = np.full((height * width, plan.input_layout.nb * 8), 128, dtype=np.uint8)
-    image[:, :channels] = q.transpose(1, 2, 0).reshape(height * width, channels)
+    image = None
+    if plan.input_layout is not None:
+        q = np.clip(np.rint(x / plan.input_scale) + 128, 0, 255).astype(np.uint8)[0]
+        channels, height, width = q.shape
+        image = np.full((height * width, plan.input_layout.nb * 8), 128, dtype=np.uint8)
+        image[:, :channels] = q.transpose(1, 2, 0).reshape(height * width, channels)
     slots = max(le.arena_slots(plan.jobs), 1 + max([j.out_slot for j in plan.host_jobs] + [0])) + int(os.environ.get("ENGINE_PAD_SLOTS", "0"))
     packs = [le.pack_job(job, le.ENGINE_SLOT_BYTES) for job in plan.jobs]
     params = np.concatenate([np.concatenate([p[col].reshape(-1) for p in packs]) for col in range(le.COLS)])
     kernel = NPUKernel(str(args.xclbin), str(args.insts))
     params_t = iron.tensor(params, dtype=np.uint8, device="npu")
     arena = iron.tensor(np.zeros(slots * le.SLOT_BYTES, dtype=np.int8), dtype=np.int8, device="npu")
-    if any(j.in_slot == 0 or j.res_slot == 0 for j in plan.jobs):
+    if image is not None and any(j.in_slot == 0 or j.res_slot == 0 for j in plan.jobs):
         with arena.overwrite() as host:
             host.view(np.uint8)[: le.SLOT_BYTES] = le.to_arena(image, plan.input_layout)
 
@@ -83,7 +85,7 @@ def main() -> int:
         prefix_ms = (time.perf_counter() - started) * 1000.0
         engine_ms = 0.0
 
-        def launch() -> dict[str, np.ndarray]:
+        def launch(level: int | None = None) -> dict[str, np.ndarray]:
             nonlocal engine_ms
             started_launch = time.perf_counter()
             kernel(arena, params_t, arena)
@@ -94,6 +96,7 @@ def main() -> int:
             return {
                 name: le.from_arena(data[t.slot * le.SLOT_BYTES : (t.slot + 1) * le.SLOT_BYTES], t.layout)
                 for name, t in plan.boundaries.items()
+                if level is None or t.level == level
             }
 
         def write_slot(slot: int, data: np.ndarray) -> None:
@@ -103,7 +106,7 @@ def main() -> int:
         if os.environ.get("ENGINE_KEEP_ALL") or os.environ.get("ENGINE_KEEP_EVERY") or os.environ.get("ENGINE_MAX_JOBS"):  # debugging: every job output is a boundary, no host tail
             found, floats = launch(), {}
         else:
-            found, floats = run_levels(plan, launch, write_slot, host_runner)
+            found, floats = run_levels(plan, launch, write_slot, host_runner, {model.graph.input[0].name: x} if image is None else None)
         run_once.floats = floats
         return found, prefix_ms, engine_ms
 
