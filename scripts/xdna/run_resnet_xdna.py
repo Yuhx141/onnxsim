@@ -96,6 +96,30 @@ def _centered_int8(raw: np.ndarray, zero: int, label: str) -> np.ndarray:
     return centered.astype(np.int8)
 
 
+def _basic_prefixes(model: Any) -> list[str]:
+    try:
+        from layer_engine_basic import basic_block_prefixes
+    except ImportError:
+        from .layer_engine_basic import basic_block_prefixes
+    return basic_block_prefixes(model)
+
+
+def _bind_basic_block(model: Any, prefix: str) -> dict[str, Any]:
+    try:
+        from layer_engine_basic import bind_basic_block
+    except ImportError:
+        from .layer_engine_basic import bind_basic_block
+    return bind_basic_block(model, prefix)
+
+
+def _basic_jobs(binds, reuse_slots=False):
+    try:
+        from layer_engine_net import basic_jobs_from_bindings
+    except ImportError:
+        from .layer_engine_net import basic_jobs_from_bindings
+    return basic_jobs_from_bindings(binds, reuse_slots=reuse_slots)
+
+
 def _max_pool(x: np.ndarray, attrs: dict[str, Any]) -> np.ndarray:
     kernel = tuple(attrs["kernel_shape"])
     strides = tuple(attrs.get("strides", (1,) * len(kernel)))
@@ -439,13 +463,17 @@ class XDNAResNetRunner:
                 ):
                     raise ValueError(f"fused stage block {prefix!r} overlaps another fused artifact")
                 block = bottleneck_plans.get(prefix)
-                if block is None:
+                if block is None and self.layer_engine and prefix in _basic_prefixes(model):
+                    binding = _bind_basic_block(model, prefix)  # ResNet-18/34 basic block
+                    block = binding["block"]
+                elif block is None:
                     raise ValueError(f"no bottleneck block found for prefix {prefix!r}")
-                binding = bind_fused_bottleneck(
-                    model, block, blocked=self.fused_stage_blocked,
-                    max_chunk=self.fused_body_chunk_caps.get(prefix) or None,
-                    engine=self.layer_engine,
-                )
+                else:
+                    binding = bind_fused_bottleneck(
+                        model, block, blocked=self.fused_stage_blocked,
+                        max_chunk=self.fused_body_chunk_caps.get(prefix) or None,
+                        engine=self.layer_engine,
+                    )
                 if previous_binding is not None and (
                     previous_binding["output_shape"] != binding["input_shape"]
                     or previous_binding["output_raw_name"] != binding["input_raw_name"]
@@ -1586,8 +1614,13 @@ class XDNAResNetRunner:
             from . import layer_engine as le
             from .layer_engine_net import jobs_from_bindings
             from .resnet_stage_design import stage_specs
-        _cols, binds = stage_specs(model, self.device_network_stages, engine=True)
-        jobs, _outs = jobs_from_bindings(binds, reuse_slots=True)
+        basic = set(_basic_prefixes(model))
+        if basic and all(p in basic for stage in self.device_network_stages for p in stage):
+            binds = [[_bind_basic_block(model, p) for p in stage] for stage in self.device_network_stages]
+            jobs, _outs = _basic_jobs(binds, reuse_slots=True)
+        else:
+            _cols, binds = stage_specs(model, self.device_network_stages, engine=True)
+            jobs, _outs = jobs_from_bindings(binds, reuse_slots=True)
         stem = None
         if self.layer_engine_stem:
             try:

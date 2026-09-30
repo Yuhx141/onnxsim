@@ -420,10 +420,50 @@ What made the difference, and what did not:
   `s*2048 + c*512`), then a pool job (mode 2 in the kernel) over that map; slots 0-8 are reserved for
   these, the body reuses 4.
 
-Not done yet: fusing conv1 and the skip conv of projection blocks (same input, fewer jobs), a faster
-stride-2 gather (phase-split copies), a second weight channel per column (the activation stream currently
-takes one shim MM2S channel), keeping activations in L2 between layers instead of round-tripping DDR.
+### Other models: layer engine vs Vitis AI, and how close to ideal
 
+Both runtimes were run on the same models on the same host (Ryzen AI 1.8 Vitis AI EP, `real_npu`, 32x32
+input, batch 1, min of 3 x 300 timed iterations; ours through the graph runner, min of 3 x 100, stem/pool/
+all convs on the device, classifier tail on the host). The quicktest model is one Quark-quantized net, so
+the other depths come from `quantize_pow2_resnet.py` (torchvision, random weights with non-trivial BN
+statistics, same QDQ pattern: uint8 zero point 128 activations, int8 power-of-two weights/biases,
+quantized head), which both runtimes accept; `compare_models.py` runs the whole comparison. Every row is
+bit-exact against ONNX Runtime CPU (max abs logit error 0.0):
+
+| model | weights MB | MMACs | Vitis AI ms | ours ms (device call) | ours / Vitis | streaming floor ms | MAC floor us |
+|---|---|---|---|---|---|---|---|
+| ResNet-18 (basic blocks) | 11.7 | 37.5 | 0.83 | 0.89 (0.58) | 1.08 | 0.27 | 2 |
+| ResNet-34 | 21.8 | 75.3 | 1.42 | 1.17 (0.85) | 0.82 | 0.51 | 3 |
+| ResNet-50 | 25.5 | 85.5 | 1.63 | 1.70 (1.18) | 1.04 | 0.59 | 3 |
+| ResNet-101 | 44.4 | 161.2 | 2.90 | 2.64 (1.89) | 0.91 | 1.03 | 6 |
+| ResNet-152 | 60.0 | 237.0 | 4.08 | 3.12 (2.48) | 0.76 | 1.40 | 9 |
+| Wide-ResNet-50-2 | 68.8 | 234.6 | 26.3 | 2.89 (2.30) | 0.11 | 1.60 | 9 |
+
+- The engine supports bottleneck nets of any depth/width (`--arch 3,4,23,3`, `--arch 3,4,6,3:2`) and basic-block
+  nets (`--arch basic:2,2,2,2`, ResNet-18/34; `layer_engine_basic.py`); one artifact per architecture, weights
+  are packed at run time. Not supported: grouped/depthwise convs (ResNeXt, MobileNet, EfficientNet) and input
+  sizes whose activations no longer fit a 16 KB object (about 32x32 today), so those models only have Vitis
+  numbers. Vitis AI's Wide-ResNet time (26 ms) is ~9x its ResNet-50-scaled expectation; the reason (probably
+  layers left on the CPU) was not investigated. It handles 224x224 models, which the engine does not.
+- The engine wins from ResNet-34 up because per-job overhead is fixed while weight bytes grow; it is
+  slightly behind on the two smallest nets, where the ~0.3 ms of host work (image quantize, im2col, tail,
+  Python) is a larger share.
+- **Ideal**: at 32x32 these nets are weight-bandwidth bound, not compute bound: even at the NPU's 25 TMAC/s
+  (50 TOPS int8) the MACs take 2-9 us. The "streaming floor" is weights / 43 GB/s (the best rate the engine
+  reached with every kernel call skipped: 28.8 MB in 0.65 ms). The engine's device time is 1.4-2.2x that
+  floor: for ResNet-50, 0.82 ms is the floor of the current job structure (launch ~0.17 ms + 57 jobs, kernels
+  skipped) and the kernels add 0.31 ms (28%) that does not overlap with streaming. DDR itself (256-bit
+  LPDDR5X) would allow far more, so the remaining gap to a true roofline is per-job synchronization
+  (~10 us: one activation fill + eight column drains through one control processor, ~1.3 us per DMA task)
+  and the 8 shim weight streams.
+- What the remaining ideas can buy (bounded by the skipped-kernel run): conv1+skip fusion saves 4 of 57
+  jobs (~40 us), a faster stride-2 gather touches 6 jobs (~50 us of the 310 us kernel time), and a second
+  weight channel per column cannot help while the floor is per-job bound and the activation stream already
+  takes the 16th shim MM2S channel (17 would be needed). None is worth its complexity next to the host
+  overhead (~0.5 ms on ResNet-50) or a design that keeps activations in L2 between layers.
+- Host findings worth keeping: OpenBLAS defaulted to one thread per core, and a 2048x1000 Gemm took 2.9 ms on
+  this 64-thread host versus 0.05-0.1 ms with 1-2 threads (the runner now sets `OPENBLAS_NUM_THREADS=2`
+  before numpy loads); a 1000-class head made the runner 3x slower before that fix.
 ### Runtime-shaped kernels (`kernels/fused_bottleneck_rt.cc`, `resnet_body_design.py --rt`)
 
 The compile-time kernels bake a block's geometry in through `-D` macros, so every block kind

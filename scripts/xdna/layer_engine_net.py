@@ -61,3 +61,45 @@ def jobs_from_bindings(stage_bindings, reuse_slots=False):
     if reuse_slots:
         assign_slots(jobs)
     return jobs, {prefix: job.out_slot for prefix, job in block_outputs.items()}
+
+
+def basic_block_jobs(raw, stride, shifts, skip_shift, ea, eb, block_in, slot, lay):
+    """Jobs of one basic block: [skip 1x1 (projection only)], conv3x3 + ReLU, conv3x3 + residual.
+
+    The skip conv runs first so its output (the residual) exists two jobs before the residual add.
+    Returns (jobs, next_slot, output_layout).
+    """
+    block = []
+    res_slot, res_mode = block_in, 2
+    if raw.get("skip_weight") is not None:
+        sk = Job("sk", raw["skip_weight"], raw["skip_bias"], block_in, slot, lay, stride=stride, in_flip=True,
+                 shift=int(skip_shift), relu=False)
+        slot += 1
+        block.append(sk)
+        res_slot, res_mode = sk.out_slot, 1
+    a = Job("a", raw["w1"], raw["b1"], block_in, slot, lay, stride=stride, in_flip=True, shift=int(shifts[0]))
+    slot += 1
+    b = Job("b", raw["w2"], raw["b2"], a.out_slot, slot, a.out_layout, shift=int(shifts[1]), res_slot=res_slot,
+            res_mode=res_mode, out_flip=True, ea=int(ea), eb=int(eb))
+    slot += 1
+    return block + [a, b], slot, b.out_layout
+
+
+def basic_jobs_from_bindings(stage_bindings, reuse_slots=False):
+    jobs: list[Job] = []
+    block_outputs: dict[str, Job] = {}
+    slot, block_in, lay = 1, 0, None
+    for binds in stage_bindings:
+        for b in binds:
+            _, cin, h, w = b["input_shape"]
+            if lay is None:
+                lay = layout_for(cin, w, h)
+            block, slot, lay = basic_block_jobs(
+                b["raw_weights"], int(b["conv2_stride"][0]), b["shifts"], b["skip_output_shift"],
+                b["main_residual_shift"], b["skip_residual_shift"], block_in, slot, lay)
+            jobs += block
+            block_outputs[b["block"].prefix] = block[-1]
+            block_in = block[-1].out_slot
+    if reuse_slots:
+        assign_slots(jobs)
+    return jobs, {prefix: job.out_slot for prefix, job in block_outputs.items()}
