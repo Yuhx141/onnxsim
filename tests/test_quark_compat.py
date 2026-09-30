@@ -115,3 +115,82 @@ def test_integer_preset_requires_reader():
     q = qc.ModelQuantizer(qc.QConfig.get_default_config("U8S8_AAWS"))
     with pytest.raises(ValueError, match="calibration_data_reader"):
         q.quantize_model(_model())
+
+
+def _two_layer_model():
+    rng = np.random.default_rng(1)
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        agraph (float[N,8] x) => (float[N,8] y)
+        {
+            h = MatMul(x, w1)
+            r = Relu(h)
+            y = MatMul(r, w2)
+        }
+        """
+    )
+    # Random weights are attached programmatically (too large for text literals).
+    model.graph.initializer.extend(
+        onnx.numpy_helper.from_array(rng.standard_normal((8, 8)).astype(np.float32), n)
+        for n in ("w1", "w2")
+    )
+    return model
+
+
+def _conv_model():
+    rng = np.random.default_rng(2)
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 17]>
+        agraph (float[1,3,8,8] x) => (float[1,4,8,8] y)
+        {
+            h = Conv<pads=[1,1,1,1]>(x, w1, b1)
+            r = Relu(h)
+            y = Conv<pads=[1,1,1,1]>(r, w2, b2)
+        }
+        """
+    )
+    scale = np.array([1.0, 10.0, 0.1, 3.0], dtype=np.float32)  # uneven channel ranges
+    for name, shape in (("w1", (4, 3, 3, 3)), ("b1", (4,)), ("w2", (4, 4, 3, 3)), ("b2", (4,))):
+        arr = rng.standard_normal(shape).astype(np.float32)
+        arr *= scale.reshape(-1, *[1] * (len(shape) - 1))
+        model.graph.initializer.append(onnx.numpy_helper.from_array(arr, name))
+    return model
+
+
+def _quantize(model, algos, batches):
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.algo_config = algos
+    return qc.ModelQuantizer(cfg).quantize_model(model, calibration_data_reader=batches)
+
+
+def _batches(shape, n=4):
+    rng = np.random.default_rng(3)
+    return [{"x": rng.standard_normal(shape).astype(np.float32)} for _ in range(n)]
+
+
+@pytest.mark.parametrize(
+    "algo", [qc.SmoothQuantConfig(alpha=0.5), qc.BiasCorrectionConfig()]
+)
+def test_runnable_algo_changes_the_quantized_model(algo):
+    batches = _batches((4, 8))
+    base = _quantize(_two_layer_model(), [], batches)
+    out = _quantize(_two_layer_model(), [algo], batches)
+    assert out.SerializeToString() != base.SerializeToString()
+
+
+def test_cle_changes_a_conv_relu_conv_model():
+    batches = _batches((1, 3, 8, 8))
+    base = _quantize(_conv_model(), [], batches)
+    out = _quantize(_conv_model(), [qc.CLEConfig()], batches)
+    assert out.SerializeToString() != base.SerializeToString()
+
+
+def test_adaquant_is_refused_not_run_as_a_noop():
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.algo_config = [qc.AdaQuantConfig()]
+    with pytest.raises(NotImplementedError, match="adaquant"):
+        qc.ModelQuantizer(cfg).quantize_model(
+            _two_layer_model(), calibration_data_reader=_batches((4, 8))
+        )

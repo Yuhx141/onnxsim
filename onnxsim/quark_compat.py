@@ -32,10 +32,15 @@ names and preset *meanings*, not copied.
   ``ModelQuantizer.last_approximations`` and emitted as a ``UserWarning``.
 - ``BFP16``, ``MX4/6/9``, ``MXFP*`` and dynamic quantization raise
   ``NotImplementedError`` (no custom-op runtime for them here).
-- ``algo_config`` (AdaRound, AdaQuant, GPTQ, SmoothQuant, CLE, BiasCorrection,
-  Quarot, AutoMixprecision) is accepted and stored so configs round-trip,
-  but **not executed**: ``quantize_model`` raises ``NotImplementedError``
-  naming them unless ``ignore_unsupported_algos=True``.
+- ``algo_config``: SmoothQuant (``alpha``) and CLE run on the float model
+  before quantization; BiasCorrection runs after it, against the float
+  model. AdaQuant, AdaRound, GPTQ, Quarot and AutoMixprecision are accepted
+  and stored so configs round-trip, but **not executed** (onnxsim's AdaRound/
+  GPTQ target its int4 weight-only scheme, and its AdaQuant only recognizes
+  ``quantize_static`` output -- on ``quantize_full_qdq`` output it silently
+  changes nothing, so it is refused rather than run as a no-op):
+  ``quantize_model`` raises ``NotImplementedError`` naming them unless
+  ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted.
 """
 
@@ -220,6 +225,9 @@ def _drain_reader(reader: Any, limit: Optional[int] = None) -> List[Dict[str, np
     return batches
 
 
+_RUNNABLE_ALGOS = {"smooth_quant", "cle", "bias_correction"}
+
+
 # -- quantizer -----------------------------------------------------------------
 
 
@@ -257,12 +265,14 @@ class ModelQuantizer:
                 )
             if spec.is_dynamic:
                 raise NotImplementedError("dynamic quantization is not supported")
-        if cfg.algo_config and not ignore_unsupported_algos:
-            names = ", ".join(a.name for a in cfg.algo_config)
+        unsupported = [a.name for a in cfg.algo_config if a.name not in _RUNNABLE_ALGOS]
+        if unsupported and not ignore_unsupported_algos:
             raise NotImplementedError(
-                f"algo_config [{names}] is not executed by onnxsim.quark_compat; "
-                "pass ignore_unsupported_algos=True to quantize without them"
+                f"algo_config [{', '.join(unsupported)}] is not executed by "
+                "onnxsim.quark_compat; pass ignore_unsupported_algos=True to "
+                "quantize without them"
             )
+        runnable = [a for a in cfg.algo_config if a.name in _RUNNABLE_ALGOS]
 
         if isinstance(model_input, str):
             model_input = onnx.load(model_input)
@@ -273,7 +283,9 @@ class ModelQuantizer:
             fn = quantize_fp16 if act.dtype == "float16" else quantize_bf16
             result = fn(model_input)
         else:
-            result = self._quantize_int(model_input, act, wt, calibration_data_reader)
+            result = self._quantize_int(
+                model_input, act, wt, calibration_data_reader, runnable
+            )
 
         if cfg.specific_layer_config or cfg.layer_type_config:
             self._approx("per-layer / per-type overrides ignored (global spec used)")
@@ -287,7 +299,12 @@ class ModelQuantizer:
         self.last_approximations.append(msg)
 
     def _quantize_int(
-        self, model: onnx.ModelProto, act: QSpec, wt: QSpec, reader: Any
+        self,
+        model: onnx.ModelProto,
+        act: QSpec,
+        wt: QSpec,
+        reader: Any,
+        algos: List[AlgoConfig],
     ) -> onnx.ModelProto:
         from onnxsim.full_qdq import quantize_full_qdq
 
@@ -310,13 +327,40 @@ class ModelQuantizer:
         if not calibration:
             raise ValueError("calibration_data_reader is required for integer presets")
         exclude = [e for e in self.config.exclude if isinstance(e, str)]
-        return quantize_full_qdq(
-            model,
+        by_name = {a.name: a for a in algos}
+
+        # Float -> float pre-quantization passes (quantize_full_qdq is fed
+        # the transformed model; the untouched one stays the reference).
+        float_model = model
+        work = model
+        if "smooth_quant" in by_name:
+            from onnxsim.smoothquant import apply_smoothquant
+
+            alpha = by_name["smooth_quant"].params.get("alpha", 0.5)
+            work = apply_smoothquant(work, calibration_data=calibration, alpha=alpha)
+        if "cle" in by_name:
+            from onnxsim.onnx_simplifier import cross_layer_equalize
+
+            work = cross_layer_equalize(work)
+        if work is not model:
+            float_model = work
+
+        quantized = quantize_full_qdq(
+            work,
             calibration_data=calibration,
             activation_dtype=act_dtype,
             exclude_nodes=exclude,
             method=act.calibration_method,
         )
+
+        # Post-quantization passes, which compare against the float model.
+        if "bias_correction" in by_name:
+            from onnxsim.bias_correction import correct_bias
+
+            quantized = correct_bias(
+                float_model, quantized, calibration_data=calibration
+            )
+        return quantized
 
 
 __all__ = [
