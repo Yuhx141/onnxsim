@@ -56,6 +56,7 @@ enum {
   D_CORE,     // global core index (region index of this core's output/residual)
   D_TI0,      // (tap index, region) decomposition of tt0, computed by the host (no divide on the core)
   D_CP0,
+  D_REG,      // bytes between the input map's producing-core regions (512 unless the host wrote a wider layout)
   D_CLAMP,    // upper bound of the int8 result (127 = none): ReLU6 in the quantized domain
 };
 
@@ -90,7 +91,7 @@ struct Layer {
   const int32_t *d;
   const int8_t *weights;
   const int32_t *bias;
-  int nbp, ncp, w, h, ow, oh, s, mode, ntaps, nb, tt0, ttn, first, last, shift, relu, in_flip, out_flip, res, ea, eb, core, ti0, cp0, clamp;
+  int nbp, ncp, w, h, ow, oh, s, mode, ntaps, nb, tt0, ttn, first, last, shift, relu, in_flip, out_flip, res, ea, eb, core, ti0, cp0, clamp, reg;
   int op, t_out;
   int taps[9];
 };
@@ -105,7 +106,7 @@ inline Layer load(const uint8_t *slot) {
   for (int i = 0; i < 9; ++i) l.taps[i] = d[D_TAP0 + i];
   l.nb = d[D_NB]; l.tt0 = d[D_TT0]; l.ttn = d[D_TTN]; l.first = d[D_FIRST]; l.last = d[D_LAST];
   l.shift = pos(d[D_SHIFT]); l.relu = d[D_RELU]; l.in_flip = d[D_IN_FLIP]; l.out_flip = d[D_OUT_FLIP];
-  l.res = d[D_RES]; l.ea = d[D_EA]; l.eb = d[D_EB]; l.core = d[D_CORE]; l.ti0 = d[D_TI0]; l.cp0 = d[D_CP0]; l.clamp = d[D_CLAMP];
+  l.res = d[D_RES]; l.ea = d[D_EA]; l.eb = d[D_EB]; l.core = d[D_CORE]; l.ti0 = d[D_TI0]; l.cp0 = d[D_CP0]; l.clamp = d[D_CLAMP]; l.reg = d[D_REG];
   l.bias = (const int32_t *)((const uint8_t *)l.weights + d[D_BIAS]);
   l.op = l.ow * l.oh;
   l.t_out = (l.op + 7) / 8;
@@ -163,42 +164,118 @@ inline void tiled_gemm(const Layer &L, int nt, ABase a_base, int a_stride, Epi e
 }
 }  // namespace
 
+// Scale `n` uint8-with-zero-point-128 bytes (n multiple of 8) by 2^e in place, saturating, 8 bytes at a time.
+__attribute__((noinline)) static void requant_bytes(uint8_t *p, int n, int e) {
+  const v64 flip = aie::broadcast<int8, 64>((int8_t)-128);
+  for (int i = 0; i < n; i += 8) {
+    alignas(64) int8_t tile[64];
+    aie::store_v(tile, aie::zeros<int8, 64>());
+    __builtin_memcpy(tile, p + i, 8);
+    aie::accum<acc32, 64> a;
+    a.from_vector(aie::bit_xor(aie::load_v<64>(tile), flip), e > 0 ? e : 0);
+    aie::store_v(tile, aie::bit_xor(a.to_vector<int8>(e > 0 ? 0 : -e), flip));
+    __builtin_memcpy(p + i, tile, 8);
+  }
+}
+
+// dst = requant(a * 2^ea + b * 2^eb) for n bytes (multiple of 8) of uint8-with-zero-point-128 activations,
+// the same arithmetic as the residual epilogue: both operands are left-shifted to a common exponent, summed and
+// rounded back with one shift.
+__attribute__((noinline)) static void add_bytes(uint8_t *dst, const uint8_t *a, const uint8_t *b, int n, int ea, int eb) {
+  const v64 flip = aie::broadcast<int8, 64>((int8_t)-128);
+  const int common = (ea < eb) ? pos(-ea) : pos(-eb);
+  for (int i = 0; i < n; i += 8) {
+    alignas(64) int8_t ta[64], tb[64];
+    aie::store_v(ta, aie::zeros<int8, 64>());
+    aie::store_v(tb, aie::zeros<int8, 64>());
+    __builtin_memcpy(ta, a + i, 8);
+    __builtin_memcpy(tb, b + i, 8);
+    aie::accum<acc32, 64> a1, a2;
+    a1.from_vector(aie::bit_xor(aie::load_v<64>(ta), flip), ea + common);
+    a2.from_vector(aie::bit_xor(aie::load_v<64>(tb), flip), eb + common);
+    aie::accum<acc32, 64> sum = aie::add(a1, a2);
+    aie::store_v(ta, aie::bit_xor(sum.to_vector<int8>(common), flip));
+    __builtin_memcpy(dst + i, ta, 8);
+  }
+}
+
 extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out, const int8_t *resid) {
   ::aie::set_rounding(aie::rounding_mode::conv_even);
   ::aie::set_saturation(aie::saturation_mode::saturate);
   const Layer L = load(slot);
   if (L.nb == 0) return;
+  if (L.mode == 6 || L.mode == 7 || L.mode == 8) {
+    // Data-movement jobs over this core's blocks: 6 = copy/concat/split (per-block source and scale exponent in the
+    // payload), 7 = nearest upsample by D_S, 8 = max pool (window D_NTAPS, stride D_S, "same" padding). The result
+    // is optionally re-scaled by 2^D_EA (the Q after the op has its own scale).
+    const int n = L.op * 8;
+    uint8_t *dst0 = (uint8_t *)out;
+    if (L.mode == 6) {
+      const int32_t *tab = (const int32_t *)L.weights;
+      for (int ol = 0; ol < L.nb; ++ol) {
+        const uint8_t *src = (const uint8_t *)(tab[ol * 3] ? resid : act) + tab[ol * 3 + 1];
+        uint8_t *dst = dst0 + ol * n;
+        for (int i = 0; i < n; i += 8) *(uint64_t *)(dst + i) = *(const uint64_t *)(src + i);
+        const int e = tab[ol * 3 + 2];
+        if (e != 0) requant_bytes(dst, n, e);
+      }
+    } else if (L.mode == 7) {
+      const int f = L.s;
+      for (int ol = 0; ol < L.nb; ++ol) {
+        const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * L.w * L.h * 8;
+        uint8_t *dst = dst0 + ol * n;
+        int iy = 0, ry = 0;
+        for (int oy = 0; oy < L.oh; ++oy) {
+          int ix = 0, rx = 0;
+          for (int ox = 0; ox < L.ow; ++ox) {
+            *(uint64_t *)(dst + (oy * L.ow + ox) * 8) = *(const uint64_t *)(blk + (iy * L.w + ix) * 8);
+            if (++rx == f) { rx = 0; ++ix; }
+          }
+          if (++ry == f) { ry = 0; ++iy; }
+        }
+      }
+    } else {
+      const int k = L.ntaps, pad = (k - 1) / 2;
+      for (int ol = 0; ol < L.nb; ++ol) {
+        const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * L.w * L.h * 8;
+        uint8_t *dst = dst0 + ol * n;
+        for (int oy = 0; oy < L.oh; ++oy)
+          for (int ox = 0; ox < L.ow; ++ox) {
+            uint8_t best[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // padding is byte 0: the smallest u8 activation, i.e. -inf
+            for (int ky = 0; ky < k; ++ky) {
+              const int iy = oy * L.s + ky - pad;
+              if (iy < 0 || iy >= L.h) continue;
+              for (int kx = 0; kx < k; ++kx) {
+                const int ix = ox * L.s + kx - pad;
+                if (ix < 0 || ix >= L.w) continue;
+                const uint8_t *p = blk + (iy * L.w + ix) * 8;
+                for (int c = 0; c < 8; ++c) best[c] = p[c] > best[c] ? p[c] : best[c];
+              }
+            }
+            for (int c = 0; c < 8; ++c) dst[(oy * L.ow + ox) * 8 + c] = best[c];
+          }
+      }
+    }
+    if (L.mode != 6 && L.ea != 0) requant_bytes(dst0, L.nb * n, L.ea);
+    return;
+  }
+  if (L.mode == 9) {
+    // Add of two activations (same channel blocking): A = act, B = resid with region size D_TT0.
+    const int n = L.w * L.h * 8;
+    for (int ol = 0; ol < L.nb; ++ol)
+      add_bytes((uint8_t *)out + ol * n, (const uint8_t *)act + L.core * L.reg + ol * n,
+                (const uint8_t *)resid + L.core * L.tt0 + ol * n, n, L.ea, L.eb);
+    return;
+  }
   if (L.mode == 5) {
     // Unary lookup table over this core's blocks (same layout in and out): out byte = table[in byte]. Any
     // elementwise activation (SiLU, HardSwish, Sigmoid, GELU, Tanh, ...) that was quantized to 8 bits reduces to
     // one 256-entry table built on the host from the op's float definition.
     const uint8_t *tab = (const uint8_t *)L.weights;
-    const uint8_t *src = (const uint8_t *)act + L.core * ENG_REGION_BYTES;
+    const uint8_t *src = (const uint8_t *)act + L.core * L.reg;
     uint8_t *dst = (uint8_t *)out;
     const int n = L.nb * L.w * L.h * 8;
     for (int i = 0; i < n; ++i) dst[i] = tab[src[i]];
-    return;
-  }
-  if (L.mode == 2) {
-    // 3x3 stride-2 pad-1 max pool of this core's channel block over the dense stem map (uint8, one block
-    // = W*H*8 bytes). Padding never wins: post-ReLU bytes are >= 128, so the pad value 0 is a valid -inf.
-    const uint8_t *src = (const uint8_t *)act + L.core * (L.w * L.h * 8);
-    uint8_t *dst = (uint8_t *)out;
-    for (int oy = 0; oy < L.oh; ++oy)
-      for (int ox = 0; ox < L.ow; ++ox) {
-        uint8_t best[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (int ky = 0; ky < 3; ++ky) {
-          const int iy = oy * 2 + ky - 1;
-          if (iy < 0 || iy >= L.h) continue;
-          for (int kx = 0; kx < 3; ++kx) {
-            const int ix = ox * 2 + kx - 1;
-            if (ix < 0 || ix >= L.w) continue;
-            const uint8_t *p = src + (iy * L.w + ix) * 8;
-            for (int c = 0; c < 8; ++c) best[c] = p[c] > best[c] ? p[c] : best[c];
-          }
-        }
-        for (int c = 0; c < 8; ++c) dst[(oy * L.ow + ox) * 8 + c] = best[c];
-      }
     return;
   }
   const int p_in = L.w * L.h;
@@ -245,7 +322,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
       for (int ol = 0; ol < L.nb; ++ol) {
         aie::accum<acc32, 64> acc;
         acc.from_vector(bias_tile(L.bias + ol * 8), 0);
-        const int8_t *blk = act + L.core * ENG_REGION_BYTES + ol * p_in * 8;
+        const int8_t *blk = act + L.core * L.reg + ol * p_in * 8;
         for (int ti = 0; ti < L.ntaps; ++ti) {
           const int tap = L.taps[ti], ky = tap >= 6 ? 2 : (tap >= 3 ? 1 : 0), kx = tap - ky * 3;
           for (int r = 0; r < 8; ++r) {
@@ -269,28 +346,31 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
   }
   if (L.mode == 0) {
     // Direct: tile t of every input block is the 64 contiguous bytes at t*64; regions are REGION_BYTES apart.
-    auto a_base = [&](int t, int tt) { return act + tt * ENG_REGION_BYTES + t * 64; };
+    auto a_base = [&](int t, int tt) { return act + tt * L.reg + t * 64; };
+#ifndef ENG_NO_G4  // graph-compiled nets rarely need 4-block groups and the code space is tight
     if (L.nb % 4 == 0) tiled_gemm<4>(L, L.t_out, a_base, p_in * 8, epi);
-    else tiled_gemm<2>(L, L.t_out, a_base, p_in * 8, epi);
+    else
+#endif
+    tiled_gemm<2>(L, L.t_out, a_base, p_in * 8, epi);
   } else {
     const int pad_w = L.w + 2, pad_bytes = (L.h + 2) * pad_w * 8;
-    const bool pad_fits = L.nbp * (L.w * L.h * 8 + pad_bytes) <= ENG_REGION_BYTES ||
-                          L.ncp * ENG_REGION_BYTES + L.nbp * L.ncp * pad_bytes <= ENG_ACT_BYTES;
+    const bool pad_fits = L.nbp * (L.w * L.h * 8 + pad_bytes) <= L.reg ||
+                          L.ncp * L.reg + L.nbp * L.ncp * pad_bytes <= ENG_ACT_BYTES;
     if (L.s == 1 && pad_fits) {
       // Stride-1 3x3: a zero-padded copy of every input block is built once (first chunk); an A tile is
       // then 1/2/4 contiguous row segments of that copy, so no per-row gather is needed. The copy sits
       // in the unused bytes of each input region when it fits there, else in the activation object's tail.
       const int pw = L.w + 2, padp = (L.h + 2) * pw, lps = padp * 8;
-      const bool in_region = L.nbp * (p_in + padp) * 8 <= ENG_REGION_BYTES;
-      int8_t *pad0 = (int8_t *)act + (in_region ? L.nbp * p_in * 8 : L.ncp * ENG_REGION_BYTES);
-      const int cps = in_region ? ENG_REGION_BYTES : L.nbp * lps;
+      const bool in_region = L.nbp * (p_in + padp) * 8 <= L.reg;
+      int8_t *pad0 = (int8_t *)act + (in_region ? L.nbp * p_in * 8 : L.ncp * L.reg);
+      const int cps = in_region ? L.reg : L.nbp * lps;
       const int8_t fl = L.in_flip ? (int8_t)-128 : (int8_t)0;  // uint8 inputs are re-centred while copying, so the zero border stays 0
       if (L.first) {
         for (int cp = 0; cp < L.ncp; ++cp)
           for (int l = 0; l < L.nbp; ++l) {
             uint64_t *z = (uint64_t *)(pad0 + cp * cps + l * lps);
             for (int i = 0; i < padp; ++i) z[i] = 0;
-            const int8_t *src = act + cp * ENG_REGION_BYTES + l * p_in * 8;
+            const int8_t *src = act + cp * L.reg + l * p_in * 8;
             int8_t *dst = pad0 + cp * cps + l * lps;
             for (int y = 0; y < L.h; ++y) {
               int8_t *d = dst + ((y + 1) * pw + 1) * 8;
@@ -398,7 +478,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
             mask[r] = ok ? ~0ull : 0ull;
           }
         }
-        gather_region(scratch_tiles, act + cp * ENG_REGION_BYTES, L.nbp, p_in, offs, mask, flip64);
+        gather_region(scratch_tiles, act + cp * L.reg, L.nbp, p_in, offs, mask, flip64);
         for (int l = 0; l < L.nbp; ++l) {
           v64 a = aie::load_v<64>(scratch_tiles + l * 64);
           c0.mac(a, aie::load_v<64>(w0)); w0 += 64;

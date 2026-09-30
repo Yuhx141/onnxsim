@@ -196,7 +196,9 @@ def _qdq_graph():
 def test_graph_compiler_lowers_depthwise_relu6_hardswish_and_a_fused_residual():
     from layer_engine_graph import compile_graph
 
-    jobs, in_name, out_name, _layout = compile_graph(_qdq_graph())
+    compiled = compile_graph(_qdq_graph())
+    jobs, in_name = compiled.jobs, compiled.input_name
+    out_name = next(iter(compiled.boundaries), "y_q")
     assert [job.kind for job in jobs] == ["dw", "lut", "conv"]
     dw, lut, pw = jobs
     assert dw.clamp == 96 and dw.relu  # ReLU6 at scale 2^-4 -> 6 / 0.0625
@@ -214,3 +216,75 @@ def test_graph_compiler_lowers_depthwise_relu6_hardswish_and_a_fused_residual():
         res = maps[job.res_slot] if job.res_slot is not None else None
         maps[job.out_slot] = le.reference(job, maps[job.in_slot], res)
     assert maps[jobs[-1].out_slot].shape == (16, 16)
+
+
+def test_movement_and_add_job_references():
+    rng = np.random.default_rng(4)
+    lay = le.layout_for(32, 4, 4)
+    a = rng.integers(0, 256, (16, 32), dtype=np.uint8)
+    b = rng.integers(0, 256, (16, 32), dtype=np.uint8)
+    zero = (np.zeros((32, 1, 1, 1), dtype=np.int8), np.zeros(32, dtype=np.int32))
+    # concat with a re-scaled second source
+    cat = le.Job(
+        "cat",
+        np.zeros((64, 1, 1, 1), dtype=np.int8),
+        np.zeros(64, dtype=np.int32),
+        0,
+        2,
+        lay,
+        kind="copy",
+        res_slot=1,
+        b_layout=lay,
+        copy_spec=[(0, g, 0) for g in range(4)] + [(1, g, 1) for g in range(4)],
+    )
+    out = le.reference(cat, a, b)
+    assert np.array_equal(out[:, :32], a)
+    doubled = np.clip((b.astype(np.int64) - 128) * 2, -128, 127) + 128
+    assert np.array_equal(out[:, 32:], doubled.astype(np.uint8))
+    # split = a channel range copy
+    split = le.Job(
+        "split",
+        *zero,
+        0,
+        2,
+        lay,
+        kind="copy",
+        copy_spec=[(0, 2 + g, 0) for g in range(2)],
+    )
+    assert np.array_equal(le.reference(split, a, None), a[:, 16:32])
+    # add of two activations with ratios 1:1 -> plain saturating sum
+    add = le.Job(
+        "add", *zero, 0, 2, lay, kind="add", res_slot=1, b_layout=lay, ea=0, eb=0
+    )
+    want = (
+        np.clip((a.astype(np.int64) - 128) + (b.astype(np.int64) - 128), -128, 127)
+        + 128
+    )
+    assert np.array_equal(le.reference(add, a, b), want.astype(np.uint8))
+    # nearest upsample and a 3x3 same-padded max pool
+    up = le.Job("up", *zero, 0, 2, lay, kind="up", factor=2)
+    fmap = le.reference(up, a, None).reshape(8, 8, 32)
+    assert np.array_equal(fmap[::2, ::2], a.reshape(4, 4, 32)) and np.array_equal(
+        fmap[1::2, 1::2], a.reshape(4, 4, 32)
+    )
+    pool = le.Job("pool", *zero, 0, 2, lay, kind="maxpool", factor=3, stride=1)
+    pooled = le.reference(pool, a, None).reshape(4, 4, 32)
+    assert (
+        pooled[1, 1].tolist()
+        == a.reshape(4, 4, 32)[0:3, 0:3].reshape(9, 32).max(axis=0).tolist()
+    )
+
+
+def test_subgraph_table_runs_a_sigmoid_mul_chain_through_tinygrad():
+    from onnx import helper
+
+    nodes = [
+        helper.make_node("Sigmoid", ["x"], ["s"]),
+        helper.make_node("Mul", ["x", "s"], ["y"]),
+    ]
+    table = tl.subgraph_table(
+        nodes, "x", "y", {}, 1 / 16, 128, False, 1 / 16, 128, False
+    )
+    x = (np.arange(256) - 128) / 16.0
+    want = np.clip(np.rint(x / (1 + np.exp(-x)) / (1 / 16)) + 128, 0, 255)
+    assert np.abs(table.astype(int) - want).max() <= 1  # SiLU
