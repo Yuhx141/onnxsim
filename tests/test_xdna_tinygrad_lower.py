@@ -374,3 +374,35 @@ def test_graph_compiler_keeps_the_add_after_a_depthwise_conv_a_separate_job():
     compiled = compile_graph(model, simplify=False)
     assert [job.kind for job in compiled.jobs] == ["dw", "add"]
     assert compiled.jobs[0].res_slot is None
+
+
+@pytest.mark.parametrize(
+    "kernel,stride,pads,extra", [(2, 2, 0, 0), (3, 2, 1, 1), (4, 2, 1, 0)]
+)
+def test_fast_host_conv_transpose_matches_the_reference_evaluator(
+    kernel, stride, pads, extra
+):
+    from onnx import parser
+    from onnx.reference import ReferenceEvaluator
+
+    from layer_engine_host import _fast_ops
+
+    model = parser.parse_model(
+        f"""
+        <ir_version: 8, opset_import: ["" : 19]>
+        g (float[1, 4, 5, 6] x, float[4, 3, {kernel}, {kernel}] w, float[3] b) => (float[1, 3, 1, 1] y) {{
+          y = ConvTranspose<kernel_shape = [{kernel}, {kernel}], strides = [{stride}, {stride}],
+                            pads = [{pads}, {pads}, {pads}, {pads}], output_padding = [{extra}, {extra}]>(x, w, b)
+        }}
+        """
+    )
+    rng = np.random.default_rng(0)
+    feeds = {
+        "x": rng.standard_normal((1, 4, 5, 6)).astype(np.float32),
+        "w": rng.standard_normal((4, 3, kernel, kernel)).astype(np.float32),
+        "b": rng.standard_normal(3).astype(np.float32),
+    }
+    (want,) = ReferenceEvaluator(model).run(None, feeds)
+    (got,) = ReferenceEvaluator(model, new_ops=_fast_ops()).run(None, feeds)
+    assert got.shape == want.shape
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
