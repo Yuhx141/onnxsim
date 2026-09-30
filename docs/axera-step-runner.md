@@ -42,6 +42,14 @@ comes out.
     runner selects one of three checked-in templates by the exact measured
     input/output zero point and scale. Other Div constants or calibrations
     still require a general native template before they leave the host.
+  - The crop-mask normalization `Div_453` uses a checked-in FP32
+    `Expand -> Max(count, 1) -> Div` model. Float execution has counts in
+    `[1,9]`; quantized mask inputs can produce empty positions, where both
+    numerator and count are zero. The explicit clamp makes those positions
+    zero and avoids both implicit broadcast in AxDiv and `0/0`. The exact
+    `[1024,9,3136]` template passed an AX8850 VM test including zero counts;
+    the step runner also verifies this segment against its matching safe-div
+    simulation.
   - The checked-in exact S16 overrides are enabled by default; a different
     JSON file can be selected with `--precision-overrides overrides.json`.
     They select only templates whose full scale and
@@ -290,3 +298,148 @@ Capture and profile on the VM-backed device with:
 AXCL_LXD_VM=axcl-vm python scripts/axera/capture_fp32_binaries.py \
   --refresh --runs 30
 ```
+
+## Retargeting inaccurate covered binaries
+
+The default FP32 capture list is built from nodes that the current planner
+would leave on the host. `--nodes NAME,...` additionally captures named
+binary nodes even when another native emitter claims them; these explicit
+entries are selected by the planner and retain the step's calibrated input
+and output quantization boundaries. This lets a validated FP32 arithmetic
+kernel replace a failing quantized route without changing its surrounding
+calibration contract.
+
+On 2026-09-29, an AX8850 replay identified 27 distinct signatures among the
+failing binary segments. Pulsar2 built and device-validated 22 directly. Its
+calibrator rejected the five scalar-first Mul signatures because rank-0 input
+shapes fail in calibration, so the capture path now represents scalar inputs
+as `[1]` (broadcast-equivalent) in the compiled template and reshapes the
+single runtime value accordingly. All five then built and matched FP32
+exactly. The 27 targeted templates cover 30 named step nodes, including
+`Add_976` and the five scalar Mul nodes; a focused run of those five Mul nodes
+on real step data passed at 0 LSB with no NaN updates.
+
+The next full replay, with the five scalar templates included, ran 914 NPU
+segments (1,105 graph-node executions) with no device errors and no planner
+host nodes. It measured 175 exact FP32 binary segments; the strict 2-LSB gate
+still rejected 33 MatMul chains and 21 quantized elementwise segments. The
+training loss was 16.729 vs 17.058 float, and median gradient cosine was
+-0.577, so this is not yet a validated full-training result. Report:
+`/tmp/axera-fp32-qio-full-next.json`.
+
+Two high-impact elementwise failures (`Mul_705`, `Add_730`) were separately
+captured as FP32 templates and matched the calibrated simulation at 0 LSB on
+real step inputs; selecting just these two restored loss to within 2e-6 of
+float, with median update relative error 2.3e-6. They are deliberately not
+marked `prefer_fp32_nodes`: the measured end-to-end device path took 96/133 ms
+per segment, versus 14/32 ms for the local host simulation, and the capture
+round trips were 28/82 ms. Thus they are useful accuracy probes, but do not
+meet the faster-than-host criterion for replacing fallback. MatMul-chain
+calibration/emission and faster native arithmetic remain the priority.
+
+## Stable softmax-gradient rewrite (`--stable-softmax-grad`)
+
+`step_runner.py --stable-softmax-grad CALIB.json` applies
+`rewrite_softmax_ratio_gradients` to the step, patches the per-node records,
+and regenerates the calibration for the rewritten graph over the same 4-step
+calibration set (cached in `CALIB.json`; about a minute the first time). The
+rewrite replaces `p * (a/p - sum(a/p*p))` with `p * (a - p*sum(a))`, removing
+the quantized `0/0` behind the non-finite `Log_10`/`Div_21` segments.
+
+On 2026-09-29, on the AX8850 with `--host-optimizer`: 328 NPU segments, zero
+device errors, health 0 LSB before and after, no runtime fallbacks. Median
+gradient cosine against the float reference rose from -0.577 to **0.839** with
+no NaN (simulation: 0.918); median update cosine 0.53 (was -0.0001 with 7
+NaN updates). The loss is unchanged (16.729 vs 17.058, forward path). The
+remaining gradient error is in 34 MatMul-chain segments that fail the 2-LSB
+gate. The default run without the flag is unchanged.
+
+```sh
+AXCL_LXD_VM=axcl-vm $PY step_runner.py --mode npu --host-optimizer \
+  --stable-softmax-grad /path/stable-calib.json --out /path/stable.json
+```
+
+## Adam update: `--fp32-optimizer`
+
+In simulation the NaN updates come from the uint8 `Sqrt` and `Add(eps)`
+segments in front of each optimizer `Div`: `sqrt(v)` is about 1e-5 against a
+tensor max of 0.43, so the 1e-8 eps is lost and 509,119 of 512,000 elements
+of the 1000x512 weight quantize to 0 (0/0 -> NaN). `--fp32-optimizer` never
+gives optimizer nodes a quantized template: each runs as an FP32 binary
+template when one is captured for its exact shapes, else on the host in float.
+Simulation gives 0 NaN updates and the same update cosine as
+`--host-optimizer` (0.64), with 263 optimizer nodes (Sqrt, Add-eps, scalar
+Mul) still on the host for lack of FP32 templates. Not yet run on the device.
+
+## 16-bit MatMul pilot
+
+`pilot_matmul_u16.py` builds a bare live-operand `MatMul(x, w)` with Pulsar2
+7.0-lite at U8, U16 and S16 (`quant.layer_configs` with
+`op_types: ["MatMul"]`). Pulsar2 accepts U16 and S16 for MatMul. On the AX8850,
+[1,64,128]x[1,128,64] has relative error against float of 1.76e-2 at U8 and
+6.8e-5 at U16/S16 (about 260x lower), at comparable latency
+(0.38 ms U8, 0.28 ms U16). The 16-bit axmodel is larger (5,919 vs 4,343 bytes)
+but uses the same scale-lane roles as 8-bit, plus two fixed lane constants
+(256.0 and 1.0, `matmul_record_emit.FIXED_LANES`) and an `npu_params`
+multiplier lane of `256 * s_x * s_w / s_y` (the `mult256` role). With those,
+`matmul_record_emit.recalibrate` moves one U16 build onto another exactly in
+both directions (records and params), and the emitted model matches the
+native held-out build bit for bit on the AX8850 (max diff 0.0, 6.5e-5 relative
+error against float). This is a bare MatMul: the step's Gather/Reshape chains
+and int8-symmetric input rules at 16 bits are still to be checked.
+
+## 16-bit MatMul chains (`--u16-matmul`)
+
+`step_runner.py --u16-matmul REGEX` rebuilds the `matmul_chain` segments whose
+name matches with Pulsar2 `layer_configs` U16 (`u16_chain.py`), calibrated on
+the reference batch's real tensors (one axmodel per segment, cached in
+`--u16-cache-dir`). Segments still pass and return float32; a segment passes
+when it is within `U16_MAX_REL` (5e-3) of the float chain. Two Pulsar2
+details, both measured:
+
+- Every op type of the chain is set to U16, and the bias `Add` is also named
+  in a `layer_names` entry.
+- A `Transpose`/`Reshape` that ends the chain makes Pulsar2 quantize the whole
+  output path to 8 bits (the forward Conv chains stayed at 2.2e-2 error).
+  `chain_model` cuts those ops off and the runner applies them on the host as
+  the segment's `output_transform`; the forward `stage2_conv2` chain went from
+  2.2e-2 to 3.5e-4.
+
+On real step data the bare backward MatMuls are about 240x closer to float at
+U16 (median 2-7e-2 -> 1-6e-4) for about 2.5x the device time (100 ms -> 251 ms
+summed over 17 templates; `dX_MatMul_54` 14 -> 75 ms).
+
+AX8850 replay with `--stable-softmax-grad --host-optimizer` and the 20 forward
+Convs plus eight small backward MatMuls at 16-bit (28 segments; median
+float error 7e-4; health 0 LSB, no runtime fallback): median gradient cosine
+**0.974** (8-bit: 0.839; MatMul chains on the host in float: 0.994), median
+update cosine 0.72, loss 16.660 vs 17.058 float. Not yet at 16 bits:
+`conv0_fwd` (its Pulsar2 build exceeds the 30 minute timeout), `dense0_fwd`
+(1.4e-2 from float, so it ran as float), and the large backward chains
+(`TMPDIR` must point at disk: `/tmp` is tmpfs and the calibration tars of the
+biggest chains overflow it).
+
+### Where the remaining error is (16-bit MatMuls, AX8850 replay)
+
+- `--exact-fp32-io` lets the FP32 binary segments pass float instead of
+  re-quantizing to the step's 8-bit boundaries (11 segments, max error 0). It
+  leaves the gradients where they were (median cosine 0.971).
+- `--u16-kinds` extends `--u16-matmul` to other segment kinds. The forward
+  loss error comes only from the `misc` segments (Softmax, Log, Neg,
+  ReduceSum): simulation with `misc` on the host in float gives loss 17.073
+  against 17.058, and no other kind moves it. At U16 on the device Softmax
+  is 4e-4 from float, Log 1.4e-4 and ReduceSum exact.
+- The remaining gradient error is the still-8-bit backward MatMul chains
+  (34 segments, 4-11% each).
+
+### `misc` at 16 bits closes the loss gap
+
+AX8850 replay with `--stable-softmax-grad --host-optimizer --exact-fp32-io
+--u16-kinds matmul_chain,misc` (61 segments at U16: the 20 forward Convs
+except `conv0_fwd`, eight small backward MatMuls, and the Softmax, Log, Neg and
+26 ReduceSum segments): loss **17.004 against 17.058** float (16.660 before),
+median gradient cosine **0.977**, median update cosine 0.75; zero device
+errors, health 0 LSB, no runtime fallback. Five 16-bit segments failed their
+gate or build (`ReduceSum_460` exceeded the 30 minute build timeout) and ran as
+float. The rest of the gradient error is the 34 backward MatMul chains still at
+8 bits (12 of them beyond 2 LSB of their simulation).
