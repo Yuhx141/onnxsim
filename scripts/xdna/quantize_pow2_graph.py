@@ -139,9 +139,19 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
         ]
         return bool(names) and all(n in dq_of for n in names)
 
+    def ensure_q(name: str) -> None:
+        """Re-enter the quantized domain: a float activation feeding a quantizable op gets its own Q/DQ."""
+        if name and name not in dq_of and name not in init and name in absmax:
+            qdq(name)
+
     qdq(graph.input[0].name, 2.0**-7)
     for node in graph.node:
         op = node.op_type
+        if op in ("Conv", "ConvTranspose") and node.input[0] not in dq_of:
+            ensure_q(node.input[0])
+        elif op in ("Add", "Concat") and any(i in dq_of for i in node.input if i):
+            for i in node.input:
+                ensure_q(i)
         if op == "Constant":
             nodes.append(node)
         elif op == "Identity" and node.input[0] in init:

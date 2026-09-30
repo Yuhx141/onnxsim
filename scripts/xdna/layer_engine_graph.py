@@ -62,6 +62,20 @@ class Tensor:
     scale: float
     zero: int
     host: bool = False
+    level: int = 0  # host round trips this tensor's value depends on
+
+
+@dataclass
+class Entry:
+    """A float host tensor re-entering the engine through a QuantizeLinear (written into a pinned arena slot)."""
+
+    q_name: str
+    float_name: str
+    slot: int
+    layout: Layout
+    scale: float
+    zero: int
+    level: int
 
 
 @dataclass
@@ -77,6 +91,10 @@ class Compiled:
     )  # Q-output name -> tensor (after slot assignment)
     pinned: list[int] = field(default_factory=list)
     model: Any = None  # the (onnxsim-folded) model the jobs were compiled from
+    entries: list = field(default_factory=list)  # host -> engine re-entries (see Entry)
+    levels: int = 1  # engine launches needed: one per host round trip + 1
+    dequant: dict = field(default_factory=dict)  # boundary Q name -> (float DQ output name, scale)
+    host_nodes: list = field(default_factory=list)  # (node, level) of every host-tail operator, in graph order
 
 
 def _shift(ratio: float, label: str) -> int:
@@ -160,16 +178,43 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
     host_jobs: list[Job] = []
     counter = [1]
     handled: set[str] = {first_q.name}
+    cur = [0]  # level of the node being compiled (max over the tensors it reads)
+    hlevel: dict[str, int] = {}  # float host tensor -> level
+    entries: list[Entry] = []
+    host_nodes: list = []
+    from onnx import shape_inference
+
+    shape_of = {v.name: [d.dim_value for d in v.type.tensor_type.shape.dim] for v in shape_inference.infer_shapes(model).graph.value_info}
 
     def new_slot() -> int:
         counter[0] += 1
         return counter[0] - 1
 
+    def enter(node) -> None:
+        """A QuantizeLinear over a float host tensor: the tensor re-enters the engine through a pinned arena slot."""
+        fin = res(node.input[0])
+        if fin not in hlevel or res(node.output[0]) in tensors:
+            return
+        dims = shape_of.get(fin)
+        if not dims or len(dims) != 4 or dims[0] != 1 or dims[1] % 8:
+            return  # not an engine-shaped map (e.g. the DFL decode): its consumers stay on the host
+        layout = layout_for(dims[1], dims[3], dims[2])
+        if layout.nbc * layout.pixels * 8 > REGION_BYTES:
+            return
+        scale, zero = qp(node)
+        slot = new_slot()
+        entries.append(Entry(res(node.output[0]), fin, slot, layout, scale, zero, hlevel[fin] + 1))
+        tensors[res(node.output[0])] = Tensor(slot, layout, scale, zero, host=True, level=hlevel[fin] + 1)
+
     def dq_source(name: str) -> Tensor:
         node = producers[res(name)]
         if node.op_type != "DequantizeLinear":
             raise ValueError(f"{name}: expected a DequantizeLinear activation")
-        return tensors[res(node.input[0])]
+        if res(node.input[0]) not in tensors:
+            enter(producers[res(node.input[0])])
+        t = tensors[res(node.input[0])]
+        cur[0] = max(cur[0], t.level)
+        return t
 
     def add_job(job: Job, host: bool = False) -> Job:
         if job.out_layout.nbc * job.out_layout.pixels * 8 > REGION_BYTES:
@@ -195,7 +240,7 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
 
     def register(q_out: str, job: Job, scale: float, zero: int = 128) -> None:
         tensors[res(q_out)] = Tensor(
-            job.out_slot, job.out_layout, scale, zero, host=job in host_jobs
+            job.out_slot, job.out_layout, scale, zero, host=job in host_jobs, level=cur[0]
         )
 
     def attrs_of(node):
@@ -226,15 +271,32 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             for n in names
         )
 
+    def mark_host(node) -> None:
+        lvl = max([hlevel.get(res(i), 0) for i in node.input if i and res(i) not in init] + [0])
+        for o in node.output:
+            hlevel[res(o)] = lvl
+        host_nodes.append((node, lvl))
+
     for node in nodes:
+        cur[0] = 0
         if node.name in handled:
             continue
         op = node.op_type
-        if op in ("QuantizeLinear", "DequantizeLinear"):
+        if op == "DequantizeLinear":
+            if res(node.input[0]) in tensors:
+                hlevel[res(node.output[0])] = tensors[res(node.input[0])].level
+            else:
+                mark_host(node)  # Q/DQ inside a float host region (e.g. the DFL decode)
+            continue
+        if op == "QuantizeLinear":
+            enter(node)
+            if res(node.output[0]) not in tensors:
+                mark_host(node)
             continue
         if not engine_inputs(
             node, [0] if op in ("Split", "Resize", "MaxPool", "Conv", "Slice", "AveragePool", "ConvTranspose") else None
         ):
+            mark_host(node)
             continue  # float input: host tail
         if op in ("Split", "Concat", "MaxPool", "Resize", "Add", "Slice", "AveragePool", "ConvTranspose"):
             handled.add(
@@ -301,7 +363,7 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             job_scale, out_name = out_scale, qnode.output[0]
             res_slot, res_mode, ea, eb = None, 0, 0, 0
             dqs = consumers.get(res(qnode.output[0]), [])
-            if len(dqs) == 1 and dqs[0].op_type == "DequantizeLinear":
+            if group == 1 and len(dqs) == 1 and dqs[0].op_type == "DequantizeLinear":  # the dw kernel has no fused residual
                 users = consumers.get(res(dqs[0].output[0]), [])
                 adds = (
                     [u for u in users if u.op_type == "Add"] if len(users) == 1 else []
@@ -337,8 +399,8 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             )
             slot = new_slot()
             if group > 1 and group == oc == weight.shape[0] and icg == 1:
-                if kh != kw or kh not in (3, 5):
-                    raise ValueError(f"{node.name}: only 3x3 and 5x5 depthwise are supported")
+                if kh != kw or kh not in (3, 5, 7):
+                    raise ValueError(f"{node.name}: only 3x3, 5x5 and 7x7 depthwise are supported")
                 job = Job(
                     node.name,
                     weight,
@@ -698,7 +760,8 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             add_job(job)
             register(qnode.output[0], job, out_scale, out_zero)
             handled.update({n.name for n in chain} | {qnode.name})
-        # anything else belongs to the host tail
+        if node.name not in handled:
+            mark_host(node)  # anything else belongs to the host tail
     handled_outputs = {res(o) for n in nodes if n.name in handled for o in n.output}
     boundaries: dict[str, Tensor] = {}
     for n in nodes:
@@ -718,7 +781,7 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
     ):  # debugging: never reuse a slot and expose every job output as a boundary
         keep = [j.out_slot for j in jobs]
         boundaries = {j.name: Tensor(j.out_slot, j.out_layout, 1.0, 128) for j in jobs}
-    pinned = sorted({j.out_slot for j in host_jobs} | {0})
+    pinned = sorted({j.out_slot for j in host_jobs} | {0} | {e.slot for e in entries})
     mapping: dict[int, int] = {}
     count = assign_slots(jobs, pinned=pinned, keep=keep, mapping=mapping)
     for name, t in boundaries.items():
@@ -729,6 +792,13 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
         if j.res_slot is not None:
             j.res_slot = mapping.get(j.res_slot, j.res_slot)
     del handled_outputs, count
+    for e in entries:
+        e.slot = mapping[e.slot]
+    dequant = {}
+    for n in nodes:
+        if n.op_type == "DequantizeLinear" and res(n.input[0]) in boundaries:
+            dequant.setdefault(res(n.input[0]), (n.output[0], float(init[res(n.input[1])])))
+    levels = max([e.level for e in entries] + [0]) + 1
     return Compiled(
-        host_jobs, jobs, first_q.output[0], in_layout, s0, channels, boundaries, pinned, model
+        host_jobs, jobs, first_q.output[0], in_layout, s0, channels, boundaries, pinned, model, entries, levels, dequant, host_nodes
     )

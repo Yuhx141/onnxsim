@@ -24,6 +24,7 @@ import onnx
 
 import layer_engine as le
 from layer_engine_graph import compile_graph
+from layer_engine_host import run_levels
 
 
 def main() -> int:
@@ -37,6 +38,7 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="compare the boundary tensors with ONNX Runtime")
     parser.add_argument("--json", type=Path)
     parser.add_argument("--dump-boundaries", type=Path)
+    parser.add_argument("--dump-outputs", type=Path, help="save the model outputs computed through the host tail (npz)")
     args = parser.parse_args()
 
     import aie.iron as iron
@@ -72,14 +74,25 @@ def main() -> int:
                     dense[job.out_slot], job.out_layout
                 )
         prefix_ms = (time.perf_counter() - started) * 1000.0
-        launched = time.perf_counter()
-        kernel(arena, params_t, arena)
-        engine_ms = (time.perf_counter() - launched) * 1000.0
-        data = arena.numpy().view(np.uint8)
-        found = {
-            name: le.from_arena(data[t.slot * le.SLOT_BYTES : (t.slot + 1) * le.SLOT_BYTES], t.layout)
-            for name, t in plan.boundaries.items()
-        }
+        engine_ms = 0.0
+
+        def launch() -> dict[str, np.ndarray]:
+            nonlocal engine_ms
+            started_launch = time.perf_counter()
+            kernel(arena, params_t, arena)
+            engine_ms += (time.perf_counter() - started_launch) * 1000.0
+            data = arena.numpy().view(np.uint8)
+            return {
+                name: le.from_arena(data[t.slot * le.SLOT_BYTES : (t.slot + 1) * le.SLOT_BYTES], t.layout)
+                for name, t in plan.boundaries.items()
+            }
+
+        def write_slot(slot: int, data: np.ndarray) -> None:
+            with arena.overwrite() as host:
+                host.view(np.uint8)[slot * le.SLOT_BYTES : (slot + 1) * le.SLOT_BYTES] = data
+
+        found, floats = run_levels(plan, launch, write_slot)
+        run_once.floats = floats
         return found, prefix_ms, engine_ms
 
     for _ in range(args.warmup):
@@ -94,11 +107,14 @@ def main() -> int:
     report = {
         "model": str(args.model), "engine_jobs": len(plan.jobs), "host_jobs": len(plan.host_jobs),
         "boundaries": {n: list(v.shape) for n, v in boundaries.items()},
-        "min_ms": min(totals), "median_ms": float(np.median(totals)),
+        "launches": plan.levels, "min_ms": min(totals), "median_ms": float(np.median(totals)),
         "host_prefix_ms": float(np.median(prefix)), "engine_call_ms": float(np.median(engine)),
     }
     if args.dump_boundaries:
         np.savez(args.dump_boundaries, **{k.replace("/", "|"): v for k, v in boundaries.items()})
+    if args.dump_outputs:
+        floats = getattr(run_once, "floats", {})
+        np.savez(args.dump_outputs, **{o.name.replace("/", "|"): floats[o.name] for o in model.graph.output if o.name in floats})
     if args.check:
         import onnxruntime as ort
 
@@ -113,6 +129,11 @@ def main() -> int:
             want = want[0].transpose(1, 2, 0).reshape(-1, want.shape[1])
             differing += int((got != want).sum())
         report["bytes_differing_from_ort"] = differing
+        outputs = [o.name for o in model.graph.output]
+        floats = getattr(run_once, "floats", {})
+        if all(o in floats for o in outputs):
+            reference = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"]).run(outputs, {model.graph.input[0].name: x})
+            report["max_abs_output_error_vs_ort"] = max(float(np.abs(floats[o] - r).max()) for o, r in zip(outputs, reference))
     text = json.dumps(report, indent=2)
     print(text)
     if args.json:
