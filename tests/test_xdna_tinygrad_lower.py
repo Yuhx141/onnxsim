@@ -338,3 +338,384 @@ def test_gap_bmul_and_depthwise_5x5_references():
     assert packed[
         0, 0, 0, le.DESC_BYTES : le.DESC_BYTES + 25 * 64
     ].any()  # all 25 tap vectors are packed
+
+
+def test_graph_compiler_keeps_the_add_after_a_depthwise_conv_a_separate_job():
+    # the depthwise kernel ignores a fused residual, so the compiler must not fuse an Add into a dw job
+    from onnx import numpy_helper, parser
+
+    text = """
+    <ir_version: 8, opset_import: ["" : 19]>
+    g (float[1, 8, 4, 4] input) => (float[1, 8, 4, 4] y_dq) <
+      float s = {0.0078125}, float s2 = {0.00006103515625}, uint8 z = {128}, int8 wz = {0}, float ws = {0.0078125},
+      int8[8] bq = {0, 0, 0, 0, 0, 0, 0, 0}
+    > {
+      xq = QuantizeLinear(input, s, z)
+      xd = DequantizeLinear(xq, s, z)
+      wd = DequantizeLinear(wq, ws, wz)
+      bd = DequantizeLinear(bq, s2, wz)
+      c = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1], group = 8>(xd, wd, bd)
+      cq = QuantizeLinear(c, s, z)
+      cd = DequantizeLinear(cq, s, z)
+      sum = Add(xd, cd)
+      yq = QuantizeLinear(sum, s, z)
+      y_dq = DequantizeLinear(yq, s, z)
+    }
+    """
+    model = parser.parse_model(text)
+    # the compiler tracks nodes by name; the text format leaves them empty
+    for i, node in enumerate(model.graph.node):
+        node.name = f"n{i}"
+    model.graph.initializer.append(
+        numpy_helper.from_array(np.ones((8, 1, 3, 3), dtype=np.int8), "wq")
+    )
+    from layer_engine_graph import compile_graph
+
+    compiled = compile_graph(model, simplify=False)
+    assert [job.kind for job in compiled.jobs] == ["dw", "add"]
+    assert compiled.jobs[0].res_slot is None
+
+
+@pytest.mark.parametrize(
+    "kernel,stride,pads,extra", [(2, 2, 0, 0), (3, 2, 1, 1), (4, 2, 1, 0)]
+)
+def test_fast_host_conv_transpose_matches_the_reference_evaluator(
+    kernel, stride, pads, extra
+):
+    from layer_engine_host import _fast_ops
+    from onnx import parser
+    from onnx.reference import ReferenceEvaluator
+
+    model = parser.parse_model(
+        f"""
+        <ir_version: 8, opset_import: ["" : 19]>
+        g (float[1, 4, 5, 6] x, float[4, 3, {kernel}, {kernel}] w, float[3] b) => (float[1, 3, 1, 1] y) {{
+          y = ConvTranspose<kernel_shape = [{kernel}, {kernel}], strides = [{stride}, {stride}],
+                            pads = [{pads}, {pads}, {pads}, {pads}], output_padding = [{extra}, {extra}]>(x, w, b)
+        }}
+        """
+    )
+    rng = np.random.default_rng(0)
+    feeds = {
+        "x": rng.standard_normal((1, 4, 5, 6)).astype(np.float32),
+        "w": rng.standard_normal((4, 3, kernel, kernel)).astype(np.float32),
+        "b": rng.standard_normal(3).astype(np.float32),
+    }
+    (want,) = ReferenceEvaluator(model).run(None, feeds)
+    (got,) = ReferenceEvaluator(model, new_ops=_fast_ops()).run(None, feeds)
+    assert got.shape == want.shape
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+def _name_nodes(model):
+    # the compiler tracks nodes by name; the text format leaves them empty
+    for i, node in enumerate(model.graph.node):
+        node.name = f"n{i}"
+    return model
+
+
+def _chain_matches_evaluator(model, x, out_scale):
+    """Run compile_graph's jobs with the numpy references and compare with onnx's evaluator on the float model."""
+    from layer_engine_graph import compile_graph
+    from onnx.reference import ReferenceEvaluator
+
+    compiled = compile_graph(model, simplify=False)
+    n, c, h, w = x.shape
+    q = np.clip(np.rint(x / compiled.input_scale) + 128, 0, 255).astype(np.uint8)[0]
+    dense = np.full((h * w, compiled.input_layout.nb * 8), 128, dtype=np.uint8)
+    dense[:, :c] = q.transpose(1, 2, 0).reshape(h * w, c)
+    maps = {0: dense}
+    for job in compiled.jobs:
+        res = maps[job.res_slot] if job.res_slot is not None else None
+        maps[job.out_slot] = le.reference(job, maps[job.in_slot], res)
+    (want,) = ReferenceEvaluator(model).run(None, {"input": x})
+    last = compiled.jobs[-1]
+    got = (maps[last.out_slot].astype(np.float32) - 128) * out_scale
+    oc, oh, ow = want.shape[1:]
+    np.testing.assert_allclose(
+        got[:, :oc].reshape(oh, ow, oc).transpose(2, 0, 1), want[0], atol=1e-6
+    )
+    return compiled
+
+
+@pytest.mark.parametrize(
+    "k,s,pads,ceil", [(3, 2, 0, 1), (3, 2, 1, 0), (2, 2, 0, 0), (3, 1, 1, 0)]
+)
+def test_graph_compiler_max_pool_padding_and_ceil_mode(k, s, pads, ceil):
+    from onnx import parser
+
+    model = _name_nodes(
+        parser.parse_model(
+            f"""
+            <ir_version: 8, opset_import: ["" : 19]>
+            g (float[1, 8, 7, 7] input) => (float[1, 8, 1, 1] y_dq) <float sc = {{0.0625}}, uint8 zp = {{128}}> {{
+              xq = QuantizeLinear(input, sc, zp)
+              xd = DequantizeLinear(xq, sc, zp)
+              p = MaxPool<kernel_shape = [{k}, {k}], strides = [{s}, {s}], pads = [{pads}, {pads}, {pads}, {pads}], ceil_mode = {ceil}>(xd)
+              pq = QuantizeLinear(p, sc, zp)
+              y_dq = DequantizeLinear(pq, sc, zp)
+            }}
+            """
+        )
+    )
+    x = np.random.default_rng(1).uniform(-4, 4, (1, 8, 7, 7)).astype(np.float32)
+    compiled = _chain_matches_evaluator(model, x, 0.0625)
+    assert [job.kind for job in compiled.jobs] == ["maxpool"]
+
+
+def test_graph_compiler_grouped_conv_becomes_a_block_diagonal_dense_conv():
+    from onnx import numpy_helper, parser
+
+    model = _name_nodes(
+        parser.parse_model(
+            """
+            <ir_version: 8, opset_import: ["" : 19]>
+            g (float[1, 16, 4, 4] input) => (float[1, 16, 4, 4] y_dq) <
+              float sc = {0.0625}, float ws = {0.03125}, float bs = {0.001953125}, uint8 zp = {128}, int8 wz = {0},
+              int8[16] bq = {1, -2, 3, -4, 5, -6, 7, -8, 1, -2, 3, -4, 5, -6, 7, -8}
+            > {
+              xq = QuantizeLinear(input, sc, zp)
+              xd = DequantizeLinear(xq, sc, zp)
+              wd = DequantizeLinear(wq, ws, wz)
+              bd = DequantizeLinear(bq, bs, wz)
+              c = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1], group = 2>(xd, wd, bd)
+              cq = QuantizeLinear(c, sc, zp)
+              y_dq = DequantizeLinear(cq, sc, zp)
+            }
+            """
+        )
+    )
+    rng = np.random.default_rng(2)
+    model.graph.initializer.append(
+        numpy_helper.from_array(
+            rng.integers(-20, 20, (16, 8, 3, 3), dtype=np.int8), "wq"
+        )
+    )
+    x = rng.uniform(-3, 3, (1, 16, 4, 4)).astype(np.float32)
+    compiled = _chain_matches_evaluator(model, x, 0.0625)
+    (job,) = compiled.jobs
+    assert job.kind == "conv" and job.weight.shape == (16, 16, 3, 3)
+    assert (
+        not job.weight[:8, 8:].any() and not job.weight[8:, :8].any()
+    )  # zero outside the two groups
+
+
+def test_oversized_depthwise_weights_are_split_into_channel_block_parts():
+    from onnx import numpy_helper, parser
+
+    channels = (
+        32 * 8 * 3
+    )  # three blocks per core: 5x5 taps of that many blocks overflow a 4 KB weight slot
+    model = _name_nodes(
+        parser.parse_model(
+            f"""
+            <ir_version: 8, opset_import: ["" : 19]>
+            g (float[1, {channels}, 1, 1] input) => (float[1, {channels}, 1, 1] y_dq) <
+              float sc = {{0.0625}}, float ws = {{0.03125}}, float bs = {{0.001953125}}, uint8 zp = {{128}}, int8 wz = {{0}}
+            > {{
+              xq = QuantizeLinear(input, sc, zp)
+              xd = DequantizeLinear(xq, sc, zp)
+              wd = DequantizeLinear(wq, ws, wz)
+              bd = DequantizeLinear(bq, bs, wz)
+              c = Conv<kernel_shape = [5, 5], pads = [2, 2, 2, 2], group = {channels}>(xd, wd, bd)
+              cq = QuantizeLinear(c, sc, zp)
+              y_dq = DequantizeLinear(cq, sc, zp)
+            }}
+            """
+        )
+    )
+    rng = np.random.default_rng(3)
+    model.graph.initializer.extend(
+        [
+            numpy_helper.from_array(
+                rng.integers(-20, 20, (channels, 1, 5, 5), dtype=np.int8), "wq"
+            ),
+            numpy_helper.from_array(rng.integers(-8, 8, channels, dtype=np.int8), "bq"),
+        ]
+    )
+    x = rng.uniform(-3, 3, (1, channels, 1, 1)).astype(np.float32)
+    compiled = _chain_matches_evaluator(model, x, 0.0625)
+    kinds = [job.kind for job in compiled.jobs]
+    assert kinds.count("dw") >= 2 and "copy" in kinds
+    for job in compiled.jobs:
+        le.pack_job(job, le.ENGINE_SLOT_BYTES)  # every part fits a slot
+
+
+def test_tiny_transformer_compiles_to_multi_launch_and_matches_ort(tmp_path):
+    """Linear layers are 1x1 conv jobs, GELU a table job; LayerNorm/attention run on the host between launches."""
+    import types
+
+    import onnx
+    import onnxruntime as ort
+    from layer_engine_graph import compile_graph
+    from layer_engine_host import HostRunner, run_levels
+    from tiny_transformer import build
+
+    args = types.SimpleNamespace(
+        tokens=32, hidden=128, heads=4, layers=1, seed=0, ln="host", attn="host"
+    )
+    fmodel, taps = build(False, {}, args)
+    probe = onnx.ModelProto()
+    probe.CopyFrom(fmodel)
+    for tap in dict.fromkeys(taps):
+        probe.graph.output.append(
+            onnx.helper.make_tensor_value_info(tap, onnx.TensorProto.FLOAT, None)
+        )
+    names = [o.name for o in probe.graph.output][1:]
+    session = ort.InferenceSession(
+        probe.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((1, 128, 1, 32)).astype(np.float32)
+    absmax = {
+        n: float(np.abs(v).max())
+        for n, v in zip(names, session.run(names, {"input": x}))
+    }
+    scales = {n: 2.0 ** np.ceil(np.log2(m / 127.0)) for n, m in absmax.items()}
+    model = onnx.shape_inference.infer_shapes(build(True, scales, args)[0])
+
+    compiled = compile_graph(model, simplify=False)
+    kinds = [job.kind for job in compiled.jobs]
+    assert kinds.count("lut") == 1 and kinds.count("conv") == 6
+    assert (
+        compiled.input_layout is None and compiled.levels == 4
+    )  # qkv | o | ffn | final norm (host)
+
+    # numpy-reference "device": every launch recomputes all jobs from the arena-slot dict
+    layouts = {e.slot: e.layout for e in compiled.entries}
+    maps = {
+        e.slot: np.full((e.layout.w * e.layout.h, e.layout.nb * 8), 128, dtype=np.uint8)
+        for e in compiled.entries
+    }
+
+    def launch(level):
+        for job in compiled.jobs:
+            res = maps[job.res_slot] if job.res_slot is not None else None
+            maps[job.out_slot] = le.reference(job, maps[job.in_slot], res)
+        return {
+            n: maps[t.slot] for n, t in compiled.boundaries.items() if t.level == level
+        }
+
+    def write_slot(slot, data):
+        maps[slot] = le.from_arena(data, layouts[slot])
+
+    _, floats = run_levels(
+        compiled, launch, write_slot, HostRunner(compiled), {"input": x}
+    )
+    (want,) = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {"input": x})
+    final = compiled.host_nodes[-1][0].output[
+        0
+    ]  # the graph output is an Identity alias of the last LayerNorm
+    np.testing.assert_allclose(floats[final], want, atol=1e-4)
+
+
+def _tiny_transformer_model(ln, attn, layers=1):
+    import types
+
+    import onnx
+    import onnxruntime as ort
+    from tiny_transformer import build
+
+    args = types.SimpleNamespace(
+        tokens=32, hidden=128, heads=4, layers=layers, seed=0, ln=ln, attn=attn
+    )
+    fmodel, taps = build(False, {}, args)
+    probe = onnx.ModelProto()
+    probe.CopyFrom(fmodel)
+    for tap in dict.fromkeys(taps):
+        probe.graph.output.append(
+            onnx.helper.make_tensor_value_info(tap, onnx.TensorProto.FLOAT, None)
+        )
+    names = [o.name for o in probe.graph.output][1:]
+    session = ort.InferenceSession(
+        probe.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    x = np.random.default_rng(1).standard_normal((1, 128, 1, 32)).astype(np.float32)
+    absmax = {
+        n: float(np.abs(v).max())
+        for n, v in zip(names, session.run(names, {"input": x}))
+    }
+    scales = {n: 2.0 ** np.ceil(np.log2(m / 127.0)) for n, m in absmax.items()}
+    return onnx.shape_inference.infer_shapes(build(True, scales, args)[0]), x
+
+
+def test_engine_layernorm_and_attention_compile_to_one_launch_and_match_ort():
+    """LayerNorm (conv / product / table jobs) and attention (amm jobs) leave no host round trip."""
+    import onnx
+    import onnxruntime as ort
+    from layer_engine_graph import compile_graph
+
+    model, x = _tiny_transformer_model("engine", "engine", layers=2)
+    compiled = compile_graph(model, simplify=False)
+    kinds = [job.kind for job in compiled.jobs]
+    assert compiled.levels == 1 and not compiled.entries and not compiled.host_jobs
+    assert (
+        kinds.count("amm") == 4
+        and kinds.count("lut") >= 10
+        and kinds.count("bmul") >= 12
+    )
+    assert {job.heads for job in compiled.jobs if job.kind == "amm"} == {4}
+    assert [job.amm_t for job in compiled.jobs if job.kind == "amm"] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+
+    # every job chain on the numpy references, compared with ORT on the final (engine) output tensor
+    q = np.clip(np.rint(x / compiled.input_scale) + 128, 0, 255).astype(np.uint8)[0]
+    maps = {0: q.transpose(1, 2, 0).reshape(32, 128)}
+    for job in compiled.jobs:
+        res = maps[job.res_slot] if job.res_slot is not None else None
+        maps[job.out_slot] = le.reference(job, maps[job.in_slot], res)
+    (name,) = compiled.boundaries
+    out_q = maps[compiled.boundaries[name].slot]
+    probe = onnx.ModelProto()
+    probe.CopyFrom(model)
+    probe.graph.output.append(
+        onnx.helper.make_tensor_value_info(name, onnx.TensorProto.UINT8, None)
+    )
+    want = ort.InferenceSession(
+        probe.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {"input": x})[-1]
+    np.testing.assert_array_equal(out_q, want[0].transpose(1, 2, 0).reshape(32, 128))
+
+
+def test_activation_matmul_reference_is_a_per_head_int8_matmul():
+    rng = np.random.default_rng(7)
+    heads, dh, tokens = 4, 16, 16
+    qa = rng.integers(0, 256, (tokens, heads * dh), dtype=np.uint8)
+    kb = rng.integers(0, 256, (tokens, heads * dh), dtype=np.uint8)
+    layout = le.layout_for(heads * dh, tokens, 1)
+    scores = le.Job(
+        "qk",
+        np.zeros((heads * tokens, 1, 1, 1), dtype=np.int8),
+        np.zeros(heads * tokens, dtype=np.int32),
+        0,
+        2,
+        layout,
+        kind="amm",
+        res_slot=1,
+        b_layout=layout,
+        shift=10,
+        heads=heads,
+        amm_t=True,
+    )
+    got = le.reference(scores, qa, kb)
+    a, b = qa.astype(np.int64) - 128, kb.astype(np.int64) - 128
+    for h in range(heads):
+        want = a[:, h * dh : (h + 1) * dh] @ b[:, h * dh : (h + 1) * dh].T  # [t][s]
+        rounded = np.clip(np.rint(want / 2.0**10), -128, 127) + 128
+        np.testing.assert_array_equal(
+            got[:, h * tokens : (h + 1) * tokens], rounded.astype(np.uint8)
+        )
+    packed = le.pack_job(scores, le.ENGINE_SLOT_BYTES)
+    desc = packed[0, 0, 0, : le.DESC_BYTES].view(np.int32)
+    assert (
+        desc[le.D_MODE] == 15
+        and desc[le.D_NTAPS] == dh // 8
+        and desc[le.D_S] == tokens // 8
+        and desc[le.D_EB] == 1
+    )

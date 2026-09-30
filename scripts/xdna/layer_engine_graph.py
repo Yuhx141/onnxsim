@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 from onnx import numpy_helper
 
+import layer_engine as le
 from layer_engine import REGION_BYTES, Job, Layout, assign_slots, layout_for
 
 POINTWISE = frozenset(
@@ -83,7 +84,7 @@ class Compiled:
     host_jobs: list[Job]
     jobs: list[Job]
     input_name: str
-    input_layout: Layout
+    input_layout: Layout | None  # None: the network input is a float host tensor
     input_scale: float
     input_channels: int
     boundaries: dict[str, Tensor] = field(
@@ -162,24 +163,28 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
         return float(init[res(node.input[1])]), int(init[res(node.input[2])])
 
     first_q = next(
-        n
-        for n in nodes
-        if n.op_type == "QuantizeLinear" and res(n.input[0]) == graph.input[0].name
+        (
+            n
+            for n in nodes
+            if n.op_type == "QuantizeLinear" and res(n.input[0]) == graph.input[0].name
+        ),
+        None,
     )
     shape = [d.dim_value for d in graph.input[0].type.tensor_type.shape.dim]
     _, channels, height, width = shape
     padded_channels = -(-channels // 8) * 8
-    s0, z0 = qp(first_q)
-    in_layout = layout_for(padded_channels, width, height)
-    tensors: dict[str, Tensor] = {
-        first_q.output[0]: Tensor(0, in_layout, s0, z0, host=True)
-    }
+    if first_q is not None:
+        s0, z0 = qp(first_q)
+        in_layout = layout_for(padded_channels, width, height)
+        tensors: dict[str, Tensor] = {first_q.output[0]: Tensor(0, in_layout, s0, z0, host=True)}
+    else:  # the input is a float host tensor (a transformer's residual stream): everything starts on the host
+        s0, in_layout, tensors = 1.0, None, {}
     jobs: list[Job] = []
     host_jobs: list[Job] = []
     counter = [1]
-    handled: set[str] = {first_q.name}
+    handled: set[str] = {first_q.name} if first_q is not None else set()
     cur = [0]  # level of the node being compiled (max over the tensors it reads)
-    hlevel: dict[str, int] = {}  # float host tensor -> level
+    hlevel: dict[str, int] = {} if first_q is not None else {graph.input[0].name: 0}  # float host tensor -> level
     entries: list[Entry] = []
     host_nodes: list = []
     from onnx import shape_inference
@@ -219,6 +224,8 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
     def add_job(job: Job, host: bool = False) -> Job:
         if job.out_layout.nbc * job.out_layout.pixels * 8 > REGION_BYTES:
             host = True
+        if any(l is not None and l.nb * l.w * l.h * 8 > le.SLOT_BYTES for l in (job.in_layout, job.b_layout)):
+            host = True  # an input map larger than an arena slot cannot be read by the engine: its consumers stay on the host until maps shrink
         if host:
             slots_on_host = {j.out_slot for j in host_jobs} | {0}
             if (
@@ -238,9 +245,37 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             jobs.append(job)
         return job
 
+    def split_dw(job: Job, name: str, weight, bias) -> Job:
+        """Add a depthwise job; one whose per-core weights overflow a slot becomes channel-block parts (slice, dw, concat)."""
+        k = weight.shape[2]
+        max_nbc = (le.ENGINE_SLOT_BYTES - le.DESC_BYTES) // (k * k * 64 + le.TILE * 4)
+        nb = job.in_layout.nb
+        parts = -(-(-(-nb // le.CORES)) // max_nbc)
+        if parts <= 1:
+            return add_job(job)
+        per = -(-nb // parts)
+        outs = []
+        for lo in range(0, nb, per):
+            hi = min(lo + per, nb)
+            spec = [(0, g, 0) for g in range(lo, hi)]
+            sl = add_job(Job(f"{name}:slice{lo}", np.zeros(((hi - lo) * 8, 1, 1, 1), dtype=np.int8), np.zeros((hi - lo) * 8, dtype=np.int32),
+                             job.in_slot, new_slot(), job.in_layout, kind="copy", copy_spec=spec))
+            part = Job(f"{name}:{lo}", weight[lo * 8 : hi * 8], bias[lo * 8 : hi * 8], sl.out_slot, new_slot(), sl.out_layout,
+                       stride=job.stride, kind="dw", shift=job.shift, relu=job.relu, in_flip=True, out_flip=True, clamp=job.clamp)
+            outs.append(add_job(part))
+        cur = outs[0]
+        for nxt in outs[1:]:
+            spec = [(0, g, 0) for g in range(cur.out_layout.nb)] + [(1, g, 0) for g in range(nxt.out_layout.nb)]
+            channels = (cur.out_layout.nb + nxt.out_layout.nb) * 8
+            cur = add_job(Job(f"{name}:cat{len(spec)}", np.zeros((channels, 1, 1, 1), dtype=np.int8), np.zeros(channels, dtype=np.int32),
+                              cur.out_slot, new_slot(), cur.out_layout, kind="copy", copy_spec=spec, res_slot=nxt.out_slot, b_layout=nxt.out_layout))
+        return cur
+
     def register(q_out: str, job: Job, scale: float, zero: int = 128) -> None:
+        reads = {job.in_slot, job.res_slot}
+        level = max([cur[0]] + [t.level for t in tensors.values() if t.slot in reads])  # depends on whatever its inputs do
         tensors[res(q_out)] = Tensor(
-            job.out_slot, job.out_layout, scale, zero, host=job in host_jobs, level=cur[0]
+            job.out_slot, job.out_layout, scale, zero, host=job in host_jobs, level=level
         )
 
     def attrs_of(node):
@@ -277,11 +312,59 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             hlevel[res(o)] = lvl
         host_nodes.append((node, lvl))
 
+    def back(name: str):
+        """Follow Reshape/Transpose producers back to a DequantizeLinear: (its output, chain nodes, transposed, dims)."""
+        chain, transposed, dims = [], False, None
+        while True:
+            p = producers.get(res(name))
+            if p is None:
+                return None
+            if p.op_type == "DequantizeLinear":
+                return p.output[0], chain, transposed, dims
+            if p.op_type == "Reshape" and res(p.input[1]) in init:
+                dims = dims or [int(v) for v in init[res(p.input[1])]]
+            elif p.op_type != "Transpose":
+                return None
+            transposed = transposed or p.op_type == "Transpose"
+            chain.append(p)
+            name = p.input[0]
+
+    # attention matmuls between two quantized tensors: MatMul(Transpose(Reshape(K)), Reshape(Q)) -> Reshape -> Q  is
+    # scores = K^T Q per head, MatMul(Reshape(V), Reshape(P)) -> Reshape -> Q  is context = V P (engine "amm" jobs)
+    pending_amm: dict[str, dict] = {}
+    for node in nodes:
+        if node.op_type != "MatMul":
+            continue
+        outs = consumers.get(res(node.output[0]), [])
+        if len(outs) != 1 or outs[0].op_type != "Reshape":
+            continue
+        tails = consumers.get(res(outs[0].output[0]), [])
+        a, b = back(node.input[0]), back(node.input[1])
+        if len(tails) != 1 or tails[0].op_type != "QuantizeLinear" or a is None or b is None or not b[1] or b[2] or not a[1]:
+            continue
+        pending_amm[node.name] = dict(qk=a[2], a_dq=b[0], b_dq=a[0], heads=(b[3] or [1])[0], reshape=outs[0], q=tails[0])
+        handled.update({n.name for n in a[1] + b[1]} | {outs[0].name})
+
     for node in nodes:
         cur[0] = 0
         if node.name in handled:
             continue
         op = node.op_type
+        if op == "MatMul" and node.name in pending_amm:
+            info = pending_amm[node.name]
+            a_t, b_t = dq_source(info["a_dq"]), dq_source(info["b_dq"])
+            out_scale, out_zero = qp(info["q"])
+            k = -_exp2(a_t.scale * b_t.scale / out_scale, "attention matmul rescale")
+            heads = info["heads"]
+            if k < 0 or a_t.layout.pixels % 8 or a_t.layout.pixels != b_t.layout.pixels:
+                raise ValueError(f"{node.name}: attention matmul needs a multiple of 8 tokens and a coarser output scale")
+            oc = heads * b_t.layout.pixels if info["qk"] else b_t.layout.nb * 8
+            job = Job(node.name, np.zeros((oc, 1, 1, 1), dtype=np.int8), np.zeros(oc, dtype=np.int32), a_t.slot, new_slot(), a_t.layout,
+                      kind="amm", res_slot=b_t.slot, b_layout=b_t.layout, shift=k, heads=heads, amm_t=info["qk"])
+            add_job(job)
+            register(info["q"].output[0], job, out_scale, out_zero)
+            handled.add(info["q"].name)
+            continue
         if op == "DequantizeLinear":
             if res(node.input[0]) in tensors:
                 hlevel[res(node.output[0])] = tensors[res(node.input[0])].level
@@ -292,6 +375,9 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             enter(node)
             if res(node.output[0]) not in tensors:
                 mark_host(node)
+            continue
+        if op in ("Conv", "ConvTranspose") and res(node.input[1]) in init:
+            mark_host(node)  # float weights (not quantized): stays in the float host tail
             continue
         if not engine_inputs(
             node, [0] if op in ("Split", "Resize", "MaxPool", "Conv", "Slice", "AveragePool", "ConvTranspose") else None
@@ -311,6 +397,13 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             a = attrs_of(node)
             group, strides = a.get("group", 1), a.get("strides", [1, 1])
             oc, icg, kh, kw = weight.shape
+            if group > 1 and not (group == oc and icg == 1):
+                # grouped (not depthwise): a dense conv with a block-diagonal weight (extra MACs, exact result)
+                dense = np.zeros((oc, icg * group, kh, kw), dtype=weight.dtype)
+                per = oc // group
+                for gi in range(group):
+                    dense[gi * per : (gi + 1) * per, gi * icg : (gi + 1) * icg] = weight[gi * per : (gi + 1) * per]
+                weight, icg, group = dense, icg * group, 1
             if (
                 icg * group < src.layout.nb * 8
             ):  # padded input channels (e.g. RGB -> 8): extra weights are zero
@@ -373,8 +466,21 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                     other = next(
                         i for i in add.input if res(i) != res(dqs[0].output[0])
                     )
+                    skip_src = producers.get(res(other))
+                    if skip_src is None or skip_src.op_type != "DequantizeLinear":
+                        adds = []  # the other operand is a float host tensor: the Add stays a host node
+                    elif (
+                        skip_src is not None
+                        and skip_src.op_type == "DequantizeLinear"
+                        and res(skip_src.input[0]) not in tensors
+                        and res(skip_src.input[0]) in producers
+                    ):
+                        adds = []  # the skip branch (e.g. a ResNet downsample conv) compiles later and fuses the Add itself
+                if adds:
                     skip = dq_source(other)
-                    (final_q,) = consumers[res(add.output[0])]
+                    after = consumers[res(add.output[0])]
+                    post_relu = len(after) == 1 and after[0].op_type == "Relu"  # residual block: Add -> ReLU -> Q
+                    (final_q,) = consumers[res(after[0].output[0])] if post_relu else after
                     final_scale, final_zero = qp(final_q)
                     if final_zero != 128 or skip.zero != 128 or relu:
                         raise ValueError(
@@ -384,7 +490,8 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                     eb = _exp2(skip.scale / final_scale, "skip branch scale ratio")
                     res_slot, res_mode = skip.slot, 2
                     job_scale, out_name = final_scale, final_q.output[0]
-                    handled.update({dqs[0].name, add.name, final_q.name})
+                    handled.update({dqs[0].name, add.name, final_q.name} | ({after[0].name} if post_relu else set()))
+                    relu = post_relu
             shift = _shift(out_scale / product, node.name)
             common = dict(
                 shift=shift,
@@ -438,7 +545,10 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                 raise ValueError(
                     f"{node.name}: grouped convolution (group={group}) has no kernel"
                 )
-            add_job(job)
+            if job.kind == "dw":
+                job = split_dw(job, node.name, weight, bias)
+            else:
+                add_job(job)
             register(out_name, job, job_scale)
             handled.update({node.name, qnode.name} | ({act.name} if act else set()))
         elif op == "Split":
@@ -565,7 +675,7 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                 )
                 add_job(job)
                 current, cur_scale = (
-                    Tensor(job.out_slot, job.out_layout, out_scale, out_zero),
+                    Tensor(job.out_slot, job.out_layout, out_scale, out_zero, level=max(t.level for t in srcs)),
                     out_scale,
                 )
             tensors[res(qnode.output[0])] = current
@@ -576,14 +686,15 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             out_scale, out_zero = qp(qnode)
             a = attrs_of(node)
             k, s = a["kernel_shape"][0], a.get("strides", [1, 1])[0]
+            pads = list(a.get("pads", [0] * 4))
             if (
                 a["kernel_shape"][0] != a["kernel_shape"][1]
-                or k % 2 == 0
-                or list(a.get("pads", [0] * 4)) != [(k - 1) // 2] * 4
+                or a.get("strides", [s, s])[0] != a.get("strides", [s, s])[1]
+                or len(set(pads[:2] + pads[2:])) > 1
+                or any(d != 1 for d in a.get("dilations", [1, 1]))
+                or pads[0] >= k
             ):
-                raise ValueError(
-                    f"{node.name}: only square odd 'same'-padded max pools are supported"
-                )
+                raise ValueError(f"{node.name}: only square, symmetrically padded max pools are supported")
             channels = src.layout.nb * 8
             job = Job(
                 node.name,
@@ -595,6 +706,8 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                 stride=s,
                 kind="maxpool",
                 factor=k,
+                pad=pads[0],
+                ceil_pool=bool(a.get("ceil_mode", 0)),
                 exp=_exp2(src.scale / out_scale, "pool rescale"),
             )
             add_job(job)
@@ -652,13 +765,12 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
         elif (
             op == "Mul"
             and all(res(i) in producers and producers[res(i)].op_type == "DequantizeLinear" for i in node.input)
-            and dq_source(node.input[0]).slot != dq_source(node.input[1]).slot
         ):
             a_t, b_t = dq_source(node.input[0]), dq_source(node.input[1])
             if a_t.layout.pixels == 1 and b_t.layout.pixels > 1:
                 a_t, b_t = b_t, a_t
-            if b_t.layout.pixels != 1:
-                raise ValueError(f"{node.name}: only a broadcast multiply by a 1x1 map (squeeze-excite) is supported")
+            if b_t.layout.pixels != 1 and (b_t.layout.pixels != a_t.layout.pixels or b_t.layout.nb != a_t.layout.nb):
+                raise ValueError(f"{node.name}: only a broadcast multiply by a 1x1 map (squeeze-excite) or a same-shape product is supported")
             (qnode,) = consumers[res(node.output[0])]
             out_scale, out_zero = qp(qnode)
             k = -_exp2(a_t.scale * b_t.scale / out_scale, "broadcast multiply rescale")
@@ -775,12 +887,25 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
                 and res(p.input[0]) in tensors
             ):
                 boundaries[res(p.input[0])] = tensors[res(p.input[0])]
+    for o in graph.output:  # a network output that is itself an engine tensor (DequantizeLinear of an engine result)
+        p = producers.get(res(o.name))
+        if p is not None and p.op_type == "DequantizeLinear" and res(p.input[0]) in tensors:
+            boundaries[res(p.input[0])] = tensors[res(p.input[0])]
     keep = [t.slot for t in boundaries.values()]
     if os.environ.get(
         "ENGINE_KEEP_ALL"
     ):  # debugging: never reuse a slot and expose every job output as a boundary
         keep = [j.out_slot for j in jobs]
         boundaries = {j.name: Tensor(j.out_slot, j.out_layout, 1.0, 128) for j in jobs}
+    if os.environ.get("ENGINE_KEEP_EVERY"):  # debugging: keep and expose every Nth job output but still reuse the other slots
+        spec = os.environ["ENGINE_KEEP_EVERY"]
+        wanted = (lambda i: i in {int(v) for v in spec[1:].split(",")}) if spec.startswith("@") else (lambda i: i % int(spec) == 0)
+        extra = {j.name: Tensor(j.out_slot, j.out_layout, 1.0, 128) for i, j in enumerate(jobs) if wanted(i)}
+        keep = keep + [t.slot for t in extra.values()]
+        boundaries = {**boundaries, **extra}
+    if os.environ.get("ENGINE_MAX_JOBS"):  # debugging: truncate the job list (no host tail)
+        del jobs[int(os.environ["ENGINE_MAX_JOBS"]) :]
+        keep, boundaries = [jobs[-1].out_slot], {}
     pinned = sorted({j.out_slot for j in host_jobs} | {0} | {e.slot for e in entries})
     mapping: dict[int, int] = {}
     count = assign_slots(jobs, pinned=pinned, keep=keep, mapping=mapping)
@@ -800,5 +925,5 @@ def compile_graph(model: Any, reuse_slots: bool = False, simplify: bool = True) 
             dequant.setdefault(res(n.input[0]), (n.output[0], float(init[res(n.input[1])])))
     levels = max([e.level for e in entries] + [0]) + 1
     return Compiled(
-        host_jobs, jobs, first_q.output[0], in_layout, s0, channels, boundaries, pinned, model, entries, levels, dequant, host_nodes
+        host_jobs, jobs, first_q.output[0] if first_q is not None else graph.input[0].name, in_layout, s0, channels, boundaries, pinned, model, entries, levels, dequant, host_nodes
     )

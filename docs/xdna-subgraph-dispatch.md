@@ -556,21 +556,103 @@ Other Ultralytics families at 32x32, compile coverage (engine jobs before the fi
 | model | engine jobs | verdict |
 |---|---|---|
 | YOLOv8n-seg | 187 (10 boundaries incl. the mask prototype head) | runs on the device, bit-exact, 2.1 ms |
-| YOLOv10n | 89 | stops at the PSA attention (Reshape/MatMul/Softmax) |
-| YOLO11n | 99 | stops at C2PSA attention |
-| YOLOv6n | 27 | `ConvTranspose` upsampling has no kernel |
-| YOLOv9t | 4 | ADown builds Slice bounds from `Shape` nodes: a constant-folding pass (onnxsim) would fold them, the standalone compiler does not |
+| YOLOv10n | 206 (2) | two launches like YOLO11n; bit-exact boundaries, decoded output within 1e-7 of ORT, 5.8 ms |
+| YOLO11n | 223 (2) | runs on the device in **two launches** (host C2PSA attention between them), bit-exact boundaries, decoded output within 1e-7 of ORT, 7.0 ms total (4.6 ms engine) |
+| YOLOv6n | 27+ | `ConvTranspose` as conv + depth-to-space jobs; exact, 1.19 ms (Vitis AI 1.955 ms) |
+| YOLOv9t | 4+ | ADown slices folded by onnxsim before codegen; exact, 4.6 ms (Vitis AI 11.06 ms) |
 | YOLOv3-tiny | 0 | MaxPool k=2 (even kernel) is not a "same"-padded odd pool |
 
-Not supported yet: YOLO11 (its C2PSA attention needs Reshape/Transpose/MatMul/Softmax in the middle of the
-network, i.e. a host round trip between two engine launches - a second xclbin costs ~1.8 ms of context switch),
-and real detector resolutions (640x640): maps of hundreds of pixels need pixel-split layouts and larger output
+Float regions in the middle of a network (YOLO11's C2PSA attention: Reshape/Transpose/MatMul/Softmax) run on the
+host between engine launches (`layer_engine_host.py`): each level is one full launch of the same xclbin and arena
+(earlier levels just recompute identical values, so no xclbin switch), the host evaluates the float nodes with onnx's
+reference evaluator and quantizes the re-entering tensors into pinned arena slots. The depthwise kernel has no fused
+residual, so an Add after a depthwise conv stays a separate `add` job.
+
+Not supported yet: real detector resolutions (640x640): maps of hundreds of pixels need pixel-split layouts and larger output
 objects, which is the "activation-tiled" engine this weight-streaming design deliberately is not. At 64x64 the
 host already computes 17 of 172 jobs.
 
 - Host findings worth keeping: OpenBLAS defaulted to one thread per core, and a 2048x1000 Gemm took 2.9 ms on
   this 64-thread host versus 0.05-0.1 ms with 1-2 threads (the runner now sets `OPENBLAS_NUM_THREADS=2`
   before numpy loads); a 1000-class head made the runner 3x slower before that fix.
+#### More vision models through the graph compiler (32x32 inputs, bit-exact vs ORT on every engine boundary)
+
+`run_graph_engine.py MODEL.onnx` (quantize with `quantize_pow2_graph.py` / `quantize_pow2_resnet.py`); device
+call + host prefix/tail, median of 10-50 runs on a busy host (+-0.2 ms):
+
+| model | engine jobs (host jobs) | ours | Vitis AI |
+|---|---|---|---|
+| ResNet-18 / 34 / 50 through `compile_graph` | 21 / 37 / 54 (1) | 1.5 / 1.7 / 2.2-2.8 ms | 0.83 / 1.42 / 1.63 ms |
+| MobileNetV2 | 48 (5) | 1.65 ms | 3.08 ms |
+| RegNetX-400MF (group-16 convs) | 70 (2) | 1.6-2.0 ms | 1.74 ms |
+| GoogLeNet | 97 (1) | 2.4 ms | 1.12 ms |
+| SqueezeNet 1.1 | 37 (1) | 1.03 ms | - |
+| MnasNet 1.0 (5x5 depthwise) | 73 (4) | 2.3 ms | - |
+| MobileNetV3-Small (SE, hard-swish) | 104 (2) | 2.2 ms | - |
+
+What these needed: grouped (non-depthwise) convs run as dense convs with a block-diagonal weight; a depthwise
+job whose per-core weights overflow the 4 KB slot is split into channel-block slice / dw / concat parts; maps
+larger than an arena slot keep their producers *and* consumers on the host until they shrink (MobileNetV2's first
+layers); max pools take any kernel/padding/`ceil_mode` (GoogLeNet, SqueezeNet); residual blocks `Add -> ReLU` fuse
+into the conv and a downsample skip fuses the Add itself; 3x3 convs on maps whose width is not 1/2/4/multiple of 8
+(SqueezeNet's 7x7) use the gather path (the padded-copy path assumed whole 8-pixel row segments).
+
+Not supported: ShuffleNet (channel shuffle = Reshape/Transpose on unaligned channel counts, 14 host round trips),
+DenseNet (BatchNorm not folded into a conv: 66), EfficientNet / ConvNeXt (maps over 64 pixels per channel block
+in the middle of the network: the SE / LayerNorm ops would need the host to read engine outputs back in the same
+launch), and any 224x224 input (needs the pixel-tiled layouts noted above). GoogLeNet is where Vitis AI is ahead
+(9 inception blocks of 1x1/3x3/5x5 branches: 97 sequential jobs at ~10 us each versus Vitis's fused subgraphs).
+
+#### Transformers: layer engine vs Vitis AI vs Hexagon HTP
+
+`tiny_transformer.py` builds a pre-LN encoder as a power-of-two QDQ graph in "tokens are pixels" form
+(`[1, hidden, 1, tokens]`), every operator of which is an engine job, so a whole encoder is **one launch**:
+
+| transformer op | engine jobs |
+|---|---|
+| Linear (Q/K/V/O, FFN) | 1x1 conv; LayerNorm's gamma/beta and the 1/sqrt(d) are folded into the next conv |
+| residual Add | fused into the o-proj / FFN2 conv epilogue (the residual stream is a uint8 tensor) |
+| LayerNorm | `x - mean` = one dense conv with `I - 1/C`; `d*d` = elementwise product job (`bmul`, same-shape mode); variance = conv of `1/C`; rsqrt = table job; `d * rsqrt` = product job |
+| GELU, exp, reciprocal | table jobs (tinygrad-lowered pointwise chains) |
+| attention scores `K^T Q` and context `V P` | new `amm` job (kernel mode 15): per-head int8 tile matmul of two activation maps; B is transposed in-kernel for the scores |
+| softmax | exp table, per-head key sum (block-diagonal ones conv), reciprocal table, product job |
+
+The previous version of this section kept LayerNorm, attention and the residual stream in float on the host
+(3 launches per layer); `--ln host --attn host` still builds that form. A network input that is float (no leading
+Q) and a network output that is an engine tensor are both supported now. The C = power of two requirement keeps
+the `1/C` conv weights exact in int8; other widths run but the mean/variance are then approximate.
+
+Same model (32 tokens, hidden 128, 4 heads, FFN 512), ms per inference, all bit-exact on the engine against ORT on
+the quantized graph:
+
+| layers | engine launches | our engine (host LN/attention, before) | **our engine (all ops on device)** | Vitis AI EP (bf16) | Hexagon HTP V69 (fp16) |
+|---|---|---|---|---|---|
+| 1 | 1 | 1.8 (4 launches) | **0.58** | 2.35 | 0.23 |
+| 2 | 1 | 3.7 (7) | **0.76** | 4.25 | 0.31 |
+| 4 | 1 | 9.0 (13) | **1.56** | 7.75 | 0.45 |
+| 6 | 1 | 15.9 (19) | **2.08** | 11.3 | 0.61 |
+
+Accuracy of the int8 power-of-two graph (activations uint8, per-tensor weights, no calibration tuning, 8-bit
+softmax/LayerNorm statistics) against the fp32 graph with the same weights: token cosine 0.998 / 0.994 / 0.989 /
+0.980 for 1 / 2 / 4 / 6 layers; Vitis AI's bf16 is 0.999 and Hexagon fp16 0.999998.
+
+The real MiniLM-L6 (`scripts/android/llm_tinygrad`, seq 128, hidden 384; ~1.4 GMAC) still cannot run on the engine:
+a channel block's tokens must fit one 512 B core region (<= 64 tokens at the narrowest width, 32 at the 4x FFN
+width). Same weights, encoder body only (embeddings and the mask bias fed in), measured:
+
+| | ms / inference | accuracy vs fp32 |
+|---|---|---|
+| Hexagon HTP fp16 (full graph incl. embeddings + pooling, phone) | **1.92** | cos 0.999998 |
+| Vitis AI EP on XDNA2 (bf16 kernels, 197-node body) | 5.30 | token cos 0.9991 (min 0.9986) |
+| this host's CPU, ORT fp32 | 12.9 | exact |
+| phone CPU, ORT fp32 4 threads (busy phone; README's quiet-phone number was 24.7) | 86 | exact |
+
+Reading it: with every op on the device, the engine is 4-5x faster than Vitis AI on the small encoder and within
+2.5-3.5x of Hexagon, whose per-model cost is a fixed few tenths of a millisecond (fp16 vector/HMX matmuls, one fused
+graph). Remaining engine cost is ~10 us per job (143 jobs for 6 layers) plus one launch, so it scales with depth;
+fewer, wider jobs (fusing the LayerNorm chain into the next conv, a per-head softmax kernel) are the next levers.
+The size limit (tokens per channel block) and int8 accuracy (vs fp16/bf16) are what keep it from MiniLM-scale models.
+
 ### Runtime-shaped kernels (`kernels/fused_bottleneck_rt.cc`, `resnet_body_design.py --rt`)
 
 The compile-time kernels bake a block's geometry in through `-D` macros, so every block kind

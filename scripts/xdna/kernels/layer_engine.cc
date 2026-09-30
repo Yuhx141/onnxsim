@@ -254,7 +254,7 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
 #endif
 #endif
     {
-      const int k = L.ntaps, pad = (k - 1) / 2;
+      const int k = L.ntaps, pad = L.ksz;  // max pool: D_KSZ carries the (left/top) padding
       for (int ol = 0; ol < L.nb; ++ol) {
         const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * L.w * L.h * 8;
         uint8_t *dst = dst0 + ol * n;
@@ -301,15 +301,17 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
 #endif  // ENG_NO_GAP
 #ifndef ENG_NO_BMUL
   if (L.mode == 11) {
-    // Broadcast multiply (squeeze-excite): out = sat(rshift_even((a - 128) * (b_c - 128), D_SHIFT)), b = 1x1 map in resid.
+    // Multiply (squeeze-excite gate or elementwise): out = sat(rshift_even((a - 128) * (b - 128), D_SHIFT)).
+    // D_EB == 0: b is a 1x1 map in resid broadcast over the pixels; D_EB == 1: b has the same shape as a.
     const int n = L.w * L.h;
+    const bool ew = L.eb != 0;
     for (int ol = 0; ol < L.nb; ++ol) {
       const uint8_t *blk = (const uint8_t *)act + L.core * L.reg + ol * n * 8;
-      const uint8_t *scale = (const uint8_t *)resid + L.core * L.tt0 + ol * 8;
+      const uint8_t *scale = (const uint8_t *)resid + L.core * L.tt0 + ol * (ew ? n * 8 : 8);
       uint8_t *dst = (uint8_t *)out + ol * n * 8;
       for (int p = 0; p < n; ++p)
         for (int c = 0; c < 8; ++c) {
-          int q = rshift_even(((int)blk[p * 8 + c] - 128) * ((int)scale[c] - 128), L.shift);
+          int q = rshift_even(((int)blk[p * 8 + c] - 128) * ((int)scale[(ew ? p * 8 : 0) + c] - 128), L.shift);
           q = q > 127 ? 127 : (q < -128 ? -128 : q);
           dst[p * 8 + c] = (uint8_t)(q + 128);
         }
@@ -362,6 +364,43 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     return;
   }
 #endif  // ENG_NO_D2S
+#ifndef ENG_NO_AMM
+  if (L.mode == 15) {
+    // Activation x activation matmul (attention), per head, both operands in the usual block layout:
+    //   out block g = (head, ob): out[t][ob*8 + n] = sat(rshift_even(sum_k A[t][head*KB*8 + k*8 + c] * B'[...], D_SHIFT))
+    // A = act (8 pixels x 8 channels tiles), B = resid (D_TT0 region bytes, D_NCP blocks per region). D_EB != 0: B is used
+    // transposed (scores = K^T Q: the B tile is an 8x8 byte transpose of a natural tile); else B tiles are natural
+    // (context = V P). D_NTAPS = KB contraction blocks, D_S = output blocks per head, D_EA = B blocks per head,
+    // D_TTN = output blocks per core.
+    const int P = L.w * L.h, kb = L.ntaps, obh = L.s, bbh = L.ea;
+    const bool tb = L.eb != 0;
+    const v64 flip = aie::broadcast<int8, 64>((int8_t)-128);
+    alignas(64) static int8_t bt[64];
+    for (int ol = 0; ol < L.nb; ++ol) {
+      const int g = L.core * L.ttn + ol, head = g / obh, ob = g % obh;
+      for (int t = 0; t < P / 8; ++t) {
+        MMUL c(aie::zeros<int32, 64>());
+        for (int k = 0; k < kb; ++k) {
+          const int a = head * kb + k;
+          v64 av = aie::bit_xor(aie::load_unaligned_v<64>(act + (a / L.nbp) * L.reg + (a % L.nbp) * P * 8 + t * 64), flip);
+          const int b = head * bbh + (tb ? k : ob), tile = tb ? ob : k;
+          const int8_t *bp = resid + (b / L.ncp) * L.tt0 + (b % L.ncp) * P * 8 + tile * 64;
+          v64 bv;
+          if (tb) {
+            for (int p = 0; p < 8; ++p)
+              for (int cc = 0; cc < 8; ++cc) bt[cc * 8 + p] = (int8_t)(bp[p * 8 + cc] ^ (int8_t)-128);
+            bv = aie::load_v<64>(bt);
+          } else {
+            bv = aie::bit_xor(aie::load_unaligned_v<64>(bp), flip);
+          }
+          c.mac(av, bv);
+        }
+        aie::store_unaligned_v(out + ol * P * 8 + t * 64, aie::bit_xor(c.to_vector<int8>(L.shift), flip));
+      }
+    }
+    return;
+  }
+#endif  // ENG_NO_AMM
 #ifndef ENG_NO_ADD
   if (L.mode == 9) {
     // Add of two activations (same channel blocking): A = act, B = resid with region size D_TT0.
@@ -468,7 +507,8 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     const int pad_w = L.w + 2, pad_bytes = (L.h + 2) * pad_w * 8;
     const bool pad_fits = L.nbp * (L.w * L.h * 8 + pad_bytes) <= L.reg ||
                           L.ncp * L.reg + L.nbp * L.ncp * pad_bytes <= ENG_ACT_BYTES;
-    if (L.s == 1 && pad_fits) {
+    const bool tile_rows = (L.w & 7) == 0 || L.w == 4 || L.w == 2 || L.w == 1;  // an 8-pixel tile is 1/2/4 whole row segments
+    if (L.s == 1 && pad_fits && tile_rows) {
       // Stride-1 3x3: a zero-padded copy of every input block is built once (first chunk); an A tile is
       // then 1/2/4 contiguous row segments of that copy, so no per-row gather is needed. The copy sits
       // in the unused bytes of each input region when it fits there, else in the activation object's tail.
