@@ -443,3 +443,91 @@ errors, health 0 LSB, no runtime fallback. Five 16-bit segments failed their
 gate or build (`ReduceSum_460` exceeded the 30 minute build timeout) and ran as
 float. The rest of the gradient error is the 34 backward MatMul chains still at
 8 bits (12 of them beyond 2 LSB of their simulation).
+
+### All MatMul and Conv chains at 16 bits, `--u16-splits`
+
+`--u16-splits 4,16` retries a 16-bit chain that does not compile at the step's
+batch (Pulsar2 build cap `U16_BUILD_TIMEOUT`, default 1800 s) at a smaller
+batch: the chain is rebuilt with every batch-leading input shrunk by the
+factor, calibrated on all the chunks together, and the segment runs the small
+model once per chunk (`batch_split`). `conv0_fwd` does not build at batch 16
+(it exceeded 3 hours) but builds at batch 4 and runs four times. A failed build
+leaves a `.failed` marker in `--u16-cache-dir`, so it is not retried unless
+`U16_RETRY_FAILED` is set.
+
+AX8850 replay, `--stable-softmax-grad --host-optimizer --exact-fp32-io
+--u16-kinds matmul_chain,misc --u16-splits 4` (95 segments at U16, none of the
+step's MatMul or Conv chains left at 8 bits; zero device errors, health 0
+LSB): median gradient cosine **0.9974** (was 0.839 at 8 bits), minimum
+0.021 (was 0), median update cosine 0.82, loss 17.004 against 17.058 float.
+`MatMul_121` (bare MatMul, 1.8e-4) and `conv0_fwd` (9e-4) were the last two
+8-bit chains and accounted for most of the remaining gradient error. Eight
+16-bit segments miss their gate and run as float: `dense0_fwd` (1.3e-2),
+`Softmax_9`, `Log_10` (zero probabilities), `MatMul_471` (9.8e-3), three
+`ReduceSum` (0.6-1.2e-2), and `MatMul_325` (input shape mismatch). `ReduceSum_460`
+does not build within 40 minutes even at batch 1.
+
+### The Adam update on the NPU (`--fp32-optimizer-chains`)
+
+Pulsar2 applies `layer_configs` FP32 to `Sqrt` as well (it is not in the
+documented FP32 list): a real optimizer `Sqrt` is 3.0e-2 from float at U8, 5.5e-4
+at U16 and 2.1e-5 at FP32. An FP32 layer does not quantize, so one build
+serves every node with the same operator, attributes and input shapes.
+`--fp32-optimizer-chains` (with `--fp32-optimizer`) builds each optimizer node
+that has no captured FP32 template as a one-node FP32 model with every input,
+constants included, as a float graph input; 263 nodes (Sqrt, +eps, scalar Mul,
+Sub, ...) took 65 builds.
+
+AX8850 replay, `--stable-softmax-grad --fp32-optimizer --fp32-optimizer-chains
+--exact-fp32-io --u16-kinds matmul_chain,misc --u16-splits 4` (no
+`--host-optimizer`): **1,098 of 1,102 graph nodes on the NPU** (907 segments:
+95 U16, 327 FP32 binary, 263 FP32 chains), zero device errors, health 0 LSB
+before and after, no runtime fallback, no NaN. Gradient cosine 0.9974, update
+cosine 0.82 (the same as with the update on the host, so the optimizer numerics
+equal float; Adam's normalization amplifies small gradient errors), loss 17.004
+against 17.058. The three nodes still planned on the host are two Muls whose
+zero points match no template class and `Sub_32` (no template at its shape).
+Eight 16-bit segments still miss their gate and run as float on the host.
+
+### The last 16-bit misses
+
+`--u16-margin REGEX` calibrates the matching segments on their data and a copy
+scaled by 1.3 (`--u16-margin-factor`): the replay's inputs come from upstream
+16-bit segments and can leave the float run's range. It fixed `dense0_fwd`,
+`Softmax_9` and two `ReduceSum` segments, and made `MatMul_471` and
+`ReduceSum_472` (the stem convolution's weight and bias gradients) worse, so
+those are not listed. A 16-bit model built at the full batch also has to reset
+the plan's `batch_split`: `MatMul_325` had an 8-bit template built at batch 4 and
+failed with a chunk-sized input until it did. `--u16-fp32 REGEX` builds the
+matching segments with FP32 layers instead of U16 (isolated on the float
+inputs: `ReduceSum_368` 8e-8, `MatMul_471` 7e-7).
+
+With those, AX8850 replay (1,098 of 1,102 nodes in 907 segments, health 0 LSB,
+no NaN, gradient cosine 0.9973): only `Log_10` (a zero probability), `MatMul_471`
+and `ReduceSum_472` still miss their gate and run as float.
+
+### Everything on the NPU
+
+`--fp32-refused` builds the nodes the plan refuses (two Muls whose zero
+points match no template class, and `Sub_32`, which has no template at its
+shape) as one-node Pulsar2 FP32 models, like `--fp32-optimizer-chains`. With
+`--u16-fp32 '^(MatMul_471|ReduceSum_472)$'` the stem convolution's weight and
+bias gradients build with FP32 layers (`ReduceSum_472` exact, `MatMul_471`
+4.9e-3 from float).
+
+AX8850 replay (`--stable-softmax-grad --fp32-optimizer --fp32-optimizer-chains
+--fp32-refused --exact-fp32-io --u16-kinds matmul_chain,misc --u16-splits 4
+--u16-margin ... --u16-fp32 ...`): **1,101 of 1,102 graph nodes in 910 NPU
+segments, none left on the host by the plan**; health 0 LSB before and after,
+no runtime fallback, no NaN, 5.1 s of engine time. Median gradient cosine
+0.9973 (minimum 0.015), median update cosine 0.82, loss 17.004 against 17.058
+float. Segments by kind: 95 U16, 327 FP32 binary, 266 FP32 single-node, 35
+elementwise, 81 reshape, 22 gather, 19 binary-precision, 18 reducesum, 17
+relu, 17 compare/cast, plus small ones. One segment fails its gate at runtime:
+`Log_10` (the 16-bit `Softmax_9` outputs exact zeros where float has tiny
+positive probabilities), and runs as float on the host.
+
+Costs to know: the 16-bit MatMul chains take about 2.5x the device time of
+their 8-bit templates, and calibration uses the reference batch the replay
+runs on, so a training loop needs per-step recalibration (the record emitter
+covers a bare MatMul, not these chains yet).

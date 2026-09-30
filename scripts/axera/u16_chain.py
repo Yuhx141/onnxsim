@@ -32,7 +32,10 @@ DEFAULT_IMAGE = "pulsar2:7.0-lite"
 
 
 def chain_model(
-    model: onnx.ModelProto, inputs: Sequence[str], outputs: Sequence[str]
+    model: onnx.ModelProto,
+    inputs: Sequence[str],
+    outputs: Sequence[str],
+    split: int = 1,
 ) -> tuple[onnx.ModelProto, Callable[[np.ndarray], np.ndarray] | None]:
     """The subgraph between ``inputs`` and ``outputs``, legalized the way the
     step is compiled (live-weight Conv/Gemm as MatMul) and in the opset the
@@ -47,6 +50,21 @@ def chain_model(
     if len(outputs) != 1:
         raise ValueError("16-bit chains have one output")
     sub = utils.Extractor(model).extract_model(list(inputs), list(outputs))
+    if split > 1:
+        # a chain too large to compile at the step's batch: every input whose
+        # leading dimension is the batch (the first input's, or the largest)
+        # shrinks by ``split``; the runner calls the model ``split`` times
+        batch = split_batch(sub)
+        for vi in sub.graph.input:
+            dims = vi.type.tensor_type.shape.dim
+            if dims and dims[0].dim_value == batch:
+                dims[0].dim_value = batch // split
+        del sub.graph.value_info[:]
+        del sub.graph.output[:]
+        sub.graph.output.extend(
+            onnx.helper.make_tensor_value_info(o, onnx.TensorProto.FLOAT, None)
+            for o in outputs
+        )
     sub = onnx.shape_inference.infer_shapes(sub)
     sub = step_calibration.legalized(sub)
     del sub.opset_import[:]
@@ -56,6 +74,9 @@ def chain_model(
     final_shape = tuple(
         d.dim_value for d in g.output[0].type.tensor_type.shape.dim
     )
+    if split > 1:
+        # the runner concatenates the chunks' outputs along axis 0 first
+        final_shape = (final_shape[0] * split, *final_shape[1:])
     steps: list[tuple[str, object]] = []
     by_out = {o: n for n in g.node for o in n.output}
     tail = g.output[0].name
@@ -86,11 +107,29 @@ def chain_model(
     return sub, post
 
 
+STEP_BATCH = 16
+"""The training step's batch size (a fixed-batch compiled graph)."""
+
+
+def split_batch(sub: onnx.ModelProto) -> int:
+    """The batch a chain is split along: the step's batch, taken from the
+    inputs whose leading dimension equals it."""
+    return STEP_BATCH
+
+
+def split_flags(sub_inputs: Sequence[onnx.ValueInfoProto], batch: int) -> list[bool]:
+    return [
+        bool(vi.type.tensor_type.shape.dim)
+        and vi.type.tensor_type.shape.dim[0].dim_value == batch
+        for vi in sub_inputs
+    ]
+
+
 def build_chain(
     work: str,
     tag: str,
     sub: onnx.ModelProto,
-    data: Mapping[str, np.ndarray],
+    data: Mapping[str, np.ndarray | list[np.ndarray]],
     precision: str = "U16",
     image: str = DEFAULT_IMAGE,
     timeout: int = 1800,
@@ -103,15 +142,14 @@ def build_chain(
     onnx.save(sub, os.path.join(root, "t.onnx"))
     inputs = []
     for name, arr in data.items():
-        pd.make_numpy_calibration_tar(
-            os.path.join(root, f"dataset/{name}.tar"), [arr] * 4
-        )
+        samples = list(arr) if isinstance(arr, list) else [arr] * 4
+        pd.make_numpy_calibration_tar(os.path.join(root, f"dataset/{name}.tar"), samples)
         inputs.append(
             {
                 "tensor_name": name,
                 "calibration_dataset": f"./dataset/{name}.tar",
                 "calibration_format": "Numpy",
-                "calibration_size": 4,
+                "calibration_size": len(samples),
             }
         )
     quant: dict = {
@@ -151,7 +189,7 @@ def cached_chain_axmodel(
     work: str,
     name: str,
     sub: onnx.ModelProto,
-    data: Mapping[str, np.ndarray],
+    data: Mapping[str, np.ndarray | list[np.ndarray]],
     precision: str = "U16",
     image: str = DEFAULT_IMAGE,
 ) -> bytes:
@@ -161,11 +199,16 @@ def cached_chain_axmodel(
     h.update(precision.encode())
     for k in sorted(data):
         h.update(k.encode())
-        h.update(np.ascontiguousarray(data[k], np.float32).tobytes())
+        for a in data[k] if isinstance(data[k], list) else [data[k]]:
+            h.update(np.ascontiguousarray(a, np.float32).tobytes())
     path = os.path.join(cache_dir, f"{name}.{h.hexdigest()[:16]}.axmodel")
     if os.path.exists(path):
         with open(path, "rb") as f:
             return f.read()
+    failed = path + ".failed"
+    if os.path.exists(failed) and not os.environ.get("U16_RETRY_FAILED"):
+        with open(failed) as f:
+            raise RuntimeError(f"{name}: earlier build failed ({f.read().strip()})")
     res = build_chain(
         work,
         name,
@@ -176,6 +219,9 @@ def cached_chain_axmodel(
         timeout=int(os.environ.get("U16_BUILD_TIMEOUT", "1800")),
     )
     if not res.success:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(failed, "w") as f:
+            f.write((res.error or "")[-200:].replace("\n", " "))
         raise RuntimeError(f"{name}: pulsar2 build failed: {(res.error or '')[-500:]}")
     with open(res.axmodel_path, "rb") as f:
         blob = f.read()
@@ -183,3 +229,42 @@ def cached_chain_axmodel(
     with open(path, "wb") as f:
         f.write(blob)
     return blob
+
+
+def node_model(
+    node: onnx.NodeProto, shapes: Mapping[str, Sequence[int]]
+) -> onnx.ModelProto:
+    """A one-node model whose every input (constants included) is a float32
+    graph input, so that one build serves every node with the same operator,
+    attributes and input shapes. A rank-0 input becomes ``[1]`` (Pulsar2's
+    calibrator rejects rank-0 tensors; the runner reshapes the value)."""
+    from onnx import TensorProto, helper
+
+    def shape_of(t: str) -> list[int]:
+        return list(shapes[t]) or [1]
+
+    n = onnx.NodeProto()
+    n.CopyFrom(node)
+    n.name = node.op_type.lower()
+    ins = [
+        helper.make_tensor_value_info(t, TensorProto.FLOAT, shape_of(t))
+        for t in node.input
+    ]
+    outs = [
+        helper.make_tensor_value_info(t, TensorProto.FLOAT, shape_of(t))
+        for t in node.output
+    ]
+    m = helper.make_model(
+        helper.make_graph([n], "one", ins, outs),
+        opset_imports=[helper.make_opsetid("", 13)],
+    )
+    m.ir_version = 8
+    return m
+
+
+def signature_data(node: onnx.NodeProto, shapes: Mapping[str, Sequence[int]]):
+    """Calibration tensors of a node's shapes. An FP32 layer does not quantize,
+    so the values only have to be valid for the operator (ones)."""
+    return {
+        t: np.ones(list(shapes[t]) or [1], np.float32) for t in node.input if t
+    }
