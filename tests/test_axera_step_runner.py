@@ -22,8 +22,8 @@ from onnx import numpy_helper, parser
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "scripts", "axera"))
 
-import misc_op_record_emit as misc  # noqa: E402
 import capture_fp32_binaries as fp32_capture  # noqa: E402
+import misc_op_record_emit as misc  # noqa: E402
 import step_runner as sr  # noqa: E402
 
 _HAVE_STEP = os.path.exists(sr.STEP_ONNX) and os.path.exists(sr.STEP_REF)

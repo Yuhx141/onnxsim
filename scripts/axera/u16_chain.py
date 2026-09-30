@@ -166,7 +166,15 @@ def cached_chain_axmodel(
     if os.path.exists(path):
         with open(path, "rb") as f:
             return f.read()
-    res = build_chain(work, name, sub, data, precision, image)
+    res = build_chain(
+        work,
+        name,
+        sub,
+        data,
+        precision,
+        image,
+        timeout=int(os.environ.get("U16_BUILD_TIMEOUT", "1800")),
+    )
     if not res.success:
         raise RuntimeError(f"{name}: pulsar2 build failed: {(res.error or '')[-500:]}")
     with open(res.axmodel_path, "rb") as f:
