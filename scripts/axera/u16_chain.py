@@ -229,3 +229,42 @@ def cached_chain_axmodel(
     with open(path, "wb") as f:
         f.write(blob)
     return blob
+
+
+def node_model(
+    node: onnx.NodeProto, shapes: Mapping[str, Sequence[int]]
+) -> onnx.ModelProto:
+    """A one-node model whose every input (constants included) is a float32
+    graph input, so that one build serves every node with the same operator,
+    attributes and input shapes. A rank-0 input becomes ``[1]`` (Pulsar2's
+    calibrator rejects rank-0 tensors; the runner reshapes the value)."""
+    from onnx import TensorProto, helper
+
+    def shape_of(t: str) -> list[int]:
+        return list(shapes[t]) or [1]
+
+    n = onnx.NodeProto()
+    n.CopyFrom(node)
+    n.name = node.op_type.lower()
+    ins = [
+        helper.make_tensor_value_info(t, TensorProto.FLOAT, shape_of(t))
+        for t in node.input
+    ]
+    outs = [
+        helper.make_tensor_value_info(t, TensorProto.FLOAT, shape_of(t))
+        for t in node.output
+    ]
+    m = helper.make_model(
+        helper.make_graph([n], "one", ins, outs),
+        opset_imports=[helper.make_opsetid("", 13)],
+    )
+    m.ir_version = 8
+    return m
+
+
+def signature_data(node: onnx.NodeProto, shapes: Mapping[str, Sequence[int]]):
+    """Calibration tensors of a node's shapes. An FP32 layer does not quantize,
+    so the values only have to be valid for the operator (ones)."""
+    return {
+        t: np.ones(list(shapes[t]) or [1], np.float32) for t in node.input if t
+    }

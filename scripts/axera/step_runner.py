@@ -2049,7 +2049,7 @@ class StepRunner:
                         _compare(st, seg, dev, sim)
                         flt = self._float(seg, env)
                         st.float_rel = max(_rel(d, f) for d, f in zip(dev, flt))
-                        if seg.kind == "u16_chain":
+                        if seg.kind in ("u16_chain", "fp32_chain"):
                             # built at 16-bit on real data: the reference is
                             # the float chain, not an 8-bit simulation
                             st.max_lsb = st.frac_gt1 = 0.0
@@ -2382,6 +2382,84 @@ def build_u16_segments(
     return blobs
 
 
+def build_fp32_node_segments(
+    model: onnx.ModelProto,
+    host: dict[str, str],
+    reason: str,
+    cache_dir: str,
+) -> tuple[list[Segment], dict[str, bytes]]:
+    """FP32 segments for the nodes the plan left on the host for ``reason``:
+    one Pulsar2 FP32 build per (operator, attributes, input shapes), reused
+    by every node with that signature. Nodes whose build fails stay on the
+    host."""
+    import u16_chain
+
+    shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    shapes.update({t.name: tuple(int(d) for d in t.dims) for t in model.graph.initializer})
+    consts = {t.name for t in model.graph.initializer}
+    work = os.path.join(cache_dir, "work")
+    built: dict[str, bytes | None] = {}
+    segs: list[Segment] = []
+    blobs: dict[str, bytes] = {}
+    nodes = [n for n in model.graph.node if host.get(n.name, "").startswith(reason)]
+    for k, node in enumerate(nodes):
+        tensors = [t for t in (*node.input, *node.output) if t]
+        if any(t not in shapes for t in tensors) or len(node.output) != 1:
+            continue
+        sig = hashlib.sha256(
+            json.dumps(
+                [
+                    node.op_type,
+                    [(a.name, a.SerializeToString().hex()) for a in node.attribute],
+                    [shapes[t] for t in node.input],
+                    shapes[node.output[0]],
+                ],
+                default=list,
+            ).encode()
+        ).hexdigest()[:12]
+        if sig not in built:
+            try:
+                built[sig] = u16_chain.cached_chain_axmodel(
+                    cache_dir,
+                    work,
+                    f"fp32_{node.op_type}_{sig}",
+                    u16_chain.node_model(node, shapes),
+                    u16_chain.signature_data(node, shapes),
+                    "FP32",
+                )
+            except Exception as exc:
+                print(
+                    f"  fp32 {node.op_type} {sig}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                built[sig] = None
+        blob = built[sig]
+        if blob is None:
+            continue
+        ins = list(node.input)
+        seg = Segment(
+            node.name,
+            "fp32_chain",
+            [node.name],
+            ins,
+            list(node.output),
+            f"Pulsar2 FP32 {node.op_type} built on {[shapes[t] for t in ins]}",
+            lambda: onnx.ModelProto(),
+            [],
+            [],
+            constant_inputs=[t for t in ins if t in consts],
+        )
+        segs.append(seg)
+        blobs[node.name] = blob
+        del host[node.name]
+        if k % 50 == 0:
+            print(f"  fp32 nodes {k + 1}/{len(nodes)} ({len(built)} builds)", flush=True)
+    return segs, blobs
+
+
 def load_records(path: str = STEP_OPS) -> list[dict]:
     with gzip.open(path, "rt") as f:
         return json.load(f)
@@ -2589,6 +2667,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "(e.g. matmul_chain,misc,relu,elementwise,reducesum_flatten)",
     )
     p.add_argument(
+        "--fp32-optimizer-chains",
+        action="store_true",
+        help="with --fp32-optimizer: build the optimizer nodes that have no "
+        "captured FP32 template (Sqrt, +eps, scalar Mul, ...) as Pulsar2 FP32 "
+        "single-node models, one per (operator, shapes) signature",
+    )
+    p.add_argument(
         "--u16-splits",
         default="",
         help="comma-separated batch split factors to retry with (e.g. 4,16) "
@@ -2704,6 +2789,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     segs, blobs = drop_unemittable(segs, host, args.emit_cache_dir or None)
     ref = load_reference()
     feeds = ref["feeds"]
+    if args.fp32_optimizer_chains:
+        extra, extra_blobs = build_fp32_node_segments(
+            model, host, "fp32-only optimizer node", args.u16_cache_dir
+        )
+        segs = [*segs, *extra]
+        blobs.update(extra_blobs)
     if args.exact_fp32_io:
         for sg in segs:
             if sg.quantize_device_io:

@@ -466,3 +466,25 @@ LSB): median gradient cosine **0.9974** (was 0.839 at 8 bits), minimum
 `Softmax_9`, `Log_10` (zero probabilities), `MatMul_471` (9.8e-3), three
 `ReduceSum` (0.6-1.2e-2), and `MatMul_325` (input shape mismatch). `ReduceSum_460`
 does not build within 40 minutes even at batch 1.
+
+### The Adam update on the NPU (`--fp32-optimizer-chains`)
+
+Pulsar2 applies `layer_configs` FP32 to `Sqrt` as well (it is not in the
+documented FP32 list): a real optimizer `Sqrt` is 3.0e-2 from float at U8, 5.5e-4
+at U16 and 2.1e-5 at FP32. An FP32 layer does not quantize, so one build
+serves every node with the same operator, attributes and input shapes.
+`--fp32-optimizer-chains` (with `--fp32-optimizer`) builds each optimizer node
+that has no captured FP32 template as a one-node FP32 model with every input,
+constants included, as a float graph input; 263 nodes (Sqrt, +eps, scalar Mul,
+Sub, ...) took 65 builds.
+
+AX8850 replay, `--stable-softmax-grad --fp32-optimizer --fp32-optimizer-chains
+--exact-fp32-io --u16-kinds matmul_chain,misc --u16-splits 4` (no
+`--host-optimizer`): **1,098 of 1,102 graph nodes on the NPU** (907 segments:
+95 U16, 327 FP32 binary, 263 FP32 chains), zero device errors, health 0 LSB
+before and after, no runtime fallback, no NaN. Gradient cosine 0.9974, update
+cosine 0.82 (the same as with the update on the host, so the optimizer numerics
+equal float; Adam's normalization amplifies small gradient errors), loss 17.004
+against 17.058. The three nodes still planned on the host are two Muls whose
+zero points match no template class and `Sub_32` (no template at its shape).
+Eight 16-bit segments still miss their gate and run as float on the host.
