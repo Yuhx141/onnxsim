@@ -167,6 +167,28 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
   ::aie::set_saturation(aie::saturation_mode::saturate);
   const Layer L = load(slot);
   if (L.nb == 0) return;
+  if (L.mode == 2) {
+    // 3x3 stride-2 pad-1 max pool of this core's channel block over the dense stem map (uint8, one block
+    // = W*H*8 bytes). Padding never wins: post-ReLU bytes are >= 128, so the pad value 0 is a valid -inf.
+    const uint8_t *src = (const uint8_t *)act + L.core * (L.w * L.h * 8);
+    uint8_t *dst = (uint8_t *)out;
+    for (int oy = 0; oy < L.oh; ++oy)
+      for (int ox = 0; ox < L.ow; ++ox) {
+        uint8_t best[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int ky = 0; ky < 3; ++ky) {
+          const int iy = oy * 2 + ky - 1;
+          if (iy < 0 || iy >= L.h) continue;
+          for (int kx = 0; kx < 3; ++kx) {
+            const int ix = ox * 2 + kx - 1;
+            if (ix < 0 || ix >= L.w) continue;
+            const uint8_t *p = src + (iy * L.w + ix) * 8;
+            for (int c = 0; c < 8; ++c) best[c] = p[c] > best[c] ? p[c] : best[c];
+          }
+        }
+        for (int c = 0; c < 8; ++c) dst[(oy * L.ow + ox) * 8 + c] = best[c];
+      }
+    return;
+  }
   const int p_in = L.w * L.h;
   const v64 zero = aie::zeros<int8, 64>();
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from layer_engine import SLOT_BYTES, Job, assign_slots, layout_for, reference, to_arena, from_arena
+from layer_engine import SLOT_BYTES, Job, assemble_full, assign_slots, layout_for, reference, to_arena, from_arena
 
 
 def bottleneck(name: str, cin: int, mid: int, out: int, w: int, h: int, stride: int, rng, *, project: bool):
@@ -83,6 +83,9 @@ def run_reference(jobs, x_dense: np.ndarray):
 
 def build(name: str, seed: int = 0):
     rng = np.random.default_rng(seed)
+    if name == "full":
+        jobs, _segments, _stem = full(seed)
+        return jobs, None
     if name in ("body", "bodyr"):
         jobs, _, x = body(seed)
         if name == "bodyr":  # reused arena slots (production layout)
@@ -107,6 +110,25 @@ def build(name: str, seed: int = 0):
 
 def segments_for(name: str, jobs):
     """Core-program segments (first_job, jobs_per_iteration, repeat) for a named net."""
+    if name == "full":
+        return full()[1]
     if name in ("body", "bodyr"):
         return body()[1]
     return [(0, len(jobs), 1)]
+
+
+def synthetic_stem(seed: int = 0):
+    rng = np.random.default_rng(seed)
+    return {
+        "weights": rng.integers(-24, 24, (64, 3, 7, 7), dtype=np.int8), "bias": rng.integers(-800, 800, 64, dtype=np.int32),
+        "shift": 9, "in_scale": 1.0 / 64, "in_zero": 128, "strides": [2, 2], "pads": [3, 3, 3, 3],
+    }
+
+
+def full(seed: int = 0):
+    """Stem + pool + layer1..4 (random weights) in one arena. Returns (jobs, segments, stem)."""
+    body_jobs, segments, _ = body(seed)
+    assign_slots(body_jobs)
+    stem = synthetic_stem(seed)
+    jobs = assemble_full(stem, body_jobs)
+    return jobs, [(first + 5, count, repeat) for first, count, repeat in segments], stem

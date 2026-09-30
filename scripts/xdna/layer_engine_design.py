@@ -22,6 +22,7 @@ from aie.iron.runtime import TaskGroup
 from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
 from aie.utils.hostruntime.cli import run_design_cli
 
+import layer_engine
 from layer_engine import COLS, REGION_BYTES, ROWS, SLOT_BYTES, n_chunks
 import layer_engine_nets
 
@@ -44,8 +45,9 @@ def engine(
 ):
     jobs, _ = layer_engine_nets.build(net)
     segments = layer_engine_nets.segments_for(net, jobs)
+    stem = net == "full"  # jobs[:5] are the stem GEMM chunks + pool; the rest is the looped body
     nch = [n_chunks(j, slot - 192) for j in jobs]
-    slots_used = 1 + max(j.out_slot for j in jobs)
+    slots_used = layer_engine.arena_slots(jobs)
     has_res = any(j.res_slot is not None for j in jobs)
 
     act_ty = np.ndarray[(SLOT_BYTES,), np.dtype[np.int8]]
@@ -99,14 +101,14 @@ def engine(
         variable), so the program is 7 job bodies instead of one per layer.
         """
 
-        def run(kind, res, stage):
+        def run(kind, res, stage, count=None):
             a = act.acquire(2 if res else 1)
             if res:
                 r, a = a[0], a[1]  # the residual is filled first (a job early)
             else:
                 r = a
             o = out.acquire(1)
-            for _ in range_(sched[kind, stage]):
+            for _ in range_(sched[kind, stage] if count is None else count):
                 if l2:
                     wc = w.acquire(1)
                     if (compute >> kind) & 1:
@@ -121,6 +123,10 @@ def engine(
             out.release(1)
             act.release(2 if res else 1)
 
+        if stem:  # four stem GEMM chunks (same shape) then the pool job
+            for _ in range_(4):
+                run(7, False, None, count=nch[0])
+            run(8, False, None, count=nch[4])
         for stage in range_(4):
             run(0, False, stage)
             run(1, False, stage)
@@ -184,8 +190,15 @@ def engine(
                 aprod.fill(a_in, group=group, offset=jobs[j + 1].res_slot * SLOT_BYTES, sizes=[1, 1, 1, SLOT_BYTES],
                            strides=[0, 0, 0, 1], transfer_len=SLOT_BYTES)
             for col, oc in enumerate(ocons):
-                oc.drain(a_out, wait=True, group=group, offset=job.out_slot * SLOT_BYTES + col * ROWS * REGION_BYTES,
-                         sizes=[1, 1, 1, ROWS * REGION_BYTES], strides=[0, 0, 0, 1], transfer_len=ROWS * REGION_BYTES)
+                if job.stem_chunk is not None:
+                    # chunk c of block s (core s) lands at s*2048 + c*512 of the dense stem map (blocks 2048 apart);
+                    # columns past the 8 real blocks write into the map's unused tail
+                    oc.drain(a_out, wait=True, group=group,
+                             offset=job.out_slot * SLOT_BYTES + col * ROWS * 2048 + job.stem_chunk * REGION_BYTES,
+                             sizes=[1, 1, ROWS, REGION_BYTES], strides=[0, 0, 2048, 1], transfer_len=ROWS * REGION_BYTES)
+                else:
+                    oc.drain(a_out, wait=True, group=group, offset=job.out_slot * SLOT_BYTES + col * ROWS * REGION_BYTES,
+                             sizes=[1, 1, 1, ROWS * REGION_BYTES], strides=[0, 0, 0, 1], transfer_len=ROWS * REGION_BYTES)
             group.finish()
         weights_group.finish()
 
@@ -197,7 +210,7 @@ def engine(
 def _parser():
     parser = argparse.ArgumentParser(description=__doc__)
     add_compile_args(parser)
-    parser.add_argument("--net", default="l1proj")
+    parser.add_argument("--net", default="l1proj", help="l1proj|l2proj|l3id|l4id|body|bodyr|full (full = stem + pool + body, reused slots)")
     parser.add_argument("--slot", type=int, default=8192)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--nocompute", action="store_true")

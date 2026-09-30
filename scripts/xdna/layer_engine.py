@@ -38,6 +38,7 @@ class Layout:
     nbc: int  # blocks per producing core
     w: int
     h: int
+    region_bytes: int = REGION_BYTES  # distance between producing cores' regions
 
     @property
     def ncp(self) -> int:
@@ -60,7 +61,7 @@ def to_arena(dense: np.ndarray, layout: Layout) -> np.ndarray:
     raw = np.ascontiguousarray(dense).view(np.uint8).reshape(p, layout.nb, TILE)
     for g in range(layout.nb):
         core, local = divmod(g, layout.nbc)
-        off = core * REGION_BYTES + local * p * TILE
+        off = core * layout.region_bytes + local * p * TILE
         slot[off : off + p * TILE] = raw[:, g, :].reshape(-1)
     return slot
 
@@ -70,7 +71,7 @@ def from_arena(slot: np.ndarray, layout: Layout) -> np.ndarray:
     out = np.zeros((p, layout.nb, TILE), dtype=np.uint8)
     for g in range(layout.nb):
         core, local = divmod(g, layout.nbc)
-        off = core * REGION_BYTES + local * p * TILE
+        off = core * layout.region_bytes + local * p * TILE
         out[:, g, :] = slot[off : off + p * TILE].reshape(p, TILE)
     return out.reshape(p, layout.nb * TILE)
 
@@ -92,6 +93,9 @@ class Job:
     res_mode: int = 0  # 1 int8 residual, 2 uint8 residual
     ea: int = 0
     eb: int = 0
+    kind: str = "conv"  # "conv" | "pool" (3x3 stride-2 pad-1 max pool over a dense uint8 map)
+    stem_chunk: int | None = None  # stem GEMM chunk: its output block is drained into a shared 64 KB map
+    out_span_slots: int = 1  # arena slots the job's output occupies (the stem map spans 4)
     out_layout: Layout = field(init=False)
     taps: list[int] = field(init=False)
 
@@ -100,6 +104,8 @@ class Job:
         s = self.stride
         ow = (self.in_layout.w - 1) // s + 1
         oh = (self.in_layout.h - 1) // s + 1
+        if self.kind == "pool":
+            ow, oh = self.in_layout.w // 2, self.in_layout.h // 2
         self.out_layout = layout_for(oc, ow, oh)
         if kh == 3:
             self.taps = valid_taps(self.in_layout.h, self.in_layout.w, oh, ow, s)
@@ -140,6 +146,8 @@ def plan_chunks(job: Job, payload: int) -> int:
 
 
 def n_chunks(job: Job, payload: int) -> int:
+    if job.kind == "pool":
+        return 1
     steps = len(job.taps) * job.in_layout.ncp
     return math.ceil(steps / plan_chunks(job, payload))
 
@@ -148,6 +156,17 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
     """Weight stream of one job: uint8 [column][chunk][row][slot_bytes]."""
     payload = slot_bytes - DESC_BYTES
     lay_in, lay_out = job.in_layout, job.out_layout
+    if job.kind == "pool":
+        out = np.zeros((COLS, 1, ROWS, slot_bytes), dtype=np.uint8)
+        for core in range(CORES):
+            col, row = divmod(core, ROWS)
+            desc = np.zeros(DESC_BYTES // 4, dtype=np.int32)
+            desc[D_W], desc[D_H], desc[D_OW], desc[D_OH] = lay_in.w, lay_in.h, lay_out.w, lay_out.h
+            desc[D_MODE] = 2
+            desc[D_NB] = 1 if core < lay_out.nb else 0
+            desc[D_CORE] = core
+            out[col, 0, row, :DESC_BYTES] = desc.view(np.uint8)
+        return out
     nbp, ncp = lay_in.nbc, lay_in.ncp
     ntaps = len(job.taps)
     steps = ntaps * ncp
@@ -207,6 +226,15 @@ def _rse(v: np.ndarray, s: int) -> np.ndarray:
 def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray:
     """dense [pixel][cin] uint8/int8 -> dense [pixel][cout] (uint8 view when out_flip else int8 view)."""
     lay = job.in_layout
+    if job.kind == "pool":
+        fmap = act.reshape(lay.h, lay.w, -1)
+        padded = np.pad(fmap, ((1, 1), (1, 1), (0, 0)), constant_values=0)  # post-ReLU bytes are >= 128: 0 never wins
+        oh, ow = job.out_layout.h, job.out_layout.w
+        out = np.zeros((oh, ow, fmap.shape[2]), dtype=np.uint8)
+        for oy in range(oh):
+            for ox in range(ow):
+                out[oy, ox] = padded[oy * 2 : oy * 2 + 3, ox * 2 : ox * 2 + 3].reshape(9, -1).max(axis=0)
+        return out.reshape(oh * ow, -1)
     x = act.astype(np.int64)
     if job.in_flip:
         x = x - 128
@@ -273,3 +301,51 @@ def assign_slots(jobs: list[Job], pinned: dict[int, int] | None = None) -> int:
         if job.res_slot is not None:
             job.res_slot = physical[job.res_slot]
     return count
+
+
+def stem_jobs(stem, in_slots, map_slot, pool_slot):
+    """Stem Conv as 1x1 GEMM jobs over the host im2col chunks, then the MaxPool job.
+
+    ``stem`` is ``stem_pool.extract_stem``; chunk ``c`` (64 pixels) is read from arena slot
+    ``in_slots[c]`` and drained into the shared stem map at ``map_slot`` (spans 4 slots); the pool job
+    turns that map into the first bottleneck's input at ``pool_slot``.
+    """
+    from stem_pool import CHUNK_PIXELS, geometry
+
+    g = geometry(stem)
+    weight = np.zeros((g["out_channels"], g["k_pad"], 1, 1), dtype=np.int8)
+    weight[:, : g["k"], 0, 0] = stem["weights"].reshape(g["out_channels"], -1)
+    lay_in = layout_for(g["k_pad"], CHUNK_PIXELS, 1)
+    jobs = [
+        Job(f"stem{c}", weight, stem["bias"], in_slots[c], map_slot, lay_in, in_flip=True, out_flip=True, relu=True,
+            shift=int(stem["shift"]), stem_chunk=c, out_span_slots=4)
+        for c in range(g["chunks"])
+    ]
+    map_layout = Layout(g["out_channels"] // TILE, 1, g["ow"], g["oh"], region_bytes=g["pixels"] * TILE)
+    jobs.append(
+        Job("pool", np.zeros((g["out_channels"], TILE, 1, 1), dtype=np.int8), np.zeros(g["out_channels"], dtype=np.int32),
+            map_slot, pool_slot, map_layout, kind="pool")
+    )
+    return jobs
+
+
+STEM_JOBS = 5  # four stem GEMM chunks + the pool job
+STEM_SLOTS = 9  # 4 im2col input slots, the 4-slot stem map, the pooled map (first body input)
+
+
+def assemble_full(stem, body_jobs):
+    """[stem x4, pool] + body jobs (whose slots were already reused by ``assign_slots``), all in one arena.
+
+    Body slot ``p`` moves to ``STEM_SLOTS - 1 + p`` so its input slot 0 is the pool job's output.
+    """
+    shift = STEM_SLOTS - 1
+    for job in body_jobs:
+        job.in_slot += shift
+        job.out_slot += shift
+        if job.res_slot is not None:
+            job.res_slot += shift
+    return stem_jobs(stem, [0, 1, 2, 3], 4, STEM_SLOTS - 1) + list(body_jobs)
+
+
+def arena_slots(jobs) -> int:
+    return max(max(job.out_slot + job.out_span_slots, job.in_slot + 1) for job in jobs)
