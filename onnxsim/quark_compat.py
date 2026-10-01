@@ -33,6 +33,17 @@ names and preset *meanings*, not copied.
   zero points match Quark's for the probed models
   (``tests/test_quark_parity.py``). ``XINT8`` uses ``ceil(log2(scale))`` where
   Quark searches for the MSE-best power of two, and biases stay int32.
+- Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
+  (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
+  (``input_tensors``, or the deprecated ``activation``) and outputs
+  (``output_tensors``) among int8/uint8/int16/uint16; a ``None`` key in
+  ``layer_type_config`` and ``exclude`` keep nodes float. Node names may be
+  Quark's ``^...*`` regular expressions (subgraph tuples raise). Weight dtypes
+  other than int8 raise; ``bias`` specs are ignored (biases stay int32).
+  Scales / zero points match Quark's (``tests/test_quark_parity.py``).
+- ``UINT8_DYNAMIC_QUANT``: :mod:`onnxsim.quark_dynamic` emits Quark's /
+  ONNX Runtime's dynamic pattern (``DynamicQuantizeLinear`` +
+  ``MatMulInteger`` / ``ConvInteger``); no calibration data is needed.
 - Block formats (``BFP16``, ``MX4/6/9``, ``MXFP4/6/8``, ``MXINT8``):
   :mod:`onnxsim.quark_fakequant_graph` inserts the same ``com.amd.quark``
   ``BFPQuantizeDequantize`` / ``MXQuantizeDequantize`` nodes Quark's quantizer
@@ -80,6 +91,7 @@ names and preset *meanings*, not copied.
 
 from __future__ import annotations
 
+import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -173,10 +185,72 @@ _FAKEQUANT_DTYPES = _BLOCK_DTYPES | {"float16", "bfloat16"}
 
 @dataclass(eq=True, unsafe_hash=True)
 class QLayerConfig:
-    """Activation + weight spec of one layer group (Quark's ``QLayerConfig``)."""
+    """Spec of one layer group (Quark's ``QLayerConfig``).
 
-    activation: QSpec = field(default_factory=Int8Spec)
-    weight: QSpec = field(default_factory=Int8Spec)
+    ``activation`` is Quark's deprecated spelling of ``input_tensors`` (giving
+    both raises, as in Quark). A spec left ``None`` means "inherit": the global
+    config's, for a global config that is Int8. Positional order is
+    ``(activation, weight)`` for backward compatibility.
+    """
+
+    activation: Optional[QSpec] = None
+    weight: Optional[QSpec] = None
+    input_tensors: Optional[QSpec] = None
+    bias: Optional[QSpec] = None
+    output_tensors: Optional[QSpec] = None
+
+    def __post_init__(self) -> None:
+        if self.input_tensors is not None and self.activation is not None:
+            raise ValueError(
+                "Both `activation` and `input_tensors` are provided. Please just "
+                "use `input_tensors`."
+            )
+        if self.activation is None:
+            self.activation = self.input_tensors
+        self.input_tensors = self.activation
+
+    def resolved(self) -> "QLayerConfig":
+        """The global form: a missing activation / weight spec is Int8."""
+        return QLayerConfig(
+            activation=self.activation or Int8Spec(),
+            weight=self.weight or Int8Spec(),
+            bias=self.bias,
+            output_tensors=self.output_tensors,
+        )
+
+
+def _activation_inputs(node: onnx.NodeProto, inits: "set[str]") -> List[str]:
+    """Inputs before the first constant, which Quark treats as activations."""
+    out: List[str] = []
+    for x in node.input:
+        if not x or x in inits:
+            break
+        out.append(x)
+    return out
+
+
+def _match_nodes(model: onnx.ModelProto, patterns: List[Any]) -> List[str]:
+    """Node names selected by ``patterns``: plain names, and Quark's
+    ``^...*``-style regular expressions (must contain ``.*``)."""
+    names = [n.name for n in model.graph.node]
+    out: List[str] = []
+    for p in patterns:
+        if isinstance(p, tuple):
+            raise NotImplementedError("subgraph patterns are not supported")
+        if not isinstance(p, str):
+            raise TypeError(f"expected a node name or pattern, got {type(p).__name__}")
+        if p.startswith("^"):
+            if ".*" not in p:
+                raise ValueError(
+                    f"invalid pattern {p!r}: patterns start with ^ and contain .*"
+                )
+            hit = [n for n in names if n and re.search(p, n)]
+            if not hit:
+                raise ValueError(f"pattern {p!r} matches no node")
+            out += hit
+        else:
+            out.append(p)
+    return out
 
 
 # -- algorithm configs (stored only, see module docstring) --------------------
@@ -258,6 +332,9 @@ _PCT = dict(symmetric=False, calibration_method="percentile:99.999")
 
 _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "XINT8": lambda: QConfig(_layer(XUInt8Spec, XInt8Spec)),
+    "UINT8_DYNAMIC_QUANT": lambda: QConfig(
+        _layer(Int8Spec, UInt8Spec, is_dynamic=True)
+    ),
     "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec)),
     "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec, **_PCT)),
     "U8S8_AAWS": lambda: QConfig(_layer(UInt8Spec, Int8Spec, **_PCT)),
@@ -289,7 +366,7 @@ def _algo_variant(base: str, cls: type) -> Callable[[], QConfig]:
 
 for _n in list(_PRESETS):
     _block = _n.startswith(("BFP", "MX"))
-    if _n == "BF16" or _n.startswith("FP16"):
+    if _n in ("BF16", "UINT8_DYNAMIC_QUANT") or _n.startswith("FP16"):
         continue
     if not _block:
         _PRESETS[f"{_n}_ADAROUND"] = _algo_variant(_n, AdaRoundConfig)
@@ -364,6 +441,7 @@ class ModelQuantizer:
             raise TypeError(f"expected QConfig or Config, got {type(config).__name__}")
         self.config = config
         self.last_approximations: List[str] = []
+        self._overrides_applied = False
         #: the :class:`~onnxsim.quark_auto_mixprecision.AutoMixprecisionResult`
         #: (sensitivity ranking, moved layers, scores) of the last run, if any
         self.last_auto_mixprecision: Any = None
@@ -380,13 +458,15 @@ class ModelQuantizer:
         """Quantize and (if ``model_output`` is given) save. Returns the model."""
         cfg = self.config
         self.last_approximations = []
+        self._overrides_applied = False
         self.last_auto_mixprecision = None
         self.last_weight_rounding = {}
+        cfg.global_config = cfg.global_config.resolved()
         act, wt = cfg.global_config.activation, cfg.global_config.weight
+        assert act is not None and wt is not None  # resolved() fills both
 
-        for spec in (act, wt):
-            if spec.is_dynamic:
-                raise NotImplementedError("dynamic quantization is not supported")
+        if wt.is_dynamic:
+            raise NotImplementedError("dynamic weight quantization is not supported")
         unsupported = [a.name for a in cfg.algo_config if a.name not in _RUNNABLE_ALGOS]
         if unsupported and not ignore_unsupported_algos:
             raise NotImplementedError(
@@ -411,6 +491,8 @@ class ModelQuantizer:
 
             fn = quantize_fp16 if act.dtype == "float16" else quantize_bf16
             result = fn(model_input)
+        elif act.is_dynamic:
+            result = self._quantize_dynamic(model_input, act, wt)
         elif wt.dtype in _FAKEQUANT_DTYPES or act.dtype in _FAKEQUANT_DTYPES:
             if cfg.algo_config and not ignore_unsupported_algos:
                 what = "float presets" if half else "block formats"
@@ -425,13 +507,48 @@ class ModelQuantizer:
                 model_input, act, wt, calibration_data_reader, runnable
             )
 
-        if cfg.specific_layer_config or cfg.layer_type_config:
-            self._approx("per-layer / per-type overrides ignored (global spec used)")
+        if (
+            cfg.specific_layer_config or cfg.layer_type_config
+        ) and not self._overrides_applied:
+            self._approx(
+                "per-layer / per-type overrides ignored for "
+                f"{act.dtype}/{wt.dtype} (global spec used)"
+            )
         for msg in self.last_approximations:
             warnings.warn(f"onnxsim.quark_compat: {msg}", UserWarning, stacklevel=2)
         if model_output:
             onnx.save(result, model_output)
         return result
+
+    def _quantize_dynamic(
+        self, model: onnx.ModelProto, act: QSpec, wt: QSpec
+    ) -> onnx.ModelProto:
+        from onnxsim.quark_dynamic import quantize_dynamic_integer
+
+        cfg = self.config
+        if cfg.algo_config:
+            raise NotImplementedError(
+                "algo_config is not applied to dynamic quantization"
+            )
+        if wt.dtype not in ("int8", "uint8"):
+            raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
+        if act.dtype not in ("int8", "uint8"):
+            raise NotImplementedError(
+                f"dynamic activation dtype {act.dtype} unsupported"
+            )
+        if act.dtype != "uint8":
+            self._approx(
+                "dynamic activations are quantized uint8 asymmetric "
+                "(DynamicQuantizeLinear), whatever the activation spec's dtype"
+            )
+        exclude = _match_nodes(
+            model, [e for e in cfg.exclude if isinstance(e, (str, tuple))]
+        )
+        _, _, type_excluded = self._layer_overrides(model, allow_dtypes=False)
+        self._overrides_applied = True
+        return quantize_dynamic_integer(
+            model, weight_dtype=wt.dtype, exclude_nodes=exclude + type_excluded
+        )
 
     def _quantize_block(
         self, model: onnx.ModelProto, act: QSpec, wt: QSpec
@@ -560,6 +677,62 @@ class ModelQuantizer:
         )
         return out
 
+    def _layer_overrides(
+        self, model: onnx.ModelProto, allow_dtypes: bool = True
+    ) -> "tuple[Dict[str, str], Dict[str, bool], List[str]]":
+        """``(tensor_dtypes, tensor_symmetric, excluded nodes)`` from
+        ``layer_type_config`` then ``specific_layer_config`` (the latter wins,
+        as in Quark). A layer's ``input_tensors`` spec applies to its
+        activation inputs (those before the first constant), ``output_tensors``
+        to its outputs; weight / bias overrides are not supported."""
+        cfg = self.config
+        inits = {i.name for i in model.graph.initializer}
+        dtypes: Dict[str, str] = {}
+        symmetric: Dict[str, bool] = {}
+        excluded: List[str] = []
+        by_name = {n.name: n for n in model.graph.node if n.name}
+
+        def apply(node: onnx.NodeProto, layer: QLayerConfig) -> None:
+            if layer.weight is not None and layer.weight.dtype not in (
+                "int8",
+                "uint8",
+            ):
+                raise NotImplementedError(
+                    f"per-layer weight dtype {layer.weight.dtype} is not supported "
+                    "(weights are int8)"
+                )
+            if layer.bias is not None:
+                self._approx("per-layer bias specs ignored (biases stay int32)")
+            for spec, tensors in (
+                (layer.activation, _activation_inputs(node, inits)),
+                (layer.output_tensors, list(node.output)),
+            ):
+                if spec is None:
+                    continue
+                dt = self._int_act_dtype(spec)
+                for t in tensors:
+                    dtypes[t] = dt
+                    symmetric[t] = spec.symmetric
+
+        for layer, op_types in cfg.layer_type_config.items():
+            if layer is None:
+                excluded += [
+                    n.name for n in model.graph.node if n.op_type in op_types and n.name
+                ]
+                continue
+            for n in model.graph.node:
+                if n.op_type in op_types:
+                    apply(n, layer)
+        for layer, names in cfg.specific_layer_config.items():
+            for name in _match_nodes(model, names):
+                if name not in by_name:
+                    raise ValueError(f"specific_layer_config: no node named {name!r}")
+                apply(by_name[name], layer)
+        if dtypes and not allow_dtypes:
+            self._approx("per-layer activation dtypes ignored (dynamic quantization)")
+            dtypes, symmetric = {}, {}
+        return dtypes, symmetric, excluded
+
     def _int_act_dtype(self, spec: QSpec) -> str:
         """The ``quantize_full_qdq`` activation dtype for an int spec."""
         if spec.dtype in ("int8", "uint8", "int16", "uint16"):
@@ -590,8 +763,10 @@ class ModelQuantizer:
                 raise NotImplementedError(
                     f"AutoMixprecisionConfig.{key} is not supported"
                 )
-        if target.weight.dtype not in ("int8", "uint8"):
+        if (target.weight or Int8Spec()).dtype not in ("int8", "uint8"):
             raise NotImplementedError("target_layer_config weight must be int8")
+        if target.activation is None:
+            raise ValueError("target_layer_config needs an activation spec")
         target_dtype = self._int_act_dtype(target.activation)
         if target_dtype == base_dtype:
             raise ValueError(
@@ -644,7 +819,12 @@ class ModelQuantizer:
         calibration = _drain_reader(reader)
         if not calibration:
             raise ValueError("calibration_data_reader is required for integer presets")
-        exclude = [e for e in self.config.exclude if isinstance(e, str)]
+        exclude = _match_nodes(
+            model, [e for e in self.config.exclude if isinstance(e, (str, tuple))]
+        )
+        t_dtypes, t_sym, type_excluded = self._layer_overrides(model)
+        self._overrides_applied = True
+        exclude += type_excluded
         by_name = {a.name: a for a in algos}
 
         # Quark's presets quantize weights per tensor; the weight-rounding
@@ -687,6 +867,8 @@ class ModelQuantizer:
                 symmetric_activations=act.symmetric,
                 power_of_two=act.pof2 or wt.pof2,
                 per_channel=per_channel,
+                tensor_dtypes=t_dtypes or None,
+                tensor_symmetric=t_sym or None,
             )
 
         # Post-quantization passes, which compare against the float model.
