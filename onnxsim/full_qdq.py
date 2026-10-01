@@ -235,6 +235,8 @@ def quantize_full_qdq(
     tensor_dtypes: Optional[Dict[str, str]] = None,
     symmetric_activations: Optional[bool] = None,
     power_of_two: bool = False,
+    weight_dtype: str = "int8",
+    convert_inputs: bool = True,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -268,8 +270,17 @@ def quantize_full_qdq(
             Default: on for the signed dtypes, off for the unsigned ones.
     :param power_of_two: round every activation and weight scale up to a
             power of two (fixed-point friendly, as Quark's ``XINT8``)
+    :param weight_dtype: ``"int8"`` (default) or ``"int16"`` for the symmetric
+            Conv / ConvTranspose / Gemm / MatMul weights (int16 weights use
+            ``com.microsoft`` Q/DQ below opset 21, like the 16-bit activations)
+    :param convert_inputs: re-quantize an input whose dtype differs from its
+            node's output dtype (the 8/16-bit "convert" described above);
+            False leaves such nodes consuming one dtype and producing the
+            other, as Quark's mixed-precision presets do
     :returns: the quantized ModelProto
     """
+    if weight_dtype not in ("int8", "int16"):
+        raise ValueError(f"unsupported weight_dtype: {weight_dtype!r}")
     if activation_dtype not in _DTYPES:
         raise ValueError(f"unsupported activation_dtype: {activation_dtype!r}")
     act_type, act_np, qmin, qmax = _DTYPES[activation_dtype]
@@ -430,9 +441,9 @@ def quantize_full_qdq(
         return "com.microsoft" if dt in _WIDE_DTYPES and opset < 21 else ""
 
     qdq_domain = domain_of(activation_dtype)
-    if any(domain_of(d) for d in list(qdt.values()) + [activation_dtype]) and not any(
-        o.domain == "com.microsoft" for o in m.opset_import
-    ):
+    if any(
+        domain_of(d) for d in list(qdt.values()) + [activation_dtype, weight_dtype]
+    ) and not any(o.domain == "com.microsoft" for o in m.opset_import):
         m.opset_import.append(helper.make_opsetid("com.microsoft", 1))
 
     new_inits: List[TensorProto] = []
@@ -505,7 +516,7 @@ def quantize_full_qdq(
     # to its Convert op). GridSample's grid is exempt: its coordinates are the reason to mix.
     converted: Dict[Tuple[str, str], str] = {}
     act_extra: List[str] = []
-    for n in qnodes:
+    for n in qnodes if convert_inputs else ():
         if id(n) in removed:
             continue
         outs = [o for o in n.output if o in qdt]
@@ -583,27 +594,29 @@ def quantize_full_qdq(
                 axis = _weight_axis(n, w.ndim) if per_channel else None
                 key = ("w", x, axis)
                 if key not in cache:
+                    w_np = _DTYPES[weight_dtype][1]
+                    w_max = _DTYPES[weight_dtype][3]
                     if axis is None:
-                        s = np.array(max(np.abs(w).max(), 1e-12) / 127.0, np.float32)
+                        s = np.array(max(np.abs(w).max(), 1e-12) / w_max, np.float32)
                         if p2:
                             s = np.array(_pof2(float(s)), np.float32)
-                        q = np.clip(np.round(w / s), -127, 127).astype(np.int8)
-                        zp = np.array(0, np.int8)
+                        q = np.clip(np.round(w / s), -w_max, w_max).astype(w_np)
+                        zp = np.array(0, w_np)
                     else:
                         red = tuple(i for i in range(w.ndim) if i != axis)
-                        s = (np.maximum(np.abs(w).max(axis=red), 1e-12) / 127.0).astype(
+                        s = (np.maximum(np.abs(w).max(axis=red), 1e-12) / w_max).astype(
                             np.float32
                         )
                         if p2:
                             s = (2.0 ** np.ceil(np.log2(s))).astype(np.float32)
                         shape = [1] * w.ndim
                         shape[axis] = -1
-                        q = np.clip(np.round(w / s.reshape(shape)), -127, 127).astype(
-                            np.int8
-                        )
-                        zp = np.zeros(s.shape, np.int8)
+                        q = np.clip(
+                            np.round(w / s.reshape(shape)), -w_max, w_max
+                        ).astype(w_np)
+                        zp = np.zeros(s.shape, w_np)
                     base = fresh(x)
-                    add_init(base + "/int8", q)
+                    add_init(base + f"/{weight_dtype}", q)
                     add_init(base + "/scale", s)
                     add_init(base + "/zp", zp)
                     out = base + "/dq"
@@ -611,9 +624,10 @@ def quantize_full_qdq(
                     act_nodes.append(
                         helper.make_node(
                             "DequantizeLinear",
-                            [base + "/int8", base + "/scale", base + "/zp"],
+                            [base + f"/{weight_dtype}", base + "/scale", base + "/zp"],
                             [out],
                             name=out,
+                            domain=domain_of(weight_dtype),
                             **attrs,
                         )
                     )

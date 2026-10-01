@@ -47,16 +47,11 @@ from onnxsim.quark_fakequant_graph import apply_fake_quant_format  # noqa: E402
 # Quark presets onnxsim does not implement (NPU CNN/transformer quantizers,
 # MatMulNBits, dynamic/VINT8, mixed block formats, ...).
 KNOWN_MISSING = {
-    "INT16_CNN_ACCURATE",
-    "INT16_CNN_DEFAULT",
     "INT16_TRANSFORMER_ACCURATE",
     "INT16_TRANSFORMER_DEFAULT",
-    "INT8_CNN_ACCURATE",
-    "INT8_CNN_DEFAULT",
     "INT8_TRANSFORMER_ACCURATE",
     "INT8_TRANSFORMER_DEFAULT",
     "MATMUL_NBITS",
-    "S16S16_MIXED_S8S8",
     "UINT8_DYNAMIC_QUANT",
     "VINT8",
 }
@@ -908,3 +903,130 @@ def test_block_and_half_presets_match_quark_on_transformer_graphs(
     assert _cop_map(m) == _cop_map(q)
     assert _ext_map(m) == _ext_map(q)
     assert _op_counts(m) == _op_counts(q)
+
+
+# -- integer presets: the CNN presets and the mixed int16 / int8 preset ---------------
+
+
+def _qdq_params(model):
+    """``(activations, weights, int8_biases)``: every activation
+    ``QuantizeLinear``'s ``(scale, zero_point, dtype)``, each weight's
+    ``(max scale, dtype)`` (int8 / int16 codes of rank >= 2) and the int8
+    bias codes by name."""
+    inits = {i.name: onnx.numpy_helper.to_array(i) for i in model.graph.initializer}
+    acts, weights, biases = [], [], {}
+    for n in model.graph.node:
+        if n.op_type == "QuantizeLinear" and n.input[1] in inits:
+            zp = inits[n.input[2]]
+            acts.append((float(inits[n.input[1]]), int(zp), str(zp.dtype)))
+        elif n.op_type == "DequantizeLinear" and n.input[0] in inits:
+            q = inits[n.input[0]]
+            if q.dtype in (np.int8, np.int16) and q.ndim >= 2:
+                weights.append((float(np.max(inits[n.input[1]])), str(q.dtype)))
+            elif q.dtype == np.int8:
+                key = n.input[0].replace("_quantized", "").split("/")[0]
+                biases[key] = (q, float(inits[n.input[1]]))
+    return sorted(acts), sorted(weights), biases
+
+
+def _quantize_int_pair(preset, model_name, tmp_path):
+    model, shape = MIXED_MODELS[model_name]()
+    _named(model)
+    q = quark_quantize(model, preset, shape, tmp_path, f"{model_name}_{preset}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # INT16_CNN_ACCURATE's AdaRound cannot run on int16 weights
+        m = qc.ModelQuantizer(qc.QConfig.get_default_config(preset)).quantize_model(
+            model,
+            calibration_data_reader=_reader(shape)(),
+            ignore_unsupported_algos=True,
+        )
+    return model, q, m, shape
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "conv", "gemm_transb", "branchy"])
+@pytest.mark.parametrize("preset", ["INT8_CNN_DEFAULT", "INT16_CNN_DEFAULT"])
+def test_cnn_default_presets_match_quark_exactly(preset, model_name, tmp_path):
+    """Plain min/max calibration, asymmetric uint8 / uint16 activations,
+    per-tensor int8 / int16 weights: the same quantization parameters, and the
+    same outputs, as Quark."""
+    _, q, m, shape = _quantize_int_pair(preset, model_name, tmp_path)
+    q_acts, q_w, _ = _qdq_params(q)
+    m_acts, m_w, _ = _qdq_params(m)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_array_equal([a[1] for a in m_acts], [a[1] for a in q_acts])
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=1e-5
+    )
+    assert [w[1] for w in m_w] == [w[1] for w in q_w]
+    np.testing.assert_allclose([w[0] for w in m_w], [w[0] for w in q_w], rtol=1e-6)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    np.testing.assert_allclose(_run(m, x), _run(q, x), rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "conv", "gemm_transb"])
+@pytest.mark.parametrize("preset", ["INT8_CNN_ACCURATE", "INT16_CNN_ACCURATE"])
+def test_cnn_accurate_presets_match_quark_parameters(preset, model_name, tmp_path):
+    """Percentile 99.9999 calibration: activation parameters agree up to
+    histogram binning, weight scales exactly. AdaRound only changes weight
+    codes (and runs for int8 weights only: with int16 weights the preset
+    raises unless ``ignore_unsupported_algos``)."""
+    model, q, m, shape = _quantize_int_pair(preset, model_name, tmp_path)
+    q_acts, q_w, _ = _qdq_params(q)
+    m_acts, m_w, _ = _qdq_params(m)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_allclose(
+        [a[1] for a in m_acts], [a[1] for a in q_acts], atol=40 if "16" in preset else 2
+    )
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
+    )
+    np.testing.assert_allclose([w[0] for w in m_w], [w[0] for w in q_w], rtol=1e-6)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    ref = _run(model, x)
+
+    def rel(a):
+        return float(np.linalg.norm(a - ref) / np.linalg.norm(ref))
+
+    assert rel(_run(m, x)) < max(3 * rel(_run(q, x)), 0.05)
+
+
+def test_int16_cnn_accurate_needs_ignore_flag_for_adaround():
+    model, shape = _mlp()
+    cfg = qc.QConfig.get_default_config("INT16_CNN_ACCURATE")
+    with pytest.raises(NotImplementedError, match="adaround"):
+        qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=_reader(shape)()
+        )
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "conv", "gemm_transb", "branchy"])
+def test_s16s16_mixed_s8s8_matches_quark(model_name, tmp_path):
+    """int16 everywhere, every Conv / Gemm / MatMul promoted to int8 inputs,
+    weights and (int8, per-tensor) biases; the promoted layers' outputs stay
+    int16 and no convert pairs appear."""
+    model, q, m, shape = _quantize_int_pair("S16S16_MIXED_S8S8", model_name, tmp_path)
+    # (Quark keeps a Relu behind its producer; onnxsim folds it into the Q)
+    assert {k: v for k, v in _op_counts(m).items() if k != "Relu"} == {
+        k: v for k, v in _op_counts(q).items() if k != "Relu"
+    }
+    q_acts, q_w, q_b = _qdq_params(q)
+    m_acts, m_w, m_b = _qdq_params(m)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_allclose([a[1] for a in m_acts], [a[1] for a in q_acts], atol=40)
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
+    )
+    assert m_w == q_w
+    assert set(m_b) == set(q_b) and q_b
+    for k in q_b:  # biases: scale max|b|/127, codes equal (up to a rounding tie)
+        np.testing.assert_allclose(m_b[k][1], q_b[k][1], rtol=1e-6)
+        np.testing.assert_allclose(m_b[k][0], q_b[k][0], atol=1)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    ref = _run(model, x)
+
+    def rel(a):
+        return float(np.linalg.norm(a - ref) / np.linalg.norm(ref))
+
+    assert rel(_run(m, x)) < max(2 * rel(_run(q, x)), 0.02)
+    assert float(np.linalg.norm(_run(m, x) - _run(q, x)) / np.linalg.norm(ref)) < 0.02

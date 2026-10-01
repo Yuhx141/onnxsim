@@ -465,8 +465,97 @@ def apply_mixed_block_format(
     return m
 
 
+# -- S16S16_MIXED_S8S8 ------------------------------------------------------------
+
+
+def promoted_activations(
+    model: onnx.ModelProto,
+    target_ops: Sequence[str] = PROMOTABLE_OPS,
+    include_layers: Sequence[str] = (),
+    exclude_layers: Sequence[str] = (),
+) -> Set[str]:
+    """The activation tensors Quark's AutoMixprecision re-quantizes when it
+    promotes every ``target_ops`` node: the data input and the second operand
+    (when it is not a constant) of each. Outputs are never promoted."""
+    consts = {t.name for t in model.graph.initializer}
+    out: Set[str] = set()
+    for n in model.graph.node:
+        if n.op_type not in target_ops:
+            continue
+        if (
+            include_layers and n.name not in include_layers
+        ) or n.name in exclude_layers:
+            continue
+        out.update(x for x in n.input[:2] if x and x not in consts)
+    return out
+
+
+def requantize_biases_int8(
+    model: onnx.ModelProto,
+    float_model: onnx.ModelProto,
+    target_ops: Sequence[str] = PROMOTABLE_OPS,
+    include_layers: Sequence[str] = (),
+    exclude_layers: Sequence[str] = (),
+) -> onnx.ModelProto:
+    """Replace the int32 bias (``input_scale * weight_scale``) of every
+    promoted node by Quark's int8 form: symmetric per tensor, scale
+    ``max|b| / 127``, zero point 0. The codes come from the float model's
+    bias (the int32 form is too coarse to recover them from)."""
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    g = m.graph
+    inits = {t.name: t for t in g.initializer}
+    float_inits = {t.name: t for t in float_model.graph.initializer}
+    dq_by_out = {
+        n.output[0]: n for n in g.node if n.op_type == "DequantizeLinear" and n.output
+    }
+    drop: Set[str] = set()
+    for n in g.node:
+        if n.op_type not in target_ops or len(n.input) < 3:
+            continue
+        if (
+            include_layers and n.name not in include_layers
+        ) or n.name in exclude_layers:
+            continue
+        dq = dq_by_out.get(n.input[2])
+        if dq is None or dq.input[0] not in inits:
+            continue
+        q = inits[dq.input[0]]
+        if q.data_type != onnx.TensorProto.INT32:
+            continue
+        base = dq.input[0].rsplit("/", 2)[0]  # "b1/qdq8/int32" -> "b1"
+        if base in float_inits:
+            b = numpy_helper.to_array(float_inits[base]).astype(np.float64)
+        else:
+            b = numpy_helper.to_array(q).astype(np.float64) * numpy_helper.to_array(
+                inits[dq.input[1]]
+            ).astype(np.float64)
+        amax = float(np.max(np.abs(b))) if b.size else 0.0
+        scale = np.float32(amax / 127.0) if amax > 0 else np.float32(1.0)
+        names = (base + "_quantized", base + "_scale", base + "_zero_point")
+        g.initializer.extend(
+            [
+                numpy_helper.from_array(
+                    np.clip(np.round(b / scale), -128, 127).astype(np.int8), names[0]
+                ),
+                numpy_helper.from_array(np.array(scale, np.float32), names[1]),
+                numpy_helper.from_array(np.array(0, np.int8), names[2]),
+            ]
+        )
+        drop.update(dq.input)
+        dq.input[:] = list(names)
+        del dq.attribute[:]
+    used = {x for node in g.node for x in node.input} | {o.name for o in g.output}
+    kept = [t for t in g.initializer if t.name in used or t.name not in drop]
+    del g.initializer[:]
+    g.initializer.extend(kept)
+    return m
+
+
 __all__ = [
     "PROMOTABLE_OPS",
+    "promoted_activations",
+    "requantize_biases_int8",
     "apply_block_activations_int8_constants",
     "apply_mixed_block_format",
 ]
