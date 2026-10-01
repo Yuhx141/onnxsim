@@ -496,10 +496,12 @@ def requantize_biases_int8(
     target_ops: Sequence[str] = PROMOTABLE_OPS,
     include_layers: Sequence[str] = (),
     exclude_layers: Sequence[str] = (),
+    power_of_two: bool = False,
 ) -> onnx.ModelProto:
     """Replace the int32 bias (``input_scale * weight_scale``) of every
     promoted node by Quark's int8 form: symmetric per tensor, scale
-    ``max|b| / 127``, zero point 0. The codes come from the float model's
+    ``max|b| / 127`` (rounded up to a power of two with ``power_of_two``, as
+    Quark's ``VINT8``), zero point 0. The codes come from the float model's
     bias (the int32 form is too coarse to recover them from)."""
     m = onnx.ModelProto()
     m.CopyFrom(model)
@@ -532,6 +534,8 @@ def requantize_biases_int8(
             ).astype(np.float64)
         amax = float(np.max(np.abs(b))) if b.size else 0.0
         scale = np.float32(amax / 127.0) if amax > 0 else np.float32(1.0)
+        if power_of_two and amax > 0:
+            scale = np.float32(2.0 ** np.ceil(np.log2(float(scale))))
         names = (base + "_quantized", base + "_scale", base + "_zero_point")
         g.initializer.extend(
             [
@@ -552,8 +556,72 @@ def requantize_biases_int8(
     return m
 
 
+# -- VINT8 ---------------------------------------------------------------------------
+
+
+def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Quark's ``DedicatedQDQPair``: an activation ``Q -> DQ`` pair read by
+    several nodes is replaced by one pair (same scale and zero point) per
+    consumer, so each consumer owns the quantizer in front of it. The DQ of a
+    graph output stays as it is."""
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    g = m.graph
+    nodes = list(g.node)
+    inits = {t.name for t in g.initializer}
+    outputs = {o.name for o in g.output}
+    q_by_out = {
+        n.output[0]: n
+        for n in nodes
+        if n.op_type == "QuantizeLinear" and n.input[0] not in inits
+    }
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for n in nodes:
+        for x in n.input:
+            consumers.setdefault(x, []).append(n)
+    taken = {x for n in nodes for x in list(n.input) + list(n.output)} | inits
+    drop: Set[int] = set()
+    inserts: Dict[int, List[onnx.NodeProto]] = {}  # id(consumer) -> nodes before it
+    for dq in nodes:
+        if dq.op_type != "DequantizeLinear" or dq.input[0] not in q_by_out:
+            continue
+        q = q_by_out[dq.input[0]]
+        users = list({id(u): u for u in consumers.get(dq.output[0], [])}.values())
+        if len(users) < 2 or dq.output[0] in outputs:
+            continue
+        drop.update((id(q), id(dq)))
+        for k, u in enumerate(users, 1):
+            qn, dqn = onnx.NodeProto(), onnx.NodeProto()
+            qn.CopyFrom(q)
+            dqn.CopyFrom(dq)
+            qn.name, dqn.name = f"{q.name}_{k}", f"{dq.name}_{k}"
+            qn.output[0] = f"{q.output[0]}_{k}"
+            dqn.input[0] = qn.output[0]
+            dqn.output[0] = f"{dq.output[0]}_{k}"
+            if qn.output[0] in taken or dqn.output[0] in taken:
+                raise ValueError(f"tensor name clash while duplicating {dq.name}")
+            for i, x in enumerate(u.input):
+                if x == dq.output[0]:
+                    u.input[i] = dqn.output[0]
+            inserts.setdefault(id(u), []).extend([qn, dqn])
+    if not drop:
+        return m
+    final: List[onnx.NodeProto] = []
+    for n in nodes:
+        if id(n) in drop:
+            continue
+        # the new pairs go in front of their consumer; the source tensor is
+        # produced earlier (the dropped Q sat between producer and consumer)
+        final.extend(inserts.get(id(n), []))
+        final.append(n)
+    del g.node[:]
+    g.node.extend(final)
+    return m
+
+
 __all__ = [
     "PROMOTABLE_OPS",
+    "dedicate_qdq_pairs",
     "promoted_activations",
     "requantize_biases_int8",
     "apply_block_activations_int8_constants",

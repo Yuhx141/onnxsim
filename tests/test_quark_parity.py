@@ -53,7 +53,6 @@ KNOWN_MISSING = {
     "INT8_TRANSFORMER_DEFAULT",
     "MATMUL_NBITS",
     "UINT8_DYNAMIC_QUANT",
-    "VINT8",
 }
 # onnxsim-only presets (Quark has no ADAROUND/ADAQUANT variant for U8U8_AAWA).
 KNOWN_EXTRA = {"U8U8_AAWA_ADAQUANT", "U8U8_AAWA_ADAROUND"}
@@ -1030,3 +1029,32 @@ def test_s16s16_mixed_s8s8_matches_quark(model_name, tmp_path):
 
     assert rel(_run(m, x)) < max(2 * rel(_run(q, x)), 0.02)
     assert float(np.linalg.norm(_run(m, x) - _run(q, x)) / np.linalg.norm(ref)) < 0.02
+
+
+@pytest.mark.parametrize("model_name", sorted(MIXED_MODELS))
+def test_vint8_matches_quark(model_name, tmp_path):
+    """Signed power-of-two int8 everywhere: Quark's ``VINT8`` quantizes every
+    activation (no Relu folding, one dedicated Q/DQ pair per consumer) and
+    stores weights *and biases* as per-tensor int8. Same graph structure and
+    weight / bias parameters; activation scales are powers of two that may sit
+    one octave off (Quark searches the MSE-best power of two, onnxsim rounds
+    up)."""
+    model, q, m, shape = _quantize_int_pair("VINT8", model_name, tmp_path)
+    assert _op_counts(m) == _op_counts(q)
+    q_acts, q_w, q_b = _qdq_params(q)
+    m_acts, m_w, m_b = _qdq_params(m)
+    assert [(a[1], a[2]) for a in m_acts] == [(0, "int8")] * len(q_acts)
+    assert len(m_acts) == len(q_acts)
+    log2 = lambda acts: np.log2([a[0] for a in acts])  # noqa: E731
+    assert np.all(log2(m_acts) == np.round(log2(m_acts)))
+    assert np.all(np.abs(log2(m_acts) - log2(q_acts)) <= 1)
+    assert m_w == q_w
+    assert set(m_b) == set(q_b)
+    if model_name != "transformer":  # (there the constants are activation-path ones)
+        for k in q_b:
+            assert m_b[k][1] == q_b[k][1], k
+            np.testing.assert_array_equal(m_b[k][0], q_b[k][0], err_msg=k)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    ref = _run(model, x)
+    err = float(np.linalg.norm(_run(m, x) - _run(q, x)) / np.linalg.norm(ref))
+    assert err < 0.1

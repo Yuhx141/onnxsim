@@ -361,6 +361,16 @@ _PRESETS.update(
         # The "amateur" CNN presets: asymmetric uint8 / uint16 activations,
         # per-tensor symmetric int8 / int16 weights; ACCURATE adds percentile
         # 99.9999 calibration and AdaRound (Quark's FastFinetune defaults).
+        # VINT8: signed power-of-2 int8 everywhere, every op type quantized, no
+        # Relu folding, int8 biases, one Q/DQ pair per consumer (the VAIML
+        # deployment flavour of XINT8; Quark has no ADAROUND/ADAQUANT variant).
+        "VINT8": lambda: QConfig(
+            _layer(XInt8Spec, XInt8Spec),
+            RemoveQDQConvRelu=False,
+            Int32Bias=False,
+            DedicatedQDQPair=True,
+            QuantizeAllOpTypes=True,
+        ),
         "S16S16_MIXED_S8S8": lambda: _s16s16_mixed_s8s8(),
         "INT8_CNN_DEFAULT": lambda: QConfig(_layer(UInt8Spec, Int8Spec)),
         "INT16_CNN_DEFAULT": lambda: QConfig(_layer(UInt16Spec, Int16Spec)),
@@ -876,6 +886,7 @@ class ModelQuantizer:
         if not calibration:
             raise ValueError("calibration_data_reader is required for integer presets")
         exclude = [e for e in self.config.exclude if isinstance(e, str)]
+        opts = self.config.extra_options
         by_name = {a.name: a for a in algos}
 
         # Quark's presets quantize weights per tensor; the weight-rounding
@@ -924,7 +935,25 @@ class ModelQuantizer:
                 power_of_two=act.pof2 or wt.pof2,
                 per_channel=per_channel,
                 weight_dtype="int16" if wt.dtype == "int16" else "int8",
+                fold_relu=bool(opts.get("RemoveQDQConvRelu", True)),
             )
+            if opts.get("Int32Bias", True) is False:
+                from onnxsim.quark_preset_graphs import requantize_biases_int8
+
+                self._approx(
+                    "int8 bias (Int32Bias=False): symmetric per tensor"
+                    + (", power-of-2 scale" if act.pof2 or wt.pof2 else "")
+                )
+                quantized = requantize_biases_int8(
+                    quantized,
+                    work,
+                    ("Conv", "ConvTranspose", "Gemm"),
+                    power_of_two=act.pof2 or wt.pof2,
+                )
+            if opts.get("DedicatedQDQPair", False):
+                from onnxsim.quark_preset_graphs import dedicate_qdq_pairs
+
+                quantized = dedicate_qdq_pairs(quantized)
 
         # Post-quantization passes, which compare against the float model.
         if "adaquant" in by_name:
