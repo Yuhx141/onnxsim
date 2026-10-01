@@ -43,8 +43,13 @@ def _ops(model):
 
 
 def test_default_config_lookup_and_unknown():
-    assert qc.QConfig.get_default_config("A8W8").global_config.activation.dtype == "int8"
-    assert qc.QConfig.get_default_config("U16S8_AAWS").global_config.activation.dtype == "uint16"
+    assert (
+        qc.QConfig.get_default_config("A8W8").global_config.activation.dtype == "int8"
+    )
+    assert (
+        qc.QConfig.get_default_config("U16S8_AAWS").global_config.activation.dtype
+        == "uint16"
+    )
     with pytest.raises(ValueError, match="unknown preset"):
         qc.QConfig.get_default_config("NOPE")
 
@@ -152,7 +157,12 @@ def _conv_model():
         """
     )
     scale = np.array([1.0, 10.0, 0.1, 3.0], dtype=np.float32)  # uneven channel ranges
-    for name, shape in (("w1", (4, 3, 3, 3)), ("b1", (4,)), ("w2", (4, 4, 3, 3)), ("b2", (4,))):
+    for name, shape in (
+        ("w1", (4, 3, 3, 3)),
+        ("b1", (4,)),
+        ("w2", (4, 4, 3, 3)),
+        ("b2", (4,)),
+    ):
         arr = rng.standard_normal(shape).astype(np.float32)
         arr *= scale.reshape(-1, *[1] * (len(shape) - 1))
         model.graph.initializer.append(onnx.numpy_helper.from_array(arr, name))

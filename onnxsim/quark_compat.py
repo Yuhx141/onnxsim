@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import onnx
@@ -116,7 +116,9 @@ def _algo(name: str):
     def __init__(self, **params: Any) -> None:
         AlgoConfig.__init__(self, name=name, params=params)
 
-    return type(name.title().replace("_", "") + "Config", (AlgoConfig,), {"__init__": __init__})
+    return type(
+        name.title().replace("_", "") + "Config", (AlgoConfig,), {"__init__": __init__}
+    )
 
 
 SmoothQuantConfig = _algo("smooth_quant")
@@ -153,7 +155,9 @@ class QConfig:
         self.algo_config = algo_config or []
         self.use_external_data_format = use_external_data_format
         # Quark passes these as ``extra_options={...}``; accept both spellings.
-        self.extra_options = dict(extra_options.pop("extra_options", {}), **extra_options)
+        self.extra_options = dict(
+            extra_options.pop("extra_options", {}), **extra_options
+        )
 
     @staticmethod
     def get_default_config(config_name: str) -> "QConfig":
@@ -170,7 +174,7 @@ def _layer(act: type, wt: type) -> QLayerConfig:
     return QLayerConfig(activation=act(), weight=wt())
 
 
-_PRESETS = {
+_PRESETS: Dict[str, Callable[[], QConfig]] = {
     "XINT8": lambda: QConfig(_layer(XInt8Spec, XInt8Spec)),
     "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec)),
     "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec)),
@@ -186,12 +190,19 @@ _PRESETS = {
     "MX6": lambda: QConfig(_layer(MX6Spec, MX6Spec)),
     "MX9": lambda: QConfig(_layer(MX9Spec, MX9Spec)),
 }
+
+
+def _algo_variant(base: str, cls: type) -> Callable[[], QConfig]:
+    def make() -> QConfig:
+        return _with_algo(_PRESETS[base](), cls())
+
+    return make
+
+
 for _n in list(_PRESETS):
     if _n[:2] in ("XI", "A8", "A1", "S8", "U8", "U1", "S1"):
-        for _algo_name, _cls in (("ADAROUND", AdaRoundConfig), ("ADAQUANT", AdaQuantConfig)):
-            _PRESETS[f"{_n}_{_algo_name}"] = (
-                lambda n=_n, c=_cls: _with_algo(_PRESETS[n](), c())
-            )
+        _PRESETS[f"{_n}_ADAROUND"] = _algo_variant(_n, AdaRoundConfig)
+        _PRESETS[f"{_n}_ADAQUANT"] = _algo_variant(_n, AdaQuantConfig)
 
 
 def _with_algo(cfg: QConfig, algo: AlgoConfig) -> QConfig:
@@ -209,14 +220,16 @@ class Config:
 # -- calibration-reader adapter ------------------------------------------------
 
 
-def _drain_reader(reader: Any, limit: Optional[int] = None) -> List[Dict[str, np.ndarray]]:
+def _drain_reader(
+    reader: Any, limit: Optional[int] = None
+) -> List[Dict[str, np.ndarray]]:
     """Materialize an onnxruntime-style ``CalibrationDataReader`` (anything
     with ``get_next() -> dict | None``), or pass through a list of dicts."""
     if reader is None:
         return []
     if isinstance(reader, (list, tuple)):
         return [dict(b) for b in reader]
-    batches = []
+    batches: List[Dict[str, np.ndarray]] = []
     while limit is None or len(batches) < limit:
         batch = reader.get_next()
         if batch is None:
@@ -364,9 +377,29 @@ class ModelQuantizer:
 
 
 __all__ = [
-    "AdaQuantConfig", "AdaRoundConfig", "AlgoConfig", "AutoMixprecisionConfig",
-    "BFP16Spec", "BFloat16Spec", "BiasCorrectionConfig", "CLEConfig", "Config",
-    "Float16Spec", "GPTQConfig", "Int16Spec", "Int8Spec", "MX4Spec", "MX6Spec",
-    "MX9Spec", "ModelQuantizer", "QConfig", "QLayerConfig", "QSpec",
-    "QuarotConfig", "SmoothQuantConfig", "UInt16Spec", "UInt8Spec", "XInt8Spec",
+    "AdaQuantConfig",
+    "AdaRoundConfig",
+    "AlgoConfig",
+    "AutoMixprecisionConfig",
+    "BFP16Spec",
+    "BFloat16Spec",
+    "BiasCorrectionConfig",
+    "CLEConfig",
+    "Config",
+    "Float16Spec",
+    "GPTQConfig",
+    "Int16Spec",
+    "Int8Spec",
+    "MX4Spec",
+    "MX6Spec",
+    "MX9Spec",
+    "ModelQuantizer",
+    "QConfig",
+    "QLayerConfig",
+    "QSpec",
+    "QuarotConfig",
+    "SmoothQuantConfig",
+    "UInt16Spec",
+    "UInt8Spec",
+    "XInt8Spec",
 ]
