@@ -66,7 +66,6 @@ KNOWN_MISSING = {
     "MATMUL_NBITS",
     "MX9_INT8",
     "S16S16_MIXED_S8S8",
-    "UINT8_DYNAMIC_QUANT",
     "VINT8",
 }
 # onnxsim-only presets (Quark has no ADAROUND/ADAQUANT variant for U8U8_AAWA).
@@ -695,6 +694,103 @@ def test_integer_preset_quantization_parameters_match_quark(
         [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
     )
     np.testing.assert_allclose(m_w, q_w, rtol=2e-3)
+
+
+# -- per-layer / per-type overrides ------------------------------------------------
+
+
+def _named_mlp():
+    model, shape = _mlp()
+    for n, name in zip(model.graph.node, ("g1", "relu", "g2")):
+        n.name = name
+    return model, shape
+
+
+def _layer_config(api, case):
+    """``QConfig`` for the override ``case``, built from ``api`` (either
+    ``quark.onnx`` or ``onnxsim.quark_compat`` -- the class names match)."""
+
+    def glob():
+        return api.QLayerConfig(activation=api.Int8Spec(), weight=api.Int8Spec())
+
+    def int16():
+        return api.QLayerConfig(
+            input_tensors=api.Int16Spec(),
+            weight=api.Int8Spec(),
+            output_tensors=api.Int16Spec(),
+        )
+
+    kwargs = {
+        "specific_name": dict(specific_layer_config={int16(): ["g2"]}),
+        "specific_regex": dict(specific_layer_config={int16(): ["^g.*"]}),
+        "type_gemm": dict(layer_type_config={int16(): ["Gemm"]}),
+        "exclude_node": dict(exclude=["g1"]),
+        "specific_over_type": dict(
+            layer_type_config={int16(): ["Gemm"]},
+            specific_layer_config={
+                api.QLayerConfig(
+                    input_tensors=api.Int8Spec(),
+                    weight=api.Int8Spec(),
+                    output_tensors=api.Int8Spec(),
+                ): ["g1"]
+            },
+        ),
+    }[case]
+    return api.QConfig(global_config=glob(), **kwargs)
+
+
+_LAYER_CASES = [
+    "specific_name",
+    "specific_regex",
+    "type_gemm",
+    "exclude_node",
+    "specific_over_type",
+]
+
+
+@pytest.mark.parametrize("case", _LAYER_CASES)
+def test_layer_overrides_match_quark(case, tmp_path):
+    from quark.onnx import ModelQuantizer
+
+    model, shape = _named_mlp()
+    src, dst = str(tmp_path / "m.onnx"), str(tmp_path / "m_q.onnx")
+    onnx.save(model, src)
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+        ModelQuantizer(_layer_config(quark_onnx, case)).quantize_model(
+            src, dst, _reader(shape)()
+        )
+    q_acts, q_w = _int_params(onnx.load(dst))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mine = qc.ModelQuantizer(_layer_config(qc, case)).quantize_model(
+            model, calibration_data_reader=_reader(shape)()
+        )
+    m_acts, m_w = _int_params(mine)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
+    )
+    np.testing.assert_allclose(m_w, q_w, rtol=2e-3)
+
+
+# -- dynamic quantization ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("build", [_mlp, _conv, _gemm_transb])
+def test_dynamic_quantization_matches_quark(build, tmp_path):
+    model, shape = build()
+    q = quark_quantize(model, "UINT8_DYNAMIC_QUANT", shape, tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mine = qc.ModelQuantizer(
+            qc.QConfig.get_default_config("UINT8_DYNAMIC_QUANT")
+        ).quantize_model(model)
+    assert [n.op_type for n in mine.graph.node] == [n.op_type for n in q.graph.node]
+    x = np.random.default_rng(1).standard_normal(shape).astype(np.float32)
+    np.testing.assert_allclose(_run(mine, x), _run(q, x), rtol=1e-4, atol=1e-5)
 
 
 # == calibration / scale parity (power-of-two MinMSE, int8 biases, methods) =======
