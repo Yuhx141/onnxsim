@@ -235,6 +235,7 @@ def quantize_full_qdq(
     tensor_dtypes: Optional[Dict[str, str]] = None,
     symmetric_activations: Optional[bool] = None,
     power_of_two: bool = False,
+    tensor_symmetric: Optional[Dict[str, bool]] = None,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -266,6 +267,9 @@ def quantize_full_qdq(
     :param symmetric_activations: ``scale = absmax / half-range`` with a
             centred zero point (0 for signed types, 128 / 32768 for unsigned).
             Default: on for the signed dtypes, off for the unsigned ones.
+    :param tensor_symmetric: per-activation overrides of
+            ``symmetric_activations`` (``{tensor: True}``), alongside
+            ``tensor_dtypes``
     :param power_of_two: round every activation and weight scale up to a
             power of two (fixed-point friendly, as Quark's ``XINT8``)
     :returns: the quantized ModelProto
@@ -276,6 +280,7 @@ def quantize_full_qdq(
     if symmetric_activations is None:
         symmetric_activations = qmin < 0
     sym, p2 = symmetric_activations, power_of_two
+    tensor_symmetric = dict(tensor_symmetric or {})
     if isinstance(model, str):
         model = onnx.load(model)
     m = onnx.ModelProto()
@@ -350,7 +355,8 @@ def quantize_full_qdq(
 
     # Relu folding: producer -> Relu becomes producer -> Q(range of the Relu output, lo = 0).
     removed = set()
-    if fold_relu and not sym:
+    centred = sym or any(tensor_symmetric.values())
+    if fold_relu and not centred:
         producer = {o: n for n in g.node for o in n.output}
         for r in qnodes:
             if r.op_type != "Relu":
@@ -385,12 +391,7 @@ def quantize_full_qdq(
         for r in qnodes:
             src = r.input[0] if r.op_type == "Relu" else None
             p = producer.get(src) if src else None
-            if (
-                p is not None
-                and id(p) in qnode_ids
-                and len(consumers[src]) == 1
-                and src not in graph_outputs
-            ):
+            if p is not None and len(consumers[src]) == 1 and src not in graph_outputs:
                 skip.add(src)
         acts = [a for a in acts if a not in skip]
 
@@ -403,7 +404,7 @@ def quantize_full_qdq(
 
     def set_qp(x: str) -> None:
         dt = tensor_dtypes.get(x, activation_dtype)
-        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:], sym, p2)
+        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:], tensor_symmetric.get(x, sym), p2)
         qdt[x] = dt
 
     for x in graph_inputs:
@@ -504,6 +505,7 @@ def quantize_full_qdq(
     # of the other dtype is re-quantized for it (DQ -> Q' -> DQ', a "convert" the QNN EP maps
     # to its Convert op). GridSample's grid is exempt: its coordinates are the reason to mix.
     converted: Dict[Tuple[str, str], str] = {}
+    acts_set = set(acts) | set(graph_inputs)
     act_extra: List[str] = []
     for n in qnodes:
         if id(n) in removed:
@@ -520,6 +522,7 @@ def quantize_full_qdq(
             )
             if (
                 src not in qdt
+                or src not in acts_set  # left float (Relu-adjacent), nothing to convert
                 or qdt[src] == node_dt
                 or (n.op_type == "GridSample" and k == 1)
             ):

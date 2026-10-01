@@ -756,3 +756,110 @@ def test_float_presets_refuse_an_algo_config_instead_of_dropping_it(preset):
     with pytest.warns(UserWarning):
         out = q.quantize_model(_model(), ignore_unsupported_algos=True)
     assert "ExtendedQuantizeLinear" in _ops(out)
+
+
+# -- per-layer / per-type overrides ------------------------------------------------
+
+
+def _named_chain():
+    model = parser.parse_model(
+        """
+        <ir_version: 9, opset_import: ["": 17]>
+        g (float[3,8] x) => (float[3,4] y) {
+            h0 = Gemm(x, w1, b1)
+            h1 = Relu(h0)
+            y = Gemm(h1, w2, b2)
+        }
+        """
+    )
+    for n, name in zip(model.graph.node, ("g1", "relu", "g2")):
+        n.name = name
+    rng = np.random.default_rng(0)
+    for name, shape in (("w1", (8, 6)), ("b1", (6,)), ("w2", (6, 4)), ("b2", (4,))):
+        model.graph.initializer.append(
+            onnx.numpy_helper.from_array(
+                rng.standard_normal(shape).astype(np.float32), name
+            )
+        )
+    return model
+
+
+def _int16_layer():
+    return qc.QLayerConfig(
+        input_tensors=qc.Int16Spec(),
+        weight=qc.Int8Spec(),
+        output_tensors=qc.Int16Spec(),
+    )
+
+
+def _q_zp_dtypes(model):
+    inits = {i.name: i for i in model.graph.initializer}
+    return {
+        n.input[0]: onnx.TensorProto.DataType.Name(inits[n.input[2]].data_type)
+        for n in model.graph.node
+        if n.op_type == "QuantizeLinear"
+    }
+
+
+def _quantize_with(**kwargs):
+    cfg = qc.QConfig(qc.QLayerConfig(qc.Int8Spec(), qc.Int8Spec()), **kwargs)
+    return qc.ModelQuantizer(cfg).quantize_model(
+        _named_chain(), calibration_data_reader=_batches((3, 8))
+    )
+
+
+def test_qlayerconfig_input_tensors_is_the_activation_spec():
+    spec = qc.Int16Spec()
+    assert qc.QLayerConfig(input_tensors=spec).activation is spec
+    with pytest.raises(ValueError, match="input_tensors"):
+        qc.QLayerConfig(activation=qc.Int8Spec(), input_tensors=qc.Int8Spec())
+
+
+def test_specific_layer_config_changes_that_layers_tensor_dtypes():
+    out = _quantize_with(specific_layer_config={_int16_layer(): ["g2"]})
+    dtypes = _q_zp_dtypes(out)
+    assert dtypes["x/f" if "x/f" in dtypes else "x"] == "INT8"
+    assert {dtypes["h1/f"], dtypes["y/f"]} == {"INT16"}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(layer_type_config={None: ["Gemm", "Relu"]}),
+        dict(exclude=["^g.*", "relu"]),
+    ],
+)
+def test_excluded_layers_stay_float(kwargs):
+    out = _quantize_with(**kwargs)
+    assert not [n for n in out.graph.node if n.op_type == "QuantizeLinear"]
+
+
+def test_regex_and_type_overrides_and_specific_wins():
+    out = _quantize_with(
+        layer_type_config={_int16_layer(): ["Gemm"]},
+        specific_layer_config={
+            qc.QLayerConfig(
+                input_tensors=qc.Int8Spec(),
+                weight=qc.Int8Spec(),
+                output_tensors=qc.Int8Spec(),
+            ): ["^g1.*"]
+        },
+    )
+    dtypes = _q_zp_dtypes(out)
+    # g1 (specific: int8 in and out) beats the type config on its own tensors
+    assert dtypes["y/f"] == "INT16"
+    assert dtypes[next(k for k in dtypes if k.startswith("x"))] == "INT8"
+
+
+def test_override_errors():
+    with pytest.raises(ValueError, match="no node named"):
+        _quantize_with(specific_layer_config={_int16_layer(): ["nope"]})
+    with pytest.raises(ValueError, match="matches no node"):
+        _quantize_with(specific_layer_config={_int16_layer(): ["^zzz.*"]})
+    with pytest.raises(NotImplementedError, match="subgraph"):
+        _quantize_with(specific_layer_config={_int16_layer(): [(["g1"],)]})
+    wide_weight = qc.QLayerConfig(
+        input_tensors=qc.Int8Spec(), weight=qc.Int16Spec(), output_tensors=None
+    )
+    with pytest.raises(NotImplementedError, match="weight dtype"):
+        _quantize_with(specific_layer_config={wide_weight: ["g1"]})
