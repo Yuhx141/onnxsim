@@ -2348,6 +2348,8 @@ class StepRunner:
                 print(
                     f"  node {k}/{len(self.nodes)} {time.time() - t0:.1f}s", flush=True
                 )
+        if self.session is not None and self.resident:
+            self.session.sync()
         on_device = set(keep_device) if self.resident else set()
         result = {
             t: env.raw(t) if t in on_device and isinstance(env, ResidentEnv) else env[t]

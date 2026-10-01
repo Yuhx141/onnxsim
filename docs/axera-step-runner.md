@@ -772,3 +772,18 @@ AX8850, final configuration, `--train-steps 0,1,2,3,0,1,2,3`: **6.6 to 6.7 s per
 step steady state**, the same as the host-only float step (6.6 s), with the
 losses identical to the 10.4 s runs (max difference 0.0). Only `conv0_fwd`
 (four batch chunks) is still on the staged path, 0.2 s per step.
+
+### Pipelined commands
+
+The guest runner executes commands in order, so a `RUNT` or `TDEL` need not wait for
+its reply before the next command is sent. `AXSession` sends them without waiting
+(`_cmd_async`) and reads the replies at the next synchronous command, at `sync()`,
+or when 256 are outstanding; an `ERR` reply is raised then. Of the steady-state step
+(6.9 s: `RUNT` 5.1 s over 928 calls for 4.1 s of engine, `TDEL` 0.6 s over 883
+calls, host Python 0.5 s), what is left is the engine plus about 0.2 s each of
+upload, download and staged `conv0_fwd`.
+
+AX8850, final configuration, `--train-steps 0,1,2,3,0,1,2,3`: **5.8 s per step
+steady state** against 6.6 s for the host-only float step (the 4.1 s of engine time
+is the floor; 4.6 s of the step is the host waiting for the device), with the losses
+identical to the unpipelined runs (max difference 0.0).
