@@ -1817,6 +1817,9 @@ class StepRunner:
         # device tensor name prefix of this run's outputs; a training loop
         # alternates it so a state tensor and its update never share a buffer
         self.prefix = "d"
+        self.staged_time: dict[str, float] = {}  # segment -> seconds on the staged path
+        self.expand_dir: str | None = None  # cache dir for device Expand models
+        self._expand_blobs: dict[tuple, bytes | None] = {}
         # segment name -> (device Transpose blobs, final shape) for the 16-bit
         # chains whose trailing Transpose runs on the device
         self.post_chain: dict[str, tuple[list[bytes], tuple[int, ...]]] = {}
@@ -1961,6 +1964,28 @@ class StepRunner:
         if not cached:
             self.session.unload(m)
 
+    def _expand_blob(self, src: tuple, dst: tuple) -> bytes | None:
+        """The compiled device Expand model ``src`` -> ``dst`` (built once)."""
+        key = (src, dst)
+        if key not in self._expand_blobs:
+            blob = None
+            if self.expand_dir:
+                try:
+                    import u16_chain
+
+                    blob = u16_chain.cached_chain_axmodel(
+                        self.expand_dir,
+                        os.path.join(self.expand_dir, "work"),
+                        "expand",
+                        u16_chain.expand_model(src, dst),
+                        {"x": np.ones(src, np.float32)},
+                        "FP32",
+                    )
+                except Exception as exc:
+                    print(f"  device expand {src}->{dst}: {type(exc).__name__}: {exc}"[:160], flush=True)
+            self._expand_blobs[key] = blob
+        return self._expand_blobs[key]
+
     def _pure(self, seg: Segment) -> bool:
         """A segment whose host-side work is only moving float tensors in and
         out of one model, so it can read and write the device tensor store."""
@@ -1971,8 +1996,9 @@ class StepRunner:
             or seg.output_shape
             or seg.output_take is not None
             or seg.quantize_device_io
-            or seg.nan_guard
-            or seg.kind in ("algebraic_identity", "algebraic_constant", "safe_masked_div")
+            # nan_guard (host check of the inputs for NaN) is skipped here: it
+            # would download every input; a NaN still shows in the loss/gradients
+            or seg.kind in ("algebraic_identity", "algebraic_constant")
         )
 
     def _device_resident(self, seg: Segment, env) -> list | None:
@@ -1985,6 +2011,7 @@ class StepRunner:
             if len(m.inputs) != len(seg.inputs) or len(m.outputs) != len(seg.outputs):
                 return None
             names = []
+            temps: list[str] = []
             for t, spec in zip(seg.inputs, m.inputs):
                 if t in seg.constant_inputs:
                     if t not in self._const_uploaded:
@@ -1996,6 +2023,33 @@ class StepRunner:
                     names.append("c:" + t)
                     continue
                 v = env.raw(t)
+                shape = tuple(v.shape)
+                if (
+                    shape != tuple(spec.shape)
+                    and int(np.prod(shape)) < int(np.prod(spec.shape))
+                    and np.dtype(spec.dtype) == np.float32
+                    and np.broadcast_shapes(shape, tuple(spec.shape)) == tuple(spec.shape)
+                ):
+                    # a broadcast input: expand it on the device
+                    blob = self._expand_blob(shape, tuple(spec.shape))
+                    if blob is None:
+                        return None
+                    if isinstance(v, DeviceTensor):
+                        src_name = v.name
+                    else:
+                        if t not in env.uploaded:
+                            self.session.tput("h:" + t, np.ascontiguousarray(v, dtype=np.float32))
+                            env.uploaded.add(t)
+                        src_name = "h:" + t
+                    em, ecached = self._load_blob(blob)
+                    try:
+                        xname = f"x:{t}"
+                        self.session.run_t(em, [src_name], [xname])
+                    finally:
+                        self._release(em, ecached)
+                    temps.append(xname)
+                    names.append(xname)
+                    continue
                 if isinstance(v, DeviceTensor):
                     if v.nbytes != spec.nbytes or np.dtype(v.dtype) != np.dtype(spec.dtype):
                         return None
@@ -2026,6 +2080,8 @@ class StepRunner:
                     cur = nxt
         finally:
             self._release(m, cached)
+            for name in temps:
+                self.session.tdel(name)
         want = {o.name: o for o in self.model.graph.value_info}
         res = []
         for t, spec, name in zip(seg.outputs, m.outputs, outs):
@@ -2055,6 +2111,7 @@ class StepRunner:
                     else "other"
                 )
                 self.path_counts[(why, "why")] += 1
+        t_stage = time.time()
         m, cached = self._load(seg)
         try:
             ins = []
@@ -2135,6 +2192,7 @@ class StepRunner:
                 ys = self.session.run(m, ins)
         finally:
             self._release(m, cached)
+            self.staged_time[seg.name] = self.staged_time.get(seg.name, 0.0) + time.time() - t_stage
         want = {o.name: o for o in self.model.graph.value_info}
         out = []
         for j, (t, y) in enumerate(zip(seg.outputs, ys)):
@@ -2986,11 +3044,15 @@ def run_train_loop(
             keep_device=[sm[w] for w in sm],
         )
         wall = time.time() - t0
+        timing = {k: (v[0], round(v[1], 2)) for k, v in session.timing.items()}
+        if i == len(steps) - 1:
+            print("  staged segments (cumulative s):", json.dumps({k: round(v, 2) for k, v in sorted(runner.staged_time.items(), key=lambda kv: -kv[1])}), flush=True)
         new_state = {w: outs[sm[w]] for w in sm}
         row = {
             "step": k,
             "wall_s": round(wall, 2),
             "loss": float(np.ravel(outs[loss_name])[0]),
+            "session_timing_cumulative": timing,
         }
         if validate:
             ffeeds = {t: v for t, v in data.items() if t not in sm}
@@ -3524,6 +3586,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             runner = StepRunner(model, segs, sess, None, 0)
             runner._emitted.update(blobs)
             runner.post_chain = {k: v for k, v in (post_blobs or {}).items() if v[0]}
+            runner.expand_dir = args.u16_cache_dir
             results = run_train_loop(
                 runner,
                 model,
@@ -3570,6 +3633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             runner._emitted.update(blobs)
             runner.resident = args.resident
             runner.post_chain = {k: v for k, v in (post_blobs or {}).items() if v[0]}
+            runner.expand_dir = args.u16_cache_dir
             if args.resident and not args.no_check:
                 p.error("--resident needs --no-check (the checks read every tensor)")
             try:

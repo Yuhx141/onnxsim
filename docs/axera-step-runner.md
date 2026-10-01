@@ -748,3 +748,27 @@ zero points are 0 (two builds, exact: `zb`, `sb` the bias's zero point and scale
 linear in the zero points (its coefficient is 7.4 in one pair of builds and 1.0 in
 another, which suggests saturating arithmetic), so these chains are not yet
 recalibrated and keep their template scales.
+
+### Closing the gap to the host: device Expand, NaN guards, profile
+
+Steady-state profile of the 10.4 s step: `RUNT` 4.9 s (4.1 s of it engine), staged
+`RUN` 2.4 s, `TPUT` 1.1 s, `TDEL` 0.5 s (877 calls), `TGET` 0.5 s, the host's
+Python 1.0 s. The staged `RUN` was the max-pool backward's crop mask: `Less_447`
+and `Greater_444` (compare a `[1024,9,3136]` window tensor with its per-window
+maximum, `[1024,1,3136]`) and `Div_453` (`safe_masked_div`), each moving about
+115 MB through the VM per step.
+
+- `safe_masked_div` has no host transform and was only excluded from the resident
+  path out of caution; `nan_guard` (a host check of a segment's inputs for NaN,
+  written for the old quantized segments) is skipped in resident mode, since it
+  would download every input and a NaN still shows in the loss and gradients.
+  Steady state 10.4 s to 9.2 s, losses identical.
+- A broadcast input (the `[1024,1,3136]` maximum for a model that wants
+  `[1024,9,3136]`) is expanded on the device by a one-op Expand model: exact on the
+  NPU (max error 0.0, 7.7 ms for 115 MB). Built once per shape pair
+  (`u16_chain.expand_model`, `StepRunner._expand_blob`).
+
+AX8850, final configuration, `--train-steps 0,1,2,3,0,1,2,3`: **6.6 to 6.7 s per
+step steady state**, the same as the host-only float step (6.6 s), with the
+losses identical to the 10.4 s runs (max difference 0.0). Only `conv0_fwd`
+(four batch chunks) is still on the staged path, 0.2 s per step.
