@@ -1771,6 +1771,13 @@ class ResidentEnv(dict):
     def get(self, key, default=None):
         return self[key] if key in self else default
 
+    def release_uploads(self, keep=()) -> None:
+        """Free the device copies of the host-array feeds uploaded this run."""
+        for key in list(self.uploaded):
+            if key not in keep:
+                self.session.tdel("h:" + key)
+        self.uploaded.clear()
+
     def pop(self, key, *default):
         v = dict.pop(self, key, *default) if default else dict.pop(self, key)
         if isinstance(v, DeviceTensor):
@@ -1807,6 +1814,12 @@ class StepRunner:
         self.path_counts: collections.Counter = collections.Counter()
         self.model_cache: dict[bytes, object] = {}
         self._cached_bytes = 0
+        # device tensor name prefix of this run's outputs; a training loop
+        # alternates it so a state tensor and its update never share a buffer
+        self.prefix = "d"
+        self.staged_time: dict[str, float] = {}  # segment -> seconds on the staged path
+        self.expand_dir: str | None = None  # cache dir for device Expand models
+        self._expand_blobs: dict[tuple, bytes | None] = {}
         # segment name -> (device Transpose blobs, final shape) for the 16-bit
         # chains whose trailing Transpose runs on the device
         self.post_chain: dict[str, tuple[list[bytes], tuple[int, ...]]] = {}
@@ -1951,6 +1964,28 @@ class StepRunner:
         if not cached:
             self.session.unload(m)
 
+    def _expand_blob(self, src: tuple, dst: tuple) -> bytes | None:
+        """The compiled device Expand model ``src`` -> ``dst`` (built once)."""
+        key = (src, dst)
+        if key not in self._expand_blobs:
+            blob = None
+            if self.expand_dir:
+                try:
+                    import u16_chain
+
+                    blob = u16_chain.cached_chain_axmodel(
+                        self.expand_dir,
+                        os.path.join(self.expand_dir, "work"),
+                        "expand",
+                        u16_chain.expand_model(src, dst),
+                        {"x": np.ones(src, np.float32)},
+                        "FP32",
+                    )
+                except Exception as exc:
+                    print(f"  device expand {src}->{dst}: {type(exc).__name__}: {exc}"[:160], flush=True)
+            self._expand_blobs[key] = blob
+        return self._expand_blobs[key]
+
     def _pure(self, seg: Segment) -> bool:
         """A segment whose host-side work is only moving float tensors in and
         out of one model, so it can read and write the device tensor store."""
@@ -1961,8 +1996,9 @@ class StepRunner:
             or seg.output_shape
             or seg.output_take is not None
             or seg.quantize_device_io
-            or seg.nan_guard
-            or seg.kind in ("algebraic_identity", "algebraic_constant", "safe_masked_div")
+            # nan_guard (host check of the inputs for NaN) is skipped here: it
+            # would download every input; a NaN still shows in the loss/gradients
+            or seg.kind in ("algebraic_identity", "algebraic_constant")
         )
 
     def _device_resident(self, seg: Segment, env) -> list | None:
@@ -1975,6 +2011,7 @@ class StepRunner:
             if len(m.inputs) != len(seg.inputs) or len(m.outputs) != len(seg.outputs):
                 return None
             names = []
+            temps: list[str] = []
             for t, spec in zip(seg.inputs, m.inputs):
                 if t in seg.constant_inputs:
                     if t not in self._const_uploaded:
@@ -1986,6 +2023,33 @@ class StepRunner:
                     names.append("c:" + t)
                     continue
                 v = env.raw(t)
+                shape = tuple(v.shape)
+                if (
+                    shape != tuple(spec.shape)
+                    and int(np.prod(shape)) < int(np.prod(spec.shape))
+                    and np.dtype(spec.dtype) == np.float32
+                    and np.broadcast_shapes(shape, tuple(spec.shape)) == tuple(spec.shape)
+                ):
+                    # a broadcast input: expand it on the device
+                    blob = self._expand_blob(shape, tuple(spec.shape))
+                    if blob is None:
+                        return None
+                    if isinstance(v, DeviceTensor):
+                        src_name = v.name
+                    else:
+                        if t not in env.uploaded:
+                            self.session.tput("h:" + t, np.ascontiguousarray(v, dtype=np.float32))
+                            env.uploaded.add(t)
+                        src_name = "h:" + t
+                    em, ecached = self._load_blob(blob)
+                    try:
+                        xname = f"x:{t}"
+                        self.session.run_t(em, [src_name], [xname])
+                    finally:
+                        self._release(em, ecached)
+                    temps.append(xname)
+                    names.append(xname)
+                    continue
                 if isinstance(v, DeviceTensor):
                     if v.nbytes != spec.nbytes or np.dtype(v.dtype) != np.dtype(spec.dtype):
                         return None
@@ -1998,7 +2062,7 @@ class StepRunner:
                         self.session.tput("h:" + t, a)
                         env.uploaded.add(t)
                     names.append("h:" + t)
-            outs = ["d:" + t for t in seg.outputs]
+            outs = [f"{self.prefix}:" + t for t in seg.outputs]
             pc = self.post_chain.get(seg.name)
             if pc is None:
                 self.session.run_t(m, names, outs)
@@ -2016,6 +2080,8 @@ class StepRunner:
                     cur = nxt
         finally:
             self._release(m, cached)
+            for name in temps:
+                self.session.tdel(name)
         want = {o.name: o for o in self.model.graph.value_info}
         res = []
         for t, spec, name in zip(seg.outputs, m.outputs, outs):
@@ -2045,6 +2111,7 @@ class StepRunner:
                     else "other"
                 )
                 self.path_counts[(why, "why")] += 1
+        t_stage = time.time()
         m, cached = self._load(seg)
         try:
             ins = []
@@ -2125,6 +2192,7 @@ class StepRunner:
                 ys = self.session.run(m, ins)
         finally:
             self._release(m, cached)
+            self.staged_time[seg.name] = self.staged_time.get(seg.name, 0.0) + time.time() - t_stage
         want = {o.name: o for o in self.model.graph.value_info}
         out = []
         for j, (t, y) in enumerate(zip(seg.outputs, ys)):
@@ -2151,6 +2219,7 @@ class StepRunner:
         keep: Sequence[str] = (),
         progress: bool = False,
         stats_out: list | None = None,
+        keep_device: Sequence[str] = (),
     ) -> tuple[dict[str, np.ndarray], list[SegStat]]:
         env: dict[str, np.ndarray] = (
             ResidentEnv(feeds, self.session) if self.resident else dict(feeds)
@@ -2279,7 +2348,17 @@ class StepRunner:
                 print(
                     f"  node {k}/{len(self.nodes)} {time.time() - t0:.1f}s", flush=True
                 )
-        return {t: env[t] for t in keep_set if t in env}, stats
+        if self.session is not None and self.resident:
+            self.session.sync()
+        on_device = set(keep_device) if self.resident else set()
+        result = {
+            t: env.raw(t) if t in on_device and isinstance(env, ResidentEnv) else env[t]
+            for t in keep_set | on_device
+            if t in env
+        }
+        if isinstance(env, ResidentEnv):
+            env.release_uploads()
+        return result, stats
 
     def release_models(self) -> None:
         """Unload the models kept loaded across runs."""
@@ -2806,16 +2885,18 @@ def run_recal_steps(
             tmpl, tscales = templates[name]
             new = u16_chain.predict_scales16(quant, use, m)
             try:
+                # a constant (a gather mask, an index) has a scale in the template
+                # but no range to predict from: it keeps the template's
                 out, _ = mre.recalibrate(
-                    tmpl, tscales, {t: new[t] for t in tscales}
+                    tmpl, tscales, {t: new.get(t, tscales[t]) for t in tscales}
                 )
                 runner._emitted[name] = out.SerializeToString()
                 moved += 1
             except Exception as exc:  # keep the template's scales
                 runner._emitted[name] = open(info["path"], "rb").read()
                 refused += 1
-                if refused <= 3:
-                    print(f"  recalibrate {name}: {type(exc).__name__}: {exc}"[:160])
+                if refused <= 40:
+                    print(f"  recalibrate {name}: {type(exc).__name__}: {exc}"[:200])
         prev_ranges = ranges
         outs, stats = runner.run(
             feeds,
@@ -2927,6 +3008,107 @@ def replace_with_fp32_nodes(
         flush=True,
     )
     return out, blobs
+
+
+def run_train_loop(
+    runner: "StepRunner",
+    model: onnx.ModelProto,
+    ref: Mapping,
+    steps: Sequence[int],
+    validate: bool,
+) -> list[dict]:
+    """Train on the device across ``steps`` of the calibration dataset with the
+    weights and Adam state staying on the device: step k's updated state tensors
+    are step k+1's state inputs, and only the loss (and, when validating, the
+    gradients and updates) cross to the host. ``validate`` also runs a float
+    chain (its own state carried the same way) and reports how the device loop
+    follows it."""
+    session = runner.session
+    sm = ref["state_map"]
+    grad_names = gradient_tensors(model, sm)
+    loss_name = "distill__add_27"
+    weights = [w for w in sm if not w.endswith(("__m", "__v"))]
+    dev_state: dict[str, DeviceTensor] = {}
+    fstate: dict[str, np.ndarray] = {}
+    prev_w: dict[str, np.ndarray] = {}
+    results = []
+    runner.resident = True
+    for i, k in enumerate(steps):
+        data = load_step_feeds(k)
+        feeds: dict = {t: v for t, v in data.items() if t not in sm}
+        feeds.update(dev_state if i else {w: data[w] for w in sm})
+        runner.prefix = f"d{i % 2}"
+        keep = [loss_name] + (list(grad_names.values()) if validate else [])
+        t0 = time.time()
+        outs, _ = runner.run(
+            feeds,
+            "npu",
+            check=False,
+            keep=keep,
+            keep_device=[sm[w] for w in sm],
+        )
+        wall = time.time() - t0
+        timing = {k: (v[0], round(v[1], 2)) for k, v in session.timing.items()}
+        if i == len(steps) - 1:
+            print("  staged segments (cumulative s):", json.dumps({k: round(v, 2) for k, v in sorted(runner.staged_time.items(), key=lambda kv: -kv[1])}), flush=True)
+        new_state = {w: outs[sm[w]] for w in sm}
+        row = {
+            "step": k,
+            "wall_s": round(wall, 2),
+            "loss": float(np.ravel(outs[loss_name])[0]),
+            "session_timing_cumulative": timing,
+        }
+        if validate:
+            ffeeds = {t: v for t, v in data.items() if t not in sm}
+            ffeeds.update(fstate if i else {w: data[w] for w in sm})
+            fouts, _ = StepRunner(model, []).run(
+                ffeeds,
+                "float",
+                keep=[loss_name]
+                + list(grad_names.values())
+                + [sm[w] for w in sm],
+            )
+            gcos = [
+                cos(outs[t], fouts[t]) for w, t in grad_names.items()
+            ]
+            base = prev_w if i else {w: data[w] for w in weights}
+            ucos, ulen = [], []
+            for w in weights:
+                nw = session.tget(new_state[w].name, new_state[w].dtype, new_state[w].shape)
+                d_dev = nw.astype(np.float64) - base[w]
+                d_ref = np.asarray(fouts[sm[w]], np.float64) - base[w]
+                ucos.append(cos(d_dev, d_ref))
+                ulen.append(rel_err(nw, fouts[sm[w]]))
+            # the gradient error at the device's own state: the float step run
+            # on the state the device started this step from
+            if i:
+                sstate = {w: session.tget(t.name, t.dtype, t.shape) for w, t in feeds.items() if isinstance(t, DeviceTensor)}
+            else:
+                sstate = {w: data[w] for w in sm}
+            same_feeds = {t: v for t, v in data.items() if t not in sm}
+            same_feeds.update(sstate)
+            souts, _ = StepRunner(model, []).run(
+                same_feeds, "float", keep=[loss_name] + list(grad_names.values())
+            )
+            gcos_same = [cos(outs[t], souts[t]) for t in grad_names.values()]
+            row.update(
+                grad_cos_same_state_median=float(np.nanmedian(gcos_same)),
+                loss_float_same_state=float(np.ravel(souts[loss_name])[0]),
+                loss_float=float(np.ravel(fouts[loss_name])[0]),
+                grad_cos_median=float(np.nanmedian(gcos)),
+                update_cos_median=float(np.nanmedian(ucos)),
+                weight_rel_err_max=float(np.nanmax(ulen)),
+            )
+            prev_w = {w: session.tget(new_state[w].name, new_state[w].dtype, new_state[w].shape).astype(np.float64) for w in weights}
+            fstate = {w: np.asarray(fouts[sm[w]], np.float32) for w in sm}
+        for t in dev_state.values():  # the previous step's state, consumed
+            session.tdel(t.name)
+        dev_state = new_state
+        results.append(row)
+        print("  train", json.dumps(row), flush=True)
+    for t in dev_state.values():
+        session.tdel(t.name)
+    return results
 
 
 def load_records(path: str = STEP_OPS) -> list[dict]:
@@ -3207,6 +3389,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "float run for the outputs of these nodes",
     )
     p.add_argument(
+        "--train-steps",
+        default="",
+        help="train on the device across these dataset steps (e.g. 0,1,2,3) with "
+        "the weights and Adam state staying on the device",
+    )
+    p.add_argument(
+        "--train-validate",
+        action="store_true",
+        help="with --train-steps: also run a float chain and report how the "
+        "device loop follows it (downloads gradients and weights every step)",
+    )
+    p.add_argument(
         "--steps",
         default="0",
         help="comma-separated training steps of the calibration dataset to run "
@@ -3352,7 +3546,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sg.quantize_device_io = False
                 sg.in_q, sg.out_q = [], []
     u16_info: dict = {}
-    post_blobs: dict | None = {} if args.resident else None
+    post_blobs: dict | None = {} if (args.resident or args.train_steps) else None
     if args.u16_matmul:
         blobs.update(
             build_u16_segments(
@@ -3389,6 +3583,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         "host_reasons": _reason_counts(host),
     }
     t0 = time.time()
+    if args.train_steps:
+        import axcl_session
+
+        with axcl_session.AXSession() as sess:
+            runner = StepRunner(model, segs, sess, None, 0)
+            runner._emitted.update(blobs)
+            runner.post_chain = {k: v for k, v in (post_blobs or {}).items() if v[0]}
+            runner.expand_dir = args.u16_cache_dir
+            results = run_train_loop(
+                runner,
+                model,
+                ref,
+                [int(x) for x in args.train_steps.split(",")],
+                args.train_validate,
+            )
+            runner.release_models()
+        with open(args.out, "w") as f:
+            json.dump(results, f, indent=1)
+        return 0
     if args.u16_recal:
         import axcl_session
 
@@ -3424,6 +3637,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             runner._emitted.update(blobs)
             runner.resident = args.resident
             runner.post_chain = {k: v for k, v in (post_blobs or {}).items() if v[0]}
+            runner.expand_dir = args.u16_cache_dir
             if args.resident and not args.no_check:
                 p.error("--resident needs --no-check (the checks read every tensor)")
             try:

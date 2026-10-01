@@ -705,3 +705,127 @@ removes the dependence on a calibrated range:
 (gradient cosines unchanged at 0.995 to 0.997.) Any tensor that is a loss
 term or a sum should be FP32 or recalibrated per step; a range calibrated on one
 batch is not a bound on the next.
+
+### Training on the device with the state resident (`--train-steps`)
+
+`--train-steps 0,1,2,3` trains across dataset steps with the weights and Adam
+`m` and `v` (126 tensors, 140 MB) staying on the device: a step's updated state
+tensors are the next step's state inputs (`run(keep_device=...)` returns them as
+`DeviceTensor`s; the output name prefix alternates per step so a state tensor and
+its update never share a buffer, and the previous step's state is freed after
+use). Only the 7 per-step inputs (data, teacher logits, labels, learning rate,
+...: 9.8 MB) go in and the loss comes out. `--train-validate` also runs a float
+chain (its own state carried the same way) and a float step on the device's own
+state.
+
+AX8850, final configuration (16-bit chains, FP32 optimizer, FP32 elementwise
+and loss reductions, resident), no validation downloads: **10.4 s per step
+steady state** (14.8 s for the first, which loads the models), from 11.5 s with
+the state staged; host-only float is 6.6 s. Validated over the four real steps:
+
+| step | loss (device) | float chain | float at the device's state | gradient cosine at the device's state | gradient cosine vs float chain |
+|---|---|---|---|---|---|
+| 0 | 17.041 | 17.058 | 17.058 | 0.99687 | 0.99687 |
+| 1 | 17.377 | 17.339 | 17.367 | 0.99605 | 0.94498 |
+| 2 | 17.540 | 17.496 | 17.502 | 0.99622 | 0.84259 |
+| 3 | 17.454 | 17.553 | 17.429 | 0.99795 | 0.68508 |
+
+At the device's own state the gradients stay at 0.996 to 0.998 and the loss
+follows the float loss at that state, so the device computation stays accurate
+across steps and the state is carried correctly. The drop against the float chain
+is trajectory divergence: Adam's first updates are close to `lr * sign(g)`, so
+gradient errors flip the sign of small-gradient elements (update cosine 0.85 at
+step 0) and the two chains' weights part (largest weight relative difference
+1.6% after four steps), after which they see different gradients. A float
+implementation with different rounding diverges the same way.
+
+### The second `0x1ef0` record of the 3x3 Conv chains (partial)
+
+For the refused forward 3x3 Convs the second `0x1ef0` record, over five builds at
+different calibrations, is `-round(zb * sb / sy * 2^14)` when the MatMul and output
+zero points are 0 (two builds, exact: `zb`, `sb` the bias's zero point and scale,
+`sy` the output scale). With nonzero zero points an extra term appears that is not
+linear in the zero points (its coefficient is 7.4 in one pair of builds and 1.0 in
+another, which suggests saturating arithmetic), so these chains are not yet
+recalibrated and keep their template scales.
+
+### Closing the gap to the host: device Expand, NaN guards, profile
+
+Steady-state profile of the 10.4 s step: `RUNT` 4.9 s (4.1 s of it engine), staged
+`RUN` 2.4 s, `TPUT` 1.1 s, `TDEL` 0.5 s (877 calls), `TGET` 0.5 s, the host's
+Python 1.0 s. The staged `RUN` was the max-pool backward's crop mask: `Less_447`
+and `Greater_444` (compare a `[1024,9,3136]` window tensor with its per-window
+maximum, `[1024,1,3136]`) and `Div_453` (`safe_masked_div`), each moving about
+115 MB through the VM per step.
+
+- `safe_masked_div` has no host transform and was only excluded from the resident
+  path out of caution; `nan_guard` (a host check of a segment's inputs for NaN,
+  written for the old quantized segments) is skipped in resident mode, since it
+  would download every input and a NaN still shows in the loss and gradients.
+  Steady state 10.4 s to 9.2 s, losses identical.
+- A broadcast input (the `[1024,1,3136]` maximum for a model that wants
+  `[1024,9,3136]`) is expanded on the device by a one-op Expand model: exact on the
+  NPU (max error 0.0, 7.7 ms for 115 MB). Built once per shape pair
+  (`u16_chain.expand_model`, `StepRunner._expand_blob`).
+
+AX8850, final configuration, `--train-steps 0,1,2,3,0,1,2,3`: **6.6 to 6.7 s per
+step steady state**, the same as the host-only float step (6.6 s), with the
+losses identical to the 10.4 s runs (max difference 0.0). Only `conv0_fwd`
+(four batch chunks) is still on the staged path, 0.2 s per step.
+
+### Pipelined commands
+
+The guest runner executes commands in order, so a `RUNT` or `TDEL` need not wait for
+its reply before the next command is sent. `AXSession` sends them without waiting
+(`_cmd_async`) and reads the replies at the next synchronous command, at `sync()`,
+or when 256 are outstanding; an `ERR` reply is raised then. Of the steady-state step
+(6.9 s: `RUNT` 5.1 s over 928 calls for 4.1 s of engine, `TDEL` 0.6 s over 883
+calls, host Python 0.5 s), what is left is the engine plus about 0.2 s each of
+upload, download and staged `conv0_fwd`.
+
+AX8850, final configuration, `--train-steps 0,1,2,3,0,1,2,3`: **5.8 s per step
+steady state** against 6.6 s for the host-only float step (the 4.1 s of engine time
+is the floor; 4.6 s of the step is the host waiting for the device), with the losses
+identical to the unpipelined runs (max difference 0.0).
+
+### The forward 3x3 Conv chains recalibrate (all 61 chains)
+
+The 22 chains refused in the first four-step run (the forward 3x3 and strided Convs)
+fail at register `0x1ef0`. Building stage2_conv0's forward chain at 11 calibrations
+(`variants_probe.py`-style sweeps of the weight scale and shift and of the input
+offset) showed the records are the existing 8-bit roles, with 16-bit details:
+
+- the first `0x1ef0` record is `rqoff`, the requantize of the asymmetric weight
+  into the symmetric `wcat`: `-int(f32(f32(zw) * (f32(sw) / f32(swcat))) * 32768)`,
+  shift word `0x8f`;
+- the second is `zpoff` of the fused bias Add, `trunc((zy - zmm * f32(smm/sy) - zb *
+  f32(sb/sy)) * 2^q)`, with shift word `0x0f` or `0x0e`. The only change was the tie
+  rule: a ratio of **exactly 1** keeps `q = 15` (the MatMul output and the biased
+  sum share a scale in the step's real templates), so `_add` now takes the smallest
+  `k` with a ratio `> 1` instead of `>= 1`.
+
+Tensors that share a scale tie their roles in a template, so `recalibrate` resolves
+a tie by the located Add: `s` and `ratio` lanes in terms of the Add's output (its
+output scale, x over it) and the MatMul's multiplier lane (`mult`, `mult256`) in terms
+of its input. In a 16-bit build the four lanes at `0x0fd0..0x1000` are the constant
+1.0, so a tied `ratio` that also evaluates to 1.0 must not move them. A new `zp16`
+role covers the 16-bit zero points an asymmetric activation leaves in `npu_params`
+(a table of `z | z << 16` words ending in a half-word, `zp16h`). 34 of 34 accepted
+ordered pairs across the 11 builds are exact in records and `npu_params`; the others
+cross the zero/nonzero zero-point boundary and are refused by design (Pulsar2 emits a
+different record count there). `tests/test_axera_matmul_record_emit.py` covers ten
+pairs and the refusal.
+
+In the multi-step driver, a constant tensor in a template (a gather mask) has a scale
+but no range to predict from and keeps the template's scale; this `KeyError` was
+refusing 19 more chains. AX8850, four real steps, **all 61 MatMul/Conv chains
+recalibrated at every step, none refused**:
+
+| policy | step | gradient cosine (median) | loss | float | error |
+|---|---|---|---|---|---|
+| delayed | 1 / 2 / 3 | 0.9946 / 0.9954 / 0.9977 | 17.337 / 17.478 / 17.559 | 17.339 / 17.496 / 17.555 | -0.001 / -0.019 / +0.004 |
+| exact | 1 / 2 / 3 | 0.9955 / 0.9965 / 0.9980 | 17.338 / 17.504 / 17.551 | 17.339 / 17.496 / 17.555 | -0.001 / +0.008 / -0.004 |
+
+Delayed (the previous step's ranges times 1.3) matches exact, and both match the
+static step-0 templates (0.9953 / 0.9962 / 0.9975): on these four steps recalibration
+costs nothing and the machinery is in place for ranges that move more.

@@ -249,3 +249,45 @@ def test_u16_step_chain_recalibrates_to_the_native_build(chain, src, dst):
     diff = mre.compare(out, builds[dst][0])
     assert diff["record_diffs"] == []
     assert diff["params_diff_bytes"] == 0
+
+
+# stage2_conv0's forward chain (a strided 3x3 Conv: Pad, nine taps concatenated,
+# a weight requantized from asymmetric to symmetric, MatMul, bias Add) at U16, built
+# at several calibrations (``/tmp``-free: the builds are fixtures). v0/v1/x3/x4 have
+# nonzero MatMul and output zero points (v0 and v1 share the MatMul and output scale,
+# the case that tied roles), v2/v4 have zero ones, x0/x1 an asymmetric activation
+# (16-bit zero points stored twice in each word of ``npu_params``).
+CONV3X3 = {
+    name: _build(
+        os.path.join(HERE, f"u16conv3x3_{name}.axmodel.gz"),
+        os.path.join(HERE, f"u16conv3x3_{name}.quant.json.gz"),
+    )
+    for name in ("v0", "v1", "v2", "v4", "x0", "x1", "x3", "x4")
+}
+
+
+@pytest.mark.parametrize(
+    "src,dst",
+    [
+        ("v0", "v1"),
+        ("v1", "v0"),
+        ("v0", "x3"),  # a template with a tied scale moves to an untied one
+        ("v1", "x4"),
+        ("x3", "x4"),
+        ("x4", "v0"),
+        ("v2", "v4"),  # zero MatMul and output zero points
+        ("v4", "v2"),
+        ("x0", "x1"),  # an asymmetric activation: zp16 words in npu_params
+        ("x1", "x0"),
+    ],
+)
+def test_u16_conv3x3_chain_recalibrates_to_the_native_build(src, dst):
+    out, _ = mre.recalibrate(CONV3X3[src][0], CONV3X3[src][1], CONV3X3[dst][1])
+    diff = mre.compare(out, CONV3X3[dst][0])
+    assert diff["record_diffs"] == []
+    assert diff["params_diff_bytes"] == 0
+
+
+def test_u16_conv3x3_chain_refuses_a_zero_point_layout_change():
+    with pytest.raises(mre.CalibrationError, match="zero point goes between"):
+        mre.recalibrate(CONV3X3["v0"][0], CONV3X3["v0"][1], CONV3X3["v2"][1])

@@ -18,6 +18,7 @@ agents' device runs queue behind it rather than interleaving.
 
 from __future__ import annotations
 
+import collections
 import itertools
 import json
 import os
@@ -248,6 +249,7 @@ class AXSession:
         self.exec_us = 0
         self.runs = 0
         self.timing: dict[str, list[float]] = {}  # command -> [calls, seconds]
+        self._pending: collections.deque = collections.deque()  # replies not yet read
         self.bytes = {"put": 0, "get": 0}
         self._resident_inputs: dict[int, set[int]] = {}
 
@@ -327,7 +329,41 @@ class AXSession:
             raise DeviceStall("runner exited")
         return line
 
+    # -- pipelining: commands whose reply nothing waits for ----------------
+    _MAX_PENDING = 256
+
+    def _cmd_async(self, text: str) -> None:
+        """Send a command without waiting for its reply (the guest runner
+        executes commands in order, so a later command sees its effect). The
+        replies are read by the next synchronous command, ``sync()`` or when
+        ``_MAX_PENDING`` are outstanding; an ERR reply is raised then."""
+        self._proc.stdin.write(text + "\n")
+        self._proc.stdin.flush()
+        self._pending.append(text.split(" ", 1)[0])
+        if len(self._pending) >= self._MAX_PENDING:
+            self.sync()
+
+    def sync(self) -> None:
+        """Read every outstanding reply; raise the first ERR (after reading all)."""
+        t0 = time.perf_counter()
+        err = None
+        while self._pending:
+            verb = self._pending.popleft()
+            line = self._line()
+            if line.startswith("ERR"):
+                err = err or DeviceError(f"{verb}: {line}")
+            elif verb == "RUNT":
+                self.exec_us += int(line.split()[1])
+                self.runs += 1
+        rec = self.timing.setdefault("(drain)", [0, 0.0])
+        rec[0] += 1
+        rec[1] += time.perf_counter() - t0
+        if err:
+            raise err
+
     def _cmd(self, text: str) -> str:
+        if self._pending:
+            self.sync()
         t0 = time.perf_counter()
         self._proc.stdin.write(text + "\n")
         self._proc.stdin.flush()
@@ -394,7 +430,7 @@ class AXSession:
         return a.reshape(shape) if shape else a
 
     def tdel(self, name: str) -> None:
-        self._cmd(f"TDEL {name}")
+        self._cmd_async(f"TDEL {name}")
 
     def tclear(self) -> None:
         self._cmd("TCLEAR")
@@ -405,12 +441,10 @@ class AXSession:
         the VM boundary."""
         if len(in_names) != len(m.inputs) or len(out_names) != len(m.outputs):
             raise ValueError("run_t: tensor names do not match the model's inputs/outputs")
-        line = self._cmd(
+        self._cmd_async(
             f"RUNT {m.id} {len(in_names)} {' '.join(in_names)} "
             f"{len(out_names)} {' '.join(out_names)}"
         )
-        self.exec_us += int(line.split()[1])
-        self.runs += 1
 
     def unload(self, m: Model) -> None:
         self._cmd(f"UNLOAD {m.id}")
