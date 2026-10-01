@@ -80,19 +80,44 @@ def test_u8_preset_quantizes_to_qdq_without_approximation(tmp_path):
     onnx.checker.check_model(onnx.load(str(out)))
 
 
-def test_int8_activation_preset_warns_about_approximation():
+def test_signed_int8_activations_are_symmetric_with_zero_point_zero():
     q = qc.ModelQuantizer(qc.QConfig.get_default_config("A8W8"))
-    with pytest.warns(UserWarning, match="int8 activations mapped to uint8"):
-        q.quantize_model(_model(), calibration_data_reader=_Reader())
-    assert any("int8 activations" in m for m in q.last_approximations)
+    model = q.quantize_model(_model(), calibration_data_reader=_Reader())
+    assert not any("mapped to uint" in m for m in q.last_approximations)
+    zps = [
+        i
+        for i in model.graph.initializer
+        if i.data_type == onnx.TensorProto.INT8 and i.name.endswith("/zp")
+    ]
+    assert zps and all(not onnx.numpy_helper.to_array(z).any() for z in zps)
+    assert not any(
+        i.data_type == onnx.TensorProto.UINT8 for i in model.graph.initializer
+    )
 
 
-def test_a16w8_uses_uint16_activations():
+def test_a16w8_uses_int16_activations():
     q = qc.ModelQuantizer(qc.QConfig.get_default_config("A16W8"))
-    with pytest.warns(UserWarning):
-        model = q.quantize_model(_model(), calibration_data_reader=_Reader())
+    model = q.quantize_model(_model(), calibration_data_reader=_Reader())
     types = {i.data_type for i in model.graph.initializer}
-    assert onnx.TensorProto.UINT16 in types
+    assert onnx.TensorProto.INT16 in types
+
+
+def test_xint8_scales_are_powers_of_two_with_centred_uint8_zero_point():
+    model = qc.ModelQuantizer(qc.QConfig.get_default_config("XINT8")).quantize_model(
+        _model(), calibration_data_reader=_Reader()
+    )
+    scales = [
+        float(onnx.numpy_helper.to_array(i))
+        for i in model.graph.initializer
+        if i.name.endswith("/scale") and not onnx.numpy_helper.to_array(i).ndim
+    ]
+    assert scales and all(np.log2(s) == round(np.log2(s)) for s in scales)
+    zps = [
+        int(onnx.numpy_helper.to_array(i))
+        for i in model.graph.initializer
+        if i.name.endswith("/zp") and i.data_type == onnx.TensorProto.UINT8
+    ]
+    assert zps and set(zps) == {128}
 
 
 @pytest.mark.parametrize("preset, half", [("FP16", "FLOAT16"), ("BF16", "BFLOAT16")])
