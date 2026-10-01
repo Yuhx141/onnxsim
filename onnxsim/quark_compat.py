@@ -50,9 +50,12 @@ names and preset *meanings*, not copied.
   ``subgraph_json`` and ``sensitivity_cache_file`` raise, and ``dual_quant_nodes``
   / ``no_input_qdq_shared`` / ``shared_param_mode`` / ``worker_num`` have no
   effect (every tensor already has its own Q/DQ pair; analysis is serial).
-  AdaRound, GPTQ and Quarot are accepted and stored so configs round-trip,
-  but **not executed** (onnxsim's AdaRound/GPTQ target its int4 weight-only
-  scheme): ``quantize_model`` raises ``NotImplementedError`` naming them
+  AdaRound and GPTQ refine the int8 weight codes layer by layer
+  (:mod:`onnxsim.quark_weight_rounding`; Conv / Gemm / MatMul, guarded so a
+  layer's reconstruction error never gets worse); ``update_bias``, ``drop_ratio``
+  (AdaRound) and ``bits != 8`` / ``group_size`` / asymmetric weights (GPTQ)
+  raise. Quarot is accepted and stored so configs round-trip, but **not
+  executed**: ``quantize_model`` raises ``NotImplementedError`` naming it
   unless ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted.
 """
@@ -300,6 +303,8 @@ _RUNNABLE_ALGOS = {
     "smooth_quant",
     "cle",
     "adaquant",
+    "adaround",
+    "gptq",
     "bias_correction",
     "auto_mixprecision",
 }
@@ -331,6 +336,8 @@ class ModelQuantizer:
         #: the :class:`~onnxsim.quark_auto_mixprecision.AutoMixprecisionResult`
         #: (sensitivity ranking, moved layers, scores) of the last run, if any
         self.last_auto_mixprecision: Any = None
+        #: ``{"adaround" | "gptq": [LayerReport, ...]}`` of the last run
+        self.last_weight_rounding: Dict[str, Any] = {}
 
     def quantize_model(
         self,
@@ -343,6 +350,7 @@ class ModelQuantizer:
         cfg = self.config
         self.last_approximations = []
         self.last_auto_mixprecision = None
+        self.last_weight_rounding = {}
         act, wt = cfg.global_config.activation, cfg.global_config.weight
 
         for spec in (act, wt):
@@ -429,6 +437,76 @@ class ModelQuantizer:
 
     def _approx(self, msg: str) -> None:
         self.last_approximations.append(msg)
+
+    def _adaround(
+        self,
+        float_model: onnx.ModelProto,
+        quantized: onnx.ModelProto,
+        calibration: List[Dict[str, np.ndarray]],
+        algo: AlgoConfig,
+    ) -> onnx.ModelProto:
+        from onnxsim.quark_weight_rounding import adaround_int8
+
+        p = algo.params
+        if p.get("update_bias"):
+            raise NotImplementedError("AdaRoundConfig.update_bias is not supported")
+        if p.get("drop_ratio", 1.0) != 1.0:
+            raise NotImplementedError(
+                "AdaRoundConfig.drop_ratio (QDrop) is not supported"
+            )
+        self._approx(
+            "AdaRound is layer-wise against the float model's activations "
+            "(Quark optimizes subgraph blocks)"
+        )
+        kwargs: Dict[str, Any] = {
+            k: p[k]
+            for k in ("num_iterations", "learning_rate", "reg_param", "warm_start")
+            if k in p
+        }
+        if "beta_range" in p:
+            kwargs["beta_range"] = tuple(p["beta_range"])
+        if "fixed_seed" in p:
+            kwargs["seed"] = int(p["fixed_seed"]) % (2**32)
+        if p.get("target_op_type"):
+            kwargs["target_ops"] = tuple(
+                o for o in p["target_op_type"] if o in ("Conv", "Gemm", "MatMul")
+            )
+        out, self.last_weight_rounding["adaround"] = adaround_int8(
+            float_model, quantized, calibration, **kwargs
+        )
+        return out
+
+    def _gptq(
+        self,
+        float_model: onnx.ModelProto,
+        quantized: onnx.ModelProto,
+        calibration: List[Dict[str, np.ndarray]],
+        algo: AlgoConfig,
+    ) -> onnx.ModelProto:
+        from onnxsim.quark_weight_rounding import gptq_int8
+
+        p = algo.params
+        if p.get("bits", 8) != 8:
+            raise NotImplementedError("GPTQConfig.bits must be 8 (int8 QDQ weights)")
+        if p.get("group_size", -1) != -1:
+            raise NotImplementedError("GPTQConfig.group_size must be -1 (ungrouped)")
+        if not p.get("weight_symmetric", True):
+            raise NotImplementedError("GPTQConfig.weight_symmetric must be True")
+        self._approx(
+            "GPTQ keeps quantize_full_qdq's per-channel scales "
+            "(GPTQConfig.per_channel / mse are not used)"
+        )
+        kwargs: Dict[str, Any] = {}
+        if "perc_damp" in p:
+            kwargs["perc_damp"] = p["perc_damp"]
+        if "block_size" in p:
+            kwargs["block_size"] = p["block_size"]
+        if "act_order" in p:
+            kwargs["act_order"] = bool(p["act_order"])
+        out, self.last_weight_rounding["gptq"] = gptq_int8(
+            float_model, quantized, calibration, **kwargs
+        )
+        return out
 
     def _int_act_dtype(self, spec: QSpec) -> str:
         """The ``quantize_full_qdq`` activation dtype for an int spec (uint8 or
@@ -570,6 +648,12 @@ class ModelQuantizer:
                     if key in params
                 },
             )
+        if "adaround" in by_name:
+            quantized = self._adaround(
+                float_model, quantized, calibration, by_name["adaround"]
+            )
+        if "gptq" in by_name:
+            quantized = self._gptq(float_model, quantized, calibration, by_name["gptq"])
         if "bias_correction" in by_name:
             from onnxsim.bias_correction import correct_bias
 
