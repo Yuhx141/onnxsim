@@ -246,9 +246,14 @@ def test_gptq_round_to_nearest_error_equals_quarks(mlp, per_channel):
 
 
 def _e2e_error(model, quantized, x_test):
+    # No graph optimizations: ORT would otherwise fuse DQ -> MatMul -> Q into
+    # integer kernels that saturate on x86 CPUs without VNNI (CI runners), which
+    # makes the error depend on the host rather than on the quantization.
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     feed = {"x": x_test}
-    ref = ort.InferenceSession(model.SerializeToString()).run(None, feed)[0]
-    got = ort.InferenceSession(quantized.SerializeToString()).run(None, feed)[0]
+    ref = ort.InferenceSession(model.SerializeToString(), so).run(None, feed)[0]
+    got = ort.InferenceSession(quantized.SerializeToString(), so).run(None, feed)[0]
     return float(np.mean((got - ref) ** 2))
 
 
