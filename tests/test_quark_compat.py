@@ -181,8 +181,10 @@ def test_no_adaround_variant_for_block_presets():
 
 
 def test_algo_config_not_silently_dropped():
-    q = qc.ModelQuantizer(qc.QConfig.get_default_config("U8S8_AAWS_ADAROUND"))
-    with pytest.raises(NotImplementedError, match="adaround"):
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.algo_config = [qc.QuarotConfig()]
+    q = qc.ModelQuantizer(cfg)
+    with pytest.raises(NotImplementedError, match="quarot"):
         q.quantize_model(_model(), calibration_data_reader=_Reader())
     q.quantize_model(
         _model(), calibration_data_reader=_Reader(), ignore_unsupported_algos=True
@@ -287,13 +289,64 @@ def test_adaquant_preset_runs_end_to_end():
     onnx.checker.check_model(out)
 
 
-@pytest.mark.parametrize("preset", ["U8S8_AAWS_ADAROUND", "A8W8_ADAROUND"])
-def test_adaround_is_still_refused(preset):
+@pytest.mark.parametrize("preset", ["U8S8_AAWS_ADAROUND"])
+def test_adaround_preset_runs_and_reports_layers(preset):
     cfg = qc.QConfig.get_default_config(preset)
-    with pytest.raises(NotImplementedError, match="adaround"):
+    cfg.algo_config[0].params["num_iterations"] = 30
+    q = qc.ModelQuantizer(cfg)
+    with pytest.warns(UserWarning, match="AdaRound is layer-wise"):
+        out = q.quantize_model(
+            _two_layer_model(), calibration_data_reader=_batches((4, 8))
+        )
+    reports = q.last_weight_rounding["adaround"]
+    assert reports and all(r.error_after <= r.error_before for r in reports)
+    base = _quantize(_two_layer_model(), [], _batches((4, 8)))
+    assert out.SerializeToString() != base.SerializeToString()
+    onnx.checker.check_model(out)
+
+
+def test_gptq_runs_through_the_compat_layer():
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.algo_config = [qc.GPTQConfig(act_order=True, perc_damp=0.02)]
+    q = qc.ModelQuantizer(cfg)
+    with pytest.warns(UserWarning, match="GPTQ keeps"):
+        out = q.quantize_model(
+            _two_layer_model(), calibration_data_reader=_batches((4, 8))
+        )
+    reports = q.last_weight_rounding["gptq"]
+    assert reports and all(r.error_after <= r.error_before for r in reports)
+    onnx.checker.check_model(out)
+
+
+@pytest.mark.parametrize(
+    "algo, match",
+    [
+        (qc.AdaRoundConfig(update_bias=True), "update_bias"),
+        (qc.AdaRoundConfig(drop_ratio=0.5), "drop_ratio"),
+        (qc.GPTQConfig(bits=4), "bits must be 8"),
+        (qc.GPTQConfig(group_size=128), "group_size"),
+        (qc.GPTQConfig(weight_symmetric=False), "weight_symmetric"),
+    ],
+)
+def test_weight_rounding_options_that_change_the_meaning_are_refused(algo, match):
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.algo_config = [algo]
+    with pytest.raises(NotImplementedError, match=match):
         qc.ModelQuantizer(cfg).quantize_model(
             _two_layer_model(), calibration_data_reader=_batches((4, 8))
         )
+
+
+def test_weight_rounding_state_is_reset_between_runs():
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.algo_config = [qc.GPTQConfig()]
+    q = qc.ModelQuantizer(cfg)
+    with pytest.warns(UserWarning):
+        q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
+    assert "gptq" in q.last_weight_rounding
+    q.config.algo_config = []
+    q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
+    assert q.last_weight_rounding == {}
 
 
 def _amp_config(**params):

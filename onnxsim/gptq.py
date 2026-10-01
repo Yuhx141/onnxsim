@@ -72,6 +72,8 @@ def _gptq_quantize_columns(
     h: np.ndarray,
     percdamp: float,
     proc_block_size: int,
+    qmin: float = -7.0,
+    qmax: float = 7.0,
 ) -> np.ndarray:
     """Returns GPTQ-optimized integer codes for ``w_nk`` ([N, K], output
     channel first), reusing ``scale_blocks``' existing per-(output channel,
@@ -83,6 +85,9 @@ def _gptq_quantize_columns(
     columns' errors get propagated locally before a full cross-block
     update; larger values trade memory for fewer full-width updates, with
     no effect on the result other than floating-point summation order.
+    ``qmin``/``qmax`` bound the integer codes (default: the symmetric INT4
+    grid ``[-7, 7]``; :mod:`onnxsim.quark_weight_rounding` passes
+    ``[-127, 127]`` for INT8 QDQ weights).
     """
     n, k = w_nk.shape
     hinv = _inverse_hessian_cholesky(h, percdamp)
@@ -102,7 +107,7 @@ def _gptq_quantize_columns(
             group = k_abs // quant_block_size
             s = scale_blocks[:, group]  # [N]
             w_col = w1[:, i]
-            code_col = np.clip(np.round(w_col / s), -7.0, 7.0)
+            code_col = np.clip(np.round(w_col / s), qmin, qmax)
             codes_nk[:, k_abs] = code_col
             d = hinv1[i, i]
             err = (w_col - code_col * s) / d
