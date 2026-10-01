@@ -31,8 +31,37 @@ names and preset *meanings*, not copied.
   **per tensor** like Quark (``extra_options={"PerChannel": True}`` for per
   channel; the weight-rounding algorithms need it and switch it on). Scales and
   zero points match Quark's for the probed models
-  (``tests/test_quark_parity.py``). ``XINT8`` uses ``ceil(log2(scale))`` where
-  Quark searches for the MSE-best power of two, and biases stay int32.
+  (``tests/test_quark_parity.py``). Calibration follows the preset: MinMax
+  (``A8W8``, ``A16W8``), Percentile (99.999; ``S8S8_AAWS`` 99.9999; the
+  ``Int8Spec`` family's default, as in Quark; agrees with Quark to histogram
+  binning, ~5e-4) and, for ``XINT8``, Quark's power-of-two MinMSE
+  (``method="minmse_pof2"`` in :func:`onnxsim.calibration.calibrate`): the same
+  2048-bin histogram and five candidate scales, so activation scales are
+  identical to Quark's, and weights and biases get the same MinMSE search --
+  biases are **int8** with a per-tensor power-of-two scale like Quark's
+  (``extra_options={"Int32Bias": True}`` keeps int32). Like Quark, every
+  non-weight constant of a quantized node (LayerNorm scale, Mul operand, ...)
+  is quantized as an int8 weight (activation dtype for Add / Sub / Mul / Div /
+  Min / Max constants under ``A16W8``'s ``AlignEltwiseQuantType``), and
+  Softmax outputs are calibrated to the fixed range (0, 1) except under
+  ``XINT8``. Not matched: Quark's ``Entropy`` (a different algorithm than
+  :func:`onnxsim.calibration.calibrate`'s ``"entropy"``; inner scales differ by
+  up to ~30% on the probed MLP), ``Distribution`` / ``LayerwisePercentile``
+  (``CalibMethod`` members that raise), and its non-power-of-two ``MinMSE``
+  (Quark's ``CalibMethod.MinMSE`` is the power-of-two search, which is what
+  :class:`CalibMethod` maps it to). Quark's NPU graph rewrites for ``XINT8``
+  (shift/cut adjustment, ...) did not change any probed scale.
+- Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
+  (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
+  (``input_tensors``, or the deprecated ``activation``) and outputs
+  (``output_tensors``) among int8/uint8/int16/uint16; a ``None`` key in
+  ``layer_type_config`` and ``exclude`` keep nodes float. Node names may be
+  Quark's ``^...*`` regular expressions (subgraph tuples raise). Weight dtypes
+  other than int8 raise; ``bias`` specs are ignored (biases stay int32).
+  Scales / zero points match Quark's (``tests/test_quark_parity.py``).
+- ``UINT8_DYNAMIC_QUANT``: :mod:`onnxsim.quark_dynamic` emits Quark's /
+  ONNX Runtime's dynamic pattern (``DynamicQuantizeLinear`` +
+  ``MatMulInteger`` / ``ConvInteger``); no calibration data is needed.
 - Block formats (``BFP16``, ``MX4/6/9``, ``MXFP4/6/8``, ``MXINT8``):
   :mod:`onnxsim.quark_fakequant_graph` inserts the same ``com.amd.quark``
   ``BFPQuantizeDequantize`` / ``MXQuantizeDequantize`` nodes Quark's quantizer
@@ -66,22 +95,37 @@ names and preset *meanings*, not copied.
   ``subgraph_json`` and ``sensitivity_cache_file`` raise, and ``dual_quant_nodes``
   / ``no_input_qdq_shared`` / ``shared_param_mode`` / ``worker_num`` have no
   effect (every tensor already has its own Q/DQ pair; analysis is serial).
-  AdaRound and GPTQ refine the int8 weight codes layer by layer
+  AdaRound and GPTQ refine the weight codes layer by layer
   (:mod:`onnxsim.quark_weight_rounding`; Conv / Gemm / MatMul, guarded so a
-  layer's reconstruction error never gets worse); ``update_bias``, ``drop_ratio``
-  (AdaRound) and ``bits != 8`` / ``group_size`` / asymmetric weights (GPTQ)
-  raise. Quarot folds the R1 residual-stream rotation into the float
+  layer's reconstruction error never gets worse). AdaRound honours
+  ``drop_ratio`` (QDrop-style mixing of quantized and float layer inputs),
+  ``selective_update``, ``lr_adjust`` and ``data_size``; ``update_bias`` is
+  accepted and ignored, as in Quark (only AdaQuant reads it); ``early_stop`` /
+  ``output_qdq`` / ``batch_size`` / ``num_batches`` have no effect. GPTQ with
+  ``bits`` / ``group_size`` / ``per_channel`` / ``mse`` / ``weight_symmetric``
+  set re-grids the weights the way Quark's GPTQ does (``bits``-bit codes,
+  per-tensor / per-channel / per-group scales, scales and zero points written
+  back into the QDQ weights; ``group_size`` needs a blocked
+  ``DequantizeLinear``, opset >= 21, which ONNX Runtime only runs next to
+  activation Q/DQ with ``session.disable_quant_qdq=1``); with none of them set
+  the model's own scales are kept. ``act_order`` together with ``group_size``
+  raises. Quark 0.13's GPTQ error-propagation step is a no-op (it indexes a
+  triangular factor by column), so Quark's result is round-to-nearest on its
+  grid; onnxsim really propagates the error (and is never worse). Quarot folds the R1 residual-stream rotation into the float
   weights before quantization (:mod:`onnxsim.quark_quarot`; needs
   ``r_config_path``; R2-R4 do not exist, as in Quark's ONNX flow). An
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
-- ``extra_options`` are stored, not interpreted.
+- ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
+  ``Int32Bias``, ``AlignEltwiseQuantType`` and the block-format options above.
 """
 
 from __future__ import annotations
 
+import re
 import warnings
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -101,25 +145,68 @@ class QSpec:
     dtype: str = "int8"
     symmetric: bool = True
     pof2: bool = False
-    calibration_method: str = "minmax"
+    #: ``"minmax"``, ``"percentile[:p]"``, ``"entropy"``, ``"mse"``,
+    #: ``"minmse_pof2"`` (Quark's MinMSE) or a :class:`CalibMethod`
+    calibration_method: Any = "minmax"
     is_dynamic: bool = False
 
+    def __post_init__(self) -> None:
+        if isinstance(self.calibration_method, CalibMethod):
+            self.calibration_method = _CALIB_NAMES[self.calibration_method]
 
-def _spec(name: str, dtype: str, symmetric: bool, pof2: bool = False):
+
+class CalibMethod(Enum):
+    """Quark's ``CalibMethod`` (``quark.onnx.CalibMethod``). ``MinMSE`` is its
+    power-of-two MinMSE search (:mod:`onnxsim.calibration` ``"minmse_pof2"``);
+    ``Distribution`` / ``LayerwisePercentile`` are not implemented."""
+
+    MinMax = 0
+    MinMSE = 1
+    Percentile = 2
+    Entropy = 3
+    LayerwisePercentile = 4
+    Distribution = 5
+
+
+_CALIB_NAMES = {
+    CalibMethod.MinMax: "minmax",
+    CalibMethod.MinMSE: "minmse_pof2",
+    CalibMethod.Percentile: "percentile:99.999",
+    CalibMethod.Entropy: "entropy",
+    CalibMethod.LayerwisePercentile: "layerwise_percentile",
+    CalibMethod.Distribution: "distribution",
+}
+
+
+def _spec(
+    name: str,
+    dtype: str,
+    symmetric: bool,
+    pof2: bool = False,
+    calibration_method: str = "minmax",
+):
     def __init__(self, **kwargs: Any) -> None:
-        fields: Dict[str, Any] = dict(dtype=dtype, symmetric=symmetric, pof2=pof2)
+        fields: Dict[str, Any] = dict(
+            dtype=dtype,
+            symmetric=symmetric,
+            pof2=pof2,
+            calibration_method=calibration_method,
+        )
         fields.update(kwargs)  # a caller may override e.g. ``symmetric``
         QSpec.__init__(self, **fields)
 
     return type(name, (QSpec,), {"__init__": __init__, "__doc__": f"{name}."})
 
 
-Int8Spec = _spec("Int8Spec", "int8", True)
-UInt8Spec = _spec("UInt8Spec", "uint8", False)
-Int16Spec = _spec("Int16Spec", "int16", True)
-UInt16Spec = _spec("UInt16Spec", "uint16", False)
-XInt8Spec = _spec("XInt8Spec", "int8", True, pof2=True)
-XUInt8Spec = _spec("XUInt8Spec", "uint8", True, pof2=True)
+# Quark's defaults: the integer specs calibrate with a 99.999 percentile, the
+# power-of-2 ones with MinMSE, everything else with MinMax.
+_PCT_DEFAULT = "percentile:99.999"
+Int8Spec = _spec("Int8Spec", "int8", True, calibration_method=_PCT_DEFAULT)
+UInt8Spec = _spec("UInt8Spec", "uint8", False, calibration_method=_PCT_DEFAULT)
+Int16Spec = _spec("Int16Spec", "int16", True, calibration_method=_PCT_DEFAULT)
+UInt16Spec = _spec("UInt16Spec", "uint16", False, calibration_method=_PCT_DEFAULT)
+XInt8Spec = _spec("XInt8Spec", "int8", True, True, "minmse_pof2")
+XUInt8Spec = _spec("XUInt8Spec", "uint8", True, True, "minmse_pof2")
 Float16Spec = _spec("Float16Spec", "float16", False)
 BFloat16Spec = _spec("BFloat16Spec", "bfloat16", False)
 BFP16Spec = _spec("BFP16Spec", "bfp16", False)
@@ -174,10 +261,72 @@ _FAKEQUANT_DTYPES = _BLOCK_DTYPES | {"float16", "bfloat16"}
 
 @dataclass(eq=True, unsafe_hash=True)
 class QLayerConfig:
-    """Activation + weight spec of one layer group (Quark's ``QLayerConfig``)."""
+    """Spec of one layer group (Quark's ``QLayerConfig``).
 
-    activation: QSpec = field(default_factory=Int8Spec)
-    weight: QSpec = field(default_factory=Int8Spec)
+    ``activation`` is Quark's deprecated spelling of ``input_tensors`` (giving
+    both raises, as in Quark). A spec left ``None`` means "inherit": the global
+    config's, for a global config that is Int8. Positional order is
+    ``(activation, weight)`` for backward compatibility.
+    """
+
+    activation: Optional[QSpec] = None
+    weight: Optional[QSpec] = None
+    input_tensors: Optional[QSpec] = None
+    bias: Optional[QSpec] = None
+    output_tensors: Optional[QSpec] = None
+
+    def __post_init__(self) -> None:
+        if self.input_tensors is not None and self.activation is not None:
+            raise ValueError(
+                "Both `activation` and `input_tensors` are provided. Please just "
+                "use `input_tensors`."
+            )
+        if self.activation is None:
+            self.activation = self.input_tensors
+        self.input_tensors = self.activation
+
+    def resolved(self) -> "QLayerConfig":
+        """The global form: a missing activation / weight spec is Int8."""
+        return QLayerConfig(
+            activation=self.activation or Int8Spec(),
+            weight=self.weight or Int8Spec(),
+            bias=self.bias,
+            output_tensors=self.output_tensors,
+        )
+
+
+def _activation_inputs(node: onnx.NodeProto, inits: "set[str]") -> List[str]:
+    """Inputs before the first constant, which Quark treats as activations."""
+    out: List[str] = []
+    for x in node.input:
+        if not x or x in inits:
+            break
+        out.append(x)
+    return out
+
+
+def _match_nodes(model: onnx.ModelProto, patterns: List[Any]) -> List[str]:
+    """Node names selected by ``patterns``: plain names, and Quark's
+    ``^...*``-style regular expressions (must contain ``.*``)."""
+    names = [n.name for n in model.graph.node]
+    out: List[str] = []
+    for p in patterns:
+        if isinstance(p, tuple):
+            raise NotImplementedError("subgraph patterns are not supported")
+        if not isinstance(p, str):
+            raise TypeError(f"expected a node name or pattern, got {type(p).__name__}")
+        if p.startswith("^"):
+            if ".*" not in p:
+                raise ValueError(
+                    f"invalid pattern {p!r}: patterns start with ^ and contain .*"
+                )
+            hit = [n for n in names if n and re.search(p, n)]
+            if not hit:
+                raise ValueError(f"pattern {p!r} matches no node")
+            out += hit
+        else:
+            out.append(p)
+    return out
 
 
 # -- algorithm configs (stored only, see module docstring) --------------------
@@ -253,17 +402,25 @@ def _layer(act: type, wt: type, **act_kwargs: Any) -> QLayerConfig:
     return QLayerConfig(activation=act(**act_kwargs), weight=wt())
 
 
-# Quark calibrates the asymmetric ("AA") presets with percentiles.
+# Quark calibrates the asymmetric ("AA") presets with percentiles (99.999;
+# S8S8_AAWS 99.9999), S16S8_ASWS with a symmetric 99.999 percentile.
 _PCT = dict(symmetric=False, calibration_method="percentile:99.999")
+_PCT4 = dict(symmetric=False, calibration_method="percentile:99.9999")
 
 
 _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "XINT8": lambda: QConfig(_layer(XUInt8Spec, XInt8Spec)),
-    "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec)),
-    "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec, **_PCT)),
+    "UINT8_DYNAMIC_QUANT": lambda: QConfig(
+        _layer(Int8Spec, UInt8Spec, is_dynamic=True)
+    ),
+    "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec, calibration_method="minmax")),
+    "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec, **_PCT4)),
     "U8S8_AAWS": lambda: QConfig(_layer(UInt8Spec, Int8Spec, **_PCT)),
     "U8U8_AAWA": lambda: QConfig(_layer(UInt8Spec, UInt8Spec, **_PCT)),
-    "A16W8": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
+    "A16W8": lambda: QConfig(
+        _layer(Int16Spec, Int8Spec, calibration_method="minmax"),
+        AlignEltwiseQuantType=True,
+    ),
     "S16S8_ASWS": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
     "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec, **_PCT)),
     "FP16": lambda: QConfig(_layer(Float16Spec, Float16Spec)),
@@ -290,7 +447,7 @@ def _algo_variant(base: str, cls: type) -> Callable[[], QConfig]:
 
 for _n in list(_PRESETS):
     _block = _n.startswith(("BFP", "MX"))
-    if _n == "BF16" or _n.startswith("FP16"):
+    if _n in ("BF16", "UINT8_DYNAMIC_QUANT") or _n.startswith("FP16"):
         continue
     if not _block:
         _PRESETS[f"{_n}_ADAROUND"] = _algo_variant(_n, AdaRoundConfig)
@@ -372,8 +529,12 @@ _PRESETS.update(
             QuantizeAllOpTypes=True,
         ),
         "S16S16_MIXED_S8S8": lambda: _s16s16_mixed_s8s8(),
-        "INT8_CNN_DEFAULT": lambda: QConfig(_layer(UInt8Spec, Int8Spec)),
-        "INT16_CNN_DEFAULT": lambda: QConfig(_layer(UInt16Spec, Int16Spec)),
+        "INT8_CNN_DEFAULT": lambda: QConfig(
+            _layer(UInt8Spec, Int8Spec, symmetric=False, calibration_method="minmax")
+        ),
+        "INT16_CNN_DEFAULT": lambda: QConfig(
+            _layer(UInt16Spec, Int16Spec, symmetric=False, calibration_method="minmax")
+        ),
         "INT8_CNN_ACCURATE": lambda: _cnn_accurate(UInt8Spec, Int8Spec),
         "INT16_CNN_ACCURATE": lambda: _cnn_accurate(UInt16Spec, Int16Spec),
     }
@@ -455,6 +616,7 @@ class ModelQuantizer:
             raise TypeError(f"expected QConfig or Config, got {type(config).__name__}")
         self.config = config
         self.last_approximations: List[str] = []
+        self._overrides_applied = False
         #: the :class:`~onnxsim.quark_auto_mixprecision.AutoMixprecisionResult`
         #: (sensitivity ranking, moved layers, scores) of the last run, if any
         self.last_auto_mixprecision: Any = None
@@ -471,13 +633,15 @@ class ModelQuantizer:
         """Quantize and (if ``model_output`` is given) save. Returns the model."""
         cfg = self.config
         self.last_approximations = []
+        self._overrides_applied = False
         self.last_auto_mixprecision = None
         self.last_weight_rounding = {}
+        cfg.global_config = cfg.global_config.resolved()
         act, wt = cfg.global_config.activation, cfg.global_config.weight
+        assert act is not None and wt is not None  # resolved() fills both
 
-        for spec in (act, wt):
-            if spec.is_dynamic:
-                raise NotImplementedError("dynamic quantization is not supported")
+        if wt.is_dynamic:
+            raise NotImplementedError("dynamic weight quantization is not supported")
         # the weight-rounding algorithms work on the int8 weight codes
         can_run = _RUNNABLE_ALGOS - (
             {"adaquant", "adaround", "gptq"} if wt.dtype == "int16" else set()
@@ -510,6 +674,8 @@ class ModelQuantizer:
             result = self._quantize_mixed_block(
                 model_input, act, ignore_unsupported_algos
             )
+        elif act.is_dynamic:
+            result = self._quantize_dynamic(model_input, act, wt)
         elif wt.dtype in _FAKEQUANT_DTYPES or act.dtype in _FAKEQUANT_DTYPES:
             if cfg.algo_config and not ignore_unsupported_algos:
                 what = "float presets" if half else "block formats"
@@ -524,8 +690,13 @@ class ModelQuantizer:
                 model_input, act, wt, calibration_data_reader, runnable
             )
 
-        if cfg.specific_layer_config or cfg.layer_type_config:
-            self._approx("per-layer / per-type overrides ignored (global spec used)")
+        if (
+            cfg.specific_layer_config or cfg.layer_type_config
+        ) and not self._overrides_applied:
+            self._approx(
+                "per-layer / per-type overrides ignored for "
+                f"{act.dtype}/{wt.dtype} (global spec used)"
+            )
         for msg in self.last_approximations:
             warnings.warn(f"onnxsim.quark_compat: {msg}", UserWarning, stacklevel=2)
         if model_output:
@@ -542,6 +713,7 @@ class ModelQuantizer:
             if (
                 a.name == "auto_mixprecision"
                 and isinstance(t, QLayerConfig)
+                and t.weight is not None
                 and t.weight.dtype in _BLOCK_DTYPES
             ):
                 return a
@@ -584,6 +756,36 @@ class ModelQuantizer:
             target_ops=tuple(p.get("target_op_type") or PROMOTABLE_OPS),
             include_layers=p.get("include_layers") or (),
             exclude_layers=p.get("exclude_layers") or (),
+        )
+
+    def _quantize_dynamic(
+        self, model: onnx.ModelProto, act: QSpec, wt: QSpec
+    ) -> onnx.ModelProto:
+        from onnxsim.quark_dynamic import quantize_dynamic_integer
+
+        cfg = self.config
+        if cfg.algo_config:
+            raise NotImplementedError(
+                "algo_config is not applied to dynamic quantization"
+            )
+        if wt.dtype not in ("int8", "uint8"):
+            raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
+        if act.dtype not in ("int8", "uint8"):
+            raise NotImplementedError(
+                f"dynamic activation dtype {act.dtype} unsupported"
+            )
+        if act.dtype != "uint8":
+            self._approx(
+                "dynamic activations are quantized uint8 asymmetric "
+                "(DynamicQuantizeLinear), whatever the activation spec's dtype"
+            )
+        exclude = _match_nodes(
+            model, [e for e in cfg.exclude if isinstance(e, (str, tuple))]
+        )
+        _, _, type_excluded = self._layer_overrides(model, allow_dtypes=False)
+        self._overrides_applied = True
+        return quantize_dynamic_integer(
+            model, weight_dtype=wt.dtype, exclude_nodes=exclude + type_excluded
         )
 
     def _quantize_block(
@@ -670,21 +872,27 @@ class ModelQuantizer:
         from onnxsim.quark_weight_rounding import adaround_int8
 
         p = algo.params
-        if p.get("update_bias"):
-            raise NotImplementedError("AdaRoundConfig.update_bias is not supported")
-        if p.get("drop_ratio", 1.0) != 1.0:
-            raise NotImplementedError(
-                "AdaRoundConfig.drop_ratio (QDrop) is not supported"
-            )
+        # update_bias: Quark's AdaRound never reads it (only AdaQuant does).
         self._approx(
             "AdaRound is layer-wise against the float model's activations "
             "(Quark optimizes subgraph blocks)"
         )
         kwargs: Dict[str, Any] = {
             k: p[k]
-            for k in ("num_iterations", "learning_rate", "reg_param", "warm_start")
+            for k in (
+                "num_iterations",
+                "learning_rate",
+                "reg_param",
+                "warm_start",
+                "drop_ratio",
+                "selective_update",
+            )
             if k in p
         }
+        if p.get("lr_adjust"):
+            kwargs["lr_adjust"] = tuple(p["lr_adjust"])
+        if "data_size" in p:
+            calibration = calibration[: int(p["data_size"])]
         if "beta_range" in p:
             kwargs["beta_range"] = tuple(p["beta_range"])
         if "fixed_seed" in p:
@@ -708,17 +916,33 @@ class ModelQuantizer:
         from onnxsim.quark_weight_rounding import gptq_int8
 
         p = algo.params
-        if p.get("bits", 8) != 8:
-            raise NotImplementedError("GPTQConfig.bits must be 8 (int8 QDQ weights)")
-        if p.get("group_size", -1) != -1:
-            raise NotImplementedError("GPTQConfig.group_size must be -1 (ungrouped)")
-        if not p.get("weight_symmetric", True):
-            raise NotImplementedError("GPTQConfig.weight_symmetric must be True")
-        self._approx(
-            "GPTQ keeps quantize_full_qdq's per-channel scales "
-            "(GPTQConfig.per_channel / mse are not used)"
+        bits = int(p.get("bits", 8))
+        group_size = int(p.get("group_size", -1))
+        sym = bool(p.get("weight_symmetric", True))
+        mse = bool(p.get("mse", False))
+        requantize = (
+            bits != 8 or group_size != -1 or not sym or mse or "per_channel" in p
         )
-        kwargs: Dict[str, Any] = {}
+        if requantize:
+            self._approx(
+                "GPTQ re-grids the weights like Quark's GPTQ (GPTQConfig.bits / "
+                "group_size / per_channel / mse / weight_symmetric) from all "
+                "calibration batches, and does propagate rounding error (Quark "
+                "0.13's update is a no-op)"
+            )
+        else:
+            self._approx(
+                "GPTQ keeps quantize_full_qdq's per-channel scales "
+                "(GPTQConfig.per_channel / mse are not used)"
+            )
+        kwargs: Dict[str, Any] = {
+            "bits": bits,
+            "group_size": group_size,
+            "weight_symmetric": sym,
+            "mse": mse,
+            "per_channel": bool(p.get("per_channel", False)),
+            "requantize": requantize,
+        }
         if "perc_damp" in p:
             kwargs["perc_damp"] = p["perc_damp"]
         if "block_size" in p:
@@ -738,6 +962,7 @@ class ModelQuantizer:
         return (
             act.dtype == "int16"
             and isinstance(target, QLayerConfig)
+            and target.activation is not None
             and target.activation.dtype == "int8"
         )
 
@@ -801,6 +1026,62 @@ class ModelQuantizer:
         )
         return requantize_biases_int8(quantized, model, ops, include, drop)
 
+    def _layer_overrides(
+        self, model: onnx.ModelProto, allow_dtypes: bool = True
+    ) -> "tuple[Dict[str, str], Dict[str, bool], List[str]]":
+        """``(tensor_dtypes, tensor_symmetric, excluded nodes)`` from
+        ``layer_type_config`` then ``specific_layer_config`` (the latter wins,
+        as in Quark). A layer's ``input_tensors`` spec applies to its
+        activation inputs (those before the first constant), ``output_tensors``
+        to its outputs; weight / bias overrides are not supported."""
+        cfg = self.config
+        inits = {i.name for i in model.graph.initializer}
+        dtypes: Dict[str, str] = {}
+        symmetric: Dict[str, bool] = {}
+        excluded: List[str] = []
+        by_name = {n.name: n for n in model.graph.node if n.name}
+
+        def apply(node: onnx.NodeProto, layer: QLayerConfig) -> None:
+            if layer.weight is not None and layer.weight.dtype not in (
+                "int8",
+                "uint8",
+            ):
+                raise NotImplementedError(
+                    f"per-layer weight dtype {layer.weight.dtype} is not supported "
+                    "(weights are int8)"
+                )
+            if layer.bias is not None:
+                self._approx("per-layer bias specs ignored (biases stay int32)")
+            for spec, tensors in (
+                (layer.activation, _activation_inputs(node, inits)),
+                (layer.output_tensors, list(node.output)),
+            ):
+                if spec is None:
+                    continue
+                dt = self._int_act_dtype(spec)
+                for t in tensors:
+                    dtypes[t] = dt
+                    symmetric[t] = spec.symmetric
+
+        for layer, op_types in cfg.layer_type_config.items():
+            if layer is None:
+                excluded += [
+                    n.name for n in model.graph.node if n.op_type in op_types and n.name
+                ]
+                continue
+            for n in model.graph.node:
+                if n.op_type in op_types:
+                    apply(n, layer)
+        for layer, names in cfg.specific_layer_config.items():
+            for name in _match_nodes(model, names):
+                if name not in by_name:
+                    raise ValueError(f"specific_layer_config: no node named {name!r}")
+                apply(by_name[name], layer)
+        if dtypes and not allow_dtypes:
+            self._approx("per-layer activation dtypes ignored (dynamic quantization)")
+            dtypes, symmetric = {}, {}
+        return dtypes, symmetric, excluded
+
     def _int_act_dtype(self, spec: QSpec) -> str:
         """The ``quantize_full_qdq`` activation dtype for an int spec."""
         if spec.dtype in ("int8", "uint8", "int16", "uint16"):
@@ -831,8 +1112,10 @@ class ModelQuantizer:
                 raise NotImplementedError(
                     f"AutoMixprecisionConfig.{key} is not supported"
                 )
-        if target.weight.dtype not in ("int8", "uint8"):
+        if (target.weight or Int8Spec()).dtype not in ("int8", "uint8"):
             raise NotImplementedError("target_layer_config weight must be int8")
+        if target.activation is None:
+            raise ValueError("target_layer_config needs an activation spec")
         target_dtype = self._int_act_dtype(target.activation)
         if target_dtype == base_dtype:
             raise ValueError(
@@ -885,7 +1168,12 @@ class ModelQuantizer:
         calibration = _drain_reader(reader)
         if not calibration:
             raise ValueError("calibration_data_reader is required for integer presets")
-        exclude = [e for e in self.config.exclude if isinstance(e, str)]
+        exclude = _match_nodes(
+            model, [e for e in self.config.exclude if isinstance(e, (str, tuple))]
+        )
+        t_dtypes, t_sym, type_excluded = self._layer_overrides(model)
+        self._overrides_applied = True
+        exclude += type_excluded
         opts = self.config.extra_options
         by_name = {a.name: a for a in algos}
 
@@ -936,6 +1224,17 @@ class ModelQuantizer:
                 per_channel=per_channel,
                 weight_dtype="int16" if wt.dtype == "int16" else "int8",
                 fold_relu=bool(opts.get("RemoveQDQConvRelu", True)),
+                # Quark's XINT8 (power-of-2 weights): MinMSE scale search on
+                # weights and int8 biases (``Int32Bias=True`` keeps int32)
+                pof2_mode="minmse" if wt.pof2 else "ceil",
+                int8_bias=wt.pof2 and not self.config.extra_options.get("Int32Bias"),
+                int8_constants=True,
+                align_eltwise_dtype=bool(
+                    self.config.extra_options.get("AlignEltwiseQuantType")
+                ),
+                softmax_unit_range=not act.pof2,
+                tensor_dtypes=t_dtypes or None,
+                tensor_symmetric=t_sym or None,
             )
             if opts.get("Int32Bias", True) is False:
                 from onnxsim.quark_preset_graphs import requantize_biases_int8
@@ -993,6 +1292,7 @@ __all__ = [
     "BFP16Spec",
     "BFloat16Spec",
     "BiasCorrectionConfig",
+    "CalibMethod",
     "CLEConfig",
     "Config",
     "Float16Spec",

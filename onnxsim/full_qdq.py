@@ -43,7 +43,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from onnxsim.calibration import Tensors, calibrate
+from onnxsim.calibration import Tensors, calibrate, pof2_minmse_weight_scale
 
 __all__ = ["quantize_full_qdq", "quantized_io", "sampling_coordinate_tensors"]
 
@@ -108,6 +108,7 @@ _NEVER_QUANTIZED = {
 }
 
 _WEIGHT_AXIS_OPS = {"Conv", "ConvTranspose", "Gemm", "MatMul"}
+_ELTWISE_OPS = {"Add", "Sub", "Mul", "Div", "Min", "Max"}
 
 _DTYPES = {
     "uint8": (TensorProto.UINT8, np.uint8, 0, 255),
@@ -119,8 +120,10 @@ _WIDE_DTYPES = ("uint16", "int16")  # need com.microsoft Q/DQ below opset 21
 
 
 def _pof2(scale: float) -> float:
-    """The smallest power of two >= ``scale`` (never clips more than ``scale``)."""
-    return float(2.0 ** np.ceil(np.log2(scale))) if scale > 0 else scale
+    """The smallest power of two >= ``scale`` (never clips more than ``scale``).
+    A scale a rounding error above a power of two (``absmax / 127 * 127``)
+    counts as that power of two."""
+    return float(2.0 ** np.ceil(np.log2(scale) - 1e-9)) if scale > 0 else scale
 
 
 def _qparams(
@@ -237,6 +240,12 @@ def quantize_full_qdq(
     power_of_two: bool = False,
     weight_dtype: str = "int8",
     convert_inputs: bool = True,
+    pof2_mode: str = "ceil",
+    int8_bias: bool = False,
+    int8_constants: bool = False,
+    softmax_unit_range: bool = False,
+    align_eltwise_dtype: bool = False,
+    tensor_symmetric: Optional[Dict[str, bool]] = None,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -268,6 +277,9 @@ def quantize_full_qdq(
     :param symmetric_activations: ``scale = absmax / half-range`` with a
             centred zero point (0 for signed types, 128 / 32768 for unsigned).
             Default: on for the signed dtypes, off for the unsigned ones.
+    :param tensor_symmetric: per-activation overrides of
+            ``symmetric_activations`` (``{tensor: True}``), alongside
+            ``tensor_dtypes``
     :param power_of_two: round every activation and weight scale up to a
             power of two (fixed-point friendly, as Quark's ``XINT8``)
     :param weight_dtype: ``"int8"`` (default) or ``"int16"`` for the symmetric
@@ -277,16 +289,44 @@ def quantize_full_qdq(
             node's output dtype (the 8/16-bit "convert" described above);
             False leaves such nodes consuming one dtype and producing the
             other, as Quark's mixed-precision presets do
+    :param pof2_mode: how ``power_of_two`` rounds the *weight* (and int8 bias)
+            scales: ``"ceil"`` (default) takes the smallest power of two that
+            does not clip; ``"minmse"`` is Quark's ``MinMSE`` search -- the
+            power of two among five around the min/max scale with the least
+            squared error over the weight values
+            (:func:`onnxsim.calibration.pof2_minmse_weight_scale`), which may
+            clip a few outliers for finer resolution. Activations are rounded
+            by ``method`` instead: ``"minmse_pof2"`` searches them the same
+            way (Quark's activation calibrator), any other method rounds up
+    :param int8_bias: quantize Conv/ConvTranspose/Gemm biases to int8 with a
+            per-tensor scale (a power of two under ``power_of_two``) instead
+            of int32 with ``input_scale * weight_scale`` -- what Quark's
+            ``XINT8`` emits
+    :param int8_constants: quantize the other constant inputs of quantized
+            nodes (a LayerNorm scale, a Mul operand, ...) to per-tensor
+            symmetric int8 like weights, instead of the activation dtype
+    :param align_eltwise_dtype: with ``int8_constants``, constant operands of
+            Add / Sub / Mul / Div / Min / Max keep the activation dtype
+            (Quark's ``AlignEltwiseQuantType``, set by its ``A16W8`` presets)
+    :param softmax_unit_range: calibrate every Softmax output to exactly
+            ``(0, 1)`` instead of its observed range (what ONNX Runtime's QDQ
+            quantizer, and so Quark's non-power-of-two presets, do)
     :returns: the quantized ModelProto
     """
     if weight_dtype not in ("int8", "int16"):
         raise ValueError(f"unsupported weight_dtype: {weight_dtype!r}")
     if activation_dtype not in _DTYPES:
         raise ValueError(f"unsupported activation_dtype: {activation_dtype!r}")
+    if pof2_mode not in ("ceil", "minmse"):
+        raise ValueError(f"pof2_mode must be 'ceil' or 'minmse', got {pof2_mode!r}")
     act_type, act_np, qmin, qmax = _DTYPES[activation_dtype]
     if symmetric_activations is None:
         symmetric_activations = qmin < 0
     sym, p2 = symmetric_activations, power_of_two
+    if method == "minmse_pof2" and not sym:
+        raise ValueError("method 'minmse_pof2' needs symmetric activations")
+    p2_search = p2 and pof2_mode == "minmse"
+    tensor_symmetric = dict(tensor_symmetric or {})
     if isinstance(model, str):
         model = onnx.load(model)
     m = onnx.ModelProto()
@@ -356,12 +396,23 @@ def quantize_full_qdq(
             providers=providers,
             method=method,
             extra_tensor_names=missing,
+            activation_type=activation_dtype,
+            tensor_dtypes=tensor_dtypes,
         )
         ranges = {**calibrated, **ranges}
 
+    if softmax_unit_range:
+        act_set0 = set(acts)
+        for n in g.node:
+            if n.op_type == "Softmax":
+                for o in n.output:
+                    if o in act_set0:
+                        ranges[o] = (0.0, 1.0)
+
     # Relu folding: producer -> Relu becomes producer -> Q(range of the Relu output, lo = 0).
     removed = set()
-    if fold_relu and not sym:
+    centred = sym or any(tensor_symmetric.values())
+    if fold_relu and not centred:
         producer = {o: n for n in g.node for o in n.output}
         for r in qnodes:
             if r.op_type != "Relu":
@@ -396,12 +447,7 @@ def quantize_full_qdq(
         for r in qnodes:
             src = r.input[0] if r.op_type == "Relu" else None
             p = producer.get(src) if src else None
-            if (
-                p is not None
-                and id(p) in qnode_ids
-                and len(consumers[src]) == 1
-                and src not in graph_outputs
-            ):
+            if p is not None and len(consumers[src]) == 1 and src not in graph_outputs:
                 skip.add(src)
         acts = [a for a in acts if a not in skip]
 
@@ -414,7 +460,7 @@ def quantize_full_qdq(
 
     def set_qp(x: str) -> None:
         dt = tensor_dtypes.get(x, activation_dtype)
-        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:], sym, p2)
+        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:], tensor_symmetric.get(x, sym), p2)
         qdt[x] = dt
 
     for x in graph_inputs:
@@ -515,6 +561,7 @@ def quantize_full_qdq(
     # of the other dtype is re-quantized for it (DQ -> Q' -> DQ', a "convert" the QNN EP maps
     # to its Convert op). GridSample's grid is exempt: its coordinates are the reason to mix.
     converted: Dict[Tuple[str, str], str] = {}
+    acts_set = set(acts) | set(graph_inputs)
     act_extra: List[str] = []
     for n in qnodes if convert_inputs else ():
         if id(n) in removed:
@@ -531,6 +578,7 @@ def quantize_full_qdq(
             )
             if (
                 src not in qdt
+                or src not in acts_set  # left float (Relu-adjacent), nothing to convert
                 or qdt[src] == node_dt
                 or (n.op_type == "GridSample" and k == 1)
             ):
@@ -562,6 +610,30 @@ def quantize_full_qdq(
                 converted[ckey] = c
                 act_extra.append(c)
             n.input[k] = converted[ckey]
+
+    def int8_tensor_dq(x: str, w: np.ndarray) -> str:
+        """``int8`` + per-tensor symmetric scale (+ DQ) for a weight-like
+        constant ``x``; returns the DQ output name."""
+        if p2_search:
+            s = pof2_minmse_weight_scale(w)
+        else:
+            s = max(float(np.abs(w).max()), 1e-12) / 127.0
+            s = _pof2(s) if p2 else s
+        q = np.clip(np.round(w / np.float32(s)), -127, 127).astype(np.int8)
+        base = fresh(x)
+        add_init(base + "/int8", q)
+        add_init(base + "/scale", np.array(s, np.float32))
+        add_init(base + "/zp", np.array(0, np.int8))
+        out = base + "/dq"
+        act_nodes.append(
+            helper.make_node(
+                "DequantizeLinear",
+                [base + "/int8", base + "/scale", base + "/zp"],
+                [out],
+                name=out,
+            )
+        )
+        return out
 
     def act_scale(x: str) -> Optional[float]:
         if x not in qp and x.endswith("/dq"):
@@ -598,7 +670,9 @@ def quantize_full_qdq(
                     w_max = _DTYPES[weight_dtype][3]
                     if axis is None:
                         s = np.array(max(np.abs(w).max(), 1e-12) / w_max, np.float32)
-                        if p2:
+                        if p2_search and weight_dtype == "int8":
+                            s = np.array(pof2_minmse_weight_scale(w), np.float32)
+                        elif p2:
                             s = np.array(_pof2(float(s)), np.float32)
                         q = np.clip(np.round(w / s), -w_max, w_max).astype(w_np)
                         zp = np.array(0, w_np)
@@ -607,7 +681,15 @@ def quantize_full_qdq(
                         s = (np.maximum(np.abs(w).max(axis=red), 1e-12) / w_max).astype(
                             np.float32
                         )
-                        if p2:
+                        if p2_search:
+                            s = np.array(
+                                [
+                                    pof2_minmse_weight_scale(c)
+                                    for c in np.moveaxis(w, axis, 0)
+                                ],
+                                np.float32,
+                            )
+                        elif p2:
                             s = (2.0 ** np.ceil(np.log2(s))).astype(np.float32)
                         shape = [1] * w.ndim
                         shape[axis] = -1
@@ -632,6 +714,16 @@ def quantize_full_qdq(
                         )
                     )
                     cache[key] = out
+                n.input[k] = cache[key]
+            elif (
+                n.op_type in ("Conv", "ConvTranspose", "Gemm")
+                and k == 2
+                and w.ndim == 1
+                and int8_bias
+            ):
+                key = ("b8", x, None)
+                if key not in cache:
+                    cache[key] = int8_tensor_dq(x, w)
                 n.input[k] = cache[key]
             elif (
                 n.op_type in ("Conv", "ConvTranspose", "Gemm")
@@ -671,6 +763,13 @@ def quantize_full_qdq(
                     )
                 )
                 n.input[k] = out
+            elif int8_constants and not (
+                align_eltwise_dtype and n.op_type in _ELTWISE_OPS
+            ):
+                key = ("c8", x, None)
+                if key not in cache:
+                    cache[key] = int8_tensor_dq(x, w)
+                n.input[k] = cache[key]
             else:
                 key = ("c", x, None)
                 if key not in cache:
