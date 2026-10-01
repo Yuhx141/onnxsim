@@ -791,3 +791,876 @@ def test_dynamic_quantization_matches_quark(build, tmp_path):
     assert [n.op_type for n in mine.graph.node] == [n.op_type for n in q.graph.node]
     x = np.random.default_rng(1).standard_normal(shape).astype(np.float32)
     np.testing.assert_allclose(_run(mine, x), _run(q, x), rtol=1e-4, atol=1e-5)
+
+
+# =============================================================================
+# quark_tools_extra: the rest of quark.onnx.tools and the model_utils helpers.
+# Each test runs Quark's own tool and onnxsim's on the same graph. Deliberate
+# differences are documented next to the test that sees them.
+# =============================================================================
+
+
+def _quiet(fn, *args, **kwargs):
+    # (logging is disabled too: some Quark helpers call logger.info with
+    # extra positional args, which blows up under pytest's log capture)
+    import logging
+
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+        logging.disable(logging.CRITICAL)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            logging.disable(logging.NOTSET)
+
+
+def _copy_model(model):
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    return out
+
+
+def _tx_ort(model, feed):
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    so.log_severity_level = 4
+    lib = _ops_lib()
+    if lib:
+        so.register_custom_ops_library(lib)
+    sess = ort.InferenceSession(
+        model.SerializeToString(), so, providers=["CPUExecutionProvider"]
+    )
+    return sess.run(None, feed)
+
+
+def _tx_inits(model):
+    from onnx import numpy_helper
+
+    return {
+        t.name: (t.data_type, numpy_helper.to_array(t)) for t in model.graph.initializer
+    }
+
+
+def _tx_nodes(model):
+    return [(n.op_type, n.domain) for n in model.graph.node]
+
+
+def _tx_sorted_nodes(model):
+    return sorted(_tx_nodes(model))
+
+
+def _tx_same_inits(a_model, b_model):
+    a, b = _tx_inits(a_model), _tx_inits(b_model)
+    assert set(a) == set(b)
+    for k in a:
+        assert a[k][0] == b[k][0], k
+        np.testing.assert_array_equal(a[k][1], b[k][1], err_msg=k)
+
+
+def _tx_conv_qdq(bias_dtype="int8", bias_scale=0.0007, act_zp_type="int8"):
+    """x -> Q/DQ -> Conv(w DQ, bias DQ) -> Q/DQ -> y. Scalars come from the
+    parser (``float_data``); the integer weights from numpy (``raw_data``),
+    the form Quark's A8W8 converter reads. The bias / weight DQs are listed
+    before the activation Q/DQ because Quark's converter assumes that graph
+    order (it pairs Conv inputs with producers by node position)."""
+    from onnx import numpy_helper
+
+    rng = np.random.default_rng(0)
+    model = parser.parse_model(
+        f"""
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[1,3,8,8] x) => (float[1,4,6,6] y)
+        <float xs = {{0.02}}, {act_zp_type} xz = {{0}}, float ws = {{0.01}},
+         int8 wz = {{0}}, float bs = {{{bias_scale}}}, {bias_dtype} bz = {{0}},
+         float ys = {{0.05}}, {act_zp_type} yz = {{0}}>
+        {{
+            bd = DequantizeLinear(bq, bs, bz)
+            wd = DequantizeLinear(wq, ws, wz)
+            xq = QuantizeLinear(x, xs, xz)
+            xd = DequantizeLinear(xq, xs, xz)
+            c = Conv(xd, wd, bd)
+            cq = QuantizeLinear(c, ys, yz)
+            y = DequantizeLinear(cq, ys, yz)
+        }}
+        """
+    )
+    bq = rng.integers(-100, 100, (4,)).astype(
+        np.int8 if bias_dtype == "int8" else np.int32
+    )
+    model.graph.initializer.extend(
+        [
+            numpy_helper.from_array(
+                rng.integers(-100, 100, (4, 3, 3, 3)).astype(np.int8), "wq"
+            ),
+            numpy_helper.from_array(bq, "bq"),
+        ]
+    )
+    return model
+
+
+def _tx_x(shape=(1, 3, 8, 8), seed=1):
+    return np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
+
+
+def test_tools_a8w8_npu_to_cpu_matches_quark():
+    from quark.onnx.tools.convert_a8w8_npu_to_a8w8_cpu import (
+        convert_a8w8_npu_to_a8w8_cpu as q_fn,
+    )
+
+    model = _tx_conv_qdq()
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.convert_a8w8_npu_to_a8w8_cpu(model)
+    _tx_same_inits(ours, theirs)
+    assert _tx_inits(ours)["bq"][1].dtype == np.int32
+    x = _tx_x()
+    np.testing.assert_array_equal(
+        _tx_ort(ours, {"x": x})[0], _tx_ort(theirs, {"x": x})[0]
+    )
+
+
+def test_tools_bias_int32_to_int16_matches_quark():
+    from quark.onnx.tools.convert_bias_int32_to_int16 import (
+        convert_bias_int32_to_int16 as q_fn,
+    )
+
+    model = _tx_conv_qdq(bias_dtype="int32")
+    theirs, t_flag = _quiet(q_fn, _copy_model(model))
+    ours, o_flag = quark_tools.convert_bias_int32_to_int16(model)
+    assert o_flag is True and bool(t_flag) is True
+    _tx_same_inits(ours, theirs)
+    assert _tx_inits(ours)["bq"][1].dtype == np.int16
+    assert _tx_inits(ours)["bz"][1].dtype == np.int16
+    # nothing to convert -> flag False on both
+    plain = _tx_conv_qdq()
+    assert not _quiet(q_fn, _copy_model(plain))[1]
+    assert quark_tools.convert_bias_int32_to_int16(plain)[1] is False
+
+
+def test_tools_customqdq_to_qdq_matches_quark():
+    from quark.onnx.tools.convert_customqdq_to_qdq import (
+        convert_customqdq_to_qdq as q_fn,
+    )
+
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21, "com.amd.quark": 1]>
+        g (float[4] x) => (float[4] y, float[4] z)
+        <float s = {0.1}, uint16 z16 = {32768}, int8 z8 = {0}, bfloat16 zb = {0}>
+        {
+            a = com.amd.quark.ExtendedQuantizeLinear(x, s, z16)
+            y = com.amd.quark.ExtendedDequantizeLinear(a, s, z16)
+            b = com.amd.quark.ExtendedQuantizeLinear(x, s, z8)
+            c = com.amd.quark.ExtendedDequantizeLinear(b, s, z8)
+            d = com.amd.quark.ExtendedQuantizeLinear(c, s, zb)
+            z = com.amd.quark.ExtendedDequantizeLinear(d, s, zb)
+        }
+        """
+    )
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.convert_customqdq_to_qdq(model)
+    assert _tx_nodes(ours) == _tx_nodes(theirs)
+    assert [n.op_type for n in ours.graph.node] == [
+        "QuantizeLinear",
+        "DequantizeLinear",
+        "QuantizeLinear",
+        "DequantizeLinear",
+        "ExtendedQuantizeLinear",
+        "ExtendedDequantizeLinear",
+    ]
+    # deliberate: we also register the com.microsoft opset so the model loads
+    assert "com.microsoft" in {o.domain for o in ours.opset_import}
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_tools_convert_custom_ops_matches_quark(reverse):
+    from quark.onnx.tools import convert_custom_ops as q_mod
+
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21, "com.amd.quark": 1]>
+        g (float[4] x) => (float[4] y)
+        <float s = {0.1}, int8 z = {0}>
+        {
+            a = com.amd.quark.ExtendedQuantizeLinear(x, s, z)
+            b = com.amd.quark.ExtendedDequantizeLinear(a, s, z)
+            y = Relu(b)
+        }
+        """
+    )
+    if reverse:
+        model = _quiet(
+            q_mod.convert_custom_ops,
+            _copy_model(model),
+            q_mod.OLD_DOMAIN,
+            q_mod.NAME_MAPPING,
+        )
+        domain = q_mod.NEW_DOMAIN
+        mapping = {v: k for k, v in q_mod.NAME_MAPPING.items()}
+        ours_map = {v: k for k, v in quark_tools.CUSTOM_OP_NAME_MAPPING.items()}
+    else:
+        domain, mapping = q_mod.OLD_DOMAIN, q_mod.NAME_MAPPING
+        ours_map = quark_tools.CUSTOM_OP_NAME_MAPPING
+    assert ours_map == mapping
+    theirs = _quiet(q_mod.convert_custom_ops, _copy_model(model), domain, mapping)
+    ours = quark_tools.convert_custom_ops(model, domain, ours_map)
+    assert _tx_nodes(ours) == _tx_nodes(theirs)
+    assert {(o.domain, o.version) for o in ours.opset_import} == {
+        (o.domain, o.version) for o in theirs.opset_import
+    }
+
+
+def test_tools_fp16_to_bf16_matches_quarks_bf16_format():
+    from quark.onnx.quantization.quant_utils import convert_to_bf16
+
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float16[2,4] x) => (float16[2,4] y)
+        {
+            t = Cast<to = 1>(x)
+            u = Add(x, w)
+            y = Relu(u)
+        }
+        """
+    )
+    # float16 / bfloat16 literals are not parseable: attach programmatically
+    model.graph.initializer.append(
+        onnx.helper.make_tensor(
+            "w", onnx.TensorProto.FLOAT16, [4], [0.1, -2.5, 3.14159, 1000.0]
+        )
+    )
+    theirs = _quiet(convert_to_bf16, _copy_model(model), onnx.TensorProto.BFLOAT16, 10)
+    ours = quark_tools.convert_fp16_to_bf16(model)
+
+    # deliberate: Quark appends the boundary casts at the *end* of the node
+    # list (not topologically sorted) and adds one input Cast per consuming
+    # node, so an input read twice gets two identical Casts writing the same
+    # `<in>_cast` (an invalid graph). We put one Cast first. Same nodes and
+    # wiring once the duplicates are folded.
+    def sig(m):
+        return sorted(
+            {
+                (
+                    n.op_type,
+                    tuple(n.input),
+                    tuple(n.output),
+                    tuple((t.name, t.i) for t in n.attribute),
+                )
+                for n in m.graph.node
+            }
+        )
+
+    assert sig(ours) == sig(theirs)
+    onnx.checker.check_model(ours)
+    wa = {t.name: t for t in ours.graph.initializer}
+    wb = {t.name: t for t in theirs.graph.initializer}
+    assert set(wa) == set(wb)
+    for k in wa:
+        assert wa[k].data_type == wb[k].data_type == onnx.TensorProto.BFLOAT16
+        assert wa[k].raw_data == wb[k].raw_data
+    assert [o.type.tensor_type.elem_type for o in ours.graph.output] == [
+        o.type.tensor_type.elem_type for o in theirs.graph.output
+    ]
+
+
+def test_tools_nchw_to_nhwc_matches_quark():
+    from quark.onnx.utils.model_utils import convert_nchw_to_nhwc as q_fn
+
+    plain = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[1,3,8,8] x) => (float[1,3,8,8] y)
+        { y = Relu(x) }
+        """
+    )
+    quant = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[1,3,8,8] x) => (float[1,3,8,8] y)
+        <float s = {0.1}, int8 z = {0}>
+        {
+            r = Relu(x)
+            q = QuantizeLinear(r, s, z)
+            y = DequantizeLinear(q, s, z)
+        }
+        """
+    )
+    flat = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[1,5] x) => (float[1,5] y)
+        { y = Relu(x) }
+        """
+    )
+
+    def sig(m):
+        return (
+            sorted(
+                (n.op_type, n.name, list(n.input), list(n.output)) for n in m.graph.node
+            ),
+            [o.name for o in m.graph.output],
+            [
+                [d.dim_value for d in v.type.tensor_type.shape.dim]
+                for v in list(m.graph.input) + list(m.graph.output)
+            ],
+        )
+
+    for model in (plain, quant, flat):
+        theirs = _quiet(q_fn, _copy_model(model))
+        ours = quark_tools.convert_nchw_to_nhwc(model)
+        assert sig(ours) == sig(theirs)
+        if model is not flat:
+            x = _tx_x((1, 8, 8, 3))
+            out_o = _tx_ort(ours, {"x": x})[0]
+            np.testing.assert_array_equal(out_o, _tx_ort(theirs, {"x": x})[0])
+            assert out_o.shape == (1, 8, 8, 3)
+
+
+def test_tools_qdq_to_qop_matches_quark():
+    from quark.onnx.tools.convert_qdq_to_qop import convert_qdq_to_qop as q_fn
+
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 13]>
+        g (float[2,4] x, float[2,4] u) => (float[2,4] y)
+        <float s = {0.1}, uint8 z = {128}, float sw = {0.05}, uint8 zw = {120},
+         uint8[4,4] wq = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}>
+        {
+            xq = QuantizeLinear(x, s, z)
+            xd = DequantizeLinear(xq, s, z)
+            uq = QuantizeLinear(u, s, z)
+            ud = DequantizeLinear(uq, s, z)
+            wd = DequantizeLinear(wq, sw, zw)
+            m = MatMul(xd, wd)
+            mq = QuantizeLinear(m, s, z)
+            md = DequantizeLinear(mq, s, z)
+            a = Add(md, ud)
+            aq = QuantizeLinear(a, s, z)
+            ad = DequantizeLinear(aq, s, z)
+            p = Mul(ad, xd)
+            pq = QuantizeLinear(p, s, z)
+            pd = DequantizeLinear(pq, s, z)
+            g1 = Sigmoid(pd)
+            gq = QuantizeLinear(g1, s, z)
+            y = DequantizeLinear(gq, s, z)
+        }
+        """
+    )
+    # Quark's CLI names every node (and un-shares DQs) before converting
+    from quark.onnx.utils.model_utils import copy_shared_nodes
+
+    model = _quiet(copy_shared_nodes, model)
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.convert_qdq_to_qop(model)
+
+    def sig(m):
+        return sorted(
+            (n.op_type, n.domain, list(n.input), list(n.output)) for n in m.graph.node
+        )
+
+    assert sig(ours) == sig(theirs)
+    assert {"QLinearMatMul", "QLinearAdd", "QLinearMul", "QLinearSigmoid"} <= {
+        n.op_type for n in ours.graph.node
+    }
+    feed = {"x": _tx_x((2, 4)), "u": _tx_x((2, 4), 2)}
+    np.testing.assert_array_equal(_tx_ort(ours, feed)[0], _tx_ort(theirs, feed)[0])
+    # fused integer kernels agree with the QDQ graph to a few quantization steps
+    np.testing.assert_allclose(
+        _tx_ort(ours, feed)[0], _tx_ort(model, feed)[0], atol=0.3
+    )
+
+
+def test_tools_resize_fs_to_pof2s_matches_quark():
+    from quark.onnx.tools.convert_resize_fs_to_pof2s import (
+        convert_resize_fs_to_pof2s as q_fn,
+    )
+
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 13]>
+        g (float[1,1,4,4] x) => (float[1,1,8,8] y)
+        <float s1 = {0.037}, int8 z1 = {3}, float s2 = {0.0123}, int8 z2 = {-5},
+         float[4] scales = {1.0, 1.0, 2.0, 2.0}>
+        {
+            q1 = QuantizeLinear(x, s1, z1)
+            d1 = DequantizeLinear(q1, s1, z1)
+            r = Resize<mode = "nearest">(d1, , scales)
+            q2 = QuantizeLinear(r, s2, z2)
+            y = DequantizeLinear(q2, s2, z2)
+        }
+        """
+    )
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.convert_resize_fs_to_pof2s(model)
+    _tx_same_inits(ours, theirs)
+    a = _tx_inits(ours)
+    assert a["z1"][1] == 0 and np.log2(float(a["s1"][1])) % 1 == 0
+    x = _tx_x((1, 1, 4, 4))
+    np.testing.assert_array_equal(
+        _tx_ort(ours, {"x": x})[0], _tx_ort(theirs, {"x": x})[0]
+    )
+
+
+def _tx_u16_model():
+    return parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[2,4] x) => (float[2,3] y)
+        <float s = {0.0001}, uint16 z = {32768}, float sw = {0.0001}, uint16 zw = {32768},
+         uint16[4,3] wq = {7068, 33000, 32768, 33025, 19918, 32768, 32768, 55879,
+                            31997, 35338, 50798, 27628},
+         float sb = {0.00001}, int32 zb = {0}, int32[3] bq = {5, -7, 100}>
+        {
+            xq = QuantizeLinear(x, s, z)
+            xd = DequantizeLinear(xq, s, z)
+            wd = DequantizeLinear(wq, sw, zw)
+            m = MatMul(xd, wd)
+            bd = DequantizeLinear(bq, sb, zb)
+            a = Add(m, bd)
+            aq = QuantizeLinear(a, s, z)
+            y = DequantizeLinear(aq, s, z)
+        }
+        """
+    )
+
+
+def test_tools_u16s8_to_s16s8_matches_quark():
+    from quark.onnx.tools.convert_u16s8_to_s16s8 import convert_u16s8_to_s16s8 as q_fn
+
+    model = _tx_u16_model()
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.convert_u16s8_to_s16s8(model)
+    # the activation zero point becomes int16 0; the weight DQ is untouched
+    assert [n.input[2] for n in ours.graph.node if len(n.input) > 2] == [
+        n.input[2] for n in theirs.graph.node if len(n.input) > 2
+    ]
+    _tx_same_inits(ours, theirs)
+    x = _tx_x((2, 4))
+    np.testing.assert_allclose(
+        _tx_ort(ours, {"x": x})[0], _tx_ort(model, {"x": x})[0], atol=1e-6
+    )
+    np.testing.assert_array_equal(
+        _tx_ort(ours, {"x": x})[0], _tx_ort(theirs, {"x": x})[0]
+    )
+
+
+def test_tools_u16u8_to_u8u8_matches_quark():
+    from quark.onnx.tools.convert_u16u8_to_u8u8 import convert_u16u8_to_u8u8 as q_fn
+
+    model = _tx_u16_model()
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.convert_u16u8_to_u8u8(model)
+    a, b = _tx_inits(ours), _tx_inits(theirs)
+    assert set(a) == set(b)
+    for k in a:
+        assert a[k][0] == b[k][0], k
+        if k == "wq":
+            # deliberate differences on the re-quantized uint16 constant:
+            # (1) we round to nearest, Quark truncates toward zero -> one
+            # code apart where both are right; (2) Quark computes `q - zp` in
+            # uint16, which wraps for q < zp and saturates those weights to
+            # 255 -- we dequantize them correctly.
+            src = _tx_inits(model)["wq"][1].astype(np.int64)
+            ok = src >= 32768
+            assert np.abs(a[k][1].astype(int) - b[k][1].astype(int))[ok].max() <= 1
+            exact = np.clip(
+                np.rint((src - 32768) * 0.0001 / (0.0001 * 65535 / 255) + 128), 0, 255
+            )
+            assert np.abs(a[k][1].astype(int) - exact).max() <= 1
+        else:
+            np.testing.assert_array_equal(a[k][1], b[k][1], err_msg=k)
+    x = _tx_x((2, 4))
+    ref = _tx_ort(model, {"x": x})[0]
+    # 8-bit activations: coarser by 257x, so allow a few steps of 0.0257
+    np.testing.assert_allclose(_tx_ort(ours, {"x": x})[0], ref, atol=0.5)
+
+
+def test_tools_fix_shapes_matches_quark():
+    from quark.onnx.tools import fix_shapes as q_mod
+
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[N,3] x) => (float[N,2] y)
+        <float[3,2] w = {1,2,3,4,5,6}>
+        {
+            a = Relu(x)
+            y = MatMul(a, w)
+        }
+        """
+    )
+    spec = "x:[4,3];y:[4,2]"
+    t = _quiet(q_mod.fix_input_and_output_shapes, _copy_model(model), spec)
+    o = quark_tools.fix_input_and_output_shapes(model, spec)
+
+    def dims(m):
+        return [
+            [d.dim_value for d in v.type.tensor_type.shape.dim]
+            for v in list(m.graph.input) + list(m.graph.output)
+        ]
+
+    assert dims(o) == dims(t) == [[4, 3], [4, 2]]
+    assert quark_tools.parse_input_and_output_shapes(
+        spec
+    ) == q_mod.parse_input_and_output_shapes(spec)
+    # intermediate tensors: Quark runs the model; the result must agree
+    inferred = onnx.shape_inference.infer_shapes(o)
+    shapes = _quiet(q_mod.infer_all_tensors_shape, inferred)
+    t_full = _quiet(q_mod.save_all_tensors_shape, inferred, shapes)
+    o_full = quark_tools.fix_shapes(model, spec)
+
+    def vi(m):
+        return {
+            v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+            for v in m.graph.value_info
+        }
+
+    assert vi(o_full)["a"] == vi(t_full)["a"] == [4, 3]
+
+
+def test_tools_a16w8_a8w8_nodes_match_quark(tmp_path):
+    from onnx import numpy_helper
+    from quark.onnx.tools.print_a16w8_a8w8_nodes import a16w8_a8w8_nodes as q_fn
+
+    m8 = _tx_conv_qdq()
+    m16 = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[1,3,8,8] x) => (float[1,4,6,6] y)
+        <float xs = {0.02}, int16 xz = {0}, float ws = {0.01}, int8 wz = {0}>
+        {
+            xq = QuantizeLinear(x, xs, xz)
+            xd = DequantizeLinear(xq, xs, xz)
+            wd = DequantizeLinear(wq, ws, wz)
+            y = Conv(xd, wd)
+        }
+        """
+    )
+    m16.graph.initializer.append(
+        numpy_helper.from_array(np.ones((4, 3, 3, 3), np.int8), "wq")
+    )
+    m8.graph.node[4].name = "conv8"
+    m16.graph.node[3].name = "conv16"
+    none = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[2] x) => (float[2] y)
+        { y = Relu(x) }
+        """
+    )
+    for model, want in (
+        (m8, (["conv8"], [])),
+        (m16, ([], ["conv16"])),
+        (none, ([], [])),
+    ):
+        path = str(tmp_path / "m.onnx")
+        onnx.save(model, path)
+        assert quark_tools.a16w8_a8w8_nodes(model) == want
+        assert tuple(_quiet(q_fn, path)) == want
+
+
+def _tx_bf16_model():
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21, "com.amd.quark": 1]>
+        g (float[2,4] x) => (float[2,4] y)
+        <float s = {0.5}, float one = {1.0}, bfloat16 zb = {0}, int8 z8 = {0}>
+        {
+            a = com.amd.quark.ExtendedQuantizeLinear(x, s, zb)
+            b = com.amd.quark.ExtendedDequantizeLinear(a, s, zb)
+            c = com.amd.quark.ExtendedQuantizeLinear(b, one, zb)
+            d = com.amd.quark.ExtendedDequantizeLinear(c, one, zb)
+            e = com.amd.quark.ExtendedQuantizeLinear(d, s, z8)
+            y = com.amd.quark.ExtendedDequantizeLinear(e, s, z8)
+        }
+        """
+    )
+    for i, n in enumerate(model.graph.node):
+        n.name = f"n{i}"
+    return model
+
+
+def test_tools_replace_bfloat16_qdq_cast_matches_quark():
+    from quark.onnx.tools.replace_bfloat16_qdq_cast import (
+        replace_bfloat16_qdq_cast as q_fn,
+    )
+
+    model = _tx_bf16_model()
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.replace_bfloat16_qdq_cast(model)
+
+    def sig(m):
+        return [
+            (n.op_type, n.domain, list(n.input), list(n.output)) for n in m.graph.node
+        ]
+
+    assert sorted(sig(ours)) == sorted(sig(theirs))
+    assert sorted(n.op_type for n in ours.graph.node) == sorted(
+        ["Mul", "Cast", "Cast", "Mul", "Cast", "Cast", "ExtendedQuantizeLinear"]
+        + ["ExtendedDequantizeLinear"]
+    )
+    _tx_same_inits(ours, theirs)
+    assert {k for k in _tx_inits(ours) if k.endswith("_scale")} == {
+        "n0_scale",
+        "n1_scale",
+    }
+
+
+def test_tools_insert_clip_bfloat16_qdq_matches_quark():
+    from quark.onnx.tools.insert_clip_bfloat16_qdq import (
+        insert_clip_bfloat16_qdq as q_fn,
+    )
+
+    model = _tx_bf16_model()
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.insert_clip_bfloat16_qdq(model)
+    assert _tx_sorted_nodes(ours) == _tx_sorted_nodes(theirs)
+
+    def clip_inits(m):
+        return {k: v for k, v in _tx_inits(m).items() if "clip" in k}
+
+    a, b = clip_inits(ours), clip_inits(theirs)
+    assert set(a) == set(b) and len(a) == 4
+    for k in a:
+        assert a[k][0] == b[k][0]
+        np.testing.assert_array_equal(a[k][1], b[k][1], err_msg=k)
+
+    def fed_by_clip(m):
+        prod = {o: n for n in m.graph.node for o in n.output}
+        return sorted(
+            n.output[0]
+            for n in m.graph.node
+            if n.op_type == "ExtendedQuantizeLinear"
+            and n.input[0] in prod
+            and prod[n.input[0]].op_type == "Clip"
+        )
+
+    assert fed_by_clip(ours) == fed_by_clip(theirs) == ["a", "c"]
+
+
+def _tx_cast_model():
+    # Quark reconnects the consumers of the second cast only when the first
+    # node's output name is a *substring* of that cast's output name (it tests
+    # `a in b` on strings), hence the a / a_c1 / a_c2 naming. onnxsim rewires
+    # unconditionally.
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[2,4] x) => (float[2,4] y)
+        <float[4] w = {0.1234567, -2.7182818, 3.14159265, 1000.123}>
+        {
+            a = Relu(x)
+            a_c1 = Cast<to = 16>(a)
+            a_c2 = Cast<to = 1>(a_c1)
+            wb = Cast<to = 16>(w)
+            wf = Cast<to = 1>(wb)
+            m = Add(a_c2, wf)
+            n = Mul(m, a_c2)
+            o1 = Cast<to = 16>(n)
+            y = Cast<to = 1>(o1)
+        }
+        """
+    )
+    return model
+
+
+def test_tools_remove_bf16_cast_matches_quark():
+    from quark.onnx.tools.remove_bf16_cast import remove_bf16_cast as q_fn
+
+    base = _tx_cast_model()
+    theirs = _quiet(q_fn, _copy_model(base))
+    ours = quark_tools.remove_bf16_cast(base)
+    assert [n.op_type for n in ours.graph.node] == [
+        n.op_type for n in theirs.graph.node
+    ]
+    assert [n.op_type for n in ours.graph.node] == ["Relu", "Add", "Mul"]
+    a, b = _tx_inits(ours), _tx_inits(theirs)
+    assert set(a) == set(b) == {"w_bf16"}
+    np.testing.assert_array_equal(a["w_bf16"][1], b["w_bf16"][1])
+    x = _tx_x((2, 4))
+    np.testing.assert_array_equal(
+        _tx_ort(ours, {"x": x})[0], _tx_ort(theirs, {"x": x})[0]
+    )
+
+
+def _tx_between_model():
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[1,3,8,8] x, float[1,4,6,6] u) => (float[1,4,6,6] y)
+        <float s = {0.1}, int8 z = {0}>
+        {
+            c = Conv(x, wf)
+            cq = QuantizeLinear(c, s, z)
+            cd = DequantizeLinear(cq, s, z)
+            r = Relu(cd)
+            rq = QuantizeLinear(r, s, z)
+            rd = DequantizeLinear(rq, s, z)
+            mu = Mul(rd, u)
+            mq = QuantizeLinear(mu, s, z)
+            md = DequantizeLinear(mq, s, z)
+            y = Add(md, u)
+        }
+        """
+    )
+    model.graph.initializer.append(
+        onnx.numpy_helper.from_array(np.full((4, 3, 3, 3), 0.5, np.float32), "wf")
+    )
+    return model
+
+
+@pytest.mark.parametrize(
+    "between",
+    [[("Conv", "Relu")], [("Relu", "Mul"), ("Mul", "Add")], [("Mul", "Add")]],
+)
+def test_tools_remove_qdq_between_ops_matches_quark(between):
+    from quark.onnx.tools.remove_qdq_between_ops import remove_qdq_between_ops as q_fn
+
+    model = _tx_between_model()
+    theirs = _quiet(q_fn, _copy_model(model), between)
+    ours = quark_tools.remove_qdq_between_ops(model, between)
+    assert sorted(n.op_type for n in ours.graph.node) == sorted(
+        n.op_type for n in theirs.graph.node
+    )
+    assert _tx_inits(ours).keys() == _tx_inits(theirs).keys()
+    assert len(ours.graph.node) == len(model.graph.node) - 2 * len(between)
+    feed = {"x": _tx_x(), "u": _tx_x((1, 4, 6, 6), 3)}
+    np.testing.assert_array_equal(_tx_ort(ours, feed)[0], _tx_ort(theirs, feed)[0])
+
+
+def test_tools_remove_qdq_mul_add_matches_quark():
+    from quark.onnx.tools.remove_qdq_mul_add import remove_qdq_mul_add as q_fn
+
+    model = _tx_between_model()
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.remove_qdq_mul_add(model)
+    assert sorted(n.op_type for n in ours.graph.node) == sorted(
+        n.op_type for n in theirs.graph.node
+    )
+    feed = {"x": _tx_x(), "u": _tx_x((1, 4, 6, 6), 3)}
+    np.testing.assert_array_equal(_tx_ort(ours, feed)[0], _tx_ort(theirs, feed)[0])
+
+
+def test_tools_onnxtxt_roundtrip_matches_quark():
+    from google.protobuf import text_format
+
+    model = _tx_conv_qdq()
+    text = quark_tools.convert_onnx_to_onnxtxt(model)
+    assert text == text_format.MessageToString(model)  # what Quark's CLI writes
+    back = quark_tools.convert_onnxtxt_to_onnx(text)
+    assert back == model
+    parsed = onnx.ModelProto()
+    text_format.Parse(text.encode(), parsed)  # Quark's CLI reads bytes
+    assert parsed == back
+
+
+def _tx_shared_models():
+    shared_dq = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[2,4] x) => (float[2,4] y)
+        <float s = {0.1}, int8 z = {0},
+         int8[4,4] wq = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}>
+        {
+            w = DequantizeLinear(wq, s, z)
+            a = MatMul(x, w)
+            y = MatMul(a, w)
+        }
+        """
+    )
+    shared_init = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[2,4] x) => (float[2,4] y)
+        <float[4,4] w = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}>
+        {
+            a = MatMul(x, w)
+            y = MatMul(a, w)
+        }
+        """
+    )
+    return shared_dq, shared_init
+
+
+@pytest.mark.parametrize("which", [0, 1])
+def test_tools_copy_shared_nodes_matches_quark(which):
+    from quark.onnx.utils.model_utils import check_shared_initializers
+    from quark.onnx.utils.model_utils import copy_shared_nodes as q_fn
+
+    model = _tx_shared_models()[which]
+    # a DQ-shared model has no shared *initializer* (wq is read once)
+    expect = bool(which)
+    assert check_shared_initializers(model) is quark_tools.check_shared_initializers(
+        model
+    )
+    assert quark_tools.check_shared_initializers(model) is expect
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.copy_shared_nodes(model)
+
+    def sig(m):
+        return (
+            sorted(n.op_type for n in m.graph.node),
+            sorted(t.name for t in m.graph.initializer),
+            sorted(n.name for n in m.graph.node),
+        )
+
+    assert sig(ours) == sig(theirs)
+    assert not quark_tools.check_shared_initializers(ours)
+    x = _tx_x((2, 4))
+    np.testing.assert_array_equal(
+        _tx_ort(ours, {"x": x})[0], _tx_ort(model, {"x": x})[0]
+    )
+    np.testing.assert_array_equal(
+        _tx_ort(ours, {"x": x})[0], _tx_ort(theirs, {"x": x})[0]
+    )
+
+
+def test_tools_clean_initializer_in_input_matches_quark():
+    from quark.onnx.utils.model_utils import clean_initializer_in_input as q_fn
+
+    model = parser.parse_model(
+        """
+        <ir_version: 3, opset_import: ["": 9]>
+        g (float[2] x, float[2] w) => (float[2] y)
+        <float[2] w = {1.0, 2.0}>
+        { y = Add(x, w) }
+        """
+    )
+    theirs = _quiet(q_fn, _copy_model(model))
+    ours = quark_tools.clean_initializer_in_input(model)
+    assert [i.name for i in ours.graph.input] == [i.name for i in theirs.graph.input]
+    assert ours.ir_version == theirs.ir_version == 4
+    assert model.ir_version == 3  # ours does not mutate the argument
+
+
+def test_tools_save_with_external_data_matches_quark(tmp_path):
+    from quark.onnx.utils.model_utils import (
+        save_onnx_model_with_external_data as q_fn,
+    )
+
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        g (float[2,64] x) => (float[2,64] y)
+        { y = MatMul(x, w) }
+        """
+    )
+    model.graph.initializer.append(
+        onnx.numpy_helper.from_array(
+            np.random.default_rng(0).standard_normal((64, 64)).astype(np.float32), "w"
+        )
+    )
+    for tag, fn in (
+        ("q", q_fn),
+        ("o", quark_tools.save_onnx_model_with_external_data),
+    ):
+        path = str(tmp_path / f"{tag}.onnx")
+        _quiet(fn, _copy_model(model), path, True)
+        assert (tmp_path / f"{tag}.onnx.data").exists()
+        loaded = onnx.load(path)
+        assert _tx_inits(loaded).keys() == _tx_inits(model).keys()
+        for k, v in _tx_inits(loaded).items():
+            np.testing.assert_array_equal(v[1], _tx_inits(model)[k][1])
