@@ -156,6 +156,7 @@ def _block_fn(dtype: str) -> Optional[Callable[[np.ndarray, int], np.ndarray]]:
     return None
 
 
+PROMOTABLE_OPS = ("Conv", "ConvTranspose", "Gemm", "MatMul")
 _BLOCK_DTYPES = {
     "bfp16",
     "mx4",
@@ -296,6 +297,49 @@ for _n in list(_PRESETS):
     _PRESETS[f"{_n}_ADAQUANT"] = _algo_variant(_n, AdaQuantConfig)
 
 
+# Quark's mixed-format presets (no ADAROUND variants -- and, apart from the
+# BF16_MIXED_* ones registered below, no ADAQUANT ones -- exist in Quark):
+# bfloat16 activations over block-format constants, block-format activations
+# over int8 constants.
+def _mixed_block(block: Callable[[], QSpec], *algos: AlgoConfig) -> QConfig:
+    """bfloat16 everywhere, every Conv / Gemm / MatMul promoted to ``block``
+    (Quark: AutoMixprecision with the metric threshold disabled, dual nodes at
+    the boundaries, biases left unquantized)."""
+    target = QLayerConfig(activation=block(), weight=block())
+    return QConfig(
+        _layer(BFloat16Spec, BFloat16Spec),
+        algo_config=[
+            AutoMixprecisionConfig(
+                target_layer_config=target, dual_quant_nodes=True, metric_threshold=0
+            ),
+            *algos,
+        ],
+        QuantizeBias=False,
+    )
+
+
+_PRESETS.update(
+    {
+        "BF16_MIXED_BFP16": lambda: _mixed_block(BFP16Spec),
+        "BF16_MIXED_MXINT8": lambda: _mixed_block(MXInt8Spec),
+        "BF16_MIXED_BFP16_ADAQUANT": lambda: _mixed_block(BFP16Spec, AdaQuantConfig()),
+        "BF16_MIXED_MXINT8_ADAQUANT": lambda: _mixed_block(
+            MXInt8Spec, AdaQuantConfig()
+        ),
+        "BF16_BFP16": lambda: QConfig(_layer(BFloat16Spec, BFP16Spec)),
+        "BF16_MXINT8": lambda: QConfig(_layer(BFloat16Spec, MXInt8Spec)),
+        "MX9_INT8": lambda: QConfig(_layer(MX9Spec, Int8Spec)),
+    }
+)
+
+
+# FP16 / BF16 AdaQuant: Quark emits the FP16 / BF16 graph with tuned
+# weights / biases. The graph half is reproduced; the tuning is not (like
+# BFP16_ADAQUANT, quantize_model raises unless ignore_unsupported_algos=True).
+_PRESETS["FP16_ADAQUANT"] = _algo_variant("FP16", AdaQuantConfig)
+_PRESETS["BF16_ADAQUANT"] = _algo_variant("BF16", AdaQuantConfig)
+
+
 def _with_algo(cfg: QConfig, algo: AlgoConfig) -> QConfig:
     cfg.algo_config = [algo]
     return cfg
@@ -411,6 +455,10 @@ class ModelQuantizer:
 
             fn = quantize_fp16 if act.dtype == "float16" else quantize_bf16
             result = fn(model_input)
+        elif self._mixed_block_target(act) is not None:
+            result = self._quantize_mixed_block(
+                model_input, act, ignore_unsupported_algos
+            )
         elif wt.dtype in _FAKEQUANT_DTYPES or act.dtype in _FAKEQUANT_DTYPES:
             if cfg.algo_config and not ignore_unsupported_algos:
                 what = "float presets" if half else "block formats"
@@ -433,18 +481,87 @@ class ModelQuantizer:
             onnx.save(result, model_output)
         return result
 
+    def _mixed_block_target(self, act: QSpec) -> Optional[AlgoConfig]:
+        """The ``AutoMixprecisionConfig`` of a bfloat16 model whose target
+        layers use a block format (``BF16_MIXED_BFP16`` / ``_MXINT8``), if any."""
+        if act.dtype != "bfloat16":
+            return None
+        for a in self.config.algo_config:
+            t = a.params.get("target_layer_config")
+            if (
+                a.name == "auto_mixprecision"
+                and isinstance(t, QLayerConfig)
+                and t.weight.dtype in _BLOCK_DTYPES
+            ):
+                return a
+        return None
+
+    def _quantize_mixed_block(
+        self, model: onnx.ModelProto, act: QSpec, ignore_unsupported: bool
+    ) -> onnx.ModelProto:
+        from onnxsim.quark_preset_graphs import apply_mixed_block_format
+
+        algo = self._mixed_block_target(act)
+        assert algo is not None
+        p = algo.params
+        target = p["target_layer_config"]
+        others = [a.name for a in self.config.algo_config if a is not algo]
+        if others and not ignore_unsupported:
+            raise NotImplementedError(
+                f"algo_config [{', '.join(others)}] is not applied to block formats; "
+                "pass ignore_unsupported_algos=True to quantize without it"
+            )
+        if p.get("metric_threshold", 0):
+            raise NotImplementedError(
+                "AutoMixprecisionConfig.metric_threshold must be 0 (promote every "
+                "candidate): onnxsim cannot evaluate com.amd.quark custom ops"
+            )
+        for key in ("subgraph_json", "sensitivity_cache_file"):
+            if p.get(key) is not None:
+                raise NotImplementedError(
+                    f"AutoMixprecisionConfig.{key} is not supported"
+                )
+        self._approx(
+            f"{target.weight.dtype} layers: every candidate is promoted (Quark's "
+            "metric_threshold=0), no sensitivity ranking; the model uses "
+            "com.amd.quark custom ops that onnxsim cannot execute"
+        )
+        return apply_mixed_block_format(
+            model,
+            target.weight.dtype,
+            exclude=[e for e in self.config.exclude if isinstance(e, str)],
+            target_ops=tuple(p.get("target_op_type") or PROMOTABLE_OPS),
+            include_layers=p.get("include_layers") or (),
+            exclude_layers=p.get("exclude_layers") or (),
+        )
+
     def _quantize_block(
         self, model: onnx.ModelProto, act: QSpec, wt: QSpec
     ) -> onnx.ModelProto:
         from onnxsim.quark_fakequant_graph import apply_fake_quant_format
 
+        opts = self.config.extra_options
+        exclude = [e for e in self.config.exclude if isinstance(e, str)]
+        if act.dtype in _BLOCK_DTYPES and wt.dtype == "int8":  # MX9_INT8
+            from onnxsim.quark_preset_graphs import (
+                apply_block_activations_int8_constants,
+            )
+
+            self._approx(
+                f"{act.dtype} uses com.amd.quark custom ops: the model needs Quark's "
+                "ONNX custom-op library to run (onnxsim cannot execute it)"
+            )
+            return apply_block_activations_int8_constants(model, act.dtype, exclude)
         fn = _block_fn(wt.dtype)
-        if fn is None or (act.dtype in _FAKEQUANT_DTYPES and act.dtype != wt.dtype):
+        # bfloat16 activations over block-format constants (BF16_BFP16 / BF16_MXINT8)
+        mixed = act.dtype == "bfloat16" and wt.dtype in _BLOCK_DTYPES
+        if fn is None or (
+            act.dtype in _FAKEQUANT_DTYPES and act.dtype != wt.dtype and not mixed
+        ):
             raise NotImplementedError(
                 f"weight dtype {wt.dtype} with activation dtype {act.dtype}: "
                 "block / half formats must match on both sides"
             )
-        opts = self.config.extra_options
         quantize_acts = act.dtype in _FAKEQUANT_DTYPES and opts.get(
             "BlockFormatActivations", True
         )
@@ -458,13 +575,15 @@ class ModelQuantizer:
                 f"{act.dtype} uses com.amd.quark custom ops: the model needs Quark's "
                 "ONNX custom-op library to run (onnxsim cannot execute it)"
             )
+        fold = bool(opts.get("BlockFormatFoldWeights", False))
         return apply_fake_quant_format(
             model,
-            wt.dtype,
+            act.dtype if mixed else wt.dtype,
             activations=bool(quantize_acts),
-            fold_weights=bool(opts.get("BlockFormatFoldWeights", False)),
+            fold_weights=fold,
             fold_fn=fn,
-            exclude=[e for e in self.config.exclude if isinstance(e, str)],
+            exclude=exclude,
+            const_dtype=wt.dtype if mixed and quantize_acts and not fold else None,
         )
 
     def _approx(self, msg: str) -> None:
