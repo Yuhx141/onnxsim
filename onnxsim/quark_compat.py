@@ -24,12 +24,15 @@ names and preset *meanings*, not copied.
 - Presets with a real backend here: ``A8W8``, ``A16W8`` (and the
   ``S8S8_AAWS`` / ``U8S8_AAWS`` / ``U8U8_AAWA`` / ``U16S8_AAWS`` /
   ``S16S8_ASWS`` / ``XINT8`` spellings, see ``_PRESETS``), ``FP16``, ``BF16``.
-  Integer presets use :func:`onnxsim.full_qdq.quantize_full_qdq`, whose
-  activations are **uint8/uint16 only** (asymmetric) and whose weights are
-  symmetric int8. A preset that asks for signed or power-of-2 activations
-  (``A8W8`` int8, ``XINT8``) is therefore *approximated* by uint8 / uint16
-  activations; the approximation is recorded in
-  ``ModelQuantizer.last_approximations`` and emitted as a ``UserWarning``.
+  Integer presets use :func:`onnxsim.full_qdq.quantize_full_qdq`: signed /
+  unsigned 8- and 16-bit activations, symmetric (``A8W8``, ``A16W8``,
+  ``XINT8``: centred zero point) or asymmetric with percentile calibration
+  (``*_AAWS``), power-of-2 scales for ``XINT8``, and symmetric int8 weights
+  **per tensor** like Quark (``extra_options={"PerChannel": True}`` for per
+  channel; the weight-rounding algorithms need it and switch it on). Scales and
+  zero points match Quark's for the probed models
+  (``tests/test_quark_parity.py``). ``XINT8`` uses ``ceil(log2(scale))`` where
+  Quark searches for the MSE-best power of two, and biases stay int32.
 - Block formats (``BFP16``, ``MX4/6/9``, ``MXFP4/6/8``, ``MXINT8``):
   :mod:`onnxsim.quark_fakequant_graph` inserts the same ``com.amd.quark``
   ``BFPQuantizeDequantize`` / ``MXQuantizeDequantize`` nodes Quark's quantizer
@@ -104,7 +107,9 @@ class QSpec:
 
 def _spec(name: str, dtype: str, symmetric: bool, pof2: bool = False):
     def __init__(self, **kwargs: Any) -> None:
-        QSpec.__init__(self, dtype=dtype, symmetric=symmetric, pof2=pof2, **kwargs)
+        fields: Dict[str, Any] = dict(dtype=dtype, symmetric=symmetric, pof2=pof2)
+        fields.update(kwargs)  # a caller may override e.g. ``symmetric``
+        QSpec.__init__(self, **fields)
 
     return type(name, (QSpec,), {"__init__": __init__, "__doc__": f"{name}."})
 
@@ -114,7 +119,7 @@ UInt8Spec = _spec("UInt8Spec", "uint8", False)
 Int16Spec = _spec("Int16Spec", "int16", True)
 UInt16Spec = _spec("UInt16Spec", "uint16", False)
 XInt8Spec = _spec("XInt8Spec", "int8", True, pof2=True)
-XUInt8Spec = _spec("XUInt8Spec", "uint8", False, pof2=True)
+XUInt8Spec = _spec("XUInt8Spec", "uint8", True, pof2=True)
 Float16Spec = _spec("Float16Spec", "float16", False)
 BFloat16Spec = _spec("BFloat16Spec", "bfloat16", False)
 BFP16Spec = _spec("BFP16Spec", "bfp16", False)
@@ -243,19 +248,23 @@ class QConfig:
             ) from None
 
 
-def _layer(act: type, wt: type) -> QLayerConfig:
-    return QLayerConfig(activation=act(), weight=wt())
+def _layer(act: type, wt: type, **act_kwargs: Any) -> QLayerConfig:
+    return QLayerConfig(activation=act(**act_kwargs), weight=wt())
+
+
+# Quark calibrates the asymmetric ("AA") presets with percentiles.
+_PCT = dict(symmetric=False, calibration_method="percentile:99.999")
 
 
 _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "XINT8": lambda: QConfig(_layer(XUInt8Spec, XInt8Spec)),
     "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec)),
-    "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec)),
-    "U8S8_AAWS": lambda: QConfig(_layer(UInt8Spec, Int8Spec)),
-    "U8U8_AAWA": lambda: QConfig(_layer(UInt8Spec, UInt8Spec)),
+    "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec, **_PCT)),
+    "U8S8_AAWS": lambda: QConfig(_layer(UInt8Spec, Int8Spec, **_PCT)),
+    "U8U8_AAWA": lambda: QConfig(_layer(UInt8Spec, UInt8Spec, **_PCT)),
     "A16W8": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
     "S16S8_ASWS": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
-    "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec)),
+    "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec, **_PCT)),
     "FP16": lambda: QConfig(_layer(Float16Spec, Float16Spec)),
     "BF16": lambda: QConfig(_layer(BFloat16Spec, BFloat16Spec)),
     "BFP16": lambda: QConfig(_layer(BFP16Spec, BFP16Spec)),
@@ -552,16 +561,9 @@ class ModelQuantizer:
         return out
 
     def _int_act_dtype(self, spec: QSpec) -> str:
-        """The ``quantize_full_qdq`` activation dtype for an int spec (uint8 or
-        uint16), recording an approximation for the signed ones."""
-        if spec.dtype in ("int16", "uint16"):
-            if spec.dtype == "int16":
-                self._approx("int16 activations mapped to uint16 (asymmetric)")
-            return "uint16"
-        if spec.dtype in ("int8", "uint8"):
-            if spec.dtype == "int8":
-                self._approx("int8 activations mapped to uint8 (asymmetric)")
-            return "uint8"
+        """The ``quantize_full_qdq`` activation dtype for an int spec."""
+        if spec.dtype in ("int8", "uint8", "int16", "uint16"):
+            return spec.dtype
         raise NotImplementedError(f"activation dtype {spec.dtype} unsupported")
 
     def _auto_mixprecision(
@@ -638,14 +640,19 @@ class ModelQuantizer:
         if wt.dtype == "uint8":
             self._approx("weights quantized int8-symmetric instead of uint8")
         act_dtype = self._int_act_dtype(act)
-        if act.pof2 or wt.pof2:
-            self._approx("power-of-2 scales not enforced (float scales used)")
 
         calibration = _drain_reader(reader)
         if not calibration:
             raise ValueError("calibration_data_reader is required for integer presets")
         exclude = [e for e in self.config.exclude if isinstance(e, str)]
         by_name = {a.name: a for a in algos}
+
+        # Quark's presets quantize weights per tensor; the weight-rounding
+        # algorithms below work per output channel.
+        per_channel = bool(self.config.extra_options.get("PerChannel", False))
+        if not per_channel and {"adaquant", "adaround", "gptq"} & set(by_name):
+            per_channel = True
+            self._approx("weights quantized per channel (needed by the algorithm)")
 
         # Float -> float pre-quantization passes (quantize_full_qdq is fed
         # the transformed model; the untouched one stays the reference).
@@ -677,6 +684,9 @@ class ModelQuantizer:
                 activation_dtype=act_dtype,
                 exclude_nodes=exclude,
                 method=act.calibration_method,
+                symmetric_activations=act.symmetric,
+                power_of_two=act.pof2 or wt.pof2,
+                per_channel=per_channel,
             )
 
         # Post-quantization passes, which compare against the float model.

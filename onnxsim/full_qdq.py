@@ -112,14 +112,44 @@ _WEIGHT_AXIS_OPS = {"Conv", "ConvTranspose", "Gemm", "MatMul"}
 _DTYPES = {
     "uint8": (TensorProto.UINT8, np.uint8, 0, 255),
     "uint16": (TensorProto.UINT16, np.uint16, 0, 65535),
+    "int8": (TensorProto.INT8, np.int8, -128, 127),
+    "int16": (TensorProto.INT16, np.int16, -32768, 32767),
 }
+_WIDE_DTYPES = ("uint16", "int16")  # need com.microsoft Q/DQ below opset 21
 
 
-def _qparams(lo: float, hi: float, qmin: int, qmax: int) -> Tuple[float, int]:
+def _pof2(scale: float) -> float:
+    """The smallest power of two >= ``scale`` (never clips more than ``scale``)."""
+    return float(2.0 ** np.ceil(np.log2(scale))) if scale > 0 else scale
+
+
+def _qparams(
+    lo: float,
+    hi: float,
+    qmin: int,
+    qmax: int,
+    symmetric: bool = False,
+    power_of_two: bool = False,
+) -> Tuple[float, int]:
+    """``(scale, zero_point)`` for the range ``[lo, hi]`` (always including 0).
+
+    ``symmetric``: ``scale = absmax / half-range`` with the zero point in the
+    middle of the integer range -- 0 for signed types, 128 / 32768 for unsigned
+    ones. ``power_of_two`` rounds the scale up to a power of two."""
     lo, hi = min(float(lo), 0.0), max(float(hi), 0.0)
+    if symmetric:
+        absmax = max(-lo, hi)
+        half = qmax if qmin < 0 else (qmax - qmin) // 2
+        scale = absmax / half
+        zp = 0 if qmin < 0 else half + 1
+        if not scale > 0:
+            return 1.0, zp
+        return (_pof2(scale) if power_of_two else scale), zp
     scale = (hi - lo) / (qmax - qmin)
     if not scale > 0:
         return 1.0, qmin
+    if power_of_two:
+        scale = _pof2(scale)
     zp = int(np.clip(round(qmin - lo / scale), qmin, qmax))
     return scale, zp
 
@@ -203,6 +233,8 @@ def quantize_full_qdq(
     providers: Optional[Sequence[str]] = None,
     ranges: Optional[Dict[str, Tuple[float, float]]] = None,
     tensor_dtypes: Optional[Dict[str, str]] = None,
+    symmetric_activations: Optional[bool] = None,
+    power_of_two: bool = False,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -212,14 +244,16 @@ def quantize_full_qdq(
     :param calibration_data: representative input batches (``{name: array}``),
             run through ONNX Runtime by :func:`onnxsim.calibration.calibrate`.
             Not needed when ``ranges`` is given.
-    :param activation_dtype: ``"uint8"`` (default) or ``"uint16"`` (W8A16;
+    :param activation_dtype: ``"uint8"`` (default), ``"uint16"`` (W8A16;
             opset < 21 models get ``com.microsoft`` Q/DQ, which ONNX Runtime
-            and its QNN execution provider accept)
+            and its QNN execution provider accept), or the signed ``"int8"`` /
+            ``"int16"`` (zero point 0)
     :param per_channel: int8 weights per output channel (default) or per tensor
     :param op_types: only quantize nodes of these op types (default: all)
     :param exclude_op_types: never quantize nodes of these op types
     :param exclude_nodes: node names (or first-output names) to keep in float
-    :param fold_relu: fold a Relu into its quantized producer's output Q
+    :param fold_relu: fold a Relu into its quantized producer's output Q (not
+            done with symmetric activations: their zero point is centred)
     :param method: calibration method, passed to
             :func:`onnxsim.calibration.calibrate`
     :param providers: onnxruntime providers for calibration
@@ -229,11 +263,19 @@ def quantize_full_qdq(
             (``{tensor: "uint16"}``), e.g. 16-bit sampling coordinates in an
             otherwise 8-bit graph. Data-movement ops pass their input's dtype
             on unless their output is overridden too.
+    :param symmetric_activations: ``scale = absmax / half-range`` with a
+            centred zero point (0 for signed types, 128 / 32768 for unsigned).
+            Default: on for the signed dtypes, off for the unsigned ones.
+    :param power_of_two: round every activation and weight scale up to a
+            power of two (fixed-point friendly, as Quark's ``XINT8``)
     :returns: the quantized ModelProto
     """
     if activation_dtype not in _DTYPES:
         raise ValueError(f"unsupported activation_dtype: {activation_dtype!r}")
     act_type, act_np, qmin, qmax = _DTYPES[activation_dtype]
+    if symmetric_activations is None:
+        symmetric_activations = qmin < 0
+    sym, p2 = symmetric_activations, power_of_two
     if isinstance(model, str):
         model = onnx.load(model)
     m = onnx.ModelProto()
@@ -308,7 +350,7 @@ def quantize_full_qdq(
 
     # Relu folding: producer -> Relu becomes producer -> Q(range of the Relu output, lo = 0).
     removed = set()
-    if fold_relu:
+    if fold_relu and not sym:
         producer = {o: n for n in g.node for o in n.output}
         for r in qnodes:
             if r.op_type != "Relu":
@@ -334,6 +376,24 @@ def quantize_full_qdq(
             if not any(id(r) in removed and r.input[0] == a for r in consumers[a])
         ]
 
+    elif fold_relu:
+        # A centred zero point cannot clamp at zero, so the Relu stays; instead
+        # the tensor between a quantized producer and its Relu is left float
+        # (Quark's "remove Q/DQ between conv and relu").
+        producer = {o: n for n in g.node for o in n.output}
+        skip = set()
+        for r in qnodes:
+            src = r.input[0] if r.op_type == "Relu" else None
+            p = producer.get(src) if src else None
+            if (
+                p is not None
+                and id(p) in qnode_ids
+                and len(consumers[src]) == 1
+                and src not in graph_outputs
+            ):
+                skip.add(src)
+        acts = [a for a in acts if a not in skip]
+
     # Quantization parameters, propagating through data-movement ops in topological order.
     tensor_dtypes = dict(tensor_dtypes or {})
     for t in set(tensor_dtypes.values()) - set(_DTYPES):
@@ -343,7 +403,7 @@ def quantize_full_qdq(
 
     def set_qp(x: str) -> None:
         dt = tensor_dtypes.get(x, activation_dtype)
-        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:])
+        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:], sym, p2)
         qdt[x] = dt
 
     for x in graph_inputs:
@@ -367,7 +427,7 @@ def quantize_full_qdq(
         )
 
     def domain_of(dt: str) -> str:
-        return "com.microsoft" if dt == "uint16" and opset < 21 else ""
+        return "com.microsoft" if dt in _WIDE_DTYPES and opset < 21 else ""
 
     qdq_domain = domain_of(activation_dtype)
     if any(domain_of(d) for d in list(qdt.values()) + [activation_dtype]) and not any(
@@ -467,7 +527,7 @@ def quantize_full_qdq(
             ckey = (src, node_dt)
             if ckey not in converted:
                 c = f"{src}/as_{node_dt}"
-                sc, zc = _qparams(*ranges[src], *_DTYPES[node_dt][2:])
+                sc, zc = _qparams(*ranges[src], *_DTYPES[node_dt][2:], sym, p2)
                 qp[c], qdt[c] = (sc, zc), node_dt
                 sn = add_init(fresh(c) + "/scale", np.array(sc, np.float32))
                 zn = add_init(fresh(c) + "/zp", np.array(zc, _DTYPES[node_dt][1]))
@@ -525,6 +585,8 @@ def quantize_full_qdq(
                 if key not in cache:
                     if axis is None:
                         s = np.array(max(np.abs(w).max(), 1e-12) / 127.0, np.float32)
+                        if p2:
+                            s = np.array(_pof2(float(s)), np.float32)
                         q = np.clip(np.round(w / s), -127, 127).astype(np.int8)
                         zp = np.array(0, np.int8)
                     else:
@@ -532,6 +594,8 @@ def quantize_full_qdq(
                         s = (np.maximum(np.abs(w).max(axis=red), 1e-12) / 127.0).astype(
                             np.float32
                         )
+                        if p2:
+                            s = (2.0 ** np.ceil(np.log2(s))).astype(np.float32)
                         shape = [1] * w.ndim
                         shape[axis] = -1
                         q = np.clip(np.round(w / s.reshape(shape)), -127, 127).astype(
@@ -596,7 +660,7 @@ def quantize_full_qdq(
             else:
                 key = ("c", x, None)
                 if key not in cache:
-                    s, zp = _qparams(w.min(), w.max(), qmin, qmax)
+                    s, zp = _qparams(w.min(), w.max(), qmin, qmax, sym, p2)
                     q = np.clip(np.round(w / s) + zp, qmin, qmax).astype(act_np)
                     base = fresh(x)
                     add_init(base + "/q", q)

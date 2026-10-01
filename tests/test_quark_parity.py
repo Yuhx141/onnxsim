@@ -641,3 +641,57 @@ def test_quality_report_against_quark(tmp_path):
                     fh.write(
                         f"| {r['model']} | {r['preset']} | {r['quark_rel_err']:.4f} | {r['onnxsim_rel_err']:.4f} |\n"
                     )
+
+
+# -- integer presets: quantization parameters ------------------------------------
+
+
+def _int_params(model):
+    """Sorted ``(scale, zero_point, dtype)`` of every activation QuantizeLinear
+    and the scales of the weight DequantizeLinear nodes (per-tensor)."""
+    inits = {i.name: i for i in model.graph.initializer}
+
+    def arr(name):
+        return onnx.numpy_helper.to_array(inits[name])
+
+    acts, weights = [], []
+    for n in model.graph.node:
+        if n.op_type == "QuantizeLinear" and n.input[1] in inits:
+            zp = arr(n.input[2])
+            acts.append((float(arr(n.input[1])), int(zp), str(zp.dtype)))
+        elif (
+            n.op_type == "DequantizeLinear"
+            and n.input[0] in inits
+            and arr(n.input[0]).dtype == np.int8
+            and arr(n.input[0]).ndim >= 2
+        ):
+            weights.append(float(np.max(arr(n.input[1]))))
+    return sorted(acts), sorted(weights)
+
+
+@pytest.mark.parametrize("model_name", sorted(MODELS))
+@pytest.mark.parametrize(
+    "preset",
+    ["A8W8", "S8S8_AAWS", "U8S8_AAWS", "A16W8", "S16S8_ASWS", "U16S8_AAWS", "XINT8"],
+)
+def test_integer_preset_quantization_parameters_match_quark(
+    preset, model_name, tmp_path
+):
+    """Same scale / zero point / dtype on every activation Q node and the same
+    per-tensor weight scales. (``U8S8_AAWS``-style presets calibrate with
+    percentiles; ours uses the same percentile, so the parameters agree up to
+    histogram binning.)"""
+    model, shape = MODELS[model_name]()
+    q_acts, q_w = _int_params(quark_quantize(model, preset, shape, tmp_path))
+    m_acts, m_w = _int_params(mine_quantize(model, preset, shape))
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    # histogram binning moves a percentile's zero point by a few codes of 16
+    np.testing.assert_allclose(
+        [a[1] for a in m_acts],
+        [a[1] for a in q_acts],
+        atol=40 if "16" in preset else 1,
+    )
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
+    )
+    np.testing.assert_allclose(m_w, q_w, rtol=2e-3)

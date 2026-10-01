@@ -164,6 +164,39 @@ def test_uint16_activations_use_ms_domain_below_opset_21():
     assert _cos(_run(_conv_block(), x), _run(q, x)) > 0.99999
 
 
+@pytest.mark.parametrize(
+    "dt, np_dt, ms", [("int8", np.int8, False), ("int16", np.int16, True)]
+)
+def test_signed_activations_are_symmetric(dt, np_dt, ms):
+    q = quantize_full_qdq(_conv_block(), _data(), activation_dtype=dt)
+    qs = [n for n in q.graph.node if n.op_type == "QuantizeLinear"]
+    inits = {i.name: numpy_helper.to_array(i) for i in q.graph.initializer}
+    assert qs and all((n.domain == "com.microsoft") == ms for n in qs)
+    for n in qs:
+        zp = inits[n.input[2]]
+        assert zp.dtype == np_dt and not zp.any()
+    assert any(n.op_type == "Relu" for n in q.graph.node)  # not folded
+    x = _data(1)[0]
+    assert _cos(_run(_conv_block(), x), _run(q, x)) > 0.999
+
+
+def test_power_of_two_scales_with_centred_unsigned_zero_point():
+    q = quantize_full_qdq(
+        _conv_block(),
+        _data(),
+        symmetric_activations=True,
+        power_of_two=True,
+        per_channel=False,
+    )
+    inits = {i.name: numpy_helper.to_array(i) for i in q.graph.initializer}
+    scales = [v for k, v in inits.items() if k.endswith("/scale") and v.ndim == 0]
+    assert scales and all(np.log2(v) == round(float(np.log2(v))) for v in scales)
+    zps = {
+        int(v) for k, v in inits.items() if k.endswith("/zp") and v.dtype == np.uint8
+    }
+    assert zps == {128}
+
+
 def test_precomputed_ranges_skip_calibration():
     m = _conv_block()
     with pytest.raises(ValueError):
