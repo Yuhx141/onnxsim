@@ -31,8 +31,26 @@ names and preset *meanings*, not copied.
   **per tensor** like Quark (``extra_options={"PerChannel": True}`` for per
   channel; the weight-rounding algorithms need it and switch it on). Scales and
   zero points match Quark's for the probed models
-  (``tests/test_quark_parity.py``). ``XINT8`` uses ``ceil(log2(scale))`` where
-  Quark searches for the MSE-best power of two, and biases stay int32.
+  (``tests/test_quark_parity.py``). Calibration follows the preset: MinMax
+  (``A8W8``, ``A16W8``), Percentile (99.999; ``S8S8_AAWS`` 99.9999; the
+  ``Int8Spec`` family's default, as in Quark; agrees with Quark to histogram
+  binning, ~5e-4) and, for ``XINT8``, Quark's power-of-two MinMSE
+  (``method="minmse_pof2"`` in :func:`onnxsim.calibration.calibrate`): the same
+  2048-bin histogram and five candidate scales, so activation scales are
+  identical to Quark's, and weights and biases get the same MinMSE search --
+  biases are **int8** with a per-tensor power-of-two scale like Quark's
+  (``extra_options={"Int32Bias": True}`` keeps int32). Like Quark, every
+  non-weight constant of a quantized node (LayerNorm scale, Mul operand, ...)
+  is quantized as an int8 weight (activation dtype for Add / Sub / Mul / Div /
+  Min / Max constants under ``A16W8``'s ``AlignEltwiseQuantType``), and
+  Softmax outputs are calibrated to the fixed range (0, 1) except under
+  ``XINT8``. Not matched: Quark's ``Entropy`` (a different algorithm than
+  :func:`onnxsim.calibration.calibrate`'s ``"entropy"``; inner scales differ by
+  up to ~30% on the probed MLP), ``Distribution`` / ``LayerwisePercentile``
+  (``CalibMethod`` members that raise), and its non-power-of-two ``MinMSE``
+  (Quark's ``CalibMethod.MinMSE`` is the power-of-two search, which is what
+  :class:`CalibMethod` maps it to). Quark's NPU graph rewrites for ``XINT8``
+  (shift/cut adjustment, ...) did not change any probed scale.
 - Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
   (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
   (``input_tensors``, or the deprecated ``activation``) and outputs
@@ -98,7 +116,8 @@ names and preset *meanings*, not copied.
   ``r_config_path``; R2-R4 do not exist, as in Quark's ONNX flow). An
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
-- ``extra_options`` are stored, not interpreted.
+- ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
+  ``Int32Bias``, ``AlignEltwiseQuantType`` and the block-format options above.
 """
 
 from __future__ import annotations
@@ -106,6 +125,7 @@ from __future__ import annotations
 import re
 import warnings
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -125,25 +145,68 @@ class QSpec:
     dtype: str = "int8"
     symmetric: bool = True
     pof2: bool = False
-    calibration_method: str = "minmax"
+    #: ``"minmax"``, ``"percentile[:p]"``, ``"entropy"``, ``"mse"``,
+    #: ``"minmse_pof2"`` (Quark's MinMSE) or a :class:`CalibMethod`
+    calibration_method: Any = "minmax"
     is_dynamic: bool = False
 
+    def __post_init__(self) -> None:
+        if isinstance(self.calibration_method, CalibMethod):
+            self.calibration_method = _CALIB_NAMES[self.calibration_method]
 
-def _spec(name: str, dtype: str, symmetric: bool, pof2: bool = False):
+
+class CalibMethod(Enum):
+    """Quark's ``CalibMethod`` (``quark.onnx.CalibMethod``). ``MinMSE`` is its
+    power-of-two MinMSE search (:mod:`onnxsim.calibration` ``"minmse_pof2"``);
+    ``Distribution`` / ``LayerwisePercentile`` are not implemented."""
+
+    MinMax = 0
+    MinMSE = 1
+    Percentile = 2
+    Entropy = 3
+    LayerwisePercentile = 4
+    Distribution = 5
+
+
+_CALIB_NAMES = {
+    CalibMethod.MinMax: "minmax",
+    CalibMethod.MinMSE: "minmse_pof2",
+    CalibMethod.Percentile: "percentile:99.999",
+    CalibMethod.Entropy: "entropy",
+    CalibMethod.LayerwisePercentile: "layerwise_percentile",
+    CalibMethod.Distribution: "distribution",
+}
+
+
+def _spec(
+    name: str,
+    dtype: str,
+    symmetric: bool,
+    pof2: bool = False,
+    calibration_method: str = "minmax",
+):
     def __init__(self, **kwargs: Any) -> None:
-        fields: Dict[str, Any] = dict(dtype=dtype, symmetric=symmetric, pof2=pof2)
+        fields: Dict[str, Any] = dict(
+            dtype=dtype,
+            symmetric=symmetric,
+            pof2=pof2,
+            calibration_method=calibration_method,
+        )
         fields.update(kwargs)  # a caller may override e.g. ``symmetric``
         QSpec.__init__(self, **fields)
 
     return type(name, (QSpec,), {"__init__": __init__, "__doc__": f"{name}."})
 
 
-Int8Spec = _spec("Int8Spec", "int8", True)
-UInt8Spec = _spec("UInt8Spec", "uint8", False)
-Int16Spec = _spec("Int16Spec", "int16", True)
-UInt16Spec = _spec("UInt16Spec", "uint16", False)
-XInt8Spec = _spec("XInt8Spec", "int8", True, pof2=True)
-XUInt8Spec = _spec("XUInt8Spec", "uint8", True, pof2=True)
+# Quark's defaults: the integer specs calibrate with a 99.999 percentile, the
+# power-of-2 ones with MinMSE, everything else with MinMax.
+_PCT_DEFAULT = "percentile:99.999"
+Int8Spec = _spec("Int8Spec", "int8", True, calibration_method=_PCT_DEFAULT)
+UInt8Spec = _spec("UInt8Spec", "uint8", False, calibration_method=_PCT_DEFAULT)
+Int16Spec = _spec("Int16Spec", "int16", True, calibration_method=_PCT_DEFAULT)
+UInt16Spec = _spec("UInt16Spec", "uint16", False, calibration_method=_PCT_DEFAULT)
+XInt8Spec = _spec("XInt8Spec", "int8", True, True, "minmse_pof2")
+XUInt8Spec = _spec("XUInt8Spec", "uint8", True, True, "minmse_pof2")
 Float16Spec = _spec("Float16Spec", "float16", False)
 BFloat16Spec = _spec("BFloat16Spec", "bfloat16", False)
 BFP16Spec = _spec("BFP16Spec", "bfp16", False)
@@ -338,8 +401,10 @@ def _layer(act: type, wt: type, **act_kwargs: Any) -> QLayerConfig:
     return QLayerConfig(activation=act(**act_kwargs), weight=wt())
 
 
-# Quark calibrates the asymmetric ("AA") presets with percentiles.
+# Quark calibrates the asymmetric ("AA") presets with percentiles (99.999;
+# S8S8_AAWS 99.9999), S16S8_ASWS with a symmetric 99.999 percentile.
 _PCT = dict(symmetric=False, calibration_method="percentile:99.999")
+_PCT4 = dict(symmetric=False, calibration_method="percentile:99.9999")
 
 
 _PRESETS: Dict[str, Callable[[], QConfig]] = {
@@ -347,11 +412,14 @@ _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "UINT8_DYNAMIC_QUANT": lambda: QConfig(
         _layer(Int8Spec, UInt8Spec, is_dynamic=True)
     ),
-    "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec)),
-    "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec, **_PCT)),
+    "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec, calibration_method="minmax")),
+    "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec, **_PCT4)),
     "U8S8_AAWS": lambda: QConfig(_layer(UInt8Spec, Int8Spec, **_PCT)),
     "U8U8_AAWA": lambda: QConfig(_layer(UInt8Spec, UInt8Spec, **_PCT)),
-    "A16W8": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
+    "A16W8": lambda: QConfig(
+        _layer(Int16Spec, Int8Spec, calibration_method="minmax"),
+        AlignEltwiseQuantType=True,
+    ),
     "S16S8_ASWS": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
     "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec, **_PCT)),
     "FP16": lambda: QConfig(_layer(Float16Spec, Float16Spec)),
@@ -901,6 +969,15 @@ class ModelQuantizer:
                 symmetric_activations=act.symmetric,
                 power_of_two=act.pof2 or wt.pof2,
                 per_channel=per_channel,
+                # Quark's XINT8 (power-of-2 weights): MinMSE scale search on
+                # weights and int8 biases (``Int32Bias=True`` keeps int32)
+                pof2_mode="minmse" if wt.pof2 else "ceil",
+                int8_bias=wt.pof2 and not self.config.extra_options.get("Int32Bias"),
+                int8_constants=True,
+                align_eltwise_dtype=bool(
+                    self.config.extra_options.get("AlignEltwiseQuantType")
+                ),
+                softmax_unit_range=not act.pof2,
                 tensor_dtypes=t_dtypes or None,
                 tensor_symmetric=t_sym or None,
             )
@@ -943,6 +1020,7 @@ __all__ = [
     "BFP16Spec",
     "BFloat16Spec",
     "BiasCorrectionConfig",
+    "CalibMethod",
     "CLEConfig",
     "Config",
     "Float16Spec",
