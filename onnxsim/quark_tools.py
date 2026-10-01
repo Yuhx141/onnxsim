@@ -1,6 +1,7 @@
 """Post-quantization graph utilities named after the scripts in
 ``quark.onnx.tools`` (``remove_qdq``, ``convert_shared_initializer_to_unique``,
-``convert_dynamic_to_fixed``, ``replace_inf_weights``). Independent
+``convert_dynamic_to_fixed``, ``replace_inf_weights``, ``convert_s8s8_to_u8s8``,
+``convert_fp16_to_fp32`` ...). Independent
 implementations: Quark's source was read for the names and intent only.
 
 Every function takes and returns an ``onnx.ModelProto`` (the input is not
@@ -216,9 +217,221 @@ def replace_inf_weights(
     return m
 
 
+def convert_s8s8_to_u8s8(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Re-express int8 *activation* Q/DQ pairs as uint8 (weights stay int8).
+
+    Exact: ``(q - zp) * scale`` is unchanged by ``q' = q + 128``,
+    ``zp' = zp + 128``, and the int8 / uint8 clamp ranges map onto each
+    other. A ``QuantizeLinear`` is converted when its input is not an
+    initializer and its zero point is an int8 initializer; the
+    ``DequantizeLinear`` nodes consuming it follow (so Q and DQ agree). A
+    zero-point initializer also used by a node that is *not* converted is
+    copied rather than changed. Q nodes with no zero point, or a non-constant
+    one, are left untouched.
+    """
+    m = _copy(model)
+    g = m.graph
+    inits = {t.name: t for t in g.initializer}
+    graph_outputs = {o.name for o in g.output}
+    consumers = defaultdict(list)
+    for n in g.node:
+        for x in n.input:
+            consumers[x].append(n)
+
+    def is_int8_const(name: str) -> bool:
+        return (
+            bool(name)
+            and name in inits
+            and inits[name].data_type == onnx.TensorProto.INT8
+        )
+
+    convert: Dict[int, onnx.NodeProto] = {}  # id(node) -> node, zp at input[2]
+    for q in g.node:
+        if not _is(q, _Q_OPS) or len(q.input) < 3 or q.input[0] in inits:
+            continue
+        if not is_int8_const(q.input[2]):
+            continue
+        users = consumers[q.output[0]]
+        dqs = [u for u in users if _is(u, _DQ_OPS) and u.input[0] == q.output[0]]
+        if not users or len(dqs) != len(users) or q.output[0] in graph_outputs:
+            continue  # the int8 tensor is used as int8 elsewhere: its type is observable
+        if any(len(d.input) < 3 or not is_int8_const(d.input[2]) for d in dqs):
+            continue  # a DQ we cannot convert consistently: leave the whole chain
+        convert[id(q)] = q
+        for d in dqs:
+            convert[id(d)] = d
+
+    users_of_zp = defaultdict(list)
+    for n in g.node:
+        if len(n.input) >= 3 and n.input[2] in inits:
+            users_of_zp[n.input[2]].append(n)
+
+    shifted: Dict[str, str] = {}
+    for n in g.node:
+        if id(n) not in convert:
+            continue
+        zp = n.input[2]
+        if zp not in shifted:
+            arr = numpy_helper.to_array(inits[zp])
+            new = (arr.astype(np.int16) + 128).astype(np.uint8)
+            all_converted = all(id(u) in convert for u in users_of_zp[zp])
+            name = zp if all_converted else f"{zp}_u8"
+            tensor = numpy_helper.from_array(new, name)
+            if all_converted:
+                inits[zp].CopyFrom(tensor)
+            else:
+                g.initializer.append(tensor)
+            shifted[zp] = name
+        n.input[2] = shifted[zp]
+        if _is(n, _Q_OPS):
+            for a in n.attribute:
+                if a.name == "output_dtype":
+                    a.i = onnx.TensorProto.UINT8
+    return m
+
+
+_HALF_TYPES = (onnx.TensorProto.FLOAT16, onnx.TensorProto.BFLOAT16)
+
+
+def _convert_half_to_fp32(model: onnx.ModelProto, half: int) -> onnx.ModelProto:
+    m = _copy(model)
+    g = m.graph
+    f32 = onnx.TensorProto.FLOAT
+
+    def fix_tensor(t: onnx.TensorProto) -> None:
+        if t.data_type == half:
+            t.CopyFrom(
+                numpy_helper.from_array(
+                    numpy_helper.to_array(t).astype(np.float32), t.name
+                )
+            )
+
+    def fix_value_info(vi: onnx.ValueInfoProto) -> None:
+        if vi.type.HasField("tensor_type") and vi.type.tensor_type.elem_type == half:
+            vi.type.tensor_type.elem_type = f32
+
+    for t in g.initializer:
+        fix_tensor(t)
+    for vi in list(g.input) + list(g.output) + list(g.value_info):
+        fix_value_info(vi)
+    for n in g.node:
+        for a in n.attribute:
+            if a.type == onnx.AttributeProto.TENSOR:
+                fix_tensor(a.t)
+            elif a.name == "to" and a.i == half:
+                a.i = f32  # Cast(..., to=half) -> Cast(..., to=float)
+
+    # A Cast whose input is already float32 is now a no-op: drop it unless it
+    # produces a graph output.
+    inferred = onnx.shape_inference.infer_shapes(m)
+    elem = {
+        vi.name: vi.type.tensor_type.elem_type
+        for vi in list(inferred.graph.input)
+        + list(inferred.graph.value_info)
+        + list(inferred.graph.output)
+    }
+    elem.update({t.name: t.data_type for t in g.initializer})
+    outputs = {o.name for o in g.output}
+    producer = {o: n for n in g.node for o in n.output}
+    uses: Dict[str, int] = defaultdict(int)
+    for n in g.node:
+        for x in n.input:
+            uses[x] += 1
+    rename: Dict[str, str] = {}
+    kept: List[onnx.NodeProto] = []
+    for n in g.node:
+        for i, x in enumerate(n.input):
+            while x in rename:
+                x = rename[x]
+            n.input[i] = x
+        noop_cast = (
+            n.op_type == "Cast"
+            and n.domain in ("", "ai.onnx")
+            and any(a.name == "to" and a.i == f32 for a in n.attribute)
+            and elem.get(n.input[0]) == f32
+        )
+        if noop_cast and n.output[0] not in outputs:
+            rename[n.output[0]] = n.input[0]
+            continue
+        if noop_cast:
+            # Produces a graph output: let the node feeding it produce that
+            # name directly, if nothing else uses the intermediate tensor.
+            src = n.input[0]
+            prod = producer.get(src)
+            if (
+                prod is not None
+                and uses[src] == 1
+                and src not in outputs
+                and any(prod is k for k in kept)
+            ):
+                prod.output[list(prod.output).index(src)] = n.output[0]
+                continue
+        kept.append(n)
+    del g.node[:]
+    g.node.extend(kept)
+    return m
+
+
+def convert_fp16_to_fp32(model: onnx.ModelProto) -> onnx.ModelProto:
+    """float16 -> float32: initializers, ``Constant`` values, graph and
+    intermediate types and ``Cast`` targets; casts that become float32 ->
+    float32 are removed (so ``quantize_fp16(..., keep_io_types=True)``
+    round-trips to the original structure)."""
+    return _convert_half_to_fp32(model, onnx.TensorProto.FLOAT16)
+
+
+def convert_bf16_to_fp32(model: onnx.ModelProto) -> onnx.ModelProto:
+    """bfloat16 -> float32; see :func:`convert_fp16_to_fp32`."""
+    return _convert_half_to_fp32(model, onnx.TensorProto.BFLOAT16)
+
+
+def convert_fp32_to_fp16(
+    model: onnx.ModelProto, keep_io_types: bool = True
+) -> onnx.ModelProto:
+    """float32 -> float16 (onnxsim's own :func:`onnxsim.quantize_fp16`)."""
+    from onnxsim.onnx_simplifier import quantize_fp16
+
+    return quantize_fp16(_copy(model), keep_io_types=keep_io_types)
+
+
+def convert_fp32_to_bf16(
+    model: onnx.ModelProto, keep_io_types: bool = True
+) -> onnx.ModelProto:
+    """float32 -> bfloat16 (onnxsim's own :func:`onnxsim.quantize_bf16`)."""
+    from onnxsim.onnx_simplifier import quantize_bf16
+
+    return quantize_bf16(_copy(model), keep_io_types=keep_io_types)
+
+
+def convert_opset_version(model: onnx.ModelProto, target: int) -> onnx.ModelProto:
+    """Convert the default-domain opset with ``onnx.version_converter``;
+    ``ValueError`` if the converter cannot do it."""
+    try:
+        return onnx.version_converter.convert_version(_copy(model), target)
+    except Exception as e:  # the converter raises assorted types
+        raise ValueError(f"cannot convert to opset {target}: {e}") from e
+
+
+def remove_initializer_from_input(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Drop graph inputs that merely mirror an initializer (old exporters
+    list every weight as an input). Same behavior as onnxsim's internal pass:
+    a model with IR version < 4 is bumped to IR 4 (unless its opset is too
+    old for that to be safe, in which case it is returned unchanged)."""
+    from onnxsim.onnx_simplifier import remove_initializer_from_input as _impl
+
+    return _impl(_copy(model))
+
+
 __all__ = [
+    "convert_bf16_to_fp32",
     "convert_dynamic_to_fixed",
+    "convert_fp16_to_fp32",
+    "convert_fp32_to_bf16",
+    "convert_fp32_to_fp16",
+    "convert_opset_version",
+    "convert_s8s8_to_u8s8",
     "convert_shared_initializer_to_unique",
+    "remove_initializer_from_input",
     "remove_qdq",
     "replace_inf_weights",
 ]

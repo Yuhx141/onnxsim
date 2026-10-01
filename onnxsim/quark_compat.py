@@ -42,8 +42,15 @@ names and preset *meanings*, not copied.
   before quantization; AdaQuant (``num_iterations``, ``learning_rate``,
   ``reg_param``) and BiasCorrection run after it, against the float model.
   AdaQuant only reoptimizes MatMul/Gemm layers whose output is not folded
-  with a following Relu, and leaves the rest as calibrated. AdaRound, GPTQ,
-  Quarot and AutoMixprecision are accepted and stored so configs round-trip,
+  with a following Relu, and leaves the rest as calibrated.
+  AutoMixprecision replaces the plain quantization step with
+  :func:`onnxsim.quark_auto_mixprecision.auto_mixprecision`: a single
+  ``target_layer_config`` whose *activation* is the other of ``uint8`` /
+  ``uint16`` (weights stay int8); the dict/list multi-config forms,
+  ``subgraph_json`` and ``sensitivity_cache_file`` raise, and ``dual_quant_nodes``
+  / ``no_input_qdq_shared`` / ``shared_param_mode`` / ``worker_num`` have no
+  effect (every tensor already has its own Q/DQ pair; analysis is serial).
+  AdaRound, GPTQ and Quarot are accepted and stored so configs round-trip,
   but **not executed** (onnxsim's AdaRound/GPTQ target its int4 weight-only
   scheme): ``quantize_model`` raises ``NotImplementedError`` naming them
   unless ``ignore_unsupported_algos=True``.
@@ -62,7 +69,7 @@ import onnx
 # -- data-type specs ---------------------------------------------------------
 
 
-@dataclass(eq=True)
+@dataclass(eq=True, unsafe_hash=True)  # hashable: usable as a dict key, as in Quark
 class QSpec:
     """Base of the per-tensor spec classes (Quark's ``Int8Spec`` etc.).
 
@@ -135,7 +142,7 @@ _BLOCK_DTYPES = {
 }
 
 
-@dataclass(eq=True)
+@dataclass(eq=True, unsafe_hash=True)
 class QLayerConfig:
     """Activation + weight spec of one layer group (Quark's ``QLayerConfig``)."""
 
@@ -289,7 +296,13 @@ def _drain_reader(
     return batches
 
 
-_RUNNABLE_ALGOS = {"smooth_quant", "cle", "adaquant", "bias_correction"}
+_RUNNABLE_ALGOS = {
+    "smooth_quant",
+    "cle",
+    "adaquant",
+    "bias_correction",
+    "auto_mixprecision",
+}
 # Quark AdaQuant param -> onnxsim.apply_adaquant kwarg.
 _ADAQUANT_PARAMS = {
     "num_iterations": "num_iterations",
@@ -315,6 +328,9 @@ class ModelQuantizer:
             raise TypeError(f"expected QConfig or Config, got {type(config).__name__}")
         self.config = config
         self.last_approximations: List[str] = []
+        #: the :class:`~onnxsim.quark_auto_mixprecision.AutoMixprecisionResult`
+        #: (sensitivity ranking, moved layers, scores) of the last run, if any
+        self.last_auto_mixprecision: Any = None
 
     def quantize_model(
         self,
@@ -326,6 +342,7 @@ class ModelQuantizer:
         """Quantize and (if ``model_output`` is given) save. Returns the model."""
         cfg = self.config
         self.last_approximations = []
+        self.last_auto_mixprecision = None
         act, wt = cfg.global_config.activation, cfg.global_config.weight
 
         for spec in (act, wt):
@@ -413,6 +430,78 @@ class ModelQuantizer:
     def _approx(self, msg: str) -> None:
         self.last_approximations.append(msg)
 
+    def _int_act_dtype(self, spec: QSpec) -> str:
+        """The ``quantize_full_qdq`` activation dtype for an int spec (uint8 or
+        uint16), recording an approximation for the signed ones."""
+        if spec.dtype in ("int16", "uint16"):
+            if spec.dtype == "int16":
+                self._approx("int16 activations mapped to uint16 (asymmetric)")
+            return "uint16"
+        if spec.dtype in ("int8", "uint8"):
+            if spec.dtype == "int8":
+                self._approx("int8 activations mapped to uint8 (asymmetric)")
+            return "uint8"
+        raise NotImplementedError(f"activation dtype {spec.dtype} unsupported")
+
+    def _auto_mixprecision(
+        self,
+        model: onnx.ModelProto,
+        calibration: List[Dict[str, np.ndarray]],
+        base_dtype: str,
+        act: QSpec,
+        exclude: List[str],
+        algo: AlgoConfig,
+    ) -> onnx.ModelProto:
+        from onnxsim.quark_auto_mixprecision import auto_mixprecision
+
+        p = algo.params
+        target = p.get("target_layer_config")
+        if not isinstance(target, QLayerConfig):
+            raise NotImplementedError(
+                "AutoMixprecisionConfig needs a single QLayerConfig as "
+                "target_layer_config (the dict / list multi-config forms are "
+                "not supported)"
+            )
+        for key in ("subgraph_json", "sensitivity_cache_file"):
+            if p.get(key) is not None:
+                raise NotImplementedError(
+                    f"AutoMixprecisionConfig.{key} is not supported"
+                )
+        if target.weight.dtype not in ("int8", "uint8"):
+            raise NotImplementedError("target_layer_config weight must be int8")
+        target_dtype = self._int_act_dtype(target.activation)
+        if target_dtype == base_dtype:
+            raise ValueError(
+                "AutoMixprecision target activation precision equals the base "
+                f"precision ({base_dtype}); nothing to mix"
+            )
+        self._approx(
+            "AutoMixprecision mixes activation precision only (weights stay int8)"
+        )
+        optimize = p.get("metric_optimize_object", "speed")
+        res = auto_mixprecision(
+            model,
+            calibration,
+            base_dtype=base_dtype,
+            target_dtype=target_dtype,
+            target_op_types=tuple(
+                p.get("target_op_type") or ("Conv", "Gemm", "MatMul")
+            ),
+            include_layers=p.get("include_layers") or (),
+            exclude_layers=p.get("exclude_layers") or (),
+            exclude_nodes=exclude,
+            metric=p.get("metric_default", "l2"),
+            metric_distance_fn=p.get("metric_distance_fn"),
+            metric_evaluate_fn=p.get("metric_evaluate_fn"),
+            metric_threshold=p.get("metric_threshold", 0),
+            optimize=optimize,
+            metric_output_index=p.get("metric_output_index", 0),
+            data_size=p.get("data_size", 0),
+            method=act.calibration_method,
+        )
+        self.last_auto_mixprecision = res
+        return res.model
+
     def _quantize_int(
         self,
         model: onnx.ModelProto,
@@ -427,14 +516,7 @@ class ModelQuantizer:
             raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
         if wt.dtype == "uint8":
             self._approx("weights quantized int8-symmetric instead of uint8")
-        if act.dtype in ("int16", "uint16"):
-            act_dtype = "uint16"
-            if act.dtype == "int16":
-                self._approx("int16 activations mapped to uint16 (asymmetric)")
-        else:
-            act_dtype = "uint8"
-            if act.dtype == "int8":
-                self._approx("int8 activations mapped to uint8 (asymmetric)")
+        act_dtype = self._int_act_dtype(act)
         if act.pof2 or wt.pof2:
             self._approx("power-of-2 scales not enforced (float scales used)")
 
@@ -460,13 +542,18 @@ class ModelQuantizer:
         if work is not model:
             float_model = work
 
-        quantized = quantize_full_qdq(
-            work,
-            calibration_data=calibration,
-            activation_dtype=act_dtype,
-            exclude_nodes=exclude,
-            method=act.calibration_method,
-        )
+        if "auto_mixprecision" in by_name:
+            quantized = self._auto_mixprecision(
+                work, calibration, act_dtype, act, exclude, by_name["auto_mixprecision"]
+            )
+        else:
+            quantized = quantize_full_qdq(
+                work,
+                calibration_data=calibration,
+                activation_dtype=act_dtype,
+                exclude_nodes=exclude,
+                method=act.calibration_method,
+            )
 
         # Post-quantization passes, which compare against the float model.
         if "adaquant" in by_name:
