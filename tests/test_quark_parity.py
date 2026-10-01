@@ -158,6 +158,10 @@ def _run(model, x):
     import onnxruntime as ort
 
     so = ort.SessionOptions()
+    # No graph optimizations: ORT would otherwise fuse DQ -> MatMul/Conv -> Q into
+    # integer kernels that saturate on x86 CPUs without VNNI (CI runners), making
+    # results depend on the host rather than on the quantization.
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     lib = _ops_lib()
     if lib:
         so.register_custom_ops_library(lib)
