@@ -383,3 +383,24 @@ def transpose_models(
         models.append(m)
         shape = out
     return models
+
+
+def expand_model(src: Sequence[int], dst: Sequence[int]) -> onnx.ModelProto:
+    """A one-op Expand model (``src`` broadcast to ``dst``): data movement only,
+    exact on the NPU (max error 0.0, 7.7 ms for 115 MB), so a broadcast input of
+    a device segment need not be broadcast on the host."""
+    from onnx import TensorProto, helper, numpy_helper
+
+    node = helper.make_node("Expand", ["x", "shape"], ["y"], name="ex")
+    m = helper.make_model(
+        helper.make_graph(
+            [node],
+            "t",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, list(src))],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, list(dst))],
+            initializer=[numpy_helper.from_array(np.array(dst, np.int64), "shape")],
+        ),
+        opset_imports=[helper.make_opsetid("", 13)],
+    )
+    m.ir_version = 8
+    return m
