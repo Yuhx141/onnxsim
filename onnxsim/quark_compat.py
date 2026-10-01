@@ -33,10 +33,18 @@ names and preset *meanings*, not copied.
 - Block formats (``BFP16``, ``MX4/6/9``, ``MXFP4/6/8``, ``MXINT8``): the
   *weights* of MatMul/Gemm/Conv are fake-quantized offline with
   :mod:`onnxsim.quark_block_formats` (bit-exact against Quark's CPU kernels)
-  and stored back as float32, blocks along the reduction axis. Quark also
-  inserts runtime custom ops (domain ``com.vai.quantize``) that quantize
-  *activations*; onnxsim has no such op, so activations stay float -- recorded
-  in ``last_approximations``. ``algo_config`` is not applied to block formats.
+  and stored back as float32, blocks along the reduction axis. The layers'
+  *activation* inputs get a ``com.amd.quark::BFPQuantizeDequantize`` /
+  ``MXQuantizeDequantize`` node -- the same op, domain and attributes Quark
+  emits -- so the model runs wherever Quark's ONNX custom-op library is
+  registered (``quark.onnx.operators.custom_ops.get_library_path()``);
+  **onnxsim cannot execute those nodes itself**. Verified against a build of
+  Quark's op library under ONNX Runtime: bit-identical to
+  :mod:`onnxsim.quark_block_formats`. Set
+  ``QConfig(..., extra_options={"BlockFormatActivations": False})`` for a
+  weights-only model that runs anywhere. Activation axis: 1 for Conv (NCHW
+  channels), -1 (the reduction axis) for MatMul / Gemm. ``algo_config`` is not
+  applied to block formats.
   Dynamic quantization raises ``NotImplementedError``.
 - ``algo_config``: SmoothQuant (``alpha``) and CLE run on the float model
   before quantization; AdaQuant (``num_iterations``, ``learning_rate``,
@@ -66,7 +74,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 import numpy as np
 import onnx
@@ -131,6 +139,65 @@ def _block_fn(dtype: str) -> Optional[Callable[[np.ndarray, int], np.ndarray]]:
         elem = dtype.replace("mxfp", "fp", 1)  # mxfp8_e4m3 -> fp8_e4m3
         return lambda a, ax: bf.mx(a, element_dtype=elem, axis=ax)
     return None
+
+
+_COP_DOMAIN = "com.amd.quark"
+
+
+def _block_op_short(dtype: str) -> str:
+    return (
+        "bfp"
+        if dtype == "bfp16"
+        else ("bfp_prime" if dtype in ("mx4", "mx6", "mx9") else "mx")
+    )
+
+
+def _block_node(dtype: str, x: str, y: str, axis: int) -> onnx.NodeProto:
+    """The ``com.amd.quark`` custom-op node Quark emits to quantize-dequantize
+    ``x`` in a block format (attributes as in its ``BFPAttributes`` /
+    ``MXAttributes`` defaults, rounding mode 2 = half to even)."""
+    if dtype == "bfp16":
+        op, attrs = (
+            "BFPQuantizeDequantize",
+            dict(
+                bfp_method="to_bfp",
+                axis=axis,
+                bit_width=16,
+                block_size=8,
+                rounding_mode=2,
+            ),
+        )
+    elif dtype in ("mx4", "mx6", "mx9"):
+        op, attrs = (
+            "BFPQuantizeDequantize",
+            dict(
+                bfp_method="to_bfp_prime",
+                axis=axis,
+                bit_width={"mx4": 11, "mx6": 13, "mx9": 16}[dtype],
+                block_size=16,
+                sub_block_size=2,
+                sub_block_shift_bits=1,
+                rounding_mode=2,
+            ),
+        )
+    else:
+        op, attrs = (
+            "MXQuantizeDequantize",
+            dict(
+                element_dtype=dtype.replace("mxfp", "fp", 1).replace("mxint8", "int8"),
+                axis=axis,
+                block_size=32,
+                rounding_mode=2,
+            ),
+        )
+    return onnx.helper.make_node(
+        op,
+        [x],
+        [y],
+        name=y,
+        domain=_COP_DOMAIN,
+        **attrs,  # type: ignore[arg-type]
+    )
 
 
 _BLOCK_DTYPES = {
@@ -412,37 +479,84 @@ class ModelQuantizer:
                 f"weight dtype {wt.dtype} with block-format activation {act.dtype} "
                 "has no onnxsim backend"
             )
-        if act.dtype in _BLOCK_DTYPES:
+        quantize_acts = act.dtype in _BLOCK_DTYPES and self.config.extra_options.get(
+            "BlockFormatActivations", True
+        )
+        if act.dtype in _BLOCK_DTYPES and not quantize_acts:
             self._approx(
-                f"{act.dtype} activations are not quantized (Quark inserts runtime "
-                "ops for them; onnxsim has none) -- weights only"
+                f"{act.dtype} activations are not quantized "
+                "(extra_options BlockFormatActivations=False) -- weights only"
+            )
+        elif quantize_acts:
+            self._approx(
+                f"{act.dtype} activations use com.amd.quark custom ops: the model "
+                "needs Quark's ONNX custom-op library to run (onnxsim cannot execute it)"
             )
         m = onnx.ModelProto()
         m.CopyFrom(model)
         inits = {t.name: t for t in m.graph.initializer}
         excluded = {e for e in self.config.exclude if isinstance(e, str)}
-        done = set()
+        done: Set[str] = set()
+        act_node: Dict[str, str] = {}  # activation tensor -> its quantized tensor
+        new_nodes: List[onnx.NodeProto] = []
         for node in m.graph.node:
-            if node.op_type not in ("MatMul", "Gemm", "Conv") or len(node.input) < 2:
-                continue
-            if node.name in excluded or node.output[0] in excluded:
-                continue
-            w = inits.get(node.input[1])
-            if w is None or w.data_type != onnx.TensorProto.FLOAT or w.name in done:
-                continue
-            arr = onnx.numpy_helper.to_array(w)
-            if arr.ndim < 2:
-                continue
-            if node.op_type == "Conv":
-                axis = 1  # [O, I/g, k...]: input channels
-            elif node.op_type == "Gemm":
-                trans_b = any(a.name == "transB" and a.i for a in node.attribute)
-                axis = 1 if trans_b else 0  # [N, K] vs [K, N]: the K axis
-            else:
-                axis = arr.ndim - 2  # MatMul B [..., K, N]: the K axis
-            w.CopyFrom(onnx.numpy_helper.from_array(fn(arr, axis), w.name))
-            done.add(w.name)
+            if node.op_type in ("MatMul", "Gemm", "Conv") and len(node.input) >= 2:
+                self._block_layer(
+                    node,
+                    inits,
+                    excluded,
+                    done,
+                    fn,
+                    quantize_acts,
+                    act.dtype,
+                    act_node,
+                    new_nodes,
+                )
+            new_nodes.append(node)
+        if act_node:
+            del m.graph.node[:]
+            m.graph.node.extend(new_nodes)
+            if not any(o.domain == _COP_DOMAIN for o in m.opset_import):
+                m.opset_import.append(onnx.helper.make_opsetid(_COP_DOMAIN, 1))
         return m
+
+    def _block_layer(
+        self,
+        node: onnx.NodeProto,
+        inits: Dict[str, onnx.TensorProto],
+        excluded: Set[str],
+        done: Set[str],
+        fn: Callable[[np.ndarray, int], np.ndarray],
+        quantize_acts: bool,
+        dtype: str,
+        act_node: Dict[str, str],
+        new_nodes: List[onnx.NodeProto],
+    ) -> None:
+        if node.name in excluded or node.output[0] in excluded:
+            return
+        w = inits.get(node.input[1])
+        if w is None or w.data_type != onnx.TensorProto.FLOAT or w.name in done:
+            return
+        arr = onnx.numpy_helper.to_array(w)
+        if arr.ndim < 2:
+            return
+        if node.op_type == "Conv":
+            axis, act_axis = 1, 1  # [O, I/g, k...]: input channels
+        elif node.op_type == "Gemm":
+            trans_b = any(a.name == "transB" and a.i for a in node.attribute)
+            axis, act_axis = (1 if trans_b else 0), -1  # the K axis
+        else:
+            axis, act_axis = arr.ndim - 2, -1  # MatMul B [..., K, N]: the K axis
+        w.CopyFrom(onnx.numpy_helper.from_array(fn(arr, axis), w.name))
+        done.add(w.name)
+        if quantize_acts:
+            x = node.input[0]
+            key = f"{x}\0{act_axis}"
+            if key not in act_node:
+                out = f"{x}/{_block_op_short(dtype)}"
+                act_node[key] = out
+                new_nodes.append(_block_node(dtype, x, out, act_axis))
+            node.input[0] = act_node[key]
 
     def _approx(self, msg: str) -> None:
         self.last_approximations.append(msg)
