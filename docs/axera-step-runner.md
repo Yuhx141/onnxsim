@@ -705,3 +705,46 @@ removes the dependence on a calibrated range:
 (gradient cosines unchanged at 0.995 to 0.997.) Any tensor that is a loss
 term or a sum should be FP32 or recalibrated per step; a range calibrated on one
 batch is not a bound on the next.
+
+### Training on the device with the state resident (`--train-steps`)
+
+`--train-steps 0,1,2,3` trains across dataset steps with the weights and Adam
+`m` and `v` (126 tensors, 140 MB) staying on the device: a step's updated state
+tensors are the next step's state inputs (`run(keep_device=...)` returns them as
+`DeviceTensor`s; the output name prefix alternates per step so a state tensor and
+its update never share a buffer, and the previous step's state is freed after
+use). Only the 7 per-step inputs (data, teacher logits, labels, learning rate,
+...: 9.8 MB) go in and the loss comes out. `--train-validate` also runs a float
+chain (its own state carried the same way) and a float step on the device's own
+state.
+
+AX8850, final configuration (16-bit chains, FP32 optimizer, FP32 elementwise
+and loss reductions, resident), no validation downloads: **10.4 s per step
+steady state** (14.8 s for the first, which loads the models), from 11.5 s with
+the state staged; host-only float is 6.6 s. Validated over the four real steps:
+
+| step | loss (device) | float chain | float at the device's state | gradient cosine at the device's state | gradient cosine vs float chain |
+|---|---|---|---|---|---|
+| 0 | 17.041 | 17.058 | 17.058 | 0.99687 | 0.99687 |
+| 1 | 17.377 | 17.339 | 17.367 | 0.99605 | 0.94498 |
+| 2 | 17.540 | 17.496 | 17.502 | 0.99622 | 0.84259 |
+| 3 | 17.454 | 17.553 | 17.429 | 0.99795 | 0.68508 |
+
+At the device's own state the gradients stay at 0.996 to 0.998 and the loss
+follows the float loss at that state, so the device computation stays accurate
+across steps and the state is carried correctly. The drop against the float chain
+is trajectory divergence: Adam's first updates are close to `lr * sign(g)`, so
+gradient errors flip the sign of small-gradient elements (update cosine 0.85 at
+step 0) and the two chains' weights part (largest weight relative difference
+1.6% after four steps), after which they see different gradients. A float
+implementation with different rounding diverges the same way.
+
+### The second `0x1ef0` record of the 3x3 Conv chains (partial)
+
+For the refused forward 3x3 Convs the second `0x1ef0` record, over five builds at
+different calibrations, is `-round(zb * sb / sy * 2^14)` when the MatMul and output
+zero points are 0 (two builds, exact: `zb`, `sb` the bias's zero point and scale,
+`sy` the output scale). With nonzero zero points an extra term appears that is not
+linear in the zero points (its coefficient is 7.4 in one pair of builds and 1.0 in
+another, which suggests saturating arithmetic), so these chains are not yet
+recalibrated and keep their template scales.

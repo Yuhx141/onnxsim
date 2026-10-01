@@ -1771,6 +1771,13 @@ class ResidentEnv(dict):
     def get(self, key, default=None):
         return self[key] if key in self else default
 
+    def release_uploads(self, keep=()) -> None:
+        """Free the device copies of the host-array feeds uploaded this run."""
+        for key in list(self.uploaded):
+            if key not in keep:
+                self.session.tdel("h:" + key)
+        self.uploaded.clear()
+
     def pop(self, key, *default):
         v = dict.pop(self, key, *default) if default else dict.pop(self, key)
         if isinstance(v, DeviceTensor):
@@ -1807,6 +1814,9 @@ class StepRunner:
         self.path_counts: collections.Counter = collections.Counter()
         self.model_cache: dict[bytes, object] = {}
         self._cached_bytes = 0
+        # device tensor name prefix of this run's outputs; a training loop
+        # alternates it so a state tensor and its update never share a buffer
+        self.prefix = "d"
         # segment name -> (device Transpose blobs, final shape) for the 16-bit
         # chains whose trailing Transpose runs on the device
         self.post_chain: dict[str, tuple[list[bytes], tuple[int, ...]]] = {}
@@ -1998,7 +2008,7 @@ class StepRunner:
                         self.session.tput("h:" + t, a)
                         env.uploaded.add(t)
                     names.append("h:" + t)
-            outs = ["d:" + t for t in seg.outputs]
+            outs = [f"{self.prefix}:" + t for t in seg.outputs]
             pc = self.post_chain.get(seg.name)
             if pc is None:
                 self.session.run_t(m, names, outs)
@@ -2151,6 +2161,7 @@ class StepRunner:
         keep: Sequence[str] = (),
         progress: bool = False,
         stats_out: list | None = None,
+        keep_device: Sequence[str] = (),
     ) -> tuple[dict[str, np.ndarray], list[SegStat]]:
         env: dict[str, np.ndarray] = (
             ResidentEnv(feeds, self.session) if self.resident else dict(feeds)
@@ -2279,7 +2290,15 @@ class StepRunner:
                 print(
                     f"  node {k}/{len(self.nodes)} {time.time() - t0:.1f}s", flush=True
                 )
-        return {t: env[t] for t in keep_set if t in env}, stats
+        on_device = set(keep_device) if self.resident else set()
+        result = {
+            t: env.raw(t) if t in on_device and isinstance(env, ResidentEnv) else env[t]
+            for t in keep_set | on_device
+            if t in env
+        }
+        if isinstance(env, ResidentEnv):
+            env.release_uploads()
+        return result, stats
 
     def release_models(self) -> None:
         """Unload the models kept loaded across runs."""
@@ -2929,6 +2948,103 @@ def replace_with_fp32_nodes(
     return out, blobs
 
 
+def run_train_loop(
+    runner: "StepRunner",
+    model: onnx.ModelProto,
+    ref: Mapping,
+    steps: Sequence[int],
+    validate: bool,
+) -> list[dict]:
+    """Train on the device across ``steps`` of the calibration dataset with the
+    weights and Adam state staying on the device: step k's updated state tensors
+    are step k+1's state inputs, and only the loss (and, when validating, the
+    gradients and updates) cross to the host. ``validate`` also runs a float
+    chain (its own state carried the same way) and reports how the device loop
+    follows it."""
+    session = runner.session
+    sm = ref["state_map"]
+    grad_names = gradient_tensors(model, sm)
+    loss_name = "distill__add_27"
+    weights = [w for w in sm if not w.endswith(("__m", "__v"))]
+    dev_state: dict[str, DeviceTensor] = {}
+    fstate: dict[str, np.ndarray] = {}
+    prev_w: dict[str, np.ndarray] = {}
+    results = []
+    runner.resident = True
+    for i, k in enumerate(steps):
+        data = load_step_feeds(k)
+        feeds: dict = {t: v for t, v in data.items() if t not in sm}
+        feeds.update(dev_state if i else {w: data[w] for w in sm})
+        runner.prefix = f"d{i % 2}"
+        keep = [loss_name] + (list(grad_names.values()) if validate else [])
+        t0 = time.time()
+        outs, _ = runner.run(
+            feeds,
+            "npu",
+            check=False,
+            keep=keep,
+            keep_device=[sm[w] for w in sm],
+        )
+        wall = time.time() - t0
+        new_state = {w: outs[sm[w]] for w in sm}
+        row = {
+            "step": k,
+            "wall_s": round(wall, 2),
+            "loss": float(np.ravel(outs[loss_name])[0]),
+        }
+        if validate:
+            ffeeds = {t: v for t, v in data.items() if t not in sm}
+            ffeeds.update(fstate if i else {w: data[w] for w in sm})
+            fouts, _ = StepRunner(model, []).run(
+                ffeeds,
+                "float",
+                keep=[loss_name]
+                + list(grad_names.values())
+                + [sm[w] for w in sm],
+            )
+            gcos = [
+                cos(outs[t], fouts[t]) for w, t in grad_names.items()
+            ]
+            base = prev_w if i else {w: data[w] for w in weights}
+            ucos, ulen = [], []
+            for w in weights:
+                nw = session.tget(new_state[w].name, new_state[w].dtype, new_state[w].shape)
+                d_dev = nw.astype(np.float64) - base[w]
+                d_ref = np.asarray(fouts[sm[w]], np.float64) - base[w]
+                ucos.append(cos(d_dev, d_ref))
+                ulen.append(rel_err(nw, fouts[sm[w]]))
+            # the gradient error at the device's own state: the float step run
+            # on the state the device started this step from
+            if i:
+                sstate = {w: session.tget(t.name, t.dtype, t.shape) for w, t in feeds.items() if isinstance(t, DeviceTensor)}
+            else:
+                sstate = {w: data[w] for w in sm}
+            same_feeds = {t: v for t, v in data.items() if t not in sm}
+            same_feeds.update(sstate)
+            souts, _ = StepRunner(model, []).run(
+                same_feeds, "float", keep=[loss_name] + list(grad_names.values())
+            )
+            gcos_same = [cos(outs[t], souts[t]) for t in grad_names.values()]
+            row.update(
+                grad_cos_same_state_median=float(np.nanmedian(gcos_same)),
+                loss_float_same_state=float(np.ravel(souts[loss_name])[0]),
+                loss_float=float(np.ravel(fouts[loss_name])[0]),
+                grad_cos_median=float(np.nanmedian(gcos)),
+                update_cos_median=float(np.nanmedian(ucos)),
+                weight_rel_err_max=float(np.nanmax(ulen)),
+            )
+            prev_w = {w: session.tget(new_state[w].name, new_state[w].dtype, new_state[w].shape).astype(np.float64) for w in weights}
+            fstate = {w: np.asarray(fouts[sm[w]], np.float32) for w in sm}
+        for t in dev_state.values():  # the previous step's state, consumed
+            session.tdel(t.name)
+        dev_state = new_state
+        results.append(row)
+        print("  train", json.dumps(row), flush=True)
+    for t in dev_state.values():
+        session.tdel(t.name)
+    return results
+
+
 def load_records(path: str = STEP_OPS) -> list[dict]:
     with gzip.open(path, "rt") as f:
         return json.load(f)
@@ -3207,6 +3323,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "float run for the outputs of these nodes",
     )
     p.add_argument(
+        "--train-steps",
+        default="",
+        help="train on the device across these dataset steps (e.g. 0,1,2,3) with "
+        "the weights and Adam state staying on the device",
+    )
+    p.add_argument(
+        "--train-validate",
+        action="store_true",
+        help="with --train-steps: also run a float chain and report how the "
+        "device loop follows it (downloads gradients and weights every step)",
+    )
+    p.add_argument(
         "--steps",
         default="0",
         help="comma-separated training steps of the calibration dataset to run "
@@ -3352,7 +3480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sg.quantize_device_io = False
                 sg.in_q, sg.out_q = [], []
     u16_info: dict = {}
-    post_blobs: dict | None = {} if args.resident else None
+    post_blobs: dict | None = {} if (args.resident or args.train_steps) else None
     if args.u16_matmul:
         blobs.update(
             build_u16_segments(
@@ -3389,6 +3517,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "host_reasons": _reason_counts(host),
     }
     t0 = time.time()
+    if args.train_steps:
+        import axcl_session
+
+        with axcl_session.AXSession() as sess:
+            runner = StepRunner(model, segs, sess, None, 0)
+            runner._emitted.update(blobs)
+            runner.post_chain = {k: v for k, v in (post_blobs or {}).items() if v[0]}
+            results = run_train_loop(
+                runner,
+                model,
+                ref,
+                [int(x) for x in args.train_steps.split(",")],
+                args.train_validate,
+            )
+            runner.release_models()
+        with open(args.out, "w") as f:
+            json.dump(results, f, indent=1)
+        return 0
     if args.u16_recal:
         import axcl_session
 
