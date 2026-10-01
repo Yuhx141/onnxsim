@@ -578,3 +578,82 @@ The Softmax, Log, Neg and ReduceSum 16-bit segments need their own record
 roles. The ranges of a chain's intermediates (its MatMul output) depend on
 the step's data, so a loop applies them with delayed scaling (the previous
 step's ranges with headroom), as `--u16-margin` does for one step.
+
+### Keeping tensors on the device (`--resident`)
+
+The guest runner (`vm/axcl_batch_runner.c`) now has a device-side tensor store:
+`TPUT`/`TGET`/`TDEL`/`TCLEAR` and `RUNT`, which takes a model's inputs from named
+device tensors and stores its outputs under names by device-to-device copy, so
+tensors pass between models without crossing the VM boundary (`AXSession.tput`,
+`tget`, `tdel`, `run_t`; `AXSession` rebuilds the runner when its source
+changes). `--mode npu --no-check --resident` runs every segment that needs no
+host work this way: a `ResidentEnv` holds host arrays and `DeviceTensor`s, a
+device segment reads the raw entry, and a tensor is downloaded only when a host
+op or a staged segment reads it. The device holds at least 6 GiB of tensors.
+
+The 16-bit chains' trailing Transpose (cut off to keep the chain's output at 16
+bits) now runs as its own Transpose-only model: a Transpose model is
+bit-exact on the NPU (max error 0.0 at U8, U16 and FP32; 5.7 ms for
+`[16,112,112,64]`), so it adds no error. Small loaded models are kept loaded and
+shared by every segment with the same blob.
+
+AX8850, whole step, `--no-check --health-every 0`: **38.8 s resident against
+58.4 s staged** (host-only float: 6.6 s), and **all 42 gradients are bit-identical**
+to the staged run. Per-command time left: staged `RUN` 12.0 s (49 segments in
+296 calls: scalar-broadcast inputs and tiled mask products that need host
+broadcasting), `RUNT` 8.6 s (4.1 s of it engine), model load 4.7 s (516 loads of
+the large chains), tensor upload 3.9 s and download 3.1 s (1.5 GB each; the
+weights and optimizer state would stay on the device across steps). The next
+steps are device-side broadcast for the staged segments, binding the tensor
+store's buffers to the model I/O instead of copying, and keeping the state on the
+device across steps.
+
+`RUNT` binds the named tensors' device buffers directly as the model's input and
+output buffers instead of copying them (`axclrtEngineSetInputBufferByIndex` /
+`SetOutputBufferByIndex`; a plain `RUN` rebinds the model's own buffers first).
+That takes the `RUNT` time from 8.6 s to 4.5 s over the step, at the 4.1 s of
+engine time, and the gradients stay bit-identical to the staged run. (The
+wall-clock figure above was measured before this change; the next measurement is
+taken with the machine otherwise idle.)
+
+### FP32 nodes instead of the staged 8-bit templates (`--fp32-elementwise`)
+
+The 49 segments that still staged in resident mode were the planner's 8-bit
+`elementwise`, `binary_precision` and `mul_mask_exact` templates for plain
+Mul/Add/Sub/Div nodes: they tile, pack or broadcast their inputs on the host.
+`--fp32-elementwise elementwise,binary_precision,mul_mask_exact` swaps them for
+Pulsar2 FP32 one-node models (exact, no layout transforms, device-resident; 55
+segments, 24 builds, one per (operator, shapes) signature).
+
+AX8850, whole step, `--no-check --health-every 0 --resident --fp32-elementwise ...`
+(with the Pulsar2 rebuild still running on the host CPU): **20.4 s wall**, down
+from 58.4 s staged and 38.8 s resident (host-only float: 6.6 s). Segments still
+on the staged path: 7. Gradient cosine 0.9969, update cosine 0.845 (was 0.823),
+loss 17.039 against 17.058 float (was 17.004); the 8-bit mask products were a
+small error source. Time left by command: model load 4.9 s (509 loads of the
+large chains), `RUNT` 4.6 s (the 4.1 s engine floor), staged `RUN` 3.2 s (11 calls),
+tensor upload 1.9 s and download 1.3 s, unload 1.0 s.
+
+### Lazy model I/O and models kept loaded (`LOADT`, `--repeat`)
+
+`RUNT` binds tensor-store buffers, so a model's own I/O buffers (tens of MB for
+the large chains) were allocated at load and never used. `LOADT` loads a model
+without them; a plain `RUN` allocates them on first use. A lazily loaded
+model costs only its weights and code (all 62 MB of 16-bit builds), so the
+runner now keeps loaded models across runs (`--repeat N` runs the step N times
+and reports each wall time).
+
+AX8850, whole step, `--no-check --health-every 0 --resident --fp32-elementwise ...
+--repeat 3` (gradients bit-identical to the previous resident run):
+
+| | wall |
+|---|---|
+| first run (loads the models) | 15.2 s |
+| steady state, runs 2 and 3 | **11.5 s, 11.7 s** |
+| staged (before this work) | 58.4 s |
+| host-only float | 6.6 s |
+
+The steady state is 1.75x the host-only run; 4.1 s of it is `axclrtEngineExecute`.
+What is left per step (3 runs): `RUNT` 4.8 s, staged `RUN` 2.4 s (about 10
+segments), tensor upload 1.6 s and download 1.0 s (the weights and optimizer state
+would stay on the device across steps), `TDEL` 0.5 s, and the host's own Python.

@@ -222,6 +222,11 @@ def _vm_share(vm: str, device: str = "share") -> tuple[str, str]:
     return src, path
 
 
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 class AXSession:
     def __init__(
         self,
@@ -242,6 +247,8 @@ class AXSession:
         self._seq = itertools.count()
         self.exec_us = 0
         self.runs = 0
+        self.timing: dict[str, list[float]] = {}  # command -> [calls, seconds]
+        self.bytes = {"put": 0, "get": 0}
         self._resident_inputs: dict[int, set[int]] = {}
 
     # -- lifecycle ---------------------------------------------------------
@@ -262,7 +269,11 @@ class AXSession:
 
     def __enter__(self) -> AXSession:
         os.makedirs(os.path.join(self.host_dir, "t"), exist_ok=True)
-        if not os.path.exists(os.path.join(self.host_dir, "axrun")):
+        shared_src = os.path.join(self.host_dir, "axcl_batch_runner.c")
+        stale = not os.path.exists(os.path.join(self.host_dir, "axrun")) or (
+            not os.path.exists(shared_src) or _read_bytes(shared_src) != _read_bytes(RUNNER_SRC)
+        )
+        if stale:  # a new runner source (e.g. the tensor-store commands)
             self.build_runner()
         if self._lock_wanted:
             import fcntl  # POSIX-only; imported here so this module (and its tests) import on Windows
@@ -317,15 +328,24 @@ class AXSession:
         return line
 
     def _cmd(self, text: str) -> str:
+        t0 = time.perf_counter()
         self._proc.stdin.write(text + "\n")
         self._proc.stdin.flush()
         line = self._line()
+        rec = self.timing.setdefault(text.split(" ", 1)[0], [0, 0.0])
+        rec[0] += 1
+        rec[1] += time.perf_counter() - t0
         if line.startswith("ERR"):
             raise DeviceError(line)
         return line
 
     # -- models ------------------------------------------------------------
-    def load(self, model: bytes | str, schedule_path: str | None = None) -> Model:
+    def load(
+        self,
+        model: bytes | str,
+        schedule_path: str | None = None,
+        lazy_io: bool = False,
+    ) -> Model:
         """Load an AX model, optionally enforcing its Pulsar-free schedule."""
         n = next(self._seq)
         name = f"m{n}.axmodel"
@@ -335,7 +355,7 @@ class AXSession:
                 f.write(model)
         else:
             shutil.copy(model, dst)
-        head = self._cmd(f"LOAD {self.guest_dir}/{name}")
+        head = self._cmd(f"{'LOADT' if lazy_io else 'LOAD'} {self.guest_dir}/{name}")
         m = Model(id=int(head.split()[1]), path=dst)
         while (line := self._line()) != "END":
             kind, _, tname, nbytes, dt, *dims = line.split()
@@ -356,6 +376,41 @@ class AXSession:
                     pass
                 raise
         return m
+
+    # -- device tensor store: tensors that stay on the device between models --
+    def tput(self, name: str, x: np.ndarray) -> None:
+        """Upload ``x`` as the device tensor ``name``."""
+        buf = np.ascontiguousarray(x).tobytes()
+        self.bytes["put"] += len(buf)
+        with open(os.path.join(self.host_dir, "t", "put.bin"), "wb") as f:
+            f.write(buf)
+        self._cmd(f"TPUT {name} {self.guest_dir}/t/put.bin {len(buf)}")
+
+    def tget(self, name: str, dtype, shape) -> np.ndarray:
+        """Download the device tensor ``name``."""
+        self._cmd(f"TGET {name} {self.guest_dir}/t/get.bin")
+        a = np.fromfile(os.path.join(self.host_dir, "t", "get.bin"), dtype=dtype)
+        self.bytes["get"] += a.nbytes
+        return a.reshape(shape) if shape else a
+
+    def tdel(self, name: str) -> None:
+        self._cmd(f"TDEL {name}")
+
+    def tclear(self) -> None:
+        self._cmd("TCLEAR")
+
+    def run_t(self, m: Model, in_names: list[str], out_names: list[str]) -> None:
+        """Run ``m`` on device tensors: each input is the named tensor, each
+        output is stored under the given name (``-`` drops it). Nothing crosses
+        the VM boundary."""
+        if len(in_names) != len(m.inputs) or len(out_names) != len(m.outputs):
+            raise ValueError("run_t: tensor names do not match the model's inputs/outputs")
+        line = self._cmd(
+            f"RUNT {m.id} {len(in_names)} {' '.join(in_names)} "
+            f"{len(out_names)} {' '.join(out_names)}"
+        )
+        self.exec_us += int(line.split()[1])
+        self.runs += 1
 
     def unload(self, m: Model) -> None:
         self._cmd(f"UNLOAD {m.id}")

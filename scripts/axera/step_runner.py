@@ -30,6 +30,7 @@ per-segment check that the emitted model computes what the template claims.
 from __future__ import annotations
 
 import argparse
+import collections
 import dataclasses
 import gzip
 import hashlib
@@ -1728,6 +1729,59 @@ class SegStat:
     fallback_reason: str = ""
 
 
+@dataclasses.dataclass(frozen=True)
+class DeviceTensor:
+    """A tensor held on the device by the guest runner's tensor store."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: np.dtype
+
+    @property
+    def nbytes(self) -> int:
+        return int(np.prod(self.shape, dtype=np.int64)) * np.dtype(self.dtype).itemsize
+
+
+class ResidentEnv(dict):
+    """The runner's tensor environment when segments chain on the device
+    (``--resident``): a value is a host array or a ``DeviceTensor``. Reading a
+    ``DeviceTensor`` through ``[]`` or ``get`` downloads it (and keeps the
+    download); device segments read the raw entry instead, so a tensor only
+    crosses the VM boundary when something on the host asks for it."""
+
+    def __init__(self, items, session):
+        super().__init__(items)
+        self.session = session
+        self.uploaded: set[str] = set()  # host-array tensors also on the device
+        self.host_cache: dict[str, np.ndarray] = {}
+
+    def raw(self, key):
+        return dict.__getitem__(self, key)
+
+    def __getitem__(self, key):
+        v = dict.__getitem__(self, key)
+        if isinstance(v, DeviceTensor):
+            a = self.host_cache.get(key)
+            if a is None:
+                a = self.session.tget(v.name, v.dtype, v.shape).astype(np.float32)
+                self.host_cache[key] = a
+            return a
+        return v
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+    def pop(self, key, *default):
+        v = dict.pop(self, key, *default) if default else dict.pop(self, key)
+        if isinstance(v, DeviceTensor):
+            self.session.tdel(v.name)
+        elif key in self.uploaded:
+            self.uploaded.discard(key)
+            self.session.tdel("h:" + key)
+        self.host_cache.pop(key, None)
+        return v
+
+
 class StepRunner:
     """Execute ``model`` node by node, NPU segments on the device (``mode``
     ``"npu"``), simulated on the host (``"sim"``), or everything in float
@@ -1749,6 +1803,14 @@ class StepRunner:
         self.health_every = health_every
         self.fallback_on_failure = fallback_on_failure
         self.device_runs = 0
+        self.resident = False  # chain segments on the device (ResidentEnv)
+        self.path_counts: collections.Counter = collections.Counter()
+        self.model_cache: dict[bytes, object] = {}
+        self._cached_bytes = 0
+        # segment name -> (device Transpose blobs, final shape) for the 16-bit
+        # chains whose trailing Transpose runs on the device
+        self.post_chain: dict[str, tuple[list[bytes], tuple[int, ...]]] = {}
+        self._const_uploaded: set[str] = set()
         self.stalled: list[str] = []
         self.nodes = list(model.graph.node)
         self.index = {n.name: k for k, n in enumerate(self.nodes)}
@@ -1859,8 +1921,131 @@ class StepRunner:
             for o, qq in zip(outs, seg.out_q or [None] * len(outs))
         ]
 
+    _CACHE_BYTES = 8_000_000  # without lazy I/O buffers: a model with less I/O stays loaded
+    _CACHE_MODELS = 1200
+    _CACHE_BLOB_BYTES = 3_000_000_000  # total model bytes kept loaded
+
+    def _load(self, seg: Segment):
+        """The loaded model of ``seg``; small models are kept loaded and shared
+        by every segment with the same blob (many FP32 templates are)."""
+        return self._load_blob(self.emitted(seg))
+
+    def _load_blob(self, blob: bytes):
+        if not self.resident:
+            return self.session.load(blob), False
+        key = hashlib.sha1(blob).digest()
+        m = self.model_cache.get(key)
+        if m is not None:
+            return m, True
+        m = self.session.load(blob, lazy_io=True)
+        if (
+            len(self.model_cache) < self._CACHE_MODELS
+            and self._cached_bytes + len(blob) <= self._CACHE_BLOB_BYTES
+        ):
+            self.model_cache[key] = m
+            self._cached_bytes += len(blob)
+            return m, True
+        return m, False
+
+    def _release(self, m, cached: bool) -> None:
+        if not cached:
+            self.session.unload(m)
+
+    def _pure(self, seg: Segment) -> bool:
+        """A segment whose host-side work is only moving float tensors in and
+        out of one model, so it can read and write the device tensor store."""
+        return not (
+            seg.input_transforms
+            or (seg.output_transform is not None and seg.name not in self.post_chain)
+            or seg.batch_split > 1
+            or seg.output_shape
+            or seg.output_take is not None
+            or seg.quantize_device_io
+            or seg.nan_guard
+            or seg.kind in ("algebraic_identity", "algebraic_constant", "safe_masked_div")
+        )
+
+    def _device_resident(self, seg: Segment, env) -> list | None:
+        """Run ``seg`` on tensors that stay on the device; None when it needs
+        the host path (then ``_device`` downloads what it reads)."""
+        if not self._pure(seg):
+            return None
+        m, cached = self._load(seg)
+        try:
+            if len(m.inputs) != len(seg.inputs) or len(m.outputs) != len(seg.outputs):
+                return None
+            names = []
+            for t, spec in zip(seg.inputs, m.inputs):
+                if t in seg.constant_inputs:
+                    if t not in self._const_uploaded:
+                        v = np.asarray(self.host.inits[t], dtype=np.float32)
+                        if v.nbytes != spec.nbytes:
+                            return None
+                        self.session.tput("c:" + t, v.astype(spec.dtype))
+                        self._const_uploaded.add(t)
+                    names.append("c:" + t)
+                    continue
+                v = env.raw(t)
+                if isinstance(v, DeviceTensor):
+                    if v.nbytes != spec.nbytes or np.dtype(v.dtype) != np.dtype(spec.dtype):
+                        return None
+                    names.append(v.name)
+                else:
+                    if t not in env.uploaded:
+                        a = np.ascontiguousarray(v, dtype=spec.dtype)
+                        if a.nbytes != spec.nbytes:
+                            return None
+                        self.session.tput("h:" + t, a)
+                        env.uploaded.add(t)
+                    names.append("h:" + t)
+            outs = ["d:" + t for t in seg.outputs]
+            pc = self.post_chain.get(seg.name)
+            if pc is None:
+                self.session.run_t(m, names, outs)
+            else:
+                cur = f"p:{seg.outputs[0]}:0"
+                self.session.run_t(m, names, [cur])
+                for k, tb in enumerate(pc[0]):
+                    tm, tcached = self._load_blob(tb)
+                    try:
+                        nxt = outs[0] if k == len(pc[0]) - 1 else f"p:{seg.outputs[0]}:{k + 1}"
+                        self.session.run_t(tm, [cur], [nxt])
+                    finally:
+                        self._release(tm, tcached)
+                    self.session.tdel(cur)
+                    cur = nxt
+        finally:
+            self._release(m, cached)
+        want = {o.name: o for o in self.model.graph.value_info}
+        res = []
+        for t, spec, name in zip(seg.outputs, m.outputs, outs):
+            vi = want.get(t)
+            shape = (
+                tuple(d.dim_value for d in vi.type.tensor_type.shape.dim) if vi else ()
+            )
+            if seg.name in self.post_chain:
+                shape = tuple(self.post_chain[seg.name][1])
+            elif not shape or int(np.prod(shape)) * np.dtype(spec.dtype).itemsize != spec.nbytes:
+                shape = tuple(spec.shape)
+            res.append(DeviceTensor(name, shape, np.dtype(spec.dtype)))
+        return res
+
     def _device(self, seg: Segment, env: Mapping[str, np.ndarray]) -> list[np.ndarray]:
-        m = self.session.load(self.emitted(seg))
+        if self.resident:
+            r = self._device_resident(seg, env)
+            self.path_counts[(seg.kind, "resident" if r is not None else "staged")] += 1
+            if r is not None:
+                return r
+            if not self._pure(seg):
+                why = (
+                    "input_transforms" if seg.input_transforms
+                    else "output_transform" if seg.output_transform is not None
+                    else "batch_split" if seg.batch_split > 1
+                    else "output_shape" if seg.output_shape
+                    else "other"
+                )
+                self.path_counts[(why, "why")] += 1
+        m, cached = self._load(seg)
         try:
             ins = []
             for t in seg.inputs:
@@ -1939,7 +2124,7 @@ class StepRunner:
             else:
                 ys = self.session.run(m, ins)
         finally:
-            self.session.unload(m)
+            self._release(m, cached)
         want = {o.name: o for o in self.model.graph.value_info}
         out = []
         for j, (t, y) in enumerate(zip(seg.outputs, ys)):
@@ -1967,7 +2152,9 @@ class StepRunner:
         progress: bool = False,
         stats_out: list | None = None,
     ) -> tuple[dict[str, np.ndarray], list[SegStat]]:
-        env: dict[str, np.ndarray] = dict(feeds)
+        env: dict[str, np.ndarray] = (
+            ResidentEnv(feeds, self.session) if self.resident else dict(feeds)
+        )
         keep_set = set(keep) | {o.name for o in self.model.graph.output}
         stats: list[SegStat] = stats_out if stats_out is not None else []
         t0 = time.time()
@@ -2093,6 +2280,13 @@ class StepRunner:
                     f"  node {k}/{len(self.nodes)} {time.time() - t0:.1f}s", flush=True
                 )
         return {t: env[t] for t in keep_set if t in env}, stats
+
+    def release_models(self) -> None:
+        """Unload the models kept loaded across runs."""
+        for m in self.model_cache.values():
+            self.session.unload(m)
+        self.model_cache.clear()
+        self._cached_bytes = 0
 
 
 def _rel(a, b) -> float:
@@ -2309,6 +2503,9 @@ def build_u16_segments(
     margin_pattern: str = "",
     margin: float = 1.3,
     fp32_pattern: str = "",
+    need_quant: bool = False,
+    info_out: dict | None = None,
+    post_blobs: dict | None = None,
 ) -> dict[str, bytes]:
     """Move the 8-bit segments of ``kinds`` whose name matches ``pattern`` to
     16-bit axmodels built on the reference batch's real tensors. Returns the
@@ -2367,6 +2564,7 @@ def build_u16_segments(
                     sub,
                     chunk,
                     precision,
+                    need_quant=need_quant and seg.kind == "matmul_chain",
                 )
             except Exception as exc:  # smaller batch, or stays 8-bit
                 print(
@@ -2375,12 +2573,47 @@ def build_u16_segments(
                     flush=True,
                 )
                 continue
+            if (
+                info_out is not None
+                and need_quant
+                and seg.kind == "matmul_chain"
+                and precision == "U16"
+            ):
+                tag = seg.name if split == 1 else f"{seg.name}_s{split}"
+                info_out[seg.name] = {
+                    "path": u16_chain.chain_cache_path(
+                        cache_dir, tag, sub, chunk, precision
+                    ),
+                    "sub": sub,
+                    "split": split,
+                    "flags": u16_chain.split_flags(full.graph.input, batch),
+                    "inputs": list(seg.inputs),
+                }
             done = (split, blob, post, chunk)
             break
         if done is None:
             continue
         split, blob, post, _ = done
         blobs[seg.name] = blob
+        if post is not None and split == 1 and post_blobs is not None:
+            try:
+                tms = u16_chain.transpose_models(post.pre_shape, post.steps)
+                post_blobs[seg.name] = (
+                    [
+                        u16_chain.cached_chain_axmodel(
+                            cache_dir,
+                            work,
+                            f"tr_{k}",
+                            tm,
+                            {"x": np.ones([d.dim_value for d in tm.graph.input[0].type.tensor_type.shape.dim], np.float32)},
+                            "U16",
+                        )
+                        for k, tm in enumerate(tms)
+                    ],
+                    post.final_shape,
+                )
+            except Exception as exc:  # the host applies the transpose
+                print(f"  device transpose {seg.name}: {type(exc).__name__}: {exc}"[:160], flush=True)
         seg.kind = "u16_chain"
         seg.in_q, seg.out_q = [], []
         seg.output_transform = post
@@ -2474,6 +2707,213 @@ def build_fp32_node_segments(
         if k % 50 == 0:
             print(f"  fp32 nodes {k + 1}/{len(nodes)} ({len(built)} builds)", flush=True)
     return segs, blobs
+
+
+WD_DATASET = "/home/takecheeze/npu-scratch/t6-r18fold/wd/dataset"
+"""The calibration dataset: the first 4 steps of a real training trajectory,
+every graph input of the step as one Numpy tar per tensor (one array per step)."""
+
+
+def load_step_feeds(k: int, directory: str = WD_DATASET) -> dict[str, np.ndarray]:
+    import io
+    import tarfile
+
+    feeds = {}
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".tar"):
+            continue
+        with tarfile.open(os.path.join(directory, name)) as tf:
+            members = sorted(tf.getmembers(), key=lambda m: m.name)
+            feeds[name[: -len(".tar")]] = np.load(
+                io.BytesIO(tf.extractfile(members[k]).read())
+            )
+    return feeds
+
+
+def _chain_samples(info: Mapping, outs: Mapping[str, np.ndarray]) -> dict:
+    """The chain's input tensors as calibration samples: one per batch chunk
+    for a chain built at a smaller batch, one otherwise."""
+    split = info["split"]
+    data = {t: np.asarray(outs[t], np.float32) for t in info["inputs"]}
+    if split == 1:
+        return {t: [a] for t, a in data.items()}
+    return {
+        t: [np.array_split(a, split)[j] if f else a for j in range(split)]
+        for (t, a), f in zip(data.items(), info["flags"])
+    }
+
+
+def run_recal_steps(
+    runner: "StepRunner",
+    model: onnx.ModelProto,
+    ref: Mapping,
+    u16_info: Mapping[str, Mapping],
+    policy: str,
+    steps: Sequence[int],
+    margin: float,
+) -> list[dict]:
+    """Run training steps of the calibration dataset on the device with the
+    16-bit MatMul/Conv chains recalibrated per step (``policy``):
+
+    * ``static``: the templates as built on the reference batch (step 0);
+    * ``delayed``: the previous step's ranges widened by ``margin`` (the first
+      step uses the template's own scales);
+    * ``exact``: the step's own ranges (an oracle; the ranges come from a float
+      run of the step).
+
+    A chain is moved with ``matmul_record_emit.recalibrate`` onto the scales
+    ``u16_chain.predict_scales16`` gives, with no Pulsar2 build. Reports each
+    step's gradient and update cosines against a float run of the same step."""
+    import matmul_record_emit as mre
+    import u16_chain
+
+    state_map = ref["state_map"]
+    grad_names = gradient_tensors(model, state_map)
+    loss_name = "distill__add_27"
+    results: list[dict] = []
+    prev_ranges: dict[str, dict] = {}
+    templates = {}
+    for name, info in u16_info.items():
+        templates[name] = (
+            mre.load_model(info["path"]),
+            mre.load_scales(info["path"] + ".quant.json"),
+        )
+    for k in steps:
+        feeds = load_step_feeds(k)
+        need = {t for i in u16_info.values() for t in i["inputs"]}
+        keep = (
+            sorted(need)
+            + list(grad_names.values())
+            + [loss_name]
+            + [o for w, o in state_map.items() if not w.endswith(("__m", "__v"))]
+        )
+        fouts, _ = StepRunner(model, []).run(feeds, "float", keep=keep)
+        ranges: dict[str, dict] = {}
+        moved = refused = 0
+        for name, info in u16_info.items():
+            ranges[name] = u16_chain.chain_ranges(
+                info["sub"], _chain_samples(info, fouts)
+            )
+            if policy == "static" or (policy == "delayed" and not prev_ranges):
+                runner._emitted.pop(name + "__recal", None)
+                continue
+            use = ranges[name] if policy == "exact" else prev_ranges[name]
+            m = margin if policy == "delayed" else 1.0
+            quant = info["path"] + ".quant.json"
+            tmpl, tscales = templates[name]
+            new = u16_chain.predict_scales16(quant, use, m)
+            try:
+                out, _ = mre.recalibrate(
+                    tmpl, tscales, {t: new[t] for t in tscales}
+                )
+                runner._emitted[name] = out.SerializeToString()
+                moved += 1
+            except Exception as exc:  # keep the template's scales
+                runner._emitted[name] = open(info["path"], "rb").read()
+                refused += 1
+                if refused <= 3:
+                    print(f"  recalibrate {name}: {type(exc).__name__}: {exc}"[:160])
+        prev_ranges = ranges
+        outs, stats = runner.run(
+            feeds, "npu", check=False, keep=list(grad_names.values()) + [loss_name]
+        )
+        fgrads = {w: np.asarray(fouts[t]) for w, t in grad_names.items()}
+        gcos = [cos(outs[t], fgrads[w]) for w, t in grad_names.items()]
+        results.append(
+            {
+                "step": k,
+                "policy": policy,
+                "chains_moved": moved,
+                "chains_refused": refused,
+                "grad_cos_median": float(np.nanmedian(gcos)),
+                "grad_cos_min": float(np.nanmin(gcos)),
+                "grad_nan": int(sum(not np.isfinite(c) for c in gcos)),
+                "loss": float(np.ravel(outs[loss_name])[0]),
+                "loss_float": float(np.ravel(fouts[loss_name])[0]),
+            }
+        )
+        print("  step", json.dumps(results[-1]), flush=True)
+    return results
+
+
+def replace_with_fp32_nodes(
+    model: onnx.ModelProto,
+    segs: Sequence[Segment],
+    kinds: Sequence[str],
+    cache_dir: str,
+) -> tuple[list[Segment], dict[str, bytes]]:
+    """Swap the one-node binary segments of ``kinds`` (8-bit templates that
+    need host-side tiling, packing or broadcasting) for Pulsar2 FP32 one-node
+    models: exact, no layout transforms, and device-resident. One build per
+    (operator, shapes) signature; a node whose build fails keeps its segment."""
+    import u16_chain
+
+    shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    shapes.update({t.name: tuple(int(d) for d in t.dims) for t in model.graph.initializer})
+    consts = {t.name for t in model.graph.initializer}
+    by_name = {n.name: n for n in model.graph.node}
+    work = os.path.join(cache_dir, "work")
+    built: dict[str, bytes | None] = {}
+    out: list[Segment] = []
+    blobs: dict[str, bytes] = {}
+    for seg in segs:
+        node = by_name.get(seg.nodes[0]) if len(seg.nodes) == 1 else None
+        if (
+            seg.kind not in kinds
+            or node is None
+            or node.op_type not in ("Add", "Sub", "Mul", "Div")
+            or len(node.output) != 1
+            or any(t not in shapes for t in (*node.input, *node.output))
+        ):
+            out.append(seg)
+            continue
+        sig = hashlib.sha256(
+            json.dumps(
+                [node.op_type, [shapes[t] for t in node.input], shapes[node.output[0]]],
+                default=list,
+            ).encode()
+        ).hexdigest()[:12]
+        if sig not in built:
+            try:
+                built[sig] = u16_chain.cached_chain_axmodel(
+                    cache_dir,
+                    work,
+                    f"fp32_{node.op_type}_{sig}",
+                    u16_chain.node_model(node, shapes),
+                    u16_chain.signature_data(node, shapes),
+                    "FP32",
+                )
+            except Exception as exc:
+                print(f"  fp32 {node.op_type} {sig}: {type(exc).__name__}: {exc}"[:200], flush=True)
+                built[sig] = None
+        if built[sig] is None:
+            out.append(seg)
+            continue
+        ins = list(node.input)
+        out.append(
+            Segment(
+                node.name,
+                "fp32_chain",
+                [node.name],
+                ins,
+                list(node.output),
+                f"Pulsar2 FP32 {node.op_type} replacing {seg.kind} on {[shapes[t] for t in ins]}",
+                lambda: onnx.ModelProto(),
+                [],
+                [],
+                constant_inputs=[t for t in ins if t in consts],
+            )
+        )
+        blobs[node.name] = built[sig]
+    print(
+        f"  {sum(1 for s in out if s.detail.startswith('Pulsar2 FP32') and 'replacing' in s.detail)} "
+        f"segments replaced by FP32 nodes ({len(built)} builds)",
+        flush=True,
+    )
+    return out, blobs
 
 
 def load_records(path: str = STEP_OPS) -> list[dict]:
@@ -2696,6 +3136,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         "outputs are not validated)",
     )
     p.add_argument(
+        "--resident",
+        action="store_true",
+        help="with --mode npu --no-check: chain the segments that need no host "
+        "work on the device's tensor store, so tensors cross the VM boundary only "
+        "when a host op reads them",
+    )
+    p.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="with --resident --no-check: run the step this many times (models "
+        "stay loaded) and report each run's wall time",
+    )
+    p.add_argument(
+        "--fp32-elementwise",
+        default="",
+        metavar="KINDS",
+        help="replace the one-node Add/Sub/Mul/Div segments of these kinds "
+        "(e.g. elementwise,binary_precision,mul_mask_exact), which need host "
+        "tiling or broadcasting as 8-bit templates, with FP32 one-node models",
+    )
+    p.add_argument(
         "--fp32-refused",
         action="store_true",
         help="also build the nodes the plan refuses (no template class or shape) "
@@ -2716,6 +3178,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "scaled by --u16-margin-factor (headroom for upstream segments' error)",
     )
     p.add_argument("--u16-margin-factor", type=float, default=1.3)
+    p.add_argument(
+        "--u16-recal",
+        default="",
+        choices=["", "static", "delayed", "exact"],
+        help="run --steps with the MatMul/Conv 16-bit chains recalibrated per "
+        "step onto the scales predicted from: static = the reference batch "
+        "(no recalibration), delayed = the previous step's ranges with "
+        "--u16-margin-factor headroom, exact = the step's own ranges",
+    )
+    p.add_argument(
+        "--steps",
+        default="0",
+        help="comma-separated training steps of the calibration dataset to run "
+        "(with --u16-recal)",
+    )
     p.add_argument(
         "--u16-fp32",
         default="",
@@ -2845,11 +3322,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         segs = [*segs, *extra]
         blobs.update(extra_blobs)
         print(f"  {len(extra)} refused nodes built as FP32; host: {sorted(host)}", flush=True)
+    if args.fp32_elementwise:
+        segs, extra_blobs = replace_with_fp32_nodes(
+            model, segs, args.fp32_elementwise.split(","), args.u16_cache_dir
+        )
+        blobs.update(extra_blobs)
     if args.exact_fp32_io:
         for sg in segs:
             if sg.quantize_device_io:
                 sg.quantize_device_io = False
                 sg.in_q, sg.out_q = [], []
+    u16_info: dict = {}
+    post_blobs: dict | None = {} if args.resident else None
     if args.u16_matmul:
         blobs.update(
             build_u16_segments(
@@ -2863,6 +3347,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.u16_margin,
                 args.u16_margin_factor,
                 args.u16_fp32,
+                args.u16_recal != "",
+                u16_info,
+                post_blobs,
             )
         )
     grad_names = gradient_tensors(model, ref["state_map"])
@@ -2883,6 +3370,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "host_reasons": _reason_counts(host),
     }
     t0 = time.time()
+    if args.u16_recal:
+        import axcl_session
+
+        with axcl_session.AXSession() as sess:
+            runner = StepRunner(model, segs, sess, None, 0)
+            runner._emitted.update(blobs)
+            results = run_recal_steps(
+                runner,
+                model,
+                ref,
+                u16_info,
+                args.u16_recal,
+                [int(x) for x in args.steps.split(",")],
+                args.u16_margin_factor,
+            )
+        with open(args.out, "w") as f:
+            json.dump(results, f, indent=1)
+        return 0
     if args.mode == "npu":
         import axcl_session
 
@@ -2897,15 +3402,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fallback_on_failure=args.fallback_on_failure,
             )
             runner._emitted.update(blobs)
+            runner.resident = args.resident
+            runner.post_chain = {k: v for k, v in (post_blobs or {}).items() if v[0]}
+            if args.resident and not args.no_check:
+                p.error("--resident needs --no-check (the checks read every tensor)")
             try:
-                outs, stats = runner.run(
-                    feeds,
-                    "npu",
-                    check=not args.no_check,
-                    keep=list(grad_names.values()),
-                    progress=True,
-                    stats_out=(stats := []),
-                )
+                run_walls = []
+                for _ in range(max(1, args.repeat)):
+                    t_run = time.time()
+                    stats = []
+                    outs, stats = runner.run(
+                        feeds,
+                        "npu",
+                        check=not args.no_check,
+                        keep=list(grad_names.values()),
+                        progress=True,
+                        stats_out=stats,
+                    )
+                    run_walls.append(time.time() - t_run)
+                report["run_walls_s"] = run_walls
+                runner.release_models()
                 report["health_after_lsb"] = axcl_session.health_check(sess)
             except axcl_session.DeviceStall as exc:
                 report["stall"] = {"error": str(exc), "suspects": runner.stalled}
@@ -2916,6 +3432,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
             report["device_exec_ms"] = sess.exec_us / 1000
             report["device_runs"] = sess.runs
+            report["session_timing"] = {
+                k: {"calls": int(v[0]), "seconds": round(v[1], 2)}
+                for k, v in sess.timing.items()
+            }
+            report["session_bytes"] = dict(sess.bytes)
+            report["resident_paths"] = {
+                f"{k[0]}:{k[1]}": v for k, v in sorted(runner.path_counts.items())
+            }
     else:
         runner = StepRunner(model, segs, None, args.emit_dir)
         outs, stats = runner.run(

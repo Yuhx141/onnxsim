@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 
@@ -104,6 +105,11 @@ def chain_model(
                 y = np.transpose(y, perm)
         return np.ascontiguousarray(y).reshape(final_shape)
 
+    # the same ops as device models: the chain's output shape, the stripped
+    # steps in order, and the final shape (see ``transpose_models``)
+    post.pre_shape = tuple(d.dim_value for d in vi.type.tensor_type.shape.dim)  # type: ignore[attr-defined]
+    post.steps = order  # type: ignore[attr-defined]
+    post.final_shape = final_shape  # type: ignore[attr-defined]
     return sub, post
 
 
@@ -160,7 +166,8 @@ def build_chain(
     if precision != "U8":
         # every op of the chain: a Concat/Add/Relu left at 8 bits after the
         # 16-bit MatMuls puts the 8-bit error back (legalized Convs)
-        ops = sorted({n.op_type for n in sub.graph.node} - PASSIVE_OPS)
+        types = {n.op_type for n in sub.graph.node}
+        ops = sorted(types - PASSIVE_OPS) or sorted(types)
         quant["layer_configs"] = [{"op_types": ops, "data_type": precision}]
         # an op type entry is not applied to a bias Add that follows the
         # MatMul (its output stayed 8-bit); select those by layer name
@@ -184,6 +191,24 @@ def build_chain(
     )
 
 
+def chain_cache_path(
+    cache_dir: str,
+    name: str,
+    sub: onnx.ModelProto,
+    data: Mapping[str, np.ndarray | list[np.ndarray]],
+    precision: str,
+) -> str:
+    """Where ``cached_chain_axmodel`` keeps the build of this graph,
+    calibration data and precision."""
+    h = hashlib.sha256(sub.SerializeToString())
+    h.update(precision.encode())
+    for k in sorted(data):
+        h.update(k.encode())
+        for a in data[k] if isinstance(data[k], list) else [data[k]]:
+            h.update(np.ascontiguousarray(a, np.float32).tobytes())
+    return os.path.join(cache_dir, f"{name}.{h.hexdigest()[:16]}.axmodel")
+
+
 def cached_chain_axmodel(
     cache_dir: str,
     work: str,
@@ -192,17 +217,14 @@ def cached_chain_axmodel(
     data: Mapping[str, np.ndarray | list[np.ndarray]],
     precision: str = "U16",
     image: str = DEFAULT_IMAGE,
+    need_quant: bool = False,
 ) -> bytes:
     """The compiled axmodel bytes, from ``cache_dir`` when the same graph,
-    calibration data and precision were built before."""
-    h = hashlib.sha256(sub.SerializeToString())
-    h.update(precision.encode())
-    for k in sorted(data):
-        h.update(k.encode())
-        for a in data[k] if isinstance(data[k], list) else [data[k]]:
-            h.update(np.ascontiguousarray(a, np.float32).tobytes())
-    path = os.path.join(cache_dir, f"{name}.{h.hexdigest()[:16]}.axmodel")
-    if os.path.exists(path):
+    calibration data and precision were built before. Every build also leaves
+    its ``quant_axmodel.json`` beside the axmodel (``<axmodel>.quant.json``);
+    with ``need_quant`` a cached axmodel without one is built again."""
+    path = chain_cache_path(cache_dir, name, sub, data, precision)
+    if os.path.exists(path) and (not need_quant or os.path.exists(path + ".quant.json")):
         with open(path, "rb") as f:
             return f.read()
     failed = path + ".failed"
@@ -228,6 +250,9 @@ def cached_chain_axmodel(
     os.makedirs(cache_dir, exist_ok=True)
     with open(path, "wb") as f:
         f.write(blob)
+    quant = os.path.join(os.path.dirname(res.axmodel_path), "quant", "quant_axmodel.json")
+    if os.path.exists(quant):
+        shutil.copyfile(quant, path + ".quant.json")
     return blob
 
 
@@ -270,11 +295,23 @@ def signature_data(node: onnx.NodeProto, shapes: Mapping[str, Sequence[int]]):
     }
 
 
+def chain_ranges(
+    sub: onnx.ModelProto, samples: Mapping[str, list[np.ndarray]]
+) -> dict[str, tuple[float, float]]:
+    """``{tensor: (min, max)}`` of every float tensor of ``sub`` over the
+    calibration ``samples`` (a list per graph input)."""
+    import step_calibration
+
+    return step_calibration.collect_ranges(sub, samples)
+
+
 def predict_scales16(
-    quant_json: str | Mapping, sub: onnx.ModelProto, data: Mapping[str, np.ndarray]
+    quant_json: str | Mapping,
+    ranges: Mapping[str, tuple[float, float]],
+    margin: float = 1.0,
 ) -> dict[str, tuple[float, float]]:
     """``{tensor: (scale, zero point)}`` Pulsar2 would assign a 16-bit chain
-    calibrated on ``data``, without building it.
+    whose tensors span ``ranges`` (widened by ``margin``), without building it.
 
     The rule, checked against native U16 builds of a bare MatMul and a forward
     Conv chain at two calibrations: a tensor that is (or shares a quantization
@@ -287,8 +324,6 @@ def predict_scales16(
     symmetric and which are grouped."""
     import json
 
-    import step_calibration
-
     if not isinstance(quant_json, Mapping):
         with open(quant_json) as f:
             quant_json = json.load(f)
@@ -297,11 +332,11 @@ def predict_scales16(
         for t, v in per_op.items():
             if t not in info or v["state"] != "OVERLAPPED":
                 info[t] = v
-    ranges = step_calibration.collect_ranges(sub, {t: [v] for t, v in data.items()})
     group: dict[int, list[float]] = {}
     for t, v in info.items():
         if t in ranges:
             lo, hi = ranges[t]
+            lo, hi = lo * margin, hi * margin
             g = group.setdefault(v["dominator"], [lo, hi])
             g[0], g[1] = min(g[0], lo), max(g[1], hi)
     out: dict[str, tuple[float, float]] = {}
@@ -316,3 +351,35 @@ def predict_scales16(
             s = float(np.float32((hi0 - lo0) / 65535))
             out[t] = (s, float(round(-lo0 / s)))
     return out
+
+
+def transpose_models(
+    pre_shape: Sequence[int], steps: Sequence[tuple[str, object]]
+) -> list[onnx.ModelProto]:
+    """One-op Transpose models that apply the stripped transposes of a chain to
+    its output on the device (a Reshape moves no data, so it is only a change of
+    shape). A Transpose-only model is bit-exact on the NPU (measured at U8, U16
+    and FP32), so it adds no error."""
+    from onnx import TensorProto, helper
+
+    models = []
+    shape = list(pre_shape)
+    for kind, perm in steps:
+        if kind != "T":
+            continue
+        perm = list(perm) if perm else list(reversed(range(len(shape))))
+        out = [shape[i] for i in perm]
+        node = helper.make_node("Transpose", ["x"], ["y"], name="tr", perm=perm)
+        m = helper.make_model(
+            helper.make_graph(
+                [node],
+                "t",
+                [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+                [helper.make_tensor_value_info("y", TensorProto.FLOAT, out)],
+            ),
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        m.ir_version = 8
+        models.append(m)
+        shape = out
+    return models
