@@ -578,3 +578,32 @@ The Softmax, Log, Neg and ReduceSum 16-bit segments need their own record
 roles. The ranges of a chain's intermediates (its MatMul output) depend on
 the step's data, so a loop applies them with delayed scaling (the previous
 step's ranges with headroom), as `--u16-margin` does for one step.
+
+### Keeping tensors on the device (`--resident`)
+
+The guest runner (`vm/axcl_batch_runner.c`) now has a device-side tensor store:
+`TPUT`/`TGET`/`TDEL`/`TCLEAR` and `RUNT`, which takes a model's inputs from named
+device tensors and stores its outputs under names by device-to-device copy, so
+tensors pass between models without crossing the VM boundary (`AXSession.tput`,
+`tget`, `tdel`, `run_t`; `AXSession` rebuilds the runner when its source
+changes). `--mode npu --no-check --resident` runs every segment that needs no
+host work this way: a `ResidentEnv` holds host arrays and `DeviceTensor`s, a
+device segment reads the raw entry, and a tensor is downloaded only when a host
+op or a staged segment reads it. The device holds at least 6 GiB of tensors.
+
+The 16-bit chains' trailing Transpose (cut off to keep the chain's output at 16
+bits) now runs as its own Transpose-only model: a Transpose model is
+bit-exact on the NPU (max error 0.0 at U8, U16 and FP32; 5.7 ms for
+`[16,112,112,64]`), so it adds no error. Small loaded models are kept loaded and
+shared by every segment with the same blob.
+
+AX8850, whole step, `--no-check --health-every 0`: **38.8 s resident against
+58.4 s staged** (host-only float: 6.6 s), and **all 42 gradients are bit-identical**
+to the staged run. Per-command time left: staged `RUN` 12.0 s (49 segments in
+296 calls: scalar-broadcast inputs and tiled mask products that need host
+broadcasting), `RUNT` 8.6 s (4.1 s of it engine), model load 4.7 s (516 loads of
+the large chains), tensor upload 3.9 s and download 3.1 s (1.5 GB each; the
+weights and optimizer state would stay on the device across steps). The next
+steps are device-side broadcast for the staged segments, binding the tensor
+store's buffers to the model I/O instead of copying, and keeping the state on the
+device across steps.
