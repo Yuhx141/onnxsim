@@ -615,3 +615,21 @@ That takes the `RUNT` time from 8.6 s to 4.5 s over the step, at the 4.1 s of
 engine time, and the gradients stay bit-identical to the staged run. (The
 wall-clock figure above was measured before this change; the next measurement is
 taken with the machine otherwise idle.)
+
+### FP32 nodes instead of the staged 8-bit templates (`--fp32-elementwise`)
+
+The 49 segments that still staged in resident mode were the planner's 8-bit
+`elementwise`, `binary_precision` and `mul_mask_exact` templates for plain
+Mul/Add/Sub/Div nodes: they tile, pack or broadcast their inputs on the host.
+`--fp32-elementwise elementwise,binary_precision,mul_mask_exact` swaps them for
+Pulsar2 FP32 one-node models (exact, no layout transforms, device-resident; 55
+segments, 24 builds, one per (operator, shapes) signature).
+
+AX8850, whole step, `--no-check --health-every 0 --resident --fp32-elementwise ...`
+(with the Pulsar2 rebuild still running on the host CPU): **20.4 s wall**, down
+from 58.4 s staged and 38.8 s resident (host-only float: 6.6 s). Segments still
+on the staged path: 7. Gradient cosine 0.9969, update cosine 0.845 (was 0.823),
+loss 17.039 against 17.058 float (was 17.004); the 8-bit mask products were a
+small error source. Time left by command: model load 4.9 s (509 loads of the
+large chains), `RUNT` 4.6 s (the 4.1 s engine floor), staged `RUN` 3.2 s (11 calls),
+tensor upload 1.9 s and download 1.3 s, unload 1.0 s.

@@ -2828,6 +2828,86 @@ def run_recal_steps(
     return results
 
 
+def replace_with_fp32_nodes(
+    model: onnx.ModelProto,
+    segs: Sequence[Segment],
+    kinds: Sequence[str],
+    cache_dir: str,
+) -> tuple[list[Segment], dict[str, bytes]]:
+    """Swap the one-node binary segments of ``kinds`` (8-bit templates that
+    need host-side tiling, packing or broadcasting) for Pulsar2 FP32 one-node
+    models: exact, no layout transforms, and device-resident. One build per
+    (operator, shapes) signature; a node whose build fails keeps its segment."""
+    import u16_chain
+
+    shapes = {
+        v.name: tuple(int(d.dim_value) for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    shapes.update({t.name: tuple(int(d) for d in t.dims) for t in model.graph.initializer})
+    consts = {t.name for t in model.graph.initializer}
+    by_name = {n.name: n for n in model.graph.node}
+    work = os.path.join(cache_dir, "work")
+    built: dict[str, bytes | None] = {}
+    out: list[Segment] = []
+    blobs: dict[str, bytes] = {}
+    for seg in segs:
+        node = by_name.get(seg.nodes[0]) if len(seg.nodes) == 1 else None
+        if (
+            seg.kind not in kinds
+            or node is None
+            or node.op_type not in ("Add", "Sub", "Mul", "Div")
+            or len(node.output) != 1
+            or any(t not in shapes for t in (*node.input, *node.output))
+        ):
+            out.append(seg)
+            continue
+        sig = hashlib.sha256(
+            json.dumps(
+                [node.op_type, [shapes[t] for t in node.input], shapes[node.output[0]]],
+                default=list,
+            ).encode()
+        ).hexdigest()[:12]
+        if sig not in built:
+            try:
+                built[sig] = u16_chain.cached_chain_axmodel(
+                    cache_dir,
+                    work,
+                    f"fp32_{node.op_type}_{sig}",
+                    u16_chain.node_model(node, shapes),
+                    u16_chain.signature_data(node, shapes),
+                    "FP32",
+                )
+            except Exception as exc:
+                print(f"  fp32 {node.op_type} {sig}: {type(exc).__name__}: {exc}"[:200], flush=True)
+                built[sig] = None
+        if built[sig] is None:
+            out.append(seg)
+            continue
+        ins = list(node.input)
+        out.append(
+            Segment(
+                node.name,
+                "fp32_chain",
+                [node.name],
+                ins,
+                list(node.output),
+                f"Pulsar2 FP32 {node.op_type} replacing {seg.kind} on {[shapes[t] for t in ins]}",
+                lambda: onnx.ModelProto(),
+                [],
+                [],
+                constant_inputs=[t for t in ins if t in consts],
+            )
+        )
+        blobs[node.name] = built[sig]
+    print(
+        f"  {sum(1 for s in out if s.detail.startswith('Pulsar2 FP32') and 'replacing' in s.detail)} "
+        f"segments replaced by FP32 nodes ({len(built)} builds)",
+        flush=True,
+    )
+    return out, blobs
+
+
 def load_records(path: str = STEP_OPS) -> list[dict]:
     with gzip.open(path, "rt") as f:
         return json.load(f)
@@ -3055,6 +3135,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "when a host op reads them",
     )
     p.add_argument(
+        "--fp32-elementwise",
+        default="",
+        metavar="KINDS",
+        help="replace the one-node Add/Sub/Mul/Div segments of these kinds "
+        "(e.g. elementwise,binary_precision,mul_mask_exact), which need host "
+        "tiling or broadcasting as 8-bit templates, with FP32 one-node models",
+    )
+    p.add_argument(
         "--fp32-refused",
         action="store_true",
         help="also build the nodes the plan refuses (no template class or shape) "
@@ -3219,6 +3307,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         segs = [*segs, *extra]
         blobs.update(extra_blobs)
         print(f"  {len(extra)} refused nodes built as FP32; host: {sorted(host)}", flush=True)
+    if args.fp32_elementwise:
+        segs, extra_blobs = replace_with_fp32_nodes(
+            model, segs, args.fp32_elementwise.split(","), args.u16_cache_dir
+        )
+        blobs.update(extra_blobs)
     if args.exact_fp32_io:
         for sg in segs:
             if sg.quantize_device_io:
