@@ -33,14 +33,14 @@ names and preset *meanings*, not copied.
 - ``BFP16``, ``MX4/6/9``, ``MXFP*`` and dynamic quantization raise
   ``NotImplementedError`` (no custom-op runtime for them here).
 - ``algo_config``: SmoothQuant (``alpha``) and CLE run on the float model
-  before quantization; BiasCorrection runs after it, against the float
-  model. AdaQuant, AdaRound, GPTQ, Quarot and AutoMixprecision are accepted
-  and stored so configs round-trip, but **not executed** (onnxsim's AdaRound/
-  GPTQ target its int4 weight-only scheme, and its AdaQuant only recognizes
-  ``quantize_static`` output -- on ``quantize_full_qdq`` output it silently
-  changes nothing, so it is refused rather than run as a no-op):
-  ``quantize_model`` raises ``NotImplementedError`` naming them unless
-  ``ignore_unsupported_algos=True``.
+  before quantization; AdaQuant (``num_iterations``, ``learning_rate``,
+  ``reg_param``) and BiasCorrection run after it, against the float model.
+  AdaQuant only reoptimizes MatMul/Gemm layers whose output is not folded
+  with a following Relu, and leaves the rest as calibrated. AdaRound, GPTQ,
+  Quarot and AutoMixprecision are accepted and stored so configs round-trip,
+  but **not executed** (onnxsim's AdaRound/GPTQ target its int4 weight-only
+  scheme): ``quantize_model`` raises ``NotImplementedError`` naming them
+  unless ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted.
 """
 
@@ -238,7 +238,13 @@ def _drain_reader(
     return batches
 
 
-_RUNNABLE_ALGOS = {"smooth_quant", "cle", "bias_correction"}
+_RUNNABLE_ALGOS = {"smooth_quant", "cle", "adaquant", "bias_correction"}
+# Quark AdaQuant param -> onnxsim.apply_adaquant kwarg.
+_ADAQUANT_PARAMS = {
+    "num_iterations": "num_iterations",
+    "learning_rate": "weight_learning_rate",
+    "reg_param": "reg_param",
+}
 
 
 # -- quantizer -----------------------------------------------------------------
@@ -367,6 +373,20 @@ class ModelQuantizer:
         )
 
         # Post-quantization passes, which compare against the float model.
+        if "adaquant" in by_name:
+            from onnxsim.adaquant import apply_adaquant
+
+            params = by_name["adaquant"].params
+            quantized = apply_adaquant(
+                float_model,
+                quantized,
+                calibration_data=calibration,
+                **{
+                    kwarg: params[key]
+                    for key, kwarg in _ADAQUANT_PARAMS.items()
+                    if key in params
+                },
+            )
         if "bias_correction" in by_name:
             from onnxsim.bias_correction import correct_bias
 

@@ -87,6 +87,27 @@ std::vector<int64_t> ReadInt8Tensor(const onnx::TensorProto& t) {
   return out;
 }
 
+// Same as ReadInt8Tensor, for a UINT8 tensor: raw bytes must be read
+// unsigned, or a zero point >= 128 comes back negative.
+std::vector<int64_t> ReadUint8Tensor(const onnx::TensorProto& t) {
+  int64_t numel = 1;
+  for (int64_t d : t.dims()) {
+    numel *= d;
+  }
+  std::vector<int64_t> out(static_cast<size_t>(numel));
+  if (t.has_raw_data()) {
+    for (int64_t i = 0; i < numel; ++i) {
+      out[static_cast<size_t>(i)] = static_cast<int64_t>(
+          static_cast<uint8_t>(t.raw_data()[static_cast<size_t>(i)]));
+    }
+  } else {
+    for (int64_t i = 0; i < numel; ++i) {
+      out[static_cast<size_t>(i)] = t.int32_data(static_cast<int>(i));
+    }
+  }
+  return out;
+}
+
 std::vector<float> ReadFloatTensor(const onnx::TensorProto& t) {
   int64_t numel = 1;
   for (int64_t d : t.dims()) {
@@ -151,7 +172,18 @@ std::vector<Candidate> FindStaticQdqCandidates(
         qn.input_size() < 2) {
       continue;
     }
+    // quantize_static keeps the layer's output name; quantize_full_qdq
+    // renames the pre-requantize tensor "<name>/f". (A layer whose Relu
+    // full_qdq folded into the output Q is renamed after the Relu's output,
+    // matches no float layer here, and is skipped.)
     auto fit = f_by_output.find(out_name);
+    static const std::string kFullQdqSuffix = "/f";
+    if (fit == f_by_output.end() && out_name.size() > kFullQdqSuffix.size() &&
+        out_name.compare(out_name.size() - kFullQdqSuffix.size(),
+                         kFullQdqSuffix.size(), kFullQdqSuffix) == 0) {
+      fit = f_by_output.find(
+          out_name.substr(0, out_name.size() - kFullQdqSuffix.size()));
+    }
     if (fit == f_by_output.end()) {
       continue;
     }
@@ -724,7 +756,7 @@ onnx::ModelProto ApplyAdaquant(
     const onnx::TensorProto& x_zp_init =
         q_graph.initializer(q_init_index[c.x_zp_name]);
     const std::vector<float> x_scale_flat = ReadFloatTensor(x_scale_init);
-    const std::vector<int64_t> x_zp_flat = ReadInt8Tensor(x_zp_init);
+    const std::vector<int64_t> x_zp_flat = ReadUint8Tensor(x_zp_init);
     if (x_scale_flat.empty() || x_zp_flat.empty()) {
       continue;
     }

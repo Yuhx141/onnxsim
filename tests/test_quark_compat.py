@@ -197,10 +197,27 @@ def test_cle_changes_a_conv_relu_conv_model():
     assert out.SerializeToString() != base.SerializeToString()
 
 
-def test_adaquant_is_refused_not_run_as_a_noop():
-    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
-    cfg.algo_config = [qc.AdaQuantConfig()]
-    with pytest.raises(NotImplementedError, match="adaquant"):
+def test_adaquant_runs_and_changes_the_quantized_model():
+    batches = _batches((4, 8))
+    base = _quantize(_two_layer_model(), [], batches)
+    algo = qc.AdaQuantConfig(num_iterations=20)
+    out = _quantize(_two_layer_model(), [algo], batches)
+    assert out.SerializeToString() != base.SerializeToString()
+
+
+def test_adaquant_preset_runs_end_to_end():
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS_ADAQUANT")
+    cfg.algo_config[0].params["num_iterations"] = 20
+    out = qc.ModelQuantizer(cfg).quantize_model(
+        _two_layer_model(), calibration_data_reader=_batches((4, 8))
+    )
+    onnx.checker.check_model(out)
+
+
+@pytest.mark.parametrize("preset", ["U8S8_AAWS_ADAROUND", "A8W8_ADAROUND"])
+def test_adaround_is_still_refused(preset):
+    cfg = qc.QConfig.get_default_config(preset)
+    with pytest.raises(NotImplementedError, match="adaround"):
         qc.ModelQuantizer(cfg).quantize_model(
             _two_layer_model(), calibration_data_reader=_batches((4, 8))
         )
