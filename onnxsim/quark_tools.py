@@ -1,8 +1,22 @@
-"""Post-quantization graph utilities named after the scripts in
-``quark.onnx.tools`` (``remove_qdq``, ``convert_shared_initializer_to_unique``,
-``convert_dynamic_to_fixed``, ``replace_inf_weights``, ``convert_s8s8_to_u8s8``,
-``convert_fp16_to_fp32`` ...). Independent
-implementations: Quark's source was read for the names and intent only.
+"""Post-quantization graph utilities modelled on the scripts in
+``quark.onnx.tools``. Independent implementations: Quark's source was read for
+the names and intent only, and ``tests/test_quark_parity.py`` re-checks them
+against the installed ``amd-quark`` in CI.
+
+Correspondence with Quark (verified on the parity models):
+
+- :func:`remove_qdq` ~ Quark's ``convert_quant_to_float`` (strip every Q/DQ and
+  fold quantized weights back to float; identical outputs). Quark's own
+  ``remove_qdq()`` is a different, narrower transform pipeline -- on the models
+  probed it returned the model unchanged -- so it is *not* what this does;
+  :func:`convert_quant_to_float` is the same function under the matching name.
+- :func:`convert_s8s8_to_u8s8` is a superset of Quark's, which only converts
+  activation zero points equal to 0 (to uint8 128); this handles any int8 zero
+  point (``zp + 128``) and gives the same result for zero.
+- :func:`convert_opset_version`, :func:`convert_shared_initializer_to_unique`,
+  :func:`convert_dynamic_to_fixed`, :func:`replace_inf_weights`,
+  :func:`convert_fp32_to_fp16` / ``bf16`` and :func:`convert_fp16_to_fp32` /
+  ``bf16_to_fp32`` follow the Quark tool of the same name.
 
 Every function takes and returns an ``onnx.ModelProto`` (the input is not
 modified) and only rewrites the **top-level graph** -- nodes inside
@@ -140,6 +154,14 @@ def remove_qdq(model: onnx.ModelProto, fold_weights: bool = True) -> onnx.ModelP
     del g.initializer[:]
     g.initializer.extend(keep_inits)
     return m
+
+
+def convert_quant_to_float(
+    model: onnx.ModelProto, fold_weights: bool = True
+) -> onnx.ModelProto:
+    """Quark's name for :func:`remove_qdq`: strip the quantization from a QDQ
+    model, returning the float32 graph."""
+    return remove_qdq(model, fold_weights=fold_weights)
 
 
 def convert_shared_initializer_to_unique(model: onnx.ModelProto) -> onnx.ModelProto:
@@ -429,6 +451,7 @@ __all__ = [
     "convert_fp32_to_bf16",
     "convert_fp32_to_fp16",
     "convert_opset_version",
+    "convert_quant_to_float",
     "convert_s8s8_to_u8s8",
     "convert_shared_initializer_to_unique",
     "remove_initializer_from_input",

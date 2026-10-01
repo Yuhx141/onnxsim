@@ -259,4 +259,21 @@ def mx(
     return restore(out)
 
 
-__all__ = ["bfp16", "bfp_prime", "mx"]
+def fp16_round(x) -> np.ndarray:
+    """Round to the nearest float16 (ties to even; overflow -> inf) and back to
+    float32 -- Quark's ``FP16`` fake quantization."""
+    x = np.asarray(x, dtype=np.float32)
+    with np.errstate(over="ignore"):
+        return x.astype(np.float16).astype(np.float32)
+
+
+def bf16_round(x) -> np.ndarray:
+    """Round to the nearest bfloat16 (ties to even; overflow -> inf, NaN kept)
+    and back to float32 -- Quark's ``BF16`` fake quantization."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    bits = x.view(np.uint32).astype(np.uint64)
+    rounded = ((bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000).astype(np.uint32)
+    return np.where(np.isnan(x), x, rounded.view(np.float32)).astype(np.float32)
+
+
+__all__ = ["bf16_round", "bfp16", "bfp_prime", "fp16_round", "mx"]

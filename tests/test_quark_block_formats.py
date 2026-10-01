@@ -140,3 +140,45 @@ def test_validation_errors():
         qbf.bfp_prime(f32(1, 2), block_size=16, sub_block_size=3)
     with pytest.raises(ValueError, match="scalar"):
         qbf.bfp16(np.float32(1.0))
+
+
+# -- fp16 / bf16 rounding -------------------------------------------------------------
+
+
+def test_fp16_round_values_ties_and_overflow():
+    x = np.array([0.1, 1.0, 65504.0, 65520.0, -1e9, 2**-24, 2**-26], np.float32)
+    out = qbf.fp16_round(x)
+    assert out[0] == np.float32(np.float16(0.1)) and out[0] != np.float32(0.1)
+    assert out[1] == 1.0 and out[2] == 65504.0
+    assert out[3] == np.inf and out[4] == -np.inf  # overflow -> inf, as a Cast does
+    assert out[5] == np.float32(2**-24) and out[6] == 0.0  # subnormal / underflow
+    assert out.dtype == np.float32
+
+
+def test_bf16_round_keeps_float32_range_and_rounds_ties_to_even():
+    x = np.array([0.1, 1.0, 3e38, np.inf, -np.inf, np.nan], np.float32)
+    out = qbf.bf16_round(x)
+    assert out[1] == 1.0 and out[3] == np.inf and out[4] == -np.inf
+    assert np.isnan(out[5])
+    assert abs(out[0] - 0.1) < 0.1 * 2**-8 and out[0] != np.float32(0.1)
+    # 1 + 2**-8 is exactly halfway between two bf16 values: ties to even -> 1.0
+    assert qbf.bf16_round(np.float32(1 + 2**-8)) == 1.0
+    # 1 + 3 * 2**-8 is halfway as well, and the even neighbour is 1 + 2**-6
+    assert qbf.bf16_round(np.float32(1 + 3 * 2**-8)) == np.float32(1 + 2**-6)
+    assert qbf.bf16_round(np.float32(3.4e38)) == np.inf  # max float32 rounds up to inf
+
+
+def test_bf16_round_matches_ml_dtypes_on_random_data():
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(5000) * np.exp2(rng.integers(-30, 30, 5000))).astype(
+        np.float32
+    )
+    expected = x.astype(ml_dtypes.bfloat16).astype(np.float32)
+    np.testing.assert_array_equal(qbf.bf16_round(x), expected)
+
+
+def test_half_rounding_is_idempotent():
+    x = np.random.default_rng(1).standard_normal(1000).astype(np.float32)
+    for fn in (qbf.fp16_round, qbf.bf16_round):
+        np.testing.assert_array_equal(fn(fn(x)), fn(x))
