@@ -1,0 +1,85 @@
+{
+  "case": "GQA zero scale",
+  "comparison": {
+    "allclose_rtol_1e-5_atol_1e-6": true,
+    "exact": true,
+    "max_abs_finite": 0.0,
+    "names_equal": true,
+    "nonfinite_masks_equal": true,
+    "shape_dtype_equal": true
+  },
+  "input_sha256": "171a6068cb61a078be5080bfaec3fbab2ad9b3c0eebe334473a42a8c70a2230b",
+  "issue": 2000,
+  "mode": "default",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxsim": "0.7.3",
+  "onnxsim_extension_sha256": "758f0b87939307a6c114adeec38b65d15660fa2af26d3023f6b8ce49da542771",
+  "pass": "fuse_gqa",
+  "python": "3.11.16 (main, Sep  1 2026, 14:18:37) [Clang 22.1.3 ]",
+  "revision": "f508c227e8968ec224009cba6678a58e8cbc8cf1",
+  "runtime": "CPUExecutionProvider / ORT_DISABLE_ALL / one thread",
+  "simplifier_check_ok": true,
+  "source_checker_full": "passed",
+  "source_ort": "passed",
+  "source_outputs": {
+    "y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "4b887778649083059c4292983ab8e05b13c292e02847437f6027752277c0adef",
+      "shape": [
+        2,
+        6,
+        128
+      ]
+    }
+  },
+  "source_sha256": "b8b91b92e35421b119c6a689817c0258187307ca9ac8cd802b997e53ad2f7eef",
+  "target_checker_basic": "passed",
+  "target_checker_full": "passed",
+  "target_ops": [
+    "MatMul",
+    "Reshape",
+    "Transpose",
+    "MatMul",
+    "Reshape",
+    "Transpose",
+    "Unsqueeze",
+    "Expand",
+    "Reshape",
+    "Transpose",
+    "MatMul",
+    "Reshape",
+    "Transpose",
+    "Unsqueeze",
+    "Expand",
+    "Reshape",
+    "MatMul",
+    "Div",
+    "Add",
+    "Softmax",
+    "MatMul",
+    "Transpose",
+    "Reshape",
+    "MatMul"
+  ],
+  "target_ort": "passed",
+  "target_outputs": {
+    "y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "4b887778649083059c4292983ab8e05b13c292e02847437f6027752277c0adef",
+      "shape": [
+        2,
+        6,
+        128
+      ]
+    }
+  },
+  "target_sha256": "8edb979164d30f0e886a925076402ec3780c15784f4eb0943abde6bd7323d630"
+}

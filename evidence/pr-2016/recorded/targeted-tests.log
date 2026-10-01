@@ -1,0 +1,20 @@
+........................................................................ [ 68%]
+.................................                                        [100%]
+=============================== warnings summary ===============================
+tests/test_fusion_patterns.py::test_fuse_rms_norm_fp16_fixes_overflow
+  /home/jhy/work/onnxsim-pr2016-head-evidence-20261001/tests/test_fusion_patterns.py:843: RuntimeWarning: overflow encountered in multiply
+    assert np.isinf(x * x).any()  # strict fp16 x**2, as the unfused chain has it
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============================= slowest 10 durations =============================
+0.05s call     tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv_double
+0.04s call     tests/test_fusion_patterns.py::test_fuse_rope_declines_non_shared_angle
+0.04s call     tests/test_fusion_patterns.py::test_fuse_convtranspose_add
+0.04s call     tests/test_fusion_patterns.py::test_fuse_consecutive_reshapes_declines_ambiguous_zero_copy
+0.04s call     tests/test_fuse_attention.py::test_fuse_attention_basic
+0.04s call     tests/test_fusion_patterns.py::test_fuse_layer_norm_skips_old_opset
+0.04s call     tests/test_fusion_patterns.py::test_fuse_rope_partial_match_preserves_shared_chain
+0.04s call     tests/test_moved_optimizer_passes.py::test_fuse_preceding_mul_into_conv_per_channel
+0.04s call     tests/test_moved_optimizer_passes.py::test_fuse_matmul_add_bias_into_gemm_batched
+0.04s call     tests/test_moved_optimizer_passes.py::test_fuse_matmul_add_bias_into_gemm_batched_dynamic_many_matches
+105 passed, 1 warning in 2.85s

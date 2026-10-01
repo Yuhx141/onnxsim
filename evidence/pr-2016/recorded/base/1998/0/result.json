@@ -1,0 +1,47 @@
+{
+  "case": "public shared embedding",
+  "input_sha256": "6a95c65142355b87f467f3dbfb82150e92f97ca9813e665f6ae41c29d4ca0195",
+  "issue": 1998,
+  "mode": "default",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxsim": "0.7.3",
+  "onnxsim_extension_sha256": "8ee7727796ddfe96553665366486b6af259d82b54b3a786dbe14081930c79b73",
+  "pass": "fuse_rope",
+  "python": "3.11.16 (main, Sep  1 2026, 14:18:37) [Clang 22.1.3 ]",
+  "revision": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79",
+  "runtime": "CPUExecutionProvider / ORT_DISABLE_ALL / one thread",
+  "simplify_error": "RuntimeError: /home/jhy/work/onnxsim-pr2016-base-evidence-20261001/third_party/onnx/onnx/common/ir.h:1857: eraseOutput: Assertion `outputs_[i]->uses().empty()` failed.",
+  "source_checker_full": "passed",
+  "source_ort": "passed",
+  "source_outputs": {
+    "emb": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "066edd2d942e1d89604542e7636420d54d79db4d7e29108fef2f20f3445ea90c",
+      "shape": [
+        1,
+        3,
+        4
+      ],
+      "values_repr": "[[[0.15619489550590515, -0.8079209923744202, 0.15619489550590515, -0.8079209923744202], [-0.24628542363643646, 1.379887342453003, -0.24628542363643646, 1.379887342453003], [0.8953946232795715, -0.44325798749923706, 0.8953946232795715, -0.44325798749923706]]]"
+    },
+    "x_embed": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "6a60ceff17d9833737133e7635d5f81b16fff78e7ca5ca23f9f3fa5dc4b12319",
+      "shape": [
+        1,
+        2,
+        3,
+        4
+      ]
+    }
+  },
+  "source_sha256": "1e6280a14c534385796ab58ec921231b0477f014849db69434ffe2607182bb03"
+}

@@ -1,0 +1,33 @@
+{
+  "driver": "roundtrip.cpp",
+  "driver_binary_included": false,
+  "driver_binary_sha256": "cb3b89762abf6625b7d5f263100123b4c11c099f2d829b5203c9cee9f2eafae9",
+  "linked_onnx_revision": "281e5e6accfd6113fd57d819ce47f32a937bb106",
+  "results": {
+    "source": {
+      "available": 11,
+      "import_export_and_full_checker_passed": 11
+    },
+    "base_target": {
+      "available": 9,
+      "import_export_and_full_checker_passed": 8,
+      "full_checker_rejected": 1,
+      "rejected_issue": 1996,
+      "missing_before_serialization": [1998, 1999]
+    },
+    "pass_disabled_target": {
+      "available": 11,
+      "import_export_and_full_checker_passed": 11
+    },
+    "pr_head_target": {
+      "available": 11,
+      "import_export_and_full_checker_passed": 11
+    }
+  },
+  "interpretation": {
+    "1995": "The pre-fix target passes custom IR import/export and the native full checker; ONNX Runtime separately rejects the Conv bias.",
+    "1996": "The pre-fix target imports and exports, but the native full checker rejects its invalid Reshape target shape.",
+    "1998": "The pre-fix simplification fails during C++ IR mutation before a target can be serialized.",
+    "1999": "The pre-fix simplification fails topological validation before a target can be serialized."
+  }
+}

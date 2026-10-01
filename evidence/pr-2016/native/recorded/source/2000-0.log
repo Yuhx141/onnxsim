@@ -1,0 +1,7 @@
+source.basic=passed
+source.full=passed
+ir_import=passed
+ir_output=y producer=Identity uses=1
+ir_export=passed
+export.basic=passed
+export.full=passed

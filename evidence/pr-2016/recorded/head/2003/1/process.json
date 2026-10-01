@@ -1,0 +1,9 @@
+{
+  "case": "LayerNorm exponent 2.0005",
+  "case_index": 1,
+  "issue": 2003,
+  "mode": "default",
+  "pass": "fuse_layer_norm",
+  "returncode": 0,
+  "revision": "f508c227e8968ec224009cba6678a58e8cbc8cf1"
+}

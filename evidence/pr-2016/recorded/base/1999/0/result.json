@@ -1,0 +1,32 @@
+{
+  "case": "nested If captures loop-carried value",
+  "input_sha256": "d7c4cdcae9f0d0a12e586bdc755eab775a732e6ef086a15d46eedf44c0df22f9",
+  "issue": 1999,
+  "mode": "default",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxsim": "0.7.3",
+  "onnxsim_extension_sha256": "8ee7727796ddfe96553665366486b6af259d82b54b3a786dbe14081930c79b73",
+  "pass": "eliminate_loop_with_const_trip_count",
+  "python": "3.11.16 (main, Sep  1 2026, 14:18:37) [Clang 22.1.3 ]",
+  "revision": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79",
+  "runtime": "CPUExecutionProvider / ORT_DISABLE_ALL / one thread",
+  "simplify_error": "RuntimeError: Nodes in a graph must be topologically sorted, however input 'v_in' of node: \nname: Add_0 OpType: Add\n is not output of any previous nodes.",
+  "source_checker_full": "passed",
+  "source_ort": "passed",
+  "source_outputs": {
+    "Y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "fca31f1667a6aa1bba12fca4e4ea1becd503379d80da3213af07f6cc5702828d",
+      "shape": [
+        1
+      ],
+      "values_repr": "[5.0]"
+    }
+  },
+  "source_sha256": "1f8f3de9a0eb514882cce0eab1873d2e9908f677e3c7537401158f57e8b85ea2"
+}

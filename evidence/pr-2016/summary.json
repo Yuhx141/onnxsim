@@ -1,0 +1,97 @@
+{
+  "repository": "onnxsim/onnxsim",
+  "pull_request": 2016,
+  "issues": [1995, 1996, 1998, 1999, 2000, 2001, 2002, 2003],
+  "revisions": {
+    "base": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79",
+    "head": "f508c227e8968ec224009cba6678a58e8cbc8cf1",
+    "custom_onnx_ir": "281e5e6accfd6113fd57d819ce47f32a937bb106",
+    "onnx_optimizer_submodule": "8c13b168c37e74b610d0cccba4e9e01618c612a7"
+  },
+  "runtime": {
+    "onnxruntime": "1.30.0",
+    "provider": "CPUExecutionProvider",
+    "graph_optimization": "ORT_DISABLE_ALL",
+    "threads": 1,
+    "inputs": "fixed"
+  },
+  "counts": {
+    "cases": 11,
+    "base_failures_or_differences": 11,
+    "pass_disabled_exact": 11,
+    "head_checker_and_runtime_passed": 11,
+    "head_exact": 10,
+    "head_allclose_not_exact": 1,
+    "source_native_ir_roundtrip_passed": 11,
+    "serializable_base_targets": 9,
+    "base_target_native_ir_roundtrip_passed": 8,
+    "base_target_full_checker_rejected": 1,
+    "pass_disabled_native_ir_roundtrip_passed": 11,
+    "head_native_ir_roundtrip_passed": 11,
+    "targeted_tests_passed": 105
+  },
+  "base_results": [
+    {
+      "issue": 1995,
+      "pass": "fuse_mul_into_conv",
+      "outcome": "custom IR and full checker accept the target; ONNX Runtime rejects the Conv bias"
+    },
+    {
+      "issue": 1996,
+      "pass": "fuse_reshape_family",
+      "outcome": "custom IR exports the target; full checker and ONNX Runtime reject Reshape [0, -1] with allowzero=1"
+    },
+    {
+      "issue": 1998,
+      "pass": "fuse_rope",
+      "outcome": "eraseOutput C++ IR assertion before target serialization"
+    },
+    {
+      "issue": 1999,
+      "pass": "eliminate_loop_with_const_trip_count",
+      "outcome": "unresolved v_in and topological validation failure before target serialization"
+    },
+    {
+      "issue": 2000,
+      "pass": "fuse_attention",
+      "max_abs_finite": 6.505586504936218
+    },
+    {
+      "issue": 2000,
+      "pass": "fuse_gqa",
+      "max_abs_finite": 1.862008810043335
+    },
+    {
+      "issue": 2001,
+      "pass": "fuse_layer_norm",
+      "max_abs_finite": 0.49516302236511656
+    },
+    {
+      "issue": 2001,
+      "pass": "fuse_rms_norm",
+      "max_abs_finite": 0.49516302236511645
+    },
+    {
+      "issue": 2002,
+      "pass": "fuse_gqa",
+      "max_abs_finite": 5.0
+    },
+    {
+      "issue": 2003,
+      "pass": "fuse_gelu",
+      "max_abs_finite": 0.035999298095703125
+    },
+    {
+      "issue": 2003,
+      "pass": "fuse_layer_norm",
+      "max_abs_finite": 0.0,
+      "nonfinite_masks_equal": false
+    }
+  ],
+  "head_allclose_not_exact": {
+    "issue": 1998,
+    "pass": "fuse_rope",
+    "max_abs_finite": 1.1920928955078125e-07,
+    "nonfinite_masks_equal": true
+  }
+}

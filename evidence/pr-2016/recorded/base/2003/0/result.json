@@ -1,0 +1,62 @@
+{
+  "case": "GELU coefficient 0.5009",
+  "comparison": {
+    "allclose_rtol_1e-5_atol_1e-6": false,
+    "exact": false,
+    "max_abs_finite": 0.035999298095703125,
+    "names_equal": true,
+    "nonfinite_masks_equal": true,
+    "shape_dtype_equal": true
+  },
+  "input_sha256": "08cfe42eda775738cffbb40cdb3eb0a5a86a131af3d92ede4a86fd0639d1bff3",
+  "issue": 2003,
+  "mode": "default",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxsim": "0.7.3",
+  "onnxsim_extension_sha256": "8ee7727796ddfe96553665366486b6af259d82b54b3a786dbe14081930c79b73",
+  "pass": "fuse_gelu",
+  "python": "3.11.16 (main, Sep  1 2026, 14:18:37) [Clang 22.1.3 ]",
+  "revision": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79",
+  "runtime": "CPUExecutionProvider / ORT_DISABLE_ALL / one thread",
+  "simplifier_check_ok": true,
+  "source_checker_full": "passed",
+  "source_ort": "passed",
+  "source_outputs": {
+    "Y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "05b4e468a270aaeabf7c0c5bff97cddfa05493485cab986799b2835c65139bd3",
+      "shape": [
+        1,
+        3
+      ],
+      "values_repr": "[[10.017999649047852, 20.035999298095703, -0.15894082188606262]]"
+    }
+  },
+  "source_sha256": "d6e8838bb41f4b750237c009ea98a1f66919fe28f632d348e1c2f22725ce908c",
+  "target_checker_basic": "passed",
+  "target_checker_full": "passed",
+  "target_ops": [
+    "Gelu"
+  ],
+  "target_ort": "passed",
+  "target_outputs": {
+    "Y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "1d4f1d1e380528aa11e7edabc0e3572716db01d0165c42609246c751e78907ca",
+      "shape": [
+        1,
+        3
+      ],
+      "values_repr": "[[10.0, 20.0, -0.15865525603294373]]"
+    }
+  },
+  "target_sha256": "0a19b8295df38844f41e86ccee11ef9b0739586fbbd19b02381120502ee93eb4"
+}

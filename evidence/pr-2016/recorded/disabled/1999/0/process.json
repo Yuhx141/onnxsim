@@ -1,0 +1,9 @@
+{
+  "case": "nested If captures loop-carried value",
+  "case_index": 0,
+  "issue": 1999,
+  "mode": "disabled",
+  "pass": "eliminate_loop_with_const_trip_count",
+  "returncode": 0,
+  "revision": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79"
+}

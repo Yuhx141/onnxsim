@@ -1,0 +1,9 @@
+{
+  "case": "LayerNormalization double epsilon",
+  "case_index": 0,
+  "issue": 2001,
+  "mode": "default",
+  "pass": "fuse_layer_norm",
+  "returncode": 0,
+  "revision": "f508c227e8968ec224009cba6678a58e8cbc8cf1"
+}

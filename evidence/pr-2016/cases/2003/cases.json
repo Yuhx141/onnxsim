@@ -1,0 +1,18 @@
+[
+  {
+    "name": "GELU coefficient 0.5009",
+    "pass": "fuse_gelu",
+    "source": "case-01-source.onnx",
+    "input": "case-01-input.npz",
+    "expected_default": "mismatch",
+    "expected_disabled": "exact"
+  },
+  {
+    "name": "LayerNorm exponent 2.0005",
+    "pass": "fuse_layer_norm",
+    "source": "case-02-source.onnx",
+    "input": "case-02-input.npz",
+    "expected_default": "mismatch",
+    "expected_disabled": "exact"
+  }
+]

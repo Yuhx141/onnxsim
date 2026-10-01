@@ -1,0 +1,9 @@
+{
+  "base_failures_or_differences": 11,
+  "cases": 11,
+  "disabled_exact": 11,
+  "failures": [],
+  "head_allclose_not_exact": 1,
+  "head_exact": 10,
+  "status": "passed"
+}

@@ -1,0 +1,1 @@
+[1;31m2026-10-01 13:57:21.061452407 [E:onnxruntime:, sequential_executor.cc:671 ExecuteKernel] Non-zero status code returned while running Conv node. Name:'Conv_0' Status Message: conv.cc:261 Compute Conv : bias must be a 1D tensor of size output_channels (2)[m

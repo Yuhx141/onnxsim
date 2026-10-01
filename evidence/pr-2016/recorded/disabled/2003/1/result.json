@@ -1,0 +1,70 @@
+{
+  "case": "LayerNorm exponent 2.0005",
+  "comparison": {
+    "allclose_rtol_1e-5_atol_1e-6": true,
+    "exact": true,
+    "max_abs_finite": 0.0,
+    "names_equal": true,
+    "nonfinite_masks_equal": true,
+    "shape_dtype_equal": true
+  },
+  "input_sha256": "b755950a9b7206eb794a4bc3026ea82c1dc67825aa2cb19fbc5c9b2a9a7b1dfc",
+  "issue": 2003,
+  "mode": "disabled",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxsim": "0.7.3",
+  "onnxsim_extension_sha256": "8ee7727796ddfe96553665366486b6af259d82b54b3a786dbe14081930c79b73",
+  "pass": "fuse_layer_norm",
+  "python": "3.11.16 (main, Sep  1 2026, 14:18:37) [Clang 22.1.3 ]",
+  "revision": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79",
+  "runtime": "CPUExecutionProvider / ORT_DISABLE_ALL / one thread",
+  "simplifier_check_ok": true,
+  "source_checker_full": "passed",
+  "source_ort": "passed",
+  "source_outputs": {
+    "Y": {
+      "dtype": "float32",
+      "nan": 3,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "f56c88bda649b2dcfdb2842b2e22afdd164b5568f215ed14ef7b94222d44e703",
+      "shape": [
+        1,
+        3
+      ],
+      "values_repr": "[[nan, nan, nan]]"
+    }
+  },
+  "source_sha256": "6e9aca7f00e3cb66f99d525684a3e913a844168723637fb595c8ff5282fcf723",
+  "target_checker_basic": "passed",
+  "target_checker_full": "passed",
+  "target_ops": [
+    "ReduceMean",
+    "Sub",
+    "Pow",
+    "ReduceMean",
+    "Add",
+    "Sqrt",
+    "Div",
+    "Mul",
+    "Add"
+  ],
+  "target_ort": "passed",
+  "target_outputs": {
+    "Y": {
+      "dtype": "float32",
+      "nan": 3,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "f56c88bda649b2dcfdb2842b2e22afdd164b5568f215ed14ef7b94222d44e703",
+      "shape": [
+        1,
+        3
+      ],
+      "values_repr": "[[nan, nan, nan]]"
+    }
+  },
+  "target_sha256": "f99600076b1f090ea1af461ebdc2c57dae05bc2bf7a41d27d7d2427cf38c306f"
+}

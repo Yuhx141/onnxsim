@@ -1,0 +1,10 @@
+[
+  {
+    "name": "finite additive causal-looking mask",
+    "pass": "fuse_gqa",
+    "source": "case-01-source.onnx",
+    "input": "case-01-input.npz",
+    "expected_default": "mismatch",
+    "expected_disabled": "exact"
+  }
+]

@@ -1,0 +1,25 @@
+{
+  "platform": "Ubuntu Linux x86_64",
+  "python": "3.11.16",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxruntime_provider": "CPUExecutionProvider",
+  "onnxruntime_graph_optimization": "ORT_DISABLE_ALL",
+  "onnxruntime_threads": 1,
+  "onnxsim_base": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79",
+  "onnxsim_head": "f508c227e8968ec224009cba6678a58e8cbc8cf1",
+  "onnx_custom_ir": "281e5e6accfd6113fd57d819ce47f32a937bb106",
+  "onnx_optimizer_submodule": "8c13b168c37e74b610d0cccba4e9e01618c612a7",
+  "build_environment": {
+    "ONNXSIM_NON_CORE_FEATURES": "0",
+    "MAX_JOBS": "2",
+    "CMAKE_BUILD_PARALLEL_LEVEL": "2"
+  },
+  "fresh_build_sha256": {
+    "base_wheel": "a163049e79542270c588c29308ae729a739a839b599cee5a695ce82045a7e131",
+    "base_extension": "8ee7727796ddfe96553665366486b6af259d82b54b3a786dbe14081930c79b73",
+    "head_wheel": "2aa14c9dc53cf7ceb102d27323626313e12cb7565e6a4ed6263d5f374e3f4745",
+    "head_extension": "758f0b87939307a6c114adeec38b65d15660fa2af26d3023f6b8ce49da542771"
+  }
+}

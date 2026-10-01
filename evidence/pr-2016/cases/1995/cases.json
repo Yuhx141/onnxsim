@@ -1,0 +1,10 @@
+[
+  {
+    "name": "singleton-rank scalar",
+    "pass": "fuse_mul_into_conv",
+    "source": "case-01-source.onnx",
+    "input": "case-01-input.npz",
+    "expected_default": "runtime_error",
+    "expected_disabled": "exact"
+  }
+]

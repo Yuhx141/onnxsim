@@ -1,0 +1,10 @@
+[
+  {
+    "name": "nested If captures loop-carried value",
+    "pass": "eliminate_loop_with_const_trip_count",
+    "source": "case-01-source.onnx",
+    "input": "case-01-input.npz",
+    "expected_default": "simplify_error",
+    "expected_disabled": "exact"
+  }
+]

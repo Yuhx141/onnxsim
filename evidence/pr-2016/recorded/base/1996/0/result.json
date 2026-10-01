@@ -1,0 +1,40 @@
+{
+  "case": "zero and symbolic output dimensions",
+  "input_sha256": "f7c194cb703aa5ab741db19894dcc28cf8ad96d49af11af9feddf017054eb2bd",
+  "issue": 1996,
+  "mode": "default",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxsim": "0.7.3",
+  "onnxsim_extension_sha256": "8ee7727796ddfe96553665366486b6af259d82b54b3a786dbe14081930c79b73",
+  "pass": "fuse_reshape_family",
+  "python": "3.11.16 (main, Sep  1 2026, 14:18:37) [Clang 22.1.3 ]",
+  "revision": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79",
+  "runtime": "CPUExecutionProvider / ORT_DISABLE_ALL / one thread",
+  "simplifier_check_ok": true,
+  "source_checker_full": "passed",
+  "source_ort": "passed",
+  "source_outputs": {
+    "Y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "shape": [
+        0,
+        12
+      ],
+      "values_repr": "[]"
+    }
+  },
+  "source_sha256": "f313f2806b3c5fdfb79365dddde74e57076fb28379bbddb48f5cc48968af7350",
+  "target_checker_basic": "passed",
+  "target_checker_full": "InferenceError: [ShapeInferenceError] Inference error(s): (op_type:Reshape, node name: Reshape_0): [ShapeInferenceError] Invalid Target shape product of 0. Product cannot be 0 in combination with -1\n",
+  "target_ops": [
+    "Reshape"
+  ],
+  "target_ort_error": "Fail: [ONNXRuntimeError] : 1 : FAIL : Node (Reshape_0) Op (Reshape) [ShapeInferenceError] Invalid Target shape product of 0. Product cannot be 0 in combination with -1",
+  "target_sha256": "78e5bd563da9ff335c8df3056e52dac9a119b73d968d98af8328daeae4b5962f"
+}

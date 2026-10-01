@@ -1,0 +1,10 @@
+[
+  {
+    "name": "zero and symbolic output dimensions",
+    "pass": "fuse_reshape_family",
+    "source": "case-01-source.onnx",
+    "input": "case-01-input.npz",
+    "expected_default": "checker_error",
+    "expected_disabled": "exact"
+  }
+]

@@ -1,0 +1,9 @@
+{
+  "case": "Attention zero scale",
+  "case_index": 0,
+  "issue": 2000,
+  "mode": "default",
+  "pass": "fuse_attention",
+  "returncode": 0,
+  "revision": "f508c227e8968ec224009cba6678a58e8cbc8cf1"
+}

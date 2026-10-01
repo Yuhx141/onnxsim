@@ -1,0 +1,8 @@
+source.basic=passed
+source.full=passed
+ir_import=passed
+ir_output=x_embed producer=Add uses=1
+ir_output=emb producer=Concat uses=3
+ir_export=passed
+export.basic=passed
+export.full=passed

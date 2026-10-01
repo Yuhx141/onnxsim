@@ -1,0 +1,7 @@
+source.basic=passed
+source.full=failed: [ShapeInferenceError] Inference error(s): (op_type:Reshape, node name: Reshape_0): [ShapeInferenceError] Invalid Target shape product of 0. Product cannot be 0 in combination with -1
+ir_import=passed
+ir_output=Y producer=Reshape uses=1
+ir_export=passed
+export.basic=passed
+export.full=failed: [ShapeInferenceError] Inference error(s): (op_type:Reshape, node name: Reshape_0): [ShapeInferenceError] Invalid Target shape product of 0. Product cannot be 0 in combination with -1

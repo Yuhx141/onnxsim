@@ -1,0 +1,9 @@
+{
+  "case": "finite additive causal-looking mask",
+  "case_index": 0,
+  "issue": 2002,
+  "mode": "default",
+  "pass": "fuse_gqa",
+  "returncode": 0,
+  "revision": "f508c227e8968ec224009cba6678a58e8cbc8cf1"
+}

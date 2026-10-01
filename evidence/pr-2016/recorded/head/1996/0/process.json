@@ -1,0 +1,9 @@
+{
+  "case": "zero and symbolic output dimensions",
+  "case_index": 0,
+  "issue": 1996,
+  "mode": "default",
+  "pass": "fuse_reshape_family",
+  "returncode": 0,
+  "revision": "f508c227e8968ec224009cba6678a58e8cbc8cf1"
+}

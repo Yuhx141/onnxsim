@@ -1,0 +1,9 @@
+{
+  "case": "singleton-rank scalar",
+  "case_index": 0,
+  "issue": 1995,
+  "mode": "default",
+  "pass": "fuse_mul_into_conv",
+  "returncode": 12,
+  "revision": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79"
+}

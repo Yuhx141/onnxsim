@@ -1,0 +1,66 @@
+{
+  "case": "GELU coefficient 0.5009",
+  "comparison": {
+    "allclose_rtol_1e-5_atol_1e-6": true,
+    "exact": true,
+    "max_abs_finite": 0.0,
+    "names_equal": true,
+    "nonfinite_masks_equal": true,
+    "shape_dtype_equal": true
+  },
+  "input_sha256": "08cfe42eda775738cffbb40cdb3eb0a5a86a131af3d92ede4a86fd0639d1bff3",
+  "issue": 2003,
+  "mode": "default",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxsim": "0.7.3",
+  "onnxsim_extension_sha256": "758f0b87939307a6c114adeec38b65d15660fa2af26d3023f6b8ce49da542771",
+  "pass": "fuse_gelu",
+  "python": "3.11.16 (main, Sep  1 2026, 14:18:37) [Clang 22.1.3 ]",
+  "revision": "f508c227e8968ec224009cba6678a58e8cbc8cf1",
+  "runtime": "CPUExecutionProvider / ORT_DISABLE_ALL / one thread",
+  "simplifier_check_ok": true,
+  "source_checker_full": "passed",
+  "source_ort": "passed",
+  "source_outputs": {
+    "Y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "05b4e468a270aaeabf7c0c5bff97cddfa05493485cab986799b2835c65139bd3",
+      "shape": [
+        1,
+        3
+      ],
+      "values_repr": "[[10.017999649047852, 20.035999298095703, -0.15894082188606262]]"
+    }
+  },
+  "source_sha256": "d6e8838bb41f4b750237c009ea98a1f66919fe28f632d348e1c2f22725ce908c",
+  "target_checker_basic": "passed",
+  "target_checker_full": "passed",
+  "target_ops": [
+    "Div",
+    "Erf",
+    "Add",
+    "Mul",
+    "Mul"
+  ],
+  "target_ort": "passed",
+  "target_outputs": {
+    "Y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "05b4e468a270aaeabf7c0c5bff97cddfa05493485cab986799b2835c65139bd3",
+      "shape": [
+        1,
+        3
+      ],
+      "values_repr": "[[10.017999649047852, 20.035999298095703, -0.15894082188606262]]"
+    }
+  },
+  "target_sha256": "649b7bdff4f4dc2d805d53f7bd88d5bcf50a7a799fe0a92a2a91408912598f0d"
+}

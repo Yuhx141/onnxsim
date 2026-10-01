@@ -1,0 +1,67 @@
+{
+  "case": "finite additive causal-looking mask",
+  "comparison": {
+    "allclose_rtol_1e-5_atol_1e-6": false,
+    "exact": false,
+    "max_abs_finite": 5.0,
+    "names_equal": true,
+    "nonfinite_masks_equal": true,
+    "shape_dtype_equal": true
+  },
+  "input_sha256": "0c3743f7572bb3ce301a25ed4c109aa06af3ac96bae90f8d0d1cda1178d5923e",
+  "issue": 2002,
+  "mode": "default",
+  "numpy": "2.4.6",
+  "onnx": "1.22.0",
+  "onnxruntime": "1.30.0",
+  "onnxsim": "0.7.3",
+  "onnxsim_extension_sha256": "8ee7727796ddfe96553665366486b6af259d82b54b3a786dbe14081930c79b73",
+  "pass": "fuse_gqa",
+  "python": "3.11.16 (main, Sep  1 2026, 14:18:37) [Clang 22.1.3 ]",
+  "revision": "cbbd9bc3d13cb98a6b926ff0b191f2e1fa227d79",
+  "runtime": "CPUExecutionProvider / ORT_DISABLE_ALL / one thread",
+  "simplifier_check_ok": true,
+  "source_checker_full": "passed",
+  "source_ort": "passed",
+  "source_outputs": {
+    "y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "9ddc7ac7d4a402bceffb413a6fd508d0a2402380ec25206065c50104c9c52391",
+      "shape": [
+        2,
+        6,
+        128
+      ]
+    }
+  },
+  "source_sha256": "3c1593770136c9ba3148abe17e00c30aa4ed4e88b2b078a24161df74b31c1d60",
+  "target_checker_basic": "passed",
+  "target_checker_full": "passed",
+  "target_ops": [
+    "MatMul",
+    "MatMul",
+    "MatMul",
+    "GroupQueryAttention",
+    "Reshape",
+    "MatMul"
+  ],
+  "target_ort": "passed",
+  "target_outputs": {
+    "y": {
+      "dtype": "float32",
+      "nan": 0,
+      "neginf": 0,
+      "posinf": 0,
+      "sha256_bytes": "5e3433cac097e29f8d5bfd2d6cc75e293883d5a3ccc0dc322d31c917e55e1469",
+      "shape": [
+        2,
+        6,
+        128
+      ]
+    }
+  },
+  "target_sha256": "d47b4574efd0e1ff841781504ca27cd3eeb22534d17c8fc4d6fd1d6a6e3bd171"
+}
