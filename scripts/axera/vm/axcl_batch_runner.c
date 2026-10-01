@@ -8,6 +8,9 @@
  * line commands on stdin; tensors travel as raw files on the virtiofs share
  * (/mnt/share), never through stdin/stdout.
  *
+ *   LOADT <model path>              -> like LOAD, but the model's own I/O buffers are
+ *                                      allocated only if a plain RUN needs them (RUNT
+ *                                      binds tensor-store buffers instead)
  *   LOAD <model path>               -> OK <id>, one "IN|OUT <idx> <name> <bytes>
  *                                      <dtype> <dims...>" line per tensor, END
  *   RUN <id> <n_in> <in files...> <n_out> <out files...>
@@ -53,6 +56,7 @@ typedef struct {
   int keep_in[MAX_IO];
   int in_bound[MAX_IO]; /* inputs/outputs currently bound to a tensor-store buffer (RUNT) */
   int out_bound[MAX_IO];
+  int lazy; /* LOADT: own I/O buffers are allocated when a plain RUN first needs them */
 } Model;
 
 static Model models[MAX_MODELS];
@@ -69,8 +73,10 @@ static void *host(uint64_t n) {
 }
 
 static void unload(Model *m) {
-  for (uint32_t i = 0; i < m->n_in; i++) axclrtFree(m->in_dev[i]);
-  for (uint32_t i = 0; i < m->n_out; i++) axclrtFree(m->out_dev[i]);
+  for (uint32_t i = 0; i < m->n_in; i++)
+    if (m->in_dev[i]) axclrtFree(m->in_dev[i]);
+  for (uint32_t i = 0; i < m->n_out; i++)
+    if (m->out_dev[i]) axclrtFree(m->out_dev[i]);
   axclrtEngineDestroyIO(m->io);
   axclrtEngineDestroyIOInfo(m->info);
   axclrtEngineUnload(m->model_id);
@@ -81,7 +87,7 @@ static void print_dims(axclrtEngineIODims *d) {
   for (int k = 0; k < d->dimCount; k++) printf(" %d", d->dims[k]);
 }
 
-static void cmd_load(const char *path) {
+static void cmd_load(const char *path, int lazy) {
   int slot = -1;
   for (int i = 0; i < MAX_MODELS; i++)
     if (!models[i].used) { slot = i; break; }
@@ -104,14 +110,19 @@ static void cmd_load(const char *path) {
   if (m->n_in > MAX_IO || m->n_out > MAX_IO) {
     printf("ERR too many io\n"); unload(m); return;
   }
-  for (uint32_t i = 0; i < m->n_in; i++) {
+  for (uint32_t i = 0; i < m->n_in && lazy; i++)
+    m->in_size[i] = axclrtEngineGetInputSizeByIndex(m->info, 0, i);
+  for (uint32_t i = 0; i < m->n_out && lazy; i++)
+    m->out_size[i] = axclrtEngineGetOutputSizeByIndex(m->info, 0, i);
+  m->lazy = lazy;
+  for (uint32_t i = 0; i < m->n_in && !lazy; i++) {
     m->in_size[i] = axclrtEngineGetInputSizeByIndex(m->info, 0, i);
     if ((e = axclrtMalloc(&m->in_dev[i], m->in_size[i], AXCL_MEM_MALLOC_NORMAL_ONLY)) ||
         (e = axclrtEngineSetInputBufferByIndex(m->io, i, m->in_dev[i], m->in_size[i]))) {
       m->n_in = i; printf("ERR in alloc 0x%x\n", e); unload(m); return;
     }
   }
-  for (uint32_t i = 0; i < m->n_out; i++) {
+  for (uint32_t i = 0; i < m->n_out && !lazy; i++) {
     m->out_size[i] = axclrtEngineGetOutputSizeByIndex(m->info, 0, i);
     if ((e = axclrtMalloc(&m->out_dev[i], m->out_size[i], AXCL_MEM_MALLOC_NORMAL_ONLY)) ||
         (e = axclrtEngineSetOutputBufferByIndex(m->io, i, m->out_dev[i], m->out_size[i]))) {
@@ -156,6 +167,17 @@ static int write_file(const char *p, const void *src, uint64_t n) {
 
 /* Put a model's I/O back on its own buffers after RUNT bound tensor-store ones. */
 static int rebind_own(Model *m) {
+  if (m->lazy) {
+    for (uint32_t i = 0; i < m->n_in; i++) {
+      if (!m->in_dev[i] && axclrtMalloc(&m->in_dev[i], m->in_size[i], AXCL_MEM_MALLOC_NORMAL_ONLY)) return -1;
+      m->in_bound[i] = 1;  /* rebound to the own buffer below */
+    }
+    for (uint32_t i = 0; i < m->n_out; i++) {
+      if (!m->out_dev[i] && axclrtMalloc(&m->out_dev[i], m->out_size[i], AXCL_MEM_MALLOC_NORMAL_ONLY)) return -1;
+      m->out_bound[i] = 1;
+    }
+    m->lazy = 0;
+  }
   for (uint32_t i = 0; i < m->n_in; i++)
     if (m->in_bound[i]) {
       if (axclrtEngineSetInputBufferByIndex(m->io, i, m->in_dev[i], m->in_size[i])) return -1;
@@ -341,8 +363,8 @@ static void cmd_runt(char *args) {
   axclError e;
   for (uint32_t i = 0; i < n_out; i++) {
     void *dst = m->out_dev[i];
-    if (strcmp(out_name[i], "-")) {
-      Tensor *t = tensor_get(out_name[i], m->out_size[i]);
+    if (strcmp(out_name[i], "-") || !dst) {
+      Tensor *t = tensor_get(strcmp(out_name[i], "-") ? out_name[i] : "__scratch", m->out_size[i]);
       if (!t) { printf("ERR out alloc %s\n", out_name[i]); return; }
       dst = t->dev;
     }
@@ -375,7 +397,8 @@ int main(void) {
   static char line[1 << 16];
   while (fgets(line, sizeof line, stdin)) {
     line[strcspn(line, "\r\n")] = 0;
-    if (!strncmp(line, "LOAD ", 5)) cmd_load(line + 5);
+    if (!strncmp(line, "LOADT ", 6)) cmd_load(line + 6, 1);
+    else if (!strncmp(line, "LOAD ", 5)) cmd_load(line + 5, 0);
     else if (!strncmp(line, "RUNT ", 5)) cmd_runt(line + 5);
     else if (!strncmp(line, "TPUT ", 5)) cmd_tput(line + 5);
     else if (!strncmp(line, "TGET ", 5)) cmd_tget(line + 5);

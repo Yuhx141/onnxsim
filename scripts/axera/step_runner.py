@@ -1806,6 +1806,7 @@ class StepRunner:
         self.resident = False  # chain segments on the device (ResidentEnv)
         self.path_counts: collections.Counter = collections.Counter()
         self.model_cache: dict[bytes, object] = {}
+        self._cached_bytes = 0
         # segment name -> (device Transpose blobs, final shape) for the 16-bit
         # chains whose trailing Transpose runs on the device
         self.post_chain: dict[str, tuple[list[bytes], tuple[int, ...]]] = {}
@@ -1920,8 +1921,9 @@ class StepRunner:
             for o, qq in zip(outs, seg.out_q or [None] * len(outs))
         ]
 
-    _CACHE_BYTES = 8_000_000  # a model with less I/O than this stays loaded
-    _CACHE_MODELS = 300
+    _CACHE_BYTES = 8_000_000  # without lazy I/O buffers: a model with less I/O stays loaded
+    _CACHE_MODELS = 1200
+    _CACHE_BLOB_BYTES = 3_000_000_000  # total model bytes kept loaded
 
     def _load(self, seg: Segment):
         """The loaded model of ``seg``; small models are kept loaded and shared
@@ -1935,10 +1937,13 @@ class StepRunner:
         m = self.model_cache.get(key)
         if m is not None:
             return m, True
-        m = self.session.load(blob)
-        io = sum(i.nbytes for i in m.inputs) + sum(o.nbytes for o in m.outputs)
-        if io < self._CACHE_BYTES and len(self.model_cache) < self._CACHE_MODELS:
+        m = self.session.load(blob, lazy_io=True)
+        if (
+            len(self.model_cache) < self._CACHE_MODELS
+            and self._cached_bytes + len(blob) <= self._CACHE_BLOB_BYTES
+        ):
             self.model_cache[key] = m
+            self._cached_bytes += len(blob)
             return m, True
         return m, False
 
@@ -2274,11 +2279,14 @@ class StepRunner:
                 print(
                     f"  node {k}/{len(self.nodes)} {time.time() - t0:.1f}s", flush=True
                 )
-        result = {t: env[t] for t in keep_set if t in env}
+        return {t: env[t] for t in keep_set if t in env}, stats
+
+    def release_models(self) -> None:
+        """Unload the models kept loaded across runs."""
         for m in self.model_cache.values():
             self.session.unload(m)
         self.model_cache.clear()
-        return result, stats
+        self._cached_bytes = 0
 
 
 def _rel(a, b) -> float:
@@ -3135,6 +3143,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "when a host op reads them",
     )
     p.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="with --resident --no-check: run the step this many times (models "
+        "stay loaded) and report each run's wall time",
+    )
+    p.add_argument(
         "--fp32-elementwise",
         default="",
         metavar="KINDS",
@@ -3392,14 +3407,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.resident and not args.no_check:
                 p.error("--resident needs --no-check (the checks read every tensor)")
             try:
-                outs, stats = runner.run(
-                    feeds,
-                    "npu",
-                    check=not args.no_check,
-                    keep=list(grad_names.values()),
-                    progress=True,
-                    stats_out=(stats := []),
-                )
+                run_walls = []
+                for _ in range(max(1, args.repeat)):
+                    t_run = time.time()
+                    stats = []
+                    outs, stats = runner.run(
+                        feeds,
+                        "npu",
+                        check=not args.no_check,
+                        keep=list(grad_names.values()),
+                        progress=True,
+                        stats_out=stats,
+                    )
+                    run_walls.append(time.time() - t_run)
+                report["run_walls_s"] = run_walls
+                runner.release_models()
                 report["health_after_lsb"] = axcl_session.health_check(sess)
             except axcl_session.DeviceStall as exc:
                 report["stall"] = {"error": str(exc), "suspects": runner.stalled}

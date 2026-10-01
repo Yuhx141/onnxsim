@@ -633,3 +633,27 @@ loss 17.039 against 17.058 float (was 17.004); the 8-bit mask products were a
 small error source. Time left by command: model load 4.9 s (509 loads of the
 large chains), `RUNT` 4.6 s (the 4.1 s engine floor), staged `RUN` 3.2 s (11 calls),
 tensor upload 1.9 s and download 1.3 s, unload 1.0 s.
+
+### Lazy model I/O and models kept loaded (`LOADT`, `--repeat`)
+
+`RUNT` binds tensor-store buffers, so a model's own I/O buffers (tens of MB for
+the large chains) were allocated at load and never used. `LOADT` loads a model
+without them; a plain `RUN` allocates them on first use. A lazily loaded
+model costs only its weights and code (all 62 MB of 16-bit builds), so the
+runner now keeps loaded models across runs (`--repeat N` runs the step N times
+and reports each wall time).
+
+AX8850, whole step, `--no-check --health-every 0 --resident --fp32-elementwise ...
+--repeat 3` (gradients bit-identical to the previous resident run):
+
+| | wall |
+|---|---|
+| first run (loads the models) | 15.2 s |
+| steady state, runs 2 and 3 | **11.5 s, 11.7 s** |
+| staged (before this work) | 58.4 s |
+| host-only float | 6.6 s |
+
+The steady state is 1.75x the host-only run; 4.1 s of it is `axclrtEngineExecute`.
+What is left per step (3 runs): `RUNT` 4.8 s, staged `RUN` 2.4 s (about 10
+segments), tensor upload 1.6 s and download 1.0 s (the weights and optimizer state
+would stay on the device across steps), `TDEL` 0.5 s, and the host's own Python.

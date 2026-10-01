@@ -340,7 +340,12 @@ class AXSession:
         return line
 
     # -- models ------------------------------------------------------------
-    def load(self, model: bytes | str, schedule_path: str | None = None) -> Model:
+    def load(
+        self,
+        model: bytes | str,
+        schedule_path: str | None = None,
+        lazy_io: bool = False,
+    ) -> Model:
         """Load an AX model, optionally enforcing its Pulsar-free schedule."""
         n = next(self._seq)
         name = f"m{n}.axmodel"
@@ -350,7 +355,7 @@ class AXSession:
                 f.write(model)
         else:
             shutil.copy(model, dst)
-        head = self._cmd(f"LOAD {self.guest_dir}/{name}")
+        head = self._cmd(f"{'LOADT' if lazy_io else 'LOAD'} {self.guest_dir}/{name}")
         m = Model(id=int(head.split()[1]), path=dst)
         while (line := self._line()) != "END":
             kind, _, tname, nbytes, dt, *dims = line.split()
