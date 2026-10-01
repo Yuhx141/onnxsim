@@ -54,9 +54,11 @@ names and preset *meanings*, not copied.
   (:mod:`onnxsim.quark_weight_rounding`; Conv / Gemm / MatMul, guarded so a
   layer's reconstruction error never gets worse); ``update_bias``, ``drop_ratio``
   (AdaRound) and ``bits != 8`` / ``group_size`` / asymmetric weights (GPTQ)
-  raise. Quarot is accepted and stored so configs round-trip, but **not
-  executed**: ``quantize_model`` raises ``NotImplementedError`` naming it
-  unless ``ignore_unsupported_algos=True``.
+  raise. Quarot folds the R1 residual-stream rotation into the float
+  weights before quantization (:mod:`onnxsim.quark_quarot`; needs
+  ``r_config_path``; R2-R4 do not exist, as in Quark's ONNX flow). An
+  ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
+  raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted.
 """
 
@@ -300,6 +302,7 @@ def _drain_reader(
 
 
 _RUNNABLE_ALGOS = {
+    "quarot",
     "smooth_quant",
     "cle",
     "adaquant",
@@ -377,6 +380,12 @@ class ModelQuantizer:
                 )
             result = self._quantize_block(model_input, act, wt)
         elif act.dtype in ("float16", "bfloat16"):
+            if runnable and not ignore_unsupported_algos:
+                raise NotImplementedError(
+                    "algo_config is not applied to float presets "
+                    f"({act.dtype}); pass ignore_unsupported_algos=True to "
+                    "convert without it"
+                )
             from onnxsim.onnx_simplifier import quantize_bf16, quantize_fp16
 
             fn = quantize_fp16 if act.dtype == "float16" else quantize_bf16
@@ -437,6 +446,26 @@ class ModelQuantizer:
 
     def _approx(self, msg: str) -> None:
         self.last_approximations.append(msg)
+
+    def _quarot(self, model: onnx.ModelProto, algo: AlgoConfig) -> onnx.ModelProto:
+        from onnxsim.quark_quarot import rotate_model
+
+        p = algo.params
+        if not p.get("r_config_path"):
+            raise ValueError(
+                "QuarotConfig.r_config_path is required (a JSON file with "
+                '"R1_pairs": [{"prev_nodes", "next_nodes", "norm_node"}, ...])'
+            )
+        self._approx(
+            "Quarot: only the R1 (residual-stream) rotation is applied; the matrix "
+            "is a (random) Hadamard for power-of-two sizes, else random orthogonal"
+        )
+        return rotate_model(
+            model,
+            p["r_config_path"],
+            r_matrix_dim=p.get("r_matrix_dim", 4096),
+            use_random_had=bool(p.get("use_random_had", False)),
+        )
 
     def _adaround(
         self,
@@ -608,6 +637,8 @@ class ModelQuantizer:
         # the transformed model; the untouched one stays the reference).
         float_model = model
         work = model
+        if "quarot" in by_name:
+            work = self._quarot(work, by_name["quarot"])
         if "smooth_quant" in by_name:
             from onnxsim.smoothquant import apply_smoothquant
 
