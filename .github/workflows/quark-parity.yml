@@ -1,0 +1,146 @@
+name: Quark Parity
+
+# Compares onnxsim's Quark-compat layer (onnxsim/quark_compat.py and the
+# quark_*.py modules behind it) with the real AMD Quark ONNX package
+# (`amd-quark`): both tools quantize the same graphs and the workflow checks
+# that they place the same fake-quant nodes with the same attributes/axes,
+# that the emitted graphs compute the same outputs under ONNX Runtime (using
+# Quark's own JIT-built custom-op library), and that the shared graph tools /
+# algorithms (cross-layer equalization, convert_quant_to_float, auto
+# mixed-precision metrics, ...) agree. Known, deliberate differences live in
+# the KNOWN_* constants of tests/test_quark_parity.py, so a *new* difference
+# fails the job. It also writes a non-asserting per-preset accuracy table to
+# the job summary.
+#
+# CPU-only: Quark imports torch (CPU wheel is enough) and compiles its ONNX
+# Runtime custom-op library with the runner's g++ on first import.
+#
+# The weekly schedule is the point of the "latest" matrix leg -- it flags
+# upstream Quark releases that change preset contents, op coverage or numerics.
+
+on:
+  schedule:
+    - cron: "0 7 * * 2" # Tuesdays 07:00 UTC (weekly)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/quark-parity.yml"
+      - "onnxsim/quark_*.py"
+      - "onnxsim/adaquant.py"
+      - "onnxsim/gptq.py"
+      - "onnxsim/full_qdq.py"
+      - "tests/test_quark_*.py"
+
+concurrency:
+  group: quark-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.2.1
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-quark-parity
+          path: ./wheelhouse/*.whl
+
+  parity:
+    name: Parity with amd-quark ${{ matrix.quark }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # A new Quark release may legitimately change presets/numerics; the
+    # "latest" leg reports that without blocking unrelated PRs.
+    continue-on-error: ${{ matrix.quark == 'latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - quark: "0.13" # the version the KNOWN_* sets were written against
+            spec: "amd-quark==0.13"
+          - quark: "latest"
+            spec: "amd-quark"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-quark-parity
+          path: wheelhouse
+      - name: Install onnxsim wheel, Quark and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest onnxruntime
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "${{ matrix.spec }}"
+          python -m pip install wheelhouse/*.whl
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the tests by absolute
+      # $GITHUB_WORKSPACE path. Same guard the EP/model-regression workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxruntime as ort; print('onnxsim', onnxsim.__version__); print('onnxruntime', ort.__version__)"
+          pip show amd-quark | head -3
+      - name: Compile Quark's custom-op library
+        working-directory: ${{ runner.temp }}
+        run: |
+          # First import JIT-builds the library (a few minutes); do it once
+          # here so the test step's timing is stable and a build failure is
+          # reported as its own step.
+          lib=$(python -c "import quark.onnx; from quark.onnx.operators.custom_ops import get_library_path; print(get_library_path())" | tail -n 1)
+          echo "Quark ops library: $lib"
+          # Also lets the gated test in test_quark_compat.py run.
+          echo "QUARK_ONNX_OPS_LIB=$lib" >> "$GITHUB_ENV"
+      - name: Run Quark parity suite
+        working-directory: ${{ runner.temp }}
+        env:
+          QUARK_PARITY_REPORT: ${{ runner.temp }}/quark-parity-${{ matrix.quark }}.md
+        run: |
+          pytest -v -p no:cacheprovider --show-capture=no \
+            "$GITHUB_WORKSPACE/tests/test_quark_parity.py"
+      - name: Run the standalone quark_* suites (no Quark needed)
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -q -p no:cacheprovider "$GITHUB_WORKSPACE"/tests/test_quark_*.py \
+            --ignore="$GITHUB_WORKSPACE/tests/test_quark_parity.py"
+      - name: Publish accuracy comparison
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: |
+          f="quark-parity-${{ matrix.quark }}.md"
+          if [ -f "$f" ]; then
+            { echo "### Quark ${{ matrix.quark }}: relative output error vs float (lower is better)"; echo; cat "$f"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: quark-parity-report-${{ matrix.quark }}
+          path: ${{ runner.temp }}/quark-parity-${{ matrix.quark }}.md
+          if-no-files-found: ignore
