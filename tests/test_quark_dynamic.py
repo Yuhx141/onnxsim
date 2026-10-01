@@ -35,14 +35,33 @@ def _ops(m):
     return [n.op_type for n in m.graph.node]
 
 
-@pytest.mark.parametrize("wdt", ["uint8", "int8"])
-def test_matmul_becomes_matmulinteger_and_stays_close(wdt):
+def test_matmul_becomes_matmulinteger_and_stays_close():
     m = _model("y = MatMul(x, w)", {"w": W})
-    q = quantize_dynamic_integer(m, weight_dtype=wdt)
+    q = quantize_dynamic_integer(m, weight_dtype="uint8")
     assert _ops(q) == ["DynamicQuantizeLinear", "MatMulInteger", "Cast", "Mul", "Mul"]
     ref, got = _run(m, X), _run(q, X)
     assert np.linalg.norm(ref - got) / np.linalg.norm(ref) < 0.03
     assert not any(i.name == "w" for i in q.graph.initializer)  # replaced
+
+
+def test_int8_weights_are_symmetric_and_match_an_integer_emulation():
+    # Not run through ONNX Runtime: its u8 x s8 MatMulInteger kernel saturates
+    # on x86 CPUs without VNNI (CI runners), so the result would depend on the
+    # host. The integer arithmetic is emulated in numpy instead.
+    m = _model("y = MatMul(x, w)", {"w": W})
+    q = quantize_dynamic_integer(m, weight_dtype="int8")
+    assert _ops(q) == ["DynamicQuantizeLinear", "MatMulInteger", "Cast", "Mul", "Mul"]
+    inits = {i.name: numpy_helper.to_array(i) for i in q.graph.initializer}
+    wq, ws, wz = inits["w_quantized"], inits["w_scale"], inits["w_zero_point"]
+    assert wq.dtype == np.int8 and wz == 0 and np.abs(wq).max() == 127
+    # DynamicQuantizeLinear: uint8 asymmetric over [min(x, 0), max(x, 0)]
+    lo, hi = min(float(X.min()), 0.0), max(float(X.max()), 0.0)
+    xs = (hi - lo) / 255.0
+    xz = np.clip(np.round(-lo / xs), 0, 255)
+    xq = np.clip(np.round(X / xs) + xz, 0, 255)
+    got = ((xq - xz) @ wq.astype(np.float64)) * (xs * ws)
+    ref = X @ W
+    assert np.linalg.norm(ref - got) / np.linalg.norm(ref) < 0.03
 
 
 @pytest.mark.parametrize("trans_b", [0, 1])
