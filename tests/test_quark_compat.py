@@ -294,3 +294,79 @@ def test_adaround_is_still_refused(preset):
         qc.ModelQuantizer(cfg).quantize_model(
             _two_layer_model(), calibration_data_reader=_batches((4, 8))
         )
+
+
+def _amp_config(**params):
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    target = params.pop(
+        "target_layer_config", qc.QLayerConfig(qc.UInt16Spec(), qc.Int8Spec())
+    )
+    cfg.algo_config = [qc.AutoMixprecisionConfig(target_layer_config=target, **params)]
+    return cfg
+
+
+def test_auto_mixprecision_moves_layers_to_the_target_activation_precision():
+    q = qc.ModelQuantizer(
+        _amp_config(metric_optimize_object="quality", metric_threshold=0)
+    )
+    with pytest.warns(UserWarning, match="AutoMixprecision"):
+        out = q.quantize_model(
+            _two_layer_model(), calibration_data_reader=_batches((4, 8))
+        )
+    res = q.last_auto_mixprecision
+    assert res is not None and res.moved  # threshold 0: every candidate moves
+    assert res.final_score < res.baseline_score
+    # the moved layers' activations really are uint16 now
+    assert onnx.TensorProto.UINT16 in {i.data_type for i in out.graph.initializer}
+    onnx.checker.check_model(out)
+
+
+def test_auto_mixprecision_threshold_none_is_sensitivity_only():
+    q = qc.ModelQuantizer(_amp_config(metric_threshold=None))
+    with pytest.warns(UserWarning, match="AutoMixprecision"):
+        out = q.quantize_model(
+            _two_layer_model(), calibration_data_reader=_batches((4, 8))
+        )
+    assert q.last_auto_mixprecision.ranked and not q.last_auto_mixprecision.moved
+    assert onnx.TensorProto.UINT16 not in {i.data_type for i in out.graph.initializer}
+
+
+@pytest.mark.parametrize(
+    "params, error, match",
+    [
+        (
+            {
+                "target_layer_config": {
+                    qc.QLayerConfig(qc.UInt16Spec(), qc.Int8Spec()): []
+                }
+            },
+            NotImplementedError,
+            "single QLayerConfig",
+        ),
+        ({"subgraph_json": "x.json"}, NotImplementedError, "subgraph_json"),
+        (
+            {"sensitivity_cache_file": "c.json"},
+            NotImplementedError,
+            "sensitivity_cache_file",
+        ),
+        (
+            {"target_layer_config": qc.QLayerConfig(qc.UInt8Spec(), qc.Int8Spec())},
+            ValueError,
+            "nothing to mix",
+        ),
+    ],
+)
+def test_auto_mixprecision_unsupported_forms_are_refused(params, error, match):
+    q = qc.ModelQuantizer(_amp_config(**params))
+    with pytest.raises(error, match=match):
+        q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
+
+
+def test_auto_mixprecision_state_is_reset_between_runs():
+    q = qc.ModelQuantizer(_amp_config(metric_threshold=None))
+    with pytest.warns(UserWarning):
+        q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
+    assert q.last_auto_mixprecision is not None
+    q.config.algo_config = []
+    q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
+    assert q.last_auto_mixprecision is None
