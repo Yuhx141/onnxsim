@@ -27,10 +27,9 @@ struct EliminateShapeOp final : public PredicateBasedPass {
     }
     const auto [start, end] = normalizedRange(node);
     const auto& sizes = node->input()->sizes();
-    return std::all_of(sizes.cbegin() + start, sizes.cbegin() + end,
-                       [](const auto& dim) {
-                         return dim.is_int && dim.dim >= 0;
-                       });
+    return std::all_of(
+        sizes.cbegin() + start, sizes.cbegin() + end,
+        [](const auto& dim) { return dim.is_int && dim.dim >= 0; });
   }
 
   bool runTransform(Node* node, Graph& graph,
