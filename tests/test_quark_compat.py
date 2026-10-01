@@ -180,11 +180,11 @@ def test_no_adaround_variant_for_block_presets():
         qc.QConfig.get_default_config("MX9_ADAROUND")
 
 
-def test_algo_config_not_silently_dropped():
+def test_unknown_algo_config_is_not_silently_dropped():
     cfg = qc.QConfig.get_default_config("U8S8_AAWS")
-    cfg.algo_config = [qc.QuarotConfig()]
+    cfg.algo_config = [qc.AlgoConfig(name="some_new_algo")]
     q = qc.ModelQuantizer(cfg)
-    with pytest.raises(NotImplementedError, match="quarot"):
+    with pytest.raises(NotImplementedError, match="some_new_algo"):
         q.quantize_model(_model(), calibration_data_reader=_Reader())
     q.quantize_model(
         _model(), calibration_data_reader=_Reader(), ignore_unsupported_algos=True
@@ -423,3 +423,93 @@ def test_auto_mixprecision_state_is_reset_between_runs():
     q.config.algo_config = []
     q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
     assert q.last_auto_mixprecision is None
+
+
+def _stream_model():
+    # x -> w_in (writes the stream) -> per-channel scale (the "norm") -> w_out (reads it)
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        agraph (float[N,8] x) => (float[N,8] y)
+        {
+            s = MatMul(x, w_in)
+            n = Mul(s, g)
+            y = MatMul(n, w_out)
+        }
+        """
+    )
+    rng = np.random.default_rng(7)
+    # Random weights are attached programmatically (too large for text literals).
+    for name, shape, scale in (
+        ("w_in", (8, 16), 1.0),
+        ("g", (16,), 0.5),
+        ("w_out", (16, 8), 0.3),
+    ):
+        arr = rng.standard_normal(shape).astype(np.float32) * scale
+        if name == "g":
+            arr += 1.0
+        model.graph.initializer.append(onnx.numpy_helper.from_array(arr, name))
+    for node in model.graph.node:
+        node.name = node.output[0]
+    return model
+
+
+def _quarot_cfg(tmp_path, **params):
+    import json
+
+    path = tmp_path / "rot.json"
+    path.write_text(
+        json.dumps(
+            {"R1_pairs": [{"prev_nodes": ["s"], "next_nodes": ["y"], "norm_node": "n"}]}
+        )
+    )
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.algo_config = [
+        qc.QuarotConfig(r_matrix_dim=16, r_config_path=str(path), **params)
+    ]
+    return cfg
+
+
+def test_quarot_rotates_the_float_weights_before_quantization(tmp_path):
+    import onnxruntime as ort
+
+    batches = _batches((6, 8))
+    plain = _quantize(_stream_model(), [], batches)
+    q = qc.ModelQuantizer(_quarot_cfg(tmp_path))
+    with pytest.warns(UserWarning, match="Quarot"):
+        out = q.quantize_model(_stream_model(), calibration_data_reader=batches)
+    codes = lambda m: {  # noqa: E731
+        t.name: onnx.numpy_helper.to_array(t)
+        for t in m.graph.initializer
+        if t.name.endswith("/int8")
+    }
+    assert any(not np.array_equal(codes(out)[k], codes(plain)[k]) for k in codes(out))
+
+    def run(m, x):
+        sess = ort.InferenceSession(m.SerializeToString())
+        return sess.run(None, {"x": x})[0]
+
+    x = batches[0]["x"]
+    ref = run(_stream_model(), x)
+    err = lambda m: float(np.abs(run(m, x) - ref).max())  # noqa: E731
+    assert err(out) < 5 * err(plain) + 0.05  # a different basis, same function
+
+
+def test_quarot_requires_a_config_path():
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.algo_config = [qc.QuarotConfig()]
+    with pytest.raises(ValueError, match="r_config_path"):
+        qc.ModelQuantizer(cfg).quantize_model(
+            _stream_model(), calibration_data_reader=_batches((6, 8))
+        )
+
+
+@pytest.mark.parametrize("preset", ["FP16", "BF16"])
+def test_float_presets_refuse_an_algo_config_instead_of_dropping_it(preset):
+    cfg = qc.QConfig.get_default_config(preset)
+    cfg.algo_config = [qc.SmoothQuantConfig()]
+    q = qc.ModelQuantizer(cfg)
+    with pytest.raises(NotImplementedError, match="float presets"):
+        q.quantize_model(_model())
+    out = q.quantize_model(_model(), ignore_unsupported_algos=True)
+    assert "Cast" in _ops(out)
