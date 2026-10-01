@@ -2751,6 +2751,7 @@ def run_recal_steps(
     policy: str,
     steps: Sequence[int],
     margin: float,
+    probe_nodes: Sequence[str] = (),
 ) -> list[dict]:
     """Run training steps of the calibration dataset on the device with the
     16-bit MatMul/Conv chains recalibrated per step (``policy``):
@@ -2787,7 +2788,9 @@ def run_recal_steps(
             + [loss_name]
             + [o for w, o in state_map.items() if not w.endswith(("__m", "__v"))]
         )
-        fouts, _ = StepRunner(model, []).run(feeds, "float", keep=keep)
+        by_node = {n.name: n for n in model.graph.node}
+        probes = [t for n in probe_nodes for t in by_node[n].output]
+        fouts, _ = StepRunner(model, []).run(feeds, "float", keep=keep + probes)
         ranges: dict[str, dict] = {}
         moved = refused = 0
         for name, info in u16_info.items():
@@ -2815,8 +2818,18 @@ def run_recal_steps(
                     print(f"  recalibrate {name}: {type(exc).__name__}: {exc}"[:160])
         prev_ranges = ranges
         outs, stats = runner.run(
-            feeds, "npu", check=False, keep=list(grad_names.values()) + [loss_name]
+            feeds,
+            "npu",
+            check=False,
+            keep=list(grad_names.values()) + [loss_name] + probes,
         )
+        for n in probe_nodes:
+            for t in by_node[n].output:
+                print(
+                    f"  probe step {k} {by_node[n].op_type} {n}: rel err vs float "
+                    f"{rel_err(outs[t], fouts[t]):.3e}",
+                    flush=True,
+                )
         fgrads = {w: np.asarray(fouts[t]) for w, t in grad_names.items()}
         gcos = [cos(outs[t], fgrads[w]) for w, t in grad_names.items()]
         results.append(
@@ -3188,6 +3201,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--u16-margin-factor headroom, exact = the step's own ranges",
     )
     p.add_argument(
+        "--probe-nodes",
+        default="",
+        help="with --u16-recal: print each step's relative error against the "
+        "float run for the outputs of these nodes",
+    )
+    p.add_argument(
         "--steps",
         default="0",
         help="comma-separated training steps of the calibration dataset to run "
@@ -3384,6 +3403,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.u16_recal,
                 [int(x) for x in args.steps.split(",")],
                 args.u16_margin_factor,
+                [x for x in args.probe_nodes.split(",") if x],
             )
         with open(args.out, "w") as f:
             json.dump(results, f, indent=1)

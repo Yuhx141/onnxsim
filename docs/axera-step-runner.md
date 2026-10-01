@@ -657,3 +657,51 @@ The steady state is 1.75x the host-only run; 4.1 s of it is `axclrtEngineExecute
 What is left per step (3 runs): `RUNT` 4.8 s, staged `RUN` 2.4 s (about 10
 segments), tensor upload 1.6 s and download 1.0 s (the weights and optimizer state
 would stay on the device across steps), `TDEL` 0.5 s, and the host's own Python.
+
+### Four real training steps: recalibration policies and the loss drift
+
+The calibration dataset holds the first four steps of a real training
+trajectory (every graph input per step; step 0 is the reference batch).
+`--u16-recal static|delayed|exact --steps 0,1,2,3` runs them on the AX8850 with the
+16-bit MatMul/Conv chains recalibrated per step from `quant_axmodel.json`
+sidecars (`u16_chain.predict_scales16` and `matmul_record_emit.recalibrate`; no
+Pulsar2 build): static = the step-0 templates, delayed = the previous step's
+ranges times `--u16-margin-factor`, exact = the step's own ranges.
+`--probe-nodes` prints a node's relative error against the float run.
+
+| policy | gradient cosine (median), steps 1 / 2 / 3 |
+|---|---|
+| static | 0.9953 / 0.9962 / 0.9975 |
+| delayed | 0.9950 / 0.9964 / 0.9987 |
+| exact | 0.9970 / 0.9964 / 0.9985 |
+
+39 of the 62 chains moved with no device error or NaN; delayed scaling is as good
+as exact, and the step-0 templates already hold for these four steps. The 22
+refused chains are the forward 3x3 and strided Convs: `value ... matches no scale
+formula` at register `0x1ef0`. A 3x3 chain concatenates its nine taps and
+requantizes the asymmetric weight (zero point 32043) to a symmetric one; the
+first `0x1ef0` record is `int32(float32(zw * sw / swcat * 2^15))` (five builds at
+different calibrations; the low bits are float32 granularity, all multiples
+of 64). The second record is not yet decoded.
+
+The loss was the real problem: within 0.02 of float at step 0 but 0.7 to 0.8
+low at steps 1 to 3, under every policy. Bisecting on step 1 (kinds on the
+NPU, the rest in float): data movement alone is exact; adding `relu` or the
+binary/elementwise kinds stays within 0.01; the MatMul/Conv chains alone are
+fine (+0.010); the 16-bit `misc` segments alone give -0.82. Within them, the
+loss `Neg` and `ReduceSum` segments (`Neg_8`, `Neg_14`, `ReduceSum_6`,
+`ReduceSum_12`) are the cause: a 16-bit build is calibrated on step 0's value
+range, and the next step's loss term lies outside it and saturates. Building
+those four with FP32 layers (`--u16-fp32 '^(Neg_8|Neg_14|ReduceSum_6|ReduceSum_12)$'`)
+removes the dependence on a calibrated range:
+
+| step | loss | float | error |
+|---|---|---|---|
+| 0 | 17.041 | 17.058 | -0.017 |
+| 1 | 17.344 | 17.339 | +0.006 |
+| 2 | 17.526 | 17.496 | +0.029 |
+| 3 | 17.587 | 17.555 | +0.032 |
+
+(gradient cosines unchanged at 0.995 to 0.997.) Any tensor that is a loss
+term or a sum should be FP32 or recalibrated per step; a range calibrated on one
+batch is not a bound on the next.
