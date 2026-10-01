@@ -695,3 +695,258 @@ def test_integer_preset_quantization_parameters_match_quark(
         [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
     )
     np.testing.assert_allclose(m_w, q_w, rtol=2e-3)
+
+
+# == calibration / scale parity (power-of-two MinMSE, int8 biases, methods) =======
+
+
+def _heavy(rng, *shape):
+    """Student-t weights: heavy tails make clipping beat ``ceil(log2)`` scales."""
+    return (rng.standard_t(2.5, shape) * 0.3).astype(np.float32)
+
+
+def _cal_inits(pairs):
+    return [onnx.numpy_helper.from_array(a, n) for n, a in pairs]
+
+
+def _cal_mlp(seed):
+    rng = np.random.default_rng(seed)
+    m = parser.parse_model(
+        """
+        <ir_version: 9, opset_import: ["": 17]>
+        g (float[4,24] x) => (float[4,10] y) {
+            h0 = Gemm(x, w1, b1)
+            h1 = Relu(h0)
+            h2 = Gemm(h1, w2, b2)
+            h3 = Relu(h2)
+            y = Gemm(h3, w3, b3)
+        }
+        """
+    )
+    m.graph.initializer.extend(
+        _cal_inits(
+            [
+                ("w1", _heavy(rng, 24, 48)),
+                ("b1", _heavy(rng, 48)),
+                ("w2", _heavy(rng, 48, 32)),
+                ("b2", _heavy(rng, 32)),
+                ("w3", _heavy(rng, 32, 10)),
+                ("b3", _heavy(rng, 10)),
+            ]
+        )
+    )
+    return m, (4, 24)
+
+
+def _cal_conv(seed):
+    rng = np.random.default_rng(seed)
+    m = parser.parse_model(
+        """
+        <ir_version: 9, opset_import: ["": 17]>
+        g (float[2,3,12,12] x) => (float[2,6,6,6] y) {
+            c0 = Conv<pads=[1,1,1,1]>(x, w1, b1)
+            r0 = Relu(c0)
+            c1 = Conv<pads=[1,1,1,1]>(r0, w2, b2)
+            r1 = Relu(c1)
+            y = MaxPool<kernel_shape=[2,2], strides=[2,2]>(r1)
+        }
+        """
+    )
+    m.graph.initializer.extend(
+        _cal_inits(
+            [
+                ("w1", _heavy(rng, 8, 3, 3, 3)),
+                ("b1", _heavy(rng, 8)),
+                ("w2", _heavy(rng, 6, 8, 3, 3)),
+                ("b2", _heavy(rng, 6)),
+            ]
+        )
+    )
+    return m, (2, 3, 12, 12)
+
+
+def _cal_attn(seed):
+    """LayerNorm / Softmax / residual Add around four projections."""
+    rng = np.random.default_rng(seed)
+    d = 16
+    m = parser.parse_model(
+        f"""
+        <ir_version: 9, opset_import: ["": 17]>
+        g (float[1,6,{d}] x) => (float[1,6,{d}] y) {{
+            n = LayerNormalization<axis=-1, epsilon=1e-5>(x, ln_s, ln_b)
+            q = MatMul(n, wq)
+            k = MatMul(n, wk)
+            kt = Transpose<perm=[0,2,1]>(k)
+            s = MatMul(q, kt)
+            sc = Mul(s, c)
+            p = Softmax<axis=-1>(sc)
+            v = MatMul(n, wv)
+            a = MatMul(p, v)
+            o = MatMul(a, wo)
+            y = Add(x, o)
+        }}
+        """
+    )
+    m.graph.initializer.extend(
+        _cal_inits(
+            [
+                ("ln_s", (1 + 0.2 * rng.standard_normal(d)).astype(np.float32)),
+                ("ln_b", (0.1 * rng.standard_normal(d)).astype(np.float32)),
+                ("wq", _heavy(rng, d, d)),
+                ("wk", _heavy(rng, d, d)),
+                ("wv", _heavy(rng, d, d)),
+                ("wo", _heavy(rng, d, d)),
+                ("c", np.array(0.25, np.float32)),
+            ]
+        )
+    )
+    return m, (1, 6, d)
+
+
+CAL_MODELS = {"mlp": _cal_mlp, "conv": _cal_conv, "attn": _cal_attn}
+
+
+def _norm_name(name):
+    for cut in ("_QuantizeLinear_Input", "_quantized", "/f", "/dq"):
+        name = name.removesuffix(cut)
+    return name.split("/qdq")[0]
+
+
+def _qparam_map(model):
+    """``({tensor: (scale, zero_point, dtype)}, {initializer: (dequantized,
+    int8-code abs-sum)})``: every activation Q node, and every DQ that reads
+    an initializer."""
+    inits = {i.name: onnx.numpy_helper.to_array(i) for i in model.graph.initializer}
+    acts, consts = {}, {}
+    for n in model.graph.node:
+        if n.op_type == "QuantizeLinear" and n.input[1] in inits:
+            zp = inits[n.input[2]]
+            acts[_norm_name(n.input[0])] = (
+                float(inits[n.input[1]]),
+                int(zp),
+                str(zp.dtype),
+            )
+        elif n.op_type == "DequantizeLinear" and n.input[0] in inits:
+            q = inits[n.input[0]]
+            deq = (q.astype(np.float64) - inits[n.input[2]]) * inits[n.input[1]]
+            consts[_norm_name(n.input[0])] = (
+                deq,
+                q.dtype.name,
+                float(np.max(inits[n.input[1]])),
+            )
+    return acts, consts
+
+
+def _check_cal_parity(model, shape, preset, tmp_path, rtol, zp_atol=0, constants=True):
+    q_acts, q_consts = _qparam_map(quark_quantize(model, preset, shape, tmp_path))
+    m_acts, m_consts = _qparam_map(mine_quantize(model, preset, shape))
+    assert q_acts and set(q_acts) == set(m_acts)
+    for name, (scale, zp, dt) in q_acts.items():
+        ms, mz, mdt = m_acts[name]
+        assert mdt == dt, name
+        np.testing.assert_allclose(ms, scale, rtol=rtol, err_msg=name)
+        assert abs(mz - zp) <= zp_atol, (name, mz, zp)
+    if not constants:
+        return
+    assert set(q_consts) == set(m_consts)
+    for name, (want, dt, scale) in q_consts.items():
+        got, mdt, _ = m_consts[name]
+        assert mdt == dt, name
+        # int8 weights / biases dequantize identically; an int32 bias carries
+        # the activation scale's (percentile-binning) difference: a code or two
+        atol = 2 * scale if dt == "int32" else 1e-4
+        np.testing.assert_allclose(
+            got, want, rtol=max(rtol, 1e-6), atol=atol, err_msg=name
+        )
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("model_name", sorted(CAL_MODELS))
+def test_xint8_minmse_pof2_matches_quark(model_name, seed, tmp_path):
+    """XINT8: power-of-two scales picked by MinMSE -- activations (histogram
+    search), weights, and the int8 biases / constants -- are identical to
+    Quark's: same scale, zero point and dtype per tensor, same int8 codes."""
+    model, shape = CAL_MODELS[model_name](seed)
+    _check_cal_parity(model, shape, "XINT8", tmp_path, rtol=0)
+
+
+def _drain(reader):
+    out = []
+    while (b := reader.get_next()) is not None:
+        out.append(b)
+    return out
+
+
+def test_xint8_cases_where_ceil_log2_differs_from_quark(tmp_path):
+    """The previous ``ceil(log2(scale))`` / int32-bias rule lands on different
+    scales than Quark on these heavy-tailed models, so the parity above is not
+    vacuous."""
+    from onnxsim.full_qdq import quantize_full_qdq
+
+    differing = 0
+    for name, build in sorted(CAL_MODELS.items()):
+        for seed in range(4):
+            model, shape = build(seed)
+            q_acts, q_consts = _qparam_map(
+                quark_quantize(model, "XINT8", shape, tmp_path)
+            )
+            old = quantize_full_qdq(
+                model,
+                _drain(_reader(shape)()),
+                activation_dtype="uint8",
+                method="minmax",
+                symmetric_activations=True,
+                power_of_two=True,
+                per_channel=False,
+            )
+            o_acts, o_consts = _qparam_map(old)
+            differing += any(
+                o_acts[k][0] != v[0] for k, v in q_acts.items() if k in o_acts
+            )
+    assert differing >= 4
+
+
+@pytest.mark.parametrize("model_name", sorted(CAL_MODELS))
+def test_xint8_int32_bias_option_keeps_int32(model_name):
+    model, shape = CAL_MODELS[model_name](0)
+    cfg = qc.QConfig.get_default_config("XINT8")
+    cfg.extra_options["Int32Bias"] = True
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=_reader(shape)()
+        )
+    dtypes = {onnx.numpy_helper.to_array(i).dtype for i in out.graph.initializer}
+    has_bias = any(n.op_type in ("Gemm", "Conv") for n in model.graph.node)
+    assert (np.dtype(np.int32) in dtypes) == has_bias
+
+
+@pytest.mark.parametrize("seed", range(2))
+@pytest.mark.parametrize("model_name", sorted(CAL_MODELS))
+@pytest.mark.parametrize(
+    "preset, rtol, zp_atol",
+    [
+        # MinMax: the same range -> the same scale
+        ("A8W8", 1e-6, 0),
+        ("A16W8", 1e-6, 0),
+        # Percentile: histogram binning moves a scale by a few 1e-4
+        ("U8S8_AAWS", 2e-3, 1),
+        ("S8S8_AAWS", 2e-3, 1),
+        ("U8U8_AAWA", 2e-3, 1),
+        ("S16S8_ASWS", 2e-3, 40),
+        ("U16S8_AAWS", 2e-3, 40),
+    ],
+)
+def test_calibration_methods_match_quark_per_preset(
+    preset, rtol, zp_atol, model_name, seed, tmp_path
+):
+    """Per-tensor scale / zero point / dtype and dequantized weights, biases
+    and constants of each preset's calibration method (MinMax, Percentile
+    99.999 / 99.9999, symmetric or not), including Softmax's fixed (0, 1)
+    output range and the int8 weight treatment of non-weight constants."""
+    model, shape = CAL_MODELS[model_name](seed)
+    # U8U8_AAWA's uint8 asymmetric weights are a documented approximation
+    # (int8 symmetric here): only its activations are compared
+    _check_cal_parity(
+        model, shape, preset, tmp_path, rtol, zp_atol, constants=preset != "U8U8_AAWA"
+    )
