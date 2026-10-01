@@ -30,17 +30,23 @@ names and preset *meanings*, not copied.
   (``A8W8`` int8, ``XINT8``) is therefore *approximated* by uint8 / uint16
   activations; the approximation is recorded in
   ``ModelQuantizer.last_approximations`` and emitted as a ``UserWarning``.
-- ``BFP16``, ``MX4/6/9``, ``MXFP*`` and dynamic quantization raise
-  ``NotImplementedError`` (no custom-op runtime for them here).
+- Block formats (``BFP16``, ``MX4/6/9``, ``MXFP4/6/8``, ``MXINT8``): the
+  *weights* of MatMul/Gemm/Conv are fake-quantized offline with
+  :mod:`onnxsim.quark_block_formats` (bit-exact against Quark's CPU kernels)
+  and stored back as float32, blocks along the reduction axis. Quark also
+  inserts runtime custom ops (domain ``com.vai.quantize``) that quantize
+  *activations*; onnxsim has no such op, so activations stay float -- recorded
+  in ``last_approximations``. ``algo_config`` is not applied to block formats.
+  Dynamic quantization raises ``NotImplementedError``.
 - ``algo_config``: SmoothQuant (``alpha``) and CLE run on the float model
-  before quantization; BiasCorrection runs after it, against the float
-  model. AdaQuant, AdaRound, GPTQ, Quarot and AutoMixprecision are accepted
-  and stored so configs round-trip, but **not executed** (onnxsim's AdaRound/
-  GPTQ target its int4 weight-only scheme, and its AdaQuant only recognizes
-  ``quantize_static`` output -- on ``quantize_full_qdq`` output it silently
-  changes nothing, so it is refused rather than run as a no-op):
-  ``quantize_model`` raises ``NotImplementedError`` naming them unless
-  ``ignore_unsupported_algos=True``.
+  before quantization; AdaQuant (``num_iterations``, ``learning_rate``,
+  ``reg_param``) and BiasCorrection run after it, against the float model.
+  AdaQuant only reoptimizes MatMul/Gemm layers whose output is not folded
+  with a following Relu, and leaves the rest as calibrated. AdaRound, GPTQ,
+  Quarot and AutoMixprecision are accepted and stored so configs round-trip,
+  but **not executed** (onnxsim's AdaRound/GPTQ target its int4 weight-only
+  scheme): ``quantize_model`` raises ``NotImplementedError`` naming them
+  unless ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted.
 """
 
@@ -90,7 +96,43 @@ MX4Spec = _spec("MX4Spec", "mx4", False)
 MX6Spec = _spec("MX6Spec", "mx6", False)
 MX9Spec = _spec("MX9Spec", "mx9", False)
 
-_UNSUPPORTED_DTYPES = {"bfp16", "mx4", "mx6", "mx9"}
+MXFP4E2M1Spec = _spec("MXFP4E2M1Spec", "mxfp4_e2m1", False)
+MXFP6E3M2Spec = _spec("MXFP6E3M2Spec", "mxfp6_e3m2", False)
+MXFP6E2M3Spec = _spec("MXFP6E2M3Spec", "mxfp6_e2m3", False)
+MXFP8E5M2Spec = _spec("MXFP8E5M2Spec", "mxfp8_e5m2", False)
+MXFP8E4M3Spec = _spec("MXFP8E4M3Spec", "mxfp8_e4m3", False)
+MXInt8Spec = _spec("MXInt8Spec", "mxint8", False)
+
+
+def _block_fn(dtype: str) -> Optional[Callable[[np.ndarray, int], np.ndarray]]:
+    """Weight fake-quantizer ``f(array, axis)`` for a block-format dtype."""
+    from onnxsim import quark_block_formats as bf
+
+    if dtype == "bfp16":
+        return lambda a, ax: bf.bfp16(a, axis=ax)
+    if dtype in ("mx4", "mx6", "mx9"):
+        bw = {"mx4": 11, "mx6": 13, "mx9": 16}[dtype]
+        return lambda a, ax: bf.bfp_prime(a, bit_width=bw, axis=ax)
+    if dtype == "mxint8":
+        return lambda a, ax: bf.mx(a, element_dtype="int8", axis=ax)
+    if dtype.startswith("mxfp"):
+        elem = dtype.replace("mxfp", "fp", 1)  # mxfp8_e4m3 -> fp8_e4m3
+        return lambda a, ax: bf.mx(a, element_dtype=elem, axis=ax)
+    return None
+
+
+_BLOCK_DTYPES = {
+    "bfp16",
+    "mx4",
+    "mx6",
+    "mx9",
+    "mxint8",
+    "mxfp4_e2m1",
+    "mxfp6_e3m2",
+    "mxfp6_e2m3",
+    "mxfp8_e5m2",
+    "mxfp8_e4m3",
+}
 
 
 @dataclass(eq=True)
@@ -189,6 +231,12 @@ _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "MX4": lambda: QConfig(_layer(MX4Spec, MX4Spec)),
     "MX6": lambda: QConfig(_layer(MX6Spec, MX6Spec)),
     "MX9": lambda: QConfig(_layer(MX9Spec, MX9Spec)),
+    "MXFP4E2M1": lambda: QConfig(_layer(MXFP4E2M1Spec, MXFP4E2M1Spec)),
+    "MXFP6E3M2": lambda: QConfig(_layer(MXFP6E3M2Spec, MXFP6E3M2Spec)),
+    "MXFP6E2M3": lambda: QConfig(_layer(MXFP6E2M3Spec, MXFP6E2M3Spec)),
+    "MXFP8E5M2": lambda: QConfig(_layer(MXFP8E5M2Spec, MXFP8E5M2Spec)),
+    "MXFP8E4M3": lambda: QConfig(_layer(MXFP8E4M3Spec, MXFP8E4M3Spec)),
+    "MXINT8": lambda: QConfig(_layer(MXInt8Spec, MXInt8Spec)),
 }
 
 
@@ -200,9 +248,12 @@ def _algo_variant(base: str, cls: type) -> Callable[[], QConfig]:
 
 
 for _n in list(_PRESETS):
-    if _n[:2] in ("XI", "A8", "A1", "S8", "U8", "U1", "S1"):
+    _block = _n.startswith(("BFP", "MX"))
+    if _n == "BF16" or _n.startswith("FP16"):
+        continue
+    if not _block:
         _PRESETS[f"{_n}_ADAROUND"] = _algo_variant(_n, AdaRoundConfig)
-        _PRESETS[f"{_n}_ADAQUANT"] = _algo_variant(_n, AdaQuantConfig)
+    _PRESETS[f"{_n}_ADAQUANT"] = _algo_variant(_n, AdaQuantConfig)
 
 
 def _with_algo(cfg: QConfig, algo: AlgoConfig) -> QConfig:
@@ -238,7 +289,13 @@ def _drain_reader(
     return batches
 
 
-_RUNNABLE_ALGOS = {"smooth_quant", "cle", "bias_correction"}
+_RUNNABLE_ALGOS = {"smooth_quant", "cle", "adaquant", "bias_correction"}
+# Quark AdaQuant param -> onnxsim.apply_adaquant kwarg.
+_ADAQUANT_PARAMS = {
+    "num_iterations": "num_iterations",
+    "learning_rate": "weight_learning_rate",
+    "reg_param": "reg_param",
+}
 
 
 # -- quantizer -----------------------------------------------------------------
@@ -272,10 +329,6 @@ class ModelQuantizer:
         act, wt = cfg.global_config.activation, cfg.global_config.weight
 
         for spec in (act, wt):
-            if spec.dtype in _UNSUPPORTED_DTYPES:
-                raise NotImplementedError(
-                    f"{spec.dtype} quantization has no onnxsim backend"
-                )
             if spec.is_dynamic:
                 raise NotImplementedError("dynamic quantization is not supported")
         unsupported = [a.name for a in cfg.algo_config if a.name not in _RUNNABLE_ALGOS]
@@ -290,7 +343,15 @@ class ModelQuantizer:
         if isinstance(model_input, str):
             model_input = onnx.load(model_input)
 
-        if act.dtype in ("float16", "bfloat16"):
+        if wt.dtype in _BLOCK_DTYPES or act.dtype in _BLOCK_DTYPES:
+            if cfg.algo_config and not ignore_unsupported_algos:
+                raise NotImplementedError(
+                    "algo_config is not applied to block formats "
+                    f"({act.dtype}/{wt.dtype}); pass ignore_unsupported_algos=True "
+                    "to quantize without it"
+                )
+            result = self._quantize_block(model_input, act, wt)
+        elif act.dtype in ("float16", "bfloat16"):
             from onnxsim.onnx_simplifier import quantize_bf16, quantize_fp16
 
             fn = quantize_fp16 if act.dtype == "float16" else quantize_bf16
@@ -307,6 +368,47 @@ class ModelQuantizer:
         if model_output:
             onnx.save(result, model_output)
         return result
+
+    def _quantize_block(
+        self, model: onnx.ModelProto, act: QSpec, wt: QSpec
+    ) -> onnx.ModelProto:
+        fn = _block_fn(wt.dtype)
+        if fn is None:
+            raise NotImplementedError(
+                f"weight dtype {wt.dtype} with block-format activation {act.dtype} "
+                "has no onnxsim backend"
+            )
+        if act.dtype in _BLOCK_DTYPES:
+            self._approx(
+                f"{act.dtype} activations are not quantized (Quark inserts runtime "
+                "ops for them; onnxsim has none) -- weights only"
+            )
+        m = onnx.ModelProto()
+        m.CopyFrom(model)
+        inits = {t.name: t for t in m.graph.initializer}
+        excluded = {e for e in self.config.exclude if isinstance(e, str)}
+        done = set()
+        for node in m.graph.node:
+            if node.op_type not in ("MatMul", "Gemm", "Conv") or len(node.input) < 2:
+                continue
+            if node.name in excluded or node.output[0] in excluded:
+                continue
+            w = inits.get(node.input[1])
+            if w is None or w.data_type != onnx.TensorProto.FLOAT or w.name in done:
+                continue
+            arr = onnx.numpy_helper.to_array(w)
+            if arr.ndim < 2:
+                continue
+            if node.op_type == "Conv":
+                axis = 1  # [O, I/g, k...]: input channels
+            elif node.op_type == "Gemm":
+                trans_b = any(a.name == "transB" and a.i for a in node.attribute)
+                axis = 1 if trans_b else 0  # [N, K] vs [K, N]: the K axis
+            else:
+                axis = arr.ndim - 2  # MatMul B [..., K, N]: the K axis
+            w.CopyFrom(onnx.numpy_helper.from_array(fn(arr, axis), w.name))
+            done.add(w.name)
+        return m
 
     def _approx(self, msg: str) -> None:
         self.last_approximations.append(msg)
@@ -367,6 +469,20 @@ class ModelQuantizer:
         )
 
         # Post-quantization passes, which compare against the float model.
+        if "adaquant" in by_name:
+            from onnxsim.adaquant import apply_adaquant
+
+            params = by_name["adaquant"].params
+            quantized = apply_adaquant(
+                float_model,
+                quantized,
+                calibration_data=calibration,
+                **{
+                    kwarg: params[key]
+                    for key, kwarg in _ADAQUANT_PARAMS.items()
+                    if key in params
+                },
+            )
         if "bias_correction" in by_name:
             from onnxsim.bias_correction import correct_bias
 
@@ -393,6 +509,12 @@ __all__ = [
     "MX4Spec",
     "MX6Spec",
     "MX9Spec",
+    "MXFP4E2M1Spec",
+    "MXFP6E2M3Spec",
+    "MXFP6E3M2Spec",
+    "MXFP8E4M3Spec",
+    "MXFP8E5M2Spec",
+    "MXInt8Spec",
     "ModelQuantizer",
     "QConfig",
     "QLayerConfig",
