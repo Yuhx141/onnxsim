@@ -51,6 +51,8 @@ typedef struct {
   void *in_dev[MAX_IO], *out_dev[MAX_IO];
   uint64_t in_size[MAX_IO], out_size[MAX_IO];
   int keep_in[MAX_IO];
+  int in_bound[MAX_IO]; /* inputs/outputs currently bound to a tensor-store buffer (RUNT) */
+  int out_bound[MAX_IO];
 } Model;
 
 static Model models[MAX_MODELS];
@@ -152,12 +154,28 @@ static int write_file(const char *p, const void *src, uint64_t n) {
   return put == n ? 0 : -2;
 }
 
+/* Put a model's I/O back on its own buffers after RUNT bound tensor-store ones. */
+static int rebind_own(Model *m) {
+  for (uint32_t i = 0; i < m->n_in; i++)
+    if (m->in_bound[i]) {
+      if (axclrtEngineSetInputBufferByIndex(m->io, i, m->in_dev[i], m->in_size[i])) return -1;
+      m->in_bound[i] = 0;
+    }
+  for (uint32_t i = 0; i < m->n_out; i++)
+    if (m->out_bound[i]) {
+      if (axclrtEngineSetOutputBufferByIndex(m->io, i, m->out_dev[i], m->out_size[i])) return -1;
+      m->out_bound[i] = 0;
+    }
+  return 0;
+}
+
 static void cmd_run(char *args, int resident) {
   char *save = NULL;
   char *tok = strtok_r(args, " ", &save);
   int id = tok ? atoi(tok) : -1;
   if (id < 0 || id >= MAX_MODELS || !models[id].used) { printf("ERR bad id\n"); return; }
   Model *m = &models[id];
+  if (rebind_own(m)) { printf("ERR rebind\n"); return; }
   if (!resident) memset(m->keep_in, 0, sizeof(m->keep_in));
   tok = strtok_r(NULL, " ", &save);
   uint32_t n_in = tok ? (uint32_t)atoi(tok) : 0;
@@ -305,8 +323,10 @@ static void cmd_runt(char *args) {
              (unsigned long)t->size, i, (unsigned long)m->in_size[i]);
       return;
     }
-    axclError e = axclrtMemcpy(m->in_dev[i], t->dev, t->size, AXCL_MEMCPY_DEVICE_TO_DEVICE);
-    if (e) { printf("ERR d2d in 0x%x\n", e); return; }
+    /* bind the tensor's buffer as the model's input: no copy */
+    axclError e = axclrtEngineSetInputBufferByIndex(m->io, i, t->dev, t->size);
+    if (e) { printf("ERR bind in 0x%x\n", e); return; }
+    m->in_bound[i] = 1;
   }
   tok = strtok_r(NULL, " ", &save);
   uint32_t n_out = tok ? (uint32_t)atoi(tok) : 0;
@@ -316,18 +336,26 @@ static void cmd_runt(char *args) {
     out_name[i] = strtok_r(NULL, " ", &save);
     if (!out_name[i]) { printf("ERR output name %u\n", i); return; }
   }
+  /* bind each named output tensor as the model's output buffer: no copy ("-"
+   * keeps the model's own buffer). An output named like an input would alias it. */
+  axclError e;
+  for (uint32_t i = 0; i < n_out; i++) {
+    void *dst = m->out_dev[i];
+    if (strcmp(out_name[i], "-")) {
+      Tensor *t = tensor_get(out_name[i], m->out_size[i]);
+      if (!t) { printf("ERR out alloc %s\n", out_name[i]); return; }
+      dst = t->dev;
+    }
+    if ((e = axclrtEngineSetOutputBufferByIndex(m->io, i, dst, m->out_size[i]))) {
+      printf("ERR bind out 0x%x\n", e); return;
+    }
+    m->out_bound[i] = dst != m->out_dev[i];
+  }
   struct timeval t0, t1;
   gettimeofday(&t0, NULL);
-  axclError e = axclrtEngineExecute(m->model_id, m->ctx_id, 0, m->io);
+  e = axclrtEngineExecute(m->model_id, m->ctx_id, 0, m->io);
   gettimeofday(&t1, NULL);
   if (e) { printf("ERR execute 0x%x\n", e); return; }
-  for (uint32_t i = 0; i < n_out; i++) {
-    if (!strcmp(out_name[i], "-")) continue;
-    Tensor *t = tensor_get(out_name[i], m->out_size[i]);
-    if (!t) { printf("ERR out alloc %s\n", out_name[i]); return; }
-    e = axclrtMemcpy(t->dev, m->out_dev[i], m->out_size[i], AXCL_MEMCPY_DEVICE_TO_DEVICE);
-    if (e) { printf("ERR d2d out 0x%x\n", e); return; }
-  }
   printf("OK %ld\n", (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_usec - t0.tv_usec)));
 }
 

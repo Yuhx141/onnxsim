@@ -607,3 +607,11 @@ weights and optimizer state would stay on the device across steps). The next
 steps are device-side broadcast for the staged segments, binding the tensor
 store's buffers to the model I/O instead of copying, and keeping the state on the
 device across steps.
+
+`RUNT` binds the named tensors' device buffers directly as the model's input and
+output buffers instead of copying them (`axclrtEngineSetInputBufferByIndex` /
+`SetOutputBufferByIndex`; a plain `RUN` rebinds the model's own buffers first).
+That takes the `RUNT` time from 8.6 s to 4.5 s over the step, at the 4.1 s of
+engine time, and the gradients stay bit-identical to the staged run. (The
+wall-clock figure above was measured before this change; the next measurement is
+taken with the machine otherwise idle.)
