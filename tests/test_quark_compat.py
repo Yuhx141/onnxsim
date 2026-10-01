@@ -563,11 +563,7 @@ def test_gptq_runs_through_the_compat_layer():
 @pytest.mark.parametrize(
     "algo, match",
     [
-        (qc.AdaRoundConfig(update_bias=True), "update_bias"),
-        (qc.AdaRoundConfig(drop_ratio=0.5), "drop_ratio"),
-        (qc.GPTQConfig(bits=4), "bits must be 8"),
-        (qc.GPTQConfig(group_size=128), "group_size"),
-        (qc.GPTQConfig(weight_symmetric=False), "weight_symmetric"),
+        (qc.GPTQConfig(group_size=4, act_order=True), "act_order with group_size"),
     ],
 )
 def test_weight_rounding_options_that_change_the_meaning_are_refused(algo, match):

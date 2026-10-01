@@ -66,11 +66,23 @@ names and preset *meanings*, not copied.
   ``subgraph_json`` and ``sensitivity_cache_file`` raise, and ``dual_quant_nodes``
   / ``no_input_qdq_shared`` / ``shared_param_mode`` / ``worker_num`` have no
   effect (every tensor already has its own Q/DQ pair; analysis is serial).
-  AdaRound and GPTQ refine the int8 weight codes layer by layer
+  AdaRound and GPTQ refine the weight codes layer by layer
   (:mod:`onnxsim.quark_weight_rounding`; Conv / Gemm / MatMul, guarded so a
-  layer's reconstruction error never gets worse); ``update_bias``, ``drop_ratio``
-  (AdaRound) and ``bits != 8`` / ``group_size`` / asymmetric weights (GPTQ)
-  raise. Quarot folds the R1 residual-stream rotation into the float
+  layer's reconstruction error never gets worse). AdaRound honours
+  ``drop_ratio`` (QDrop-style mixing of quantized and float layer inputs),
+  ``selective_update``, ``lr_adjust`` and ``data_size``; ``update_bias`` is
+  accepted and ignored, as in Quark (only AdaQuant reads it); ``early_stop`` /
+  ``output_qdq`` / ``batch_size`` / ``num_batches`` have no effect. GPTQ with
+  ``bits`` / ``group_size`` / ``per_channel`` / ``mse`` / ``weight_symmetric``
+  set re-grids the weights the way Quark's GPTQ does (``bits``-bit codes,
+  per-tensor / per-channel / per-group scales, scales and zero points written
+  back into the QDQ weights; ``group_size`` needs a blocked
+  ``DequantizeLinear``, opset >= 21, which ONNX Runtime only runs next to
+  activation Q/DQ with ``session.disable_quant_qdq=1``); with none of them set
+  the model's own scales are kept. ``act_order`` together with ``group_size``
+  raises. Quark 0.13's GPTQ error-propagation step is a no-op (it indexes a
+  triangular factor by column), so Quark's result is round-to-nearest on its
+  grid; onnxsim really propagates the error (and is never worse). Quarot folds the R1 residual-stream rotation into the float
   weights before quantization (:mod:`onnxsim.quark_quarot`; needs
   ``r_config_path``; R2-R4 do not exist, as in Quark's ONNX flow). An
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
@@ -500,21 +512,27 @@ class ModelQuantizer:
         from onnxsim.quark_weight_rounding import adaround_int8
 
         p = algo.params
-        if p.get("update_bias"):
-            raise NotImplementedError("AdaRoundConfig.update_bias is not supported")
-        if p.get("drop_ratio", 1.0) != 1.0:
-            raise NotImplementedError(
-                "AdaRoundConfig.drop_ratio (QDrop) is not supported"
-            )
+        # update_bias: Quark's AdaRound never reads it (only AdaQuant does).
         self._approx(
             "AdaRound is layer-wise against the float model's activations "
             "(Quark optimizes subgraph blocks)"
         )
         kwargs: Dict[str, Any] = {
             k: p[k]
-            for k in ("num_iterations", "learning_rate", "reg_param", "warm_start")
+            for k in (
+                "num_iterations",
+                "learning_rate",
+                "reg_param",
+                "warm_start",
+                "drop_ratio",
+                "selective_update",
+            )
             if k in p
         }
+        if p.get("lr_adjust"):
+            kwargs["lr_adjust"] = tuple(p["lr_adjust"])
+        if "data_size" in p:
+            calibration = calibration[: int(p["data_size"])]
         if "beta_range" in p:
             kwargs["beta_range"] = tuple(p["beta_range"])
         if "fixed_seed" in p:
@@ -538,17 +556,33 @@ class ModelQuantizer:
         from onnxsim.quark_weight_rounding import gptq_int8
 
         p = algo.params
-        if p.get("bits", 8) != 8:
-            raise NotImplementedError("GPTQConfig.bits must be 8 (int8 QDQ weights)")
-        if p.get("group_size", -1) != -1:
-            raise NotImplementedError("GPTQConfig.group_size must be -1 (ungrouped)")
-        if not p.get("weight_symmetric", True):
-            raise NotImplementedError("GPTQConfig.weight_symmetric must be True")
-        self._approx(
-            "GPTQ keeps quantize_full_qdq's per-channel scales "
-            "(GPTQConfig.per_channel / mse are not used)"
+        bits = int(p.get("bits", 8))
+        group_size = int(p.get("group_size", -1))
+        sym = bool(p.get("weight_symmetric", True))
+        mse = bool(p.get("mse", False))
+        requantize = (
+            bits != 8 or group_size != -1 or not sym or mse or "per_channel" in p
         )
-        kwargs: Dict[str, Any] = {}
+        if requantize:
+            self._approx(
+                "GPTQ re-grids the weights like Quark's GPTQ (GPTQConfig.bits / "
+                "group_size / per_channel / mse / weight_symmetric) from all "
+                "calibration batches, and does propagate rounding error (Quark "
+                "0.13's update is a no-op)"
+            )
+        else:
+            self._approx(
+                "GPTQ keeps quantize_full_qdq's per-channel scales "
+                "(GPTQConfig.per_channel / mse are not used)"
+            )
+        kwargs: Dict[str, Any] = {
+            "bits": bits,
+            "group_size": group_size,
+            "weight_symmetric": sym,
+            "mse": mse,
+            "per_channel": bool(p.get("per_channel", False)),
+            "requantize": requantize,
+        }
         if "perc_damp" in p:
             kwargs["perc_damp"] = p["perc_damp"]
         if "block_size" in p:
