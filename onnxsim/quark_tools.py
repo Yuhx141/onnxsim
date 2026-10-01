@@ -18,6 +18,29 @@ Correspondence with Quark (verified on the parity models):
   :func:`convert_fp32_to_fp16` / ``bf16`` and :func:`convert_fp16_to_fp32` /
   ``bf16_to_fp32`` follow the Quark tool of the same name.
 
+The remaining tools of ``quark.onnx.tools`` (and the graph helpers of
+``quark.onnx.utils.model_utils``) live in :mod:`onnxsim.quark_tools_extra` and
+are re-exported here; that module's docstrings note each deliberate difference:
+
+- ``convert_a8w8_npu_to_a8w8_cpu``, ``convert_bias_int32_to_int16`` (returns
+  ``(model, changed)`` like Quark), ``convert_custom_ops``,
+  ``convert_customqdq_to_qdq``, ``convert_nchw_to_nhwc``, ``convert_qdq_to_qop``,
+  ``convert_resize_fs_to_pof2s``, ``convert_u16s8_to_s16s8``,
+  ``convert_u16u8_to_u8u8``, ``convert_fp16_to_bf16`` (Quark's ``bf16`` format),
+  ``fix_shapes`` (+ ``fix_input_and_output_shapes``), ``insert_clip_bfloat16_qdq``,
+  ``remove_bf16_cast``, ``remove_qdq_between_ops``, ``remove_qdq_mul_add``,
+  ``replace_bfloat16_qdq_cast``, ``convert_onnx_to_onnxtxt`` /
+  ``convert_onnxtxt_to_onnx`` (model <-> text; Quark's are CLI-only) and
+  ``a16w8_a8w8_nodes`` (Quark's ``print_a16w8_a8w8_nodes`` takes a path).
+- From ``model_utils``: ``copy_shared_nodes``, ``check_shared_initializers``,
+  ``clean_initializer_in_input``, ``save_onnx_model_with_external_data``.
+- Not implemented: ``convert_lstm_to_customlstm`` (needs Quark's ``ExtendedLSTM``
+  custom op), ``convert_fp16_to_bfp16`` / ``convert_fp32_to_bfp16`` and
+  ``random_quantize`` (thin drivers around Quark's whole quantizer; onnxsim's
+  BFP16 / MX fake-quantizers are in ``quark_compat``), ``evaluate`` and
+  ``save_tensor_hist`` / ``save_weights_hist`` (image metrics / matplotlib
+  reports, not graph edits).
+
 Every function takes and returns an ``onnx.ModelProto`` (the input is not
 modified) and only rewrites the **top-level graph** -- nodes inside
 control-flow subgraphs are left alone.
@@ -444,6 +467,35 @@ def remove_initializer_from_input(model: onnx.ModelProto) -> onnx.ModelProto:
     return _impl(_copy(model))
 
 
+from onnxsim.quark_tools_extra import (  # noqa: E402
+    CUSTOM_OP_NAME_MAPPING,
+    a16w8_a8w8_nodes,
+    check_shared_initializers,
+    clean_initializer_in_input,
+    convert_a8w8_npu_to_a8w8_cpu,
+    convert_bias_int32_to_int16,
+    convert_custom_ops,
+    convert_customqdq_to_qdq,
+    convert_fp16_to_bf16,
+    convert_nchw_to_nhwc,
+    convert_onnx_to_onnxtxt,
+    convert_onnxtxt_to_onnx,
+    convert_qdq_to_qop,
+    convert_resize_fs_to_pof2s,
+    convert_u16s8_to_s16s8,
+    convert_u16u8_to_u8u8,
+    copy_shared_nodes,
+    fix_input_and_output_shapes,
+    fix_shapes,
+    insert_clip_bfloat16_qdq,
+    parse_input_and_output_shapes,
+    remove_bf16_cast,
+    remove_qdq_between_ops,
+    remove_qdq_mul_add,
+    replace_bfloat16_qdq_cast,
+    save_onnx_model_with_external_data,
+)
+
 __all__ = [
     "convert_bf16_to_fp32",
     "convert_dynamic_to_fixed",
@@ -457,4 +509,30 @@ __all__ = [
     "remove_initializer_from_input",
     "remove_qdq",
     "replace_inf_weights",
+    "CUSTOM_OP_NAME_MAPPING",
+    "a16w8_a8w8_nodes",
+    "check_shared_initializers",
+    "clean_initializer_in_input",
+    "convert_a8w8_npu_to_a8w8_cpu",
+    "convert_bias_int32_to_int16",
+    "convert_custom_ops",
+    "convert_customqdq_to_qdq",
+    "convert_fp16_to_bf16",
+    "convert_nchw_to_nhwc",
+    "convert_onnx_to_onnxtxt",
+    "convert_onnxtxt_to_onnx",
+    "convert_qdq_to_qop",
+    "convert_resize_fs_to_pof2s",
+    "convert_u16s8_to_s16s8",
+    "convert_u16u8_to_u8u8",
+    "copy_shared_nodes",
+    "fix_input_and_output_shapes",
+    "fix_shapes",
+    "insert_clip_bfloat16_qdq",
+    "parse_input_and_output_shapes",
+    "remove_bf16_cast",
+    "remove_qdq_between_ops",
+    "remove_qdq_mul_add",
+    "replace_bfloat16_qdq_cast",
+    "save_onnx_model_with_external_data",
 ]

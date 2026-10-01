@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import onnx
@@ -191,6 +191,7 @@ def _optimize_rounding(
     reg_param: float,
     warm_start: float,
     beta_range: "tuple[float, float]",
+    x_sampler: "Optional[Callable[[], np.ndarray]]" = None,
 ) -> np.ndarray:
     """Returns the optimized integer codes (shape like ``w_nk``, values in
     ``[n_min, n_max]``) for one weight matrix, given its layer's activation
@@ -198,6 +199,11 @@ def _optimize_rounding(
     ``w_nk``/``scale_nk`` are the float weight and its (already
     block-broadcast) per-element scale, both laid out ``[N, K]`` (output
     channel first) regardless of the op's own storage layout.
+
+    ``x_sampler`` (default off) is what :mod:`onnxsim.quark_weight_rounding`
+    uses for Quark's ``drop_ratio``: when given, every iteration draws the
+    layer input it *predicts with* from ``x_sampler()`` (same shape as
+    ``x``) instead of ``x``; the target output stays ``x @ w_nk.T``.
     """
     y_float = x @ w_nk.T  # [num_samples, N]
 
@@ -217,9 +223,10 @@ def _optimize_rounding(
         w_hat = np.clip(raw2, n_min, n_max) * scale_nk
         active_w = (raw2 > n_min) & (raw2 < n_max)
 
-        y_hat = x @ w_hat.T
+        x_t = x if x_sampler is None else x_sampler()
+        y_hat = x_t @ w_hat.T
         dl_dy = 2.0 * (y_hat - y_float) / n
-        dl_dw_hat = dl_dy.T @ x  # [N, K]
+        dl_dw_hat = dl_dy.T @ x_t  # [N, K]
         dl_dh = dl_dw_hat * np.where(active_w, scale_nk, 0.0)
         grad = dl_dh * dh_dv
 
