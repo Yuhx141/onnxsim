@@ -1,6 +1,8 @@
 """Tests for onnxsim.quark_compat -- the Quark-ONNX-API-shaped shim backed by
 onnxsim's own quantizers (see that module's docstring for scope)."""
 
+import os
+
 import numpy as np
 import onnx
 import pytest
@@ -119,38 +121,118 @@ def _wide_matmul_model():
     return model
 
 
-@pytest.mark.parametrize(
-    "preset, fmt",
-    [
-        ("BFP16", "bfp16"),
-        ("MX4", "mx4"),
-        ("MX9", "mx9"),
-        ("MXINT8", "mxint8"),
-        ("MXFP8E4M3", "mxfp8_e4m3"),
-        ("MXFP4E2M1", "mxfp4_e2m1"),
-    ],
-)
-def test_block_format_presets_fake_quantize_weights(preset, fmt):
+_BLOCK_PRESETS = [
+    ("BFP16", "bfp16"),
+    ("MX4", "mx4"),
+    ("MX9", "mx9"),
+    ("MXINT8", "mxint8"),
+    ("MXFP8E4M3", "mxfp8_e4m3"),
+    ("MXFP4E2M1", "mxfp4_e2m1"),
+]
+
+
+def _expected_weights(fmt, w):
     from onnxsim import quark_block_formats as bf
 
-    q = qc.ModelQuantizer(qc.QConfig.get_default_config(preset))
-    model = _wide_matmul_model()
-    with pytest.warns(UserWarning, match="activations are not quantized"):
-        out = q.quantize_model(model)
-    w_in = onnx.numpy_helper.to_array(model.graph.initializer[0])
-    w_out = onnx.numpy_helper.to_array(out.graph.initializer[0])
-    assert not np.array_equal(w_in, w_out)
-    # blocks run along the reduction axis (K = axis 0 of a MatMul weight)
-    expected = {
+    return {
         "bfp16": lambda a: bf.bfp16(a, axis=0),
         "mx4": lambda a: bf.bfp_prime(a, bit_width=11, axis=0),
         "mx9": lambda a: bf.bfp_prime(a, bit_width=16, axis=0),
         "mxint8": lambda a: bf.mx(a, element_dtype="int8", axis=0),
         "mxfp8_e4m3": lambda a: bf.mx(a, element_dtype="fp8_e4m3", axis=0),
         "mxfp4_e2m1": lambda a: bf.mx(a, element_dtype="fp4_e2m1", axis=0),
-    }[fmt](w_in)
-    np.testing.assert_array_equal(w_out, expected)
-    assert out.graph.node[0].op_type == "MatMul"  # graph untouched, no custom ops
+    }[fmt](w)
+
+
+def _weights_only(preset):
+    cfg = qc.QConfig.get_default_config(preset)
+    cfg.extra_options["BlockFormatActivations"] = False
+    return qc.ModelQuantizer(cfg)
+
+
+@pytest.mark.parametrize("preset, fmt", _BLOCK_PRESETS)
+def test_block_format_presets_fake_quantize_weights(preset, fmt):
+    q = _weights_only(preset)
+    model = _wide_matmul_model()
+    with pytest.warns(UserWarning, match="BlockFormatActivations=False"):
+        out = q.quantize_model(model)
+    w_in = onnx.numpy_helper.to_array(model.graph.initializer[0])
+    w_out = onnx.numpy_helper.to_array(out.graph.initializer[0])
+    assert not np.array_equal(w_in, w_out)
+    # blocks run along the reduction axis (K = axis 0 of a MatMul weight)
+    np.testing.assert_array_equal(w_out, _expected_weights(fmt, w_in))
+    assert [n.op_type for n in out.graph.node] == ["MatMul"]  # graph untouched
+    onnx.checker.check_model(out)
+
+
+_EXPECTED_ATTRS = {
+    "BFP16": (
+        "BFPQuantizeDequantize",
+        dict(bfp_method="to_bfp", bit_width=16, block_size=8, rounding_mode=2),
+    ),
+    "MX4": (
+        "BFPQuantizeDequantize",
+        dict(
+            bfp_method="to_bfp_prime",
+            bit_width=11,
+            block_size=16,
+            sub_block_size=2,
+            sub_block_shift_bits=1,
+            rounding_mode=2,
+        ),
+    ),
+    "MX9": (
+        "BFPQuantizeDequantize",
+        dict(
+            bfp_method="to_bfp_prime",
+            bit_width=16,
+            block_size=16,
+            sub_block_size=2,
+            sub_block_shift_bits=1,
+            rounding_mode=2,
+        ),
+    ),
+    "MXINT8": (
+        "MXQuantizeDequantize",
+        dict(element_dtype="int8", block_size=32, rounding_mode=2),
+    ),
+    "MXFP8E4M3": (
+        "MXQuantizeDequantize",
+        dict(element_dtype="fp8_e4m3", block_size=32, rounding_mode=2),
+    ),
+    "MXFP4E2M1": (
+        "MXQuantizeDequantize",
+        dict(element_dtype="fp4_e2m1", block_size=32, rounding_mode=2),
+    ),
+}
+
+
+def _attrs(node):
+    return {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
+
+
+@pytest.mark.parametrize("preset, fmt", _BLOCK_PRESETS)
+def test_block_format_presets_insert_quark_custom_op_nodes_on_activations(preset, fmt):
+    q = qc.ModelQuantizer(qc.QConfig.get_default_config(preset))
+    model = _wide_matmul_model()
+    with pytest.warns(UserWarning, match="custom-op library"):
+        out = q.quantize_model(model)
+    qdq, mm = out.graph.node
+    op, expected = _EXPECTED_ATTRS[preset]
+    assert (qdq.op_type, qdq.domain) == (op, "com.amd.quark")
+    attrs = _attrs(qdq)
+    # string attributes come back as bytes
+    attrs = {k: v.decode() if isinstance(v, bytes) else v for k, v in attrs.items()}
+    assert attrs == {**expected, "axis": -1}  # MatMul activation: reduction axis
+    assert mm.op_type == "MatMul" and mm.input[0] == qdq.output[0]
+    assert qdq.input[0] == "x"
+    assert [(o.domain, o.version) for o in out.opset_import if o.domain] == [
+        ("com.amd.quark", 1)
+    ]
+    # weights are still folded offline
+    w_out = onnx.numpy_helper.to_array(out.graph.initializer[0])
+    w_in = onnx.numpy_helper.to_array(model.graph.initializer[0])
+    np.testing.assert_array_equal(w_out, _expected_weights(fmt, w_in))
     onnx.checker.check_model(out)
 
 
@@ -158,14 +240,110 @@ def test_block_format_conv_blocks_input_channels():
     from onnxsim import quark_block_formats as bf
 
     model = _conv_model()
-    q = qc.ModelQuantizer(qc.QConfig.get_default_config("BFP16"))
-    with pytest.warns(UserWarning, match="activations are not quantized"):
+    q = _weights_only("BFP16")
+    with pytest.warns(UserWarning, match="BlockFormatActivations=False"):
         out = q.quantize_model(model)
     w_in = onnx.numpy_helper.to_array(model.graph.initializer[0])
     w_out = onnx.numpy_helper.to_array(
         next(t for t in out.graph.initializer if t.name == "w1")
     )
     np.testing.assert_array_equal(w_out, bf.bfp16(w_in, axis=1))
+
+
+def test_block_format_conv_activation_axis_is_channels_and_nodes_are_shared():
+    model = _conv_model()  # conv1(x) -> relu -> conv2
+    q = qc.ModelQuantizer(qc.QConfig.get_default_config("BFP16"))
+    with pytest.warns(UserWarning):
+        out = q.quantize_model(model)
+    ops = [n.op_type for n in out.graph.node]
+    assert ops == [
+        "BFPQuantizeDequantize",
+        "Conv",
+        "Relu",
+        "BFPQuantizeDequantize",
+        "Conv",
+    ]
+    assert [
+        _attrs(n)["axis"] for n in out.graph.node if n.op_type.startswith("BFP")
+    ] == [1, 1]
+    # a tensor feeding two target layers gets a single quantize-dequantize node
+    shared = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        agraph (float[N,16] x) => (float[N,8] y1, float[N,8] y2)
+        {
+            y1 = MatMul(x, wa)
+            y2 = MatMul(x, wb)
+        }
+        """
+    )
+    rng = np.random.default_rng(0)
+    for n in ("wa", "wb"):
+        shared.graph.initializer.append(
+            onnx.numpy_helper.from_array(
+                rng.standard_normal((16, 8)).astype(np.float32), n
+            )
+        )
+    with pytest.warns(UserWarning):
+        out = qc.ModelQuantizer(qc.QConfig.get_default_config("BFP16")).quantize_model(
+            shared
+        )
+    assert [n.op_type for n in out.graph.node].count("BFPQuantizeDequantize") == 1
+    assert len({n.input[0] for n in out.graph.node if n.op_type == "MatMul"}) == 1
+
+
+def test_excluded_layers_get_neither_weight_nor_activation_quantization():
+    cfg = qc.QConfig.get_default_config("BFP16")
+    cfg.exclude = ["y"]
+    q = qc.ModelQuantizer(cfg)
+    model = _wide_matmul_model()
+    with pytest.warns(UserWarning):
+        out = q.quantize_model(model)
+    assert out.SerializeToString() == model.SerializeToString()
+
+
+# Building the library (CPU only; sources ship in the `amd-quark` wheel under
+# quark/onnx/operators/custom_ops, whose headers include ORT 1.17 and GSL):
+#   g++ -O1 -std=c++17 -shared -fPIC -DNO_GPU -Iinclude -Isrc \
+#       -Iinclude/onnxruntime-1.17.0/onnxruntime \
+#       -Iinclude/onnxruntime-1.17.0/onnxruntime/core/session \
+#       -Iinclude/gsl-4.0.0 src/custom_op_{library,qdq,in,bfp,mx,lstm}.cc \
+#       src/bfp/cpu/{bfp_kernel,bfp}.cc src/mx/cpu/{mx_kernel,mx}.cc \
+#       -o libquark_ops.so
+# It loads into the installed onnxruntime via register_custom_ops_library().
+@pytest.mark.skipif(
+    not os.environ.get("QUARK_ONNX_OPS_LIB"),
+    reason="set QUARK_ONNX_OPS_LIB to a build of Quark's ONNX custom-op library",
+)
+@pytest.mark.parametrize("preset, fmt", _BLOCK_PRESETS)
+def test_emitted_models_run_in_quarks_op_library_and_match_numpy(preset, fmt):
+    """End to end through ONNX Runtime with Quark's own compiled op library."""
+    import onnxruntime as ort
+
+    from onnxsim import quark_block_formats as bf
+
+    model = _wide_matmul_model()
+    q = qc.ModelQuantizer(qc.QConfig.get_default_config(preset))
+    with pytest.warns(UserWarning):
+        out = q.quantize_model(model)
+    so = ort.SessionOptions()
+    so.register_custom_ops_library(os.environ["QUARK_ONNX_OPS_LIB"])
+    sess = ort.InferenceSession(
+        out.SerializeToString(), so, providers=["CPUExecutionProvider"]
+    )
+    x = np.random.default_rng(1).standard_normal((5, 32)).astype(np.float32) * 3
+    got = sess.run(None, {"x": x})[0]
+
+    w_fq = onnx.numpy_helper.to_array(out.graph.initializer[0])
+    act = {
+        "bfp16": lambda a: bf.bfp16(a, axis=-1),
+        "mx4": lambda a: bf.bfp_prime(a, bit_width=11, axis=-1),
+        "mx9": lambda a: bf.bfp_prime(a, bit_width=16, axis=-1),
+        "mxint8": lambda a: bf.mx(a, element_dtype="int8", axis=-1),
+        "mxfp8_e4m3": lambda a: bf.mx(a, element_dtype="fp8_e4m3", axis=-1),
+        "mxfp4_e2m1": lambda a: bf.mx(a, element_dtype="fp4_e2m1", axis=-1),
+    }[fmt](x)
+    np.testing.assert_allclose(got, act @ w_fq, rtol=1e-5, atol=1e-5)
 
 
 def test_block_format_with_algo_config_is_refused():
