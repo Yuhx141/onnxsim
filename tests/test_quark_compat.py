@@ -100,11 +100,84 @@ def test_float_presets_need_no_calibration(preset):
     assert "Cast" in _ops(model)
 
 
-@pytest.mark.parametrize("preset", ["BFP16", "MX4", "MX9"])
-def test_unsupported_dtypes_raise(preset):
+def _wide_matmul_model():
+    rng = np.random.default_rng(5)
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        agraph (float[N,32] x) => (float[N,8] y)
+        {
+            y = MatMul(x, w)
+        }
+        """
+    )
+    # Random weights are attached programmatically (too large for text literals).
+    w = (rng.standard_normal((32, 8)) * np.exp2(rng.integers(-3, 3, (32, 8)))).astype(
+        np.float32
+    )
+    model.graph.initializer.append(onnx.numpy_helper.from_array(w, "w"))
+    return model
+
+
+@pytest.mark.parametrize(
+    "preset, fmt",
+    [
+        ("BFP16", "bfp16"),
+        ("MX4", "mx4"),
+        ("MX9", "mx9"),
+        ("MXINT8", "mxint8"),
+        ("MXFP8E4M3", "mxfp8_e4m3"),
+        ("MXFP4E2M1", "mxfp4_e2m1"),
+    ],
+)
+def test_block_format_presets_fake_quantize_weights(preset, fmt):
+    from onnxsim import quark_block_formats as bf
+
     q = qc.ModelQuantizer(qc.QConfig.get_default_config(preset))
-    with pytest.raises(NotImplementedError):
-        q.quantize_model(_model(), calibration_data_reader=_Reader())
+    model = _wide_matmul_model()
+    with pytest.warns(UserWarning, match="activations are not quantized"):
+        out = q.quantize_model(model)
+    w_in = onnx.numpy_helper.to_array(model.graph.initializer[0])
+    w_out = onnx.numpy_helper.to_array(out.graph.initializer[0])
+    assert not np.array_equal(w_in, w_out)
+    # blocks run along the reduction axis (K = axis 0 of a MatMul weight)
+    expected = {
+        "bfp16": lambda a: bf.bfp16(a, axis=0),
+        "mx4": lambda a: bf.bfp_prime(a, bit_width=11, axis=0),
+        "mx9": lambda a: bf.bfp_prime(a, bit_width=16, axis=0),
+        "mxint8": lambda a: bf.mx(a, element_dtype="int8", axis=0),
+        "mxfp8_e4m3": lambda a: bf.mx(a, element_dtype="fp8_e4m3", axis=0),
+        "mxfp4_e2m1": lambda a: bf.mx(a, element_dtype="fp4_e2m1", axis=0),
+    }[fmt](w_in)
+    np.testing.assert_array_equal(w_out, expected)
+    assert out.graph.node[0].op_type == "MatMul"  # graph untouched, no custom ops
+    onnx.checker.check_model(out)
+
+
+def test_block_format_conv_blocks_input_channels():
+    from onnxsim import quark_block_formats as bf
+
+    model = _conv_model()
+    q = qc.ModelQuantizer(qc.QConfig.get_default_config("BFP16"))
+    with pytest.warns(UserWarning, match="activations are not quantized"):
+        out = q.quantize_model(model)
+    w_in = onnx.numpy_helper.to_array(model.graph.initializer[0])
+    w_out = onnx.numpy_helper.to_array(
+        next(t for t in out.graph.initializer if t.name == "w1")
+    )
+    np.testing.assert_array_equal(w_out, bf.bfp16(w_in, axis=1))
+
+
+def test_block_format_with_algo_config_is_refused():
+    q = qc.ModelQuantizer(qc.QConfig.get_default_config("BFP16_ADAQUANT"))
+    with pytest.raises(NotImplementedError, match="block formats"):
+        q.quantize_model(_wide_matmul_model())
+
+
+def test_no_adaround_variant_for_block_presets():
+    qc.QConfig.get_default_config("MX9_ADAQUANT")
+    with pytest.raises(ValueError):
+        qc.QConfig.get_default_config("MX9_ADAROUND")
 
 
 def test_algo_config_not_silently_dropped():
