@@ -113,6 +113,24 @@ def node_spec(dtype: str, axis: int = 1) -> Tuple[str, Dict[str, object]]:
     raise ValueError(f"not a block format: {dtype!r}")
 
 
+# Quark's FP16/BF16 presets quantize a wider op set than its block formats:
+# the shape-only ops are quantized even when they start a chain, and BF16
+# additionally covers the elementwise math ops and BatchNormalization.
+_HALF_SHAPE_OPS = {
+    "MaxPool",
+    "Reshape",
+    "Transpose",
+    "Squeeze",
+    "Unsqueeze",
+    "Resize",
+    "LayerNormalization",
+}
+HALF_EXTRA_OPS = {
+    "float16": _HALF_SHAPE_OPS,
+    "bfloat16": _HALF_SHAPE_OPS
+    | {"Flatten", "Abs", "Neg", "Exp", "Sqrt", "BatchNormalization"},
+}
+
 HALF_DTYPES = {
     "float16": onnx.TensorProto.FLOAT16,
     "bfloat16": onnx.TensorProto.BFLOAT16,
@@ -185,7 +203,9 @@ class _Plan:
     def is_float(self, name: str) -> bool:
         return bool(name) and self.elem.get(name) == onnx.TensorProto.FLOAT
 
-    def quantized_tensors(self, model: onnx.ModelProto) -> List[str]:
+    def quantized_tensors(
+        self, model: onnx.ModelProto, extra_active: Optional[Set[str]] = None
+    ) -> List[str]:
         """Tensors that get a node, in first-use order (activations and
         constants alike)."""
         q: List[str] = []
@@ -197,8 +217,9 @@ class _Plan:
                 q.append(name)
 
         for n in model.graph.node:
-            if n.op_type in ACTIVE_OPS:
-                for x in n.input:
+            if n.op_type in ACTIVE_OPS or n.op_type in (extra_active or ()):
+                # Resize's roi / scales / sizes are parameters, not data.
+                for x in n.input[:1] if n.op_type == "Resize" else n.input:
                     add(x)
                 for y in n.output:
                     add(y)
@@ -208,6 +229,60 @@ class _Plan:
         # A pass-through op feeding an active op: its output was added above as
         # that op's input; nothing to do for its own input (not quantized).
         return q
+
+
+# Quark drops the fake-quant pair between a producer and a directly following
+# ReLU-like activation in its Q/DQ-based flows (FP16/BF16 here), since the
+# pair is fused into one kernel on its target; the BFP/MX custom ops stay.
+_FUSE_PRODUCERS = {
+    "Conv",
+    "Add",
+    "MaxPool",
+    "AveragePool",
+    "GlobalAveragePool",
+    "MatMul",
+    "Gemm",
+    "ConvTranspose",
+}
+_FUSE_ACTIVATIONS = {"Relu", "LeakyRelu", "PRelu"}
+
+
+def _is_relu_clip(node: onnx.NodeProto, inits: Dict[str, onnx.TensorProto]) -> bool:
+    if node.op_type != "Clip":
+        return False
+    bounds = []
+    for name in node.input[1:3]:
+        t = inits.get(name)
+        if t is None or t.data_type != onnx.TensorProto.FLOAT:
+            return False
+        bounds.append(float(numpy_helper.to_array(t).reshape(-1)[0]))
+    return len(bounds) == 2 and bounds[0] == 0.0 and bounds[1] in (1.0, 6.0)
+
+
+def _fused_activation_inputs(
+    model: onnx.ModelProto, inits: Dict[str, onnx.TensorProto]
+) -> Set[str]:
+    """Tensors written by a producer and read only by one ReLU-like node."""
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for n in model.graph.node:
+        for x in n.input:
+            consumers.setdefault(x, []).append(n)
+    graph_outputs = {o.name for o in model.graph.output}
+    producer_out = {
+        n.output[0]
+        for n in model.graph.node
+        if n.op_type in _FUSE_PRODUCERS and n.output
+    }
+    out: Set[str] = set()
+    for n in model.graph.node:
+        if not n.input or n.input[0] not in producer_out:
+            continue
+        if not (n.op_type in _FUSE_ACTIVATIONS or _is_relu_clip(n, inits)):
+            continue
+        t = n.input[0]
+        if len(consumers.get(t, [])) == 1 and t not in graph_outputs:
+            out.add(t)
+    return out
 
 
 def _refine_axes(
@@ -283,7 +358,10 @@ def apply_fake_quant_format(
         work.graph.node.extend(keep)
 
     plan = _Plan(m)
-    quantized = plan.quantized_tensors(work)
+    quantized = plan.quantized_tensors(work, HALF_EXTRA_OPS.get(dtype))
+    if half:
+        fused = _fused_activation_inputs(work, plan.inits)
+        quantized = [t for t in quantized if t not in fused]
     axes = _refine_axes(work, set(quantized), plan.inits)
     consts = [t for t in quantized if t in plan.inits]
     acts = [t for t in quantized if t not in plan.inits]
@@ -360,6 +438,7 @@ __all__ = [
     "COP_DOMAIN",
     "PASS_THROUGH_OPS",
     "HALF_DTYPES",
+    "HALF_EXTRA_OPS",
     "apply_fake_quant_format",
     "node_spec",
 ]

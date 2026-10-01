@@ -460,6 +460,35 @@ def test_cle_changes_a_conv_relu_conv_model():
     assert out.SerializeToString() != base.SerializeToString()
 
 
+def test_cle_also_equalizes_a_gemm_relu_gemm_chain():
+    rng = np.random.default_rng(0)
+    model = parser.parse_model(
+        """
+        <ir_version: 9, opset_import: ["": 17]>
+        g (float[4,8] x) => (float[4,4] y) {
+            h0 = Gemm(x, w1, b1)
+            h1 = Relu(h0)
+            y = Gemm(h1, w2, b2)
+        }
+        """
+    )
+    for name, shape, k in (
+        ("w1", (8, 6), 2.0),
+        ("b1", (6,), 1.0),
+        ("w2", (6, 4), 0.3),
+        ("b2", (4,), 1.0),
+    ):
+        model.graph.initializer.append(
+            onnx.numpy_helper.from_array(
+                (rng.standard_normal(shape) * k).astype(np.float32), name
+            )
+        )
+    batches = _batches((4, 8))
+    base = _quantize(model, [], batches)
+    out = _quantize(model, [qc.CLEConfig()], batches)
+    assert out.SerializeToString() != base.SerializeToString()
+
+
 def test_adaquant_runs_and_changes_the_quantized_model():
     batches = _batches((4, 8))
     base = _quantize(_two_layer_model(), [], batches)

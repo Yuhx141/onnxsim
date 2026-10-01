@@ -41,14 +41,18 @@ names and preset *meanings*, not copied.
   against the installed ``amd-quark`` in CI: identical placement on the probed
   ops and bit-identical outputs under ONNX Runtime. Not replicated: Quark's
   model pre-processing (BatchNormalization folding, ``ReduceMean`` ->
-  ``GlobalAveragePool``, CLE). Options (``QConfig(..., extra_options=...)``):
+  ``GlobalAveragePool``, the implicit CLE below). Options (``QConfig(..., extra_options=...)``):
   ``BlockFormatActivations=False`` quantizes only the constants, offline, so the
   model runs anywhere; ``BlockFormatFoldWeights=True`` folds the constants
   offline (via :mod:`onnxsim.quark_block_formats`) instead of leaving a node on
   them. ``algo_config`` is not applied to block formats.
   Dynamic quantization raises ``NotImplementedError``.
-- ``algo_config``: SmoothQuant (``alpha``) and CLE run on the float model
-  before quantization; AdaQuant (``num_iterations``, ``learning_rate``,
+- ``algo_config``: SmoothQuant (``alpha``) and CLE (Conv chains plus Gemm /
+  MatMul chains, :mod:`onnxsim.quark_cle`) run on the float model before
+  quantization. Note Quark enables CLE implicitly in *every* preset
+  (``include_cle=True``) while onnxsim only runs it when ``CLEConfig`` is
+  listed, so a preset's weights differ from Quark's wherever a CLE pattern
+  exists; AdaQuant (``num_iterations``, ``learning_rate``,
   ``reg_param``) and BiasCorrection run after it, against the float model.
   AdaQuant only reoptimizes MatMul/Gemm layers whose output is not folded
   with a following Relu, and leaves the rest as calibrated.
@@ -656,8 +660,9 @@ class ModelQuantizer:
             work = apply_smoothquant(work, calibration_data=calibration, alpha=alpha)
         if "cle" in by_name:
             from onnxsim.onnx_simplifier import cross_layer_equalize
+            from onnxsim.quark_cle import equalize_linear_layers
 
-            work = cross_layer_equalize(work)
+            work = equalize_linear_layers(cross_layer_equalize(work))
         if work is not model:
             float_model = work
 
