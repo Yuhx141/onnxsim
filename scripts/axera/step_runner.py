@@ -2885,16 +2885,18 @@ def run_recal_steps(
             tmpl, tscales = templates[name]
             new = u16_chain.predict_scales16(quant, use, m)
             try:
+                # a constant (a gather mask, an index) has a scale in the template
+                # but no range to predict from: it keeps the template's
                 out, _ = mre.recalibrate(
-                    tmpl, tscales, {t: new[t] for t in tscales}
+                    tmpl, tscales, {t: new.get(t, tscales[t]) for t in tscales}
                 )
                 runner._emitted[name] = out.SerializeToString()
                 moved += 1
             except Exception as exc:  # keep the template's scales
                 runner._emitted[name] = open(info["path"], "rb").read()
                 refused += 1
-                if refused <= 3:
-                    print(f"  recalibrate {name}: {type(exc).__name__}: {exc}"[:160])
+                if refused <= 40:
+                    print(f"  recalibrate {name}: {type(exc).__name__}: {exc}"[:200])
         prev_ranges = ranges
         outs, stats = runner.run(
             feeds,
