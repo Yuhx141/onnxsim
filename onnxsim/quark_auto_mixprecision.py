@@ -474,6 +474,7 @@ def auto_mixprecision(
     no_input_qdq_shared: bool = False,
     dual_quant_nodes: bool = False,
     quantize_kwargs: Optional[Dict[str, Any]] = None,
+    calibrate_options: Optional[Dict[str, Any]] = None,
 ) -> AutoMixprecisionResult:
     """Mixed-precision quantization of ``model`` (see the module docstring).
 
@@ -554,12 +555,15 @@ def auto_mixprecision(
     inits = {t.name for t in model.graph.initializer}
     acts = [i.name for i in model.graph.input if i.name not in inits]
     acts += [o for n in model.graph.node for o in n.output]
+    if calibrate_options is None:
+        calibrate_options = (quantize_kwargs or {}).get("calibrate_options")
     ranges = calibrate(
         model,
         calibration_data,
         providers=providers,
         method=(quantize_kwargs or {}).get("method", method),
         extra_tensor_names=acts,
+        **{"activation_type": base_dtype, **(calibrate_options or {})},
     )
 
     node_tensors = _node_tensors(model)

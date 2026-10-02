@@ -33,24 +33,67 @@ names and preset *meanings*, not copied.
   zero points match Quark's for the probed models
   (``tests/test_quark_parity.py``). Calibration follows the preset: MinMax
   (``A8W8``, ``A16W8``), Percentile (99.999; ``S8S8_AAWS`` 99.9999; the
-  ``Int8Spec`` family's default, as in Quark; agrees with Quark to histogram
-  binning, ~5e-4) and, for ``XINT8``, Quark's power-of-two MinMSE
-  (``method="minmse_pof2"`` in :func:`onnxsim.calibration.calibrate`): the same
-  2048-bin histogram and five candidate scales, so activation scales are
-  identical to Quark's, and weights and biases get the same MinMSE search --
-  biases are **int8** with a per-tensor power-of-two scale like Quark's
+  ``Int8Spec`` family's default, as in Quark) and, for ``XINT8``, Quark's
+  power-of-two MinMSE (``method="minmse_pof2"`` in
+  :func:`onnxsim.calibration.calibrate`): the same 2048-bin histogram and five
+  candidate scales, so activation scales are identical to Quark's, and
+  weights and biases get the same MinMSE search -- biases are **int8** with a
+  per-tensor power-of-two scale like Quark's
   (``extra_options={"Int32Bias": True}`` keeps int32). Like Quark, every
   non-weight constant of a quantized node (LayerNorm scale, Mul operand, ...)
   is quantized as an int8 weight (activation dtype for Add / Sub / Mul / Div /
   Min / Max constants under ``A16W8``'s ``AlignEltwiseQuantType``), and
   Softmax outputs are calibrated to the fixed range (0, 1) except under
-  ``XINT8``. Not matched: Quark's ``Entropy`` (a different algorithm than
-  :func:`onnxsim.calibration.calibrate`'s ``"entropy"``; inner scales differ by
-  up to ~30% on the probed MLP), ``Distribution`` / ``LayerwisePercentile``
-  (``CalibMethod`` members that raise), and its non-power-of-two ``MinMSE``
-  (Quark's ``CalibMethod.MinMSE`` is the power-of-two search, which is what
-  :class:`CalibMethod` maps it to). Quark's NPU graph rewrites for ``XINT8``
-  (shift/cut adjustment, ...) did not change any probed scale.
+  ``XINT8``.
+  Every other :class:`CalibMethod` is Quark's calibrator, scale for scale
+  (:mod:`onnxsim.quark_calibration`: Quark's growing-histogram layout and
+  its search, so ranges agree to float32 rounding -- exact, not to histogram
+  binning): ``Percentile`` (symmetric absolute-value histogram, or the
+  two-sided one with ``CalibTensorRangeSymmetric=False``), ``Entropy``
+  (128 bins / 128 quantized bins by default, ``NumBins`` /
+  ``NumQuantizedBins``), ``Distribution`` (the histogram extent) and
+  ``LayerwisePercentile`` (``LWPMetric``, ``PercentileCandidates``). The
+  ``calibration_method`` strings ``"entropy"``, ``"percentile[:p]"``,
+  ``"distribution"`` and ``"layerwise_percentile"`` mean the same;
+  ``"onnxsim:entropy"`` etc. select onnxsim's own variants. Calibration
+  ``extra_options`` read: ``Percentile``, ``CalibTensorRangeSymmetric``,
+  ``CalibMovingAverage`` (mean of the per-batch ranges), ``CalibDataSize``,
+  ``NumBins``, ``NumQuantizedBins``, ``LWPMetric``, ``PercentileCandidates``
+  (``Scenario`` only changes Distribution's float-8 statistics; ``CalibWorkerNum``
+  / ``CalibOptimizeMem`` / ``LWPUseHistogram`` have no effect). Distribution
+  reports ``(-T, T)`` for a post-Relu tensor; for uint8 activations Quark then
+  folds the Relu node onto that centred grid, which no longer clamps -- onnxsim
+  reproduces the graph and warns. Not matched: Quark's non-power-of-two
+  ``MinMSE`` (Quark's ``CalibMethod.MinMSE`` is the power-of-two search, which
+  is what :class:`CalibMethod` maps it to). Quark's NPU graph rewrites for
+  ``XINT8`` (shift/cut adjustment, ``AlignConcat`` between pof2 grids,
+  ``AveragePool`` -> Mul) are not reproduced.
+- Q/DQ placement and quantizer options follow Quark's rules
+  (:func:`onnxsim.full_qdq.quantize_full_qdq`, ``tests/test_quark_parity.py``):
+  the Q/DQ pair between a Conv / Add / MaxPool / AveragePool /
+  GlobalAveragePool / MatMul / Gemm / ConvTranspose (and, with
+  ``RemoveQDQInstanceNorm``, InstanceNormalization) and its single consumer is
+  dropped when the consumer is a Relu (``RemoveQDQConvRelu``), Clip with
+  bounds (0, 6) or (0, 1) (``RemoveQDQConvClip``), LeakyRelu
+  (``RemoveQDQConvLeakyRelu``), PRelu (``RemoveQDQConvPRelu``) or, opt-in, Gelu
+  (``RemoveQDQConvGelu``); a Relu / Clip node whose input range Quark inherits
+  from its output keeps its own Q/DQ with that range when the pair stays. For
+  asymmetric activations the Relu / Clip node itself folds into its producer
+  (always under the plain QDQ quantizer; under the extended one -- Quark's
+  ``A8W8`` and 16-bit presets, ``QConfig.quant_format`` -- only with
+  ``FoldRelu``). ``ActivationSymmetric`` / ``WeightSymmetric`` override the
+  specs' symmetry (asymmetric or uint8 weights included; Quark clips weight
+  codes to the symmetric code range), ``QuantizeBias=False`` keeps biases
+  float, and the extended quantizer's ``AlignConcat`` / ``AlignPool`` /
+  ``AlignPad`` / ``AlignSlice`` / ``AlignTranspose`` / ``AlignReshape`` copy
+  quantization parameters (Concat / Pad / Transpose / Reshape inputs from their
+  output, Pool / Slice outputs from their input). Quark's ``Slice`` (and, under
+  the extended quantizer, ``Split``) outputs are calibrated on their own, its
+  plain quantizer's ``AveragePool`` shares its input's parameters, and an
+  InstanceNormalization bias is an int32 bias. Not implemented: ``ReduceRange``
+  (a legacy ``QuantizationConfig`` attribute, not an option), ``AlignEltwise``
+  beyond ``AlignEltwiseQuantType``, the ``Convert*`` / ``Adjust*`` NPU rewrites,
+  and the 16-bit ``AlignPool`` etc. for ``XINT8``.
 - Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
   (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
   (``input_tensors``, or the deprecated ``activation``) and outputs
@@ -203,9 +246,14 @@ names and preset *meanings*, not copied.
   error propagation is Quark's no-op unless ``GPTQParams["Compensate"]``, and
   other ``algo_config`` entries raise.
 - ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
-  ``Int32Bias``, ``AlignEltwiseQuantType``, ``CalibMovingAverage`` (integer
-  presets only), ``MatMulConstBOnly`` (the transformer presets), the
-  block-format options above and the ``MATMUL_NBITS`` ones.
+  ``Int32Bias``, ``AlignEltwiseQuantType``, ``MatMulConstBOnly`` (the
+  transformer presets), the block-format options above, the ``MATMUL_NBITS`` ones, and, for the integer
+  presets, the calibration options (``Percentile``, ``CalibTensorRangeSymmetric``,
+  ``CalibMovingAverage``, ``CalibDataSize``, ``NumBins``, ``NumQuantizedBins``,
+  ``LWPMetric``, ``PercentileCandidates``), ``RemoveQDQConv{Relu,Clip,LeakyRelu,
+  PRelu,Gelu}``, ``RemoveQDQInstanceNorm``, ``FoldRelu``, ``Align{Concat,Pool,
+  Pad,Slice,Transpose,Reshape}``, ``ActivationSymmetric``, ``WeightSymmetric``
+  and ``QuantizeBias`` (see above).
 """
 
 from __future__ import annotations
@@ -234,8 +282,11 @@ class QSpec:
     dtype: str = "int8"
     symmetric: bool = True
     pof2: bool = False
-    #: ``"minmax"``, ``"percentile[:p]"``, ``"entropy"``, ``"mse"``,
-    #: ``"minmse_pof2"`` (Quark's MinMSE) or a :class:`CalibMethod`
+    #: ``"minmax"``, ``"percentile[:p]"``, ``"entropy"``, ``"distribution"``,
+    #: ``"layerwise_percentile"`` (Quark's calibrators of those names, see
+    #: :mod:`onnxsim.quark_calibration`), ``"minmse_pof2"`` (Quark's MinMSE),
+    #: ``"mse"`` / ``"onnxsim:<method>"`` (onnxsim's own methods, e.g.
+    #: ``"onnxsim:entropy"``) or a :class:`CalibMethod`
     calibration_method: Any = "minmax"
     is_dynamic: bool = False
 
@@ -247,7 +298,8 @@ class QSpec:
 class CalibMethod(Enum):
     """Quark's ``CalibMethod`` (``quark.onnx.CalibMethod``). ``MinMSE`` is its
     power-of-two MinMSE search (:mod:`onnxsim.calibration` ``"minmse_pof2"``);
-    ``Distribution`` / ``LayerwisePercentile`` are not implemented."""
+    ``Percentile`` / ``Entropy`` / ``Distribution`` / ``LayerwisePercentile``
+    are Quark's histogram calibrators (:mod:`onnxsim.quark_calibration`)."""
 
     MinMax = 0
     MinMSE = 1
@@ -265,6 +317,104 @@ _CALIB_NAMES = {
     CalibMethod.LayerwisePercentile: "layerwise_percentile",
     CalibMethod.Distribution: "distribution",
 }
+
+
+# Quark's Align* options -> the op types whose parameters they align
+_ALIGN_OPTIONS = (
+    ("AlignConcat", ("Concat",)),
+    ("AlignPool", ("MaxPool", "AveragePool", "GlobalAveragePool")),
+    ("AlignPad", ("Pad",)),
+    ("AlignSlice", ("Slice",)),
+    ("AlignTranspose", ("Transpose",)),
+    ("AlignReshape", ("Reshape",)),
+)
+
+
+def _activation_rules(
+    opts: Dict[str, Any], symmetric: bool, extended: bool, pof2: bool
+) -> Dict[str, Any]:
+    """:func:`onnxsim.full_qdq.quantize_full_qdq` keywords for Quark's
+    Q/DQ-removal options: ``RemoveQDQConvRelu`` / ``ConvClip`` (default on),
+    ``ConvLeakyRelu`` / ``ConvPRelu`` (on), ``ConvGelu`` (off) choose the
+    consumers whose producer output stays float, ``RemoveQDQInstanceNorm``
+    (off) adds InstanceNormalization to the producers. A Relu / Clip node is
+    itself folded into its producer for asymmetric activations -- under the
+    extended quantizer (see ``QConfig.quant_format``) only with ``FoldRelu``.
+    The ``Align*`` options are only run by the extended quantizer."""
+    from onnxsim.full_qdq import QUARK_QDQ_PRODUCERS
+
+    after = [
+        op
+        for op, key, default in (
+            ("Relu", "RemoveQDQConvRelu", True),
+            ("Clip", "RemoveQDQConvClip", True),
+            ("LeakyRelu", "RemoveQDQConvLeakyRelu", True),
+            ("PRelu", "RemoveQDQConvPRelu", True),
+            ("Gelu", "RemoveQDQConvGelu", False),
+        )
+        if opts.get(key, default)
+    ]
+    producers: "tuple[str, ...]" = QUARK_QDQ_PRODUCERS
+    if opts.get("RemoveQDQInstanceNorm", False):
+        producers = producers + ("InstanceNormalization",)
+    return {
+        "remove_qdq_after": after,
+        "remove_qdq_producers": producers,
+        "fold_activation": (not symmetric)
+        and (bool(opts.get("FoldRelu", False)) if extended else True),
+        "adjust_activation_ranges": True,
+        "quantize_prelu_slope": extended or pof2,
+        "align_ops": [
+            op
+            for key, ops in _ALIGN_OPTIONS
+            if extended and opts.get(key, False)
+            for op in ops
+        ],
+        # outputs calibrated on their own: Slice always, Split except under the
+        # plain quantizer (ONNX Runtime's Split shares the input's parameters)
+        "unshared_ops": ("Slice", "Split") if extended or pof2 else ("Slice",),
+        # ... and ONNX Runtime's plain quantizer gives AveragePool its input's
+        "shared_ops": () if extended or pof2 else ("AveragePool",),
+    }
+
+
+def _calibration_args(
+    method: str, opts: Dict[str, Any]
+) -> "tuple[str, Dict[str, Any]]":
+    """``(method, calibrate_options)`` for :func:`onnxsim.calibration.calibrate`
+    from a spec's ``calibration_method`` string and Quark's calibration
+    ``extra_options`` (``Percentile``, ``CalibTensorRangeSymmetric``,
+    ``CalibMovingAverage``, ``NumBins``, ``NumQuantizedBins``, ``LWPMetric``,
+    ``PercentileCandidates``). ``"entropy"`` / ``"percentile"`` /
+    ``"distribution"`` / ``"layerwise_percentile"`` are Quark's algorithms;
+    ``"onnxsim:<method>"`` selects onnxsim's own variant of the same name."""
+    kw: Dict[str, Any] = {}
+    if method.startswith("onnxsim:"):
+        return method[len("onnxsim:") :], kw
+    base, _, arg = method.partition(":")
+    if base in ("entropy", "percentile", "distribution", "layerwise_percentile"):
+        method = "quark_" + method
+    elif base not in (
+        "minmax",
+        "minmax_mean",
+        "mse",
+        "minmse_pof2",
+        "auto",
+    ) and not base.startswith("quark_"):
+        raise ValueError(f"unknown calibration method: {method!r}")
+    if method.startswith("quark_percentile") and "Percentile" in opts:
+        method = f"quark_percentile:{float(opts['Percentile'])}"
+    if "CalibTensorRangeSymmetric" in opts:
+        kw["range_symmetric"] = bool(opts["CalibTensorRangeSymmetric"])
+    if "NumBins" in opts:
+        kw["quark_num_bins"] = int(opts["NumBins"])
+    if "NumQuantizedBins" in opts:
+        kw["num_quantized_bins"] = int(opts["NumQuantizedBins"])
+    if "LWPMetric" in opts:
+        kw["lwp_metric"] = str(opts["LWPMetric"])
+    if "PercentileCandidates" in opts:
+        kw["percentile_candidates"] = tuple(opts["PercentileCandidates"])
+    return method, kw
 
 
 def _spec(
@@ -477,8 +627,13 @@ class QConfig:
         exclude: Optional[List[Any]] = None,
         algo_config: Optional[List[AlgoConfig]] = None,
         use_external_data_format: bool = False,
+        quant_format: Optional[str] = None,
         **extra_options: Any,
     ) -> None:
+        #: ``"extended"`` for Quark's ExtendedQuantFormat quantizer (its A8W8 /
+        #: 16-bit presets), ``"qdq"`` for the plain one; ``None`` derives it from
+        #: the dtypes like Quark's own QConfig mapping (8-bit both -> plain)
+        self.quant_format = quant_format
         self.global_config = global_config
         self.specific_layer_config = specific_layer_config or {}
         self.layer_type_config = layer_type_config or {}
@@ -511,18 +666,31 @@ _PCT = dict(symmetric=False, calibration_method="percentile:99.999")
 _PCT4 = dict(symmetric=False, calibration_method="percentile:99.9999")
 
 
+# extra_options Quark's A8W8 / A16W8 presets carry (the ones onnxsim reads)
+_A8_EXTRAS: Dict[str, Any] = dict(
+    ActivationSymmetric=True, FoldRelu=True, AlignConcat=True, AlignSlice=False
+)
+
 _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "XINT8": lambda: QConfig(_layer(XUInt8Spec, XInt8Spec)),
     "UINT8_DYNAMIC_QUANT": lambda: QConfig(
         _layer(Int8Spec, UInt8Spec, is_dynamic=True)
     ),
-    "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec, calibration_method="minmax")),
+    "A8W8": lambda: QConfig(
+        _layer(Int8Spec, Int8Spec, calibration_method="minmax"),
+        quant_format="extended",
+        **_A8_EXTRAS,
+    ),
     "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec, **_PCT4)),
     "U8S8_AAWS": lambda: QConfig(_layer(UInt8Spec, Int8Spec, **_PCT)),
     "U8U8_AAWA": lambda: QConfig(_layer(UInt8Spec, UInt8Spec, **_PCT)),
     "A16W8": lambda: QConfig(
         _layer(Int16Spec, Int8Spec, calibration_method="minmax"),
         AlignEltwiseQuantType=True,
+        **_A8_EXTRAS,
+    ),
+    "S16S8_ASWS": lambda: QConfig(
+        _layer(Int16Spec, Int8Spec), ActivationSymmetric=True
     ),
     "MATMUL_NBITS": lambda: QConfig(
         _layer(Int8Spec, Int8Spec, calibration_method="minmax"),
@@ -534,7 +702,6 @@ _PRESETS: Dict[str, Callable[[], QConfig]] = {
             "AccuracyLevel": 1,
         },
     ),
-    "S16S8_ASWS": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
     "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec, **_PCT)),
     "FP16": lambda: QConfig(_layer(Float16Spec, Float16Spec)),
     "BF16": lambda: QConfig(_layer(BFloat16Spec, BFloat16Spec)),
@@ -1117,6 +1284,14 @@ class ModelQuantizer:
             const_dtype=wt.dtype if mixed and quantize_acts and not fold else None,
         )
 
+    def _extended(self, act: QSpec, wt: QSpec) -> bool:
+        """Whether Quark would use its extended QDQ quantizer (see
+        ``QConfig.quant_format``)."""
+        fmt = self.config.quant_format
+        if fmt is not None:
+            return fmt == "extended"
+        return not (act.dtype in ("int8", "uint8") and wt.dtype in ("int8", "uint8"))
+
     def _approx(self, msg: str) -> None:
         self.last_approximations.append(msg)
 
@@ -1319,12 +1494,16 @@ class ModelQuantizer:
         tensor_dtypes = {
             t: "int8" for t in promoted_activations(model, ops, include, drop)
         }
+        cal_method, cal_options = _calibration_args(
+            self._calib_method(act), self.config.extra_options
+        )
         quantized = quantize_full_qdq(
             model,
             calibration_data=calibration,
             activation_dtype="int16",
             exclude_nodes=exclude,
-            method=act.calibration_method,
+            method=cal_method,
+            calibrate_options=cal_options,
             symmetric_activations=act.symmetric,
             per_channel=per_channel,
             weight_dtype="int8",
@@ -1461,6 +1640,9 @@ class ModelQuantizer:
             "AutoMixprecision mixes activation precision only (weights stay int8)"
         )
         optimize = p.get("metric_optimize_object", "speed")
+        cal_method, cal_options = _calibration_args(
+            self._calib_method(act), self.config.extra_options
+        )
         res = auto_mixprecision(
             model,
             calibration,
@@ -1486,7 +1668,8 @@ class ModelQuantizer:
             optimize=optimize,
             metric_output_index=p.get("metric_output_index", 0),
             data_size=p.get("data_size", 0),
-            method=act.calibration_method,
+            method=cal_method,
+            calibrate_options=cal_options,
         )
         self.last_auto_mixprecision = res
         return res.model
@@ -1496,6 +1679,8 @@ class ModelQuantizer:
         ``CalibMovingAverage`` extra option applied to min / max calibration
         (the mean of the per-batch ranges instead of the global range)."""
         method = act.calibration_method
+        if isinstance(method, CalibMethod):  # assigned after construction
+            method = _CALIB_NAMES[method]
         moving = self.config.extra_options.get("CalibMovingAverage")
         if method == "minmax" and moving:
             return "minmax_mean"
@@ -1536,7 +1721,10 @@ class ModelQuantizer:
 
         if wt.dtype not in ("int8", "uint8", "int16"):
             raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
-        if wt.dtype == "uint8":
+        # the weight-rounding algorithms work on int8 weight codes
+        int8_only = bool({"adaquant", "adaround", "gptq"} & {a.name for a in algos})
+        uint8_weights = wt.dtype == "uint8" and not int8_only
+        if wt.dtype == "uint8" and not uint8_weights:
             self._approx("weights quantized int8-symmetric instead of uint8")
         act_dtype = self._int_act_dtype(act)
 
@@ -1592,18 +1780,28 @@ class ModelQuantizer:
         if work is not model:
             float_model = work
 
+        cal_method, cal_options = _calibration_args(self._calib_method(act), opts)
+        cal_size = int(opts.get("CalibDataSize") or 0)
+        act_sym = bool(opts.get("ActivationSymmetric", act.symmetric))
         qkw: Dict[str, Any] = dict(
-            calibration_data=calibration,
+            calibration_data=calibration[:cal_size] if cal_size else calibration,
             activation_dtype=act_dtype,
             op_types=op_types,
             float_clamp_input=op_types is not None,
             exclude_nodes=exclude,
-            method=self._calib_method(act),
-            symmetric_activations=act.symmetric,
+            method=cal_method,
+            calibrate_options=cal_options,
+            symmetric_activations=act_sym,
             power_of_two=act.pof2 or wt.pof2,
             per_channel=per_channel,
-            weight_dtype="int16" if wt.dtype == "int16" else "int8",
-            fold_relu=bool(opts.get("RemoveQDQConvRelu", True)),
+            weight_dtype=(
+                "int16" if wt.dtype == "int16" else "uint8" if uint8_weights else "int8"
+            ),
+            weight_symmetric=bool(
+                opts.get("WeightSymmetric", wt.symmetric or int8_only)
+            ),
+            quantize_bias=bool(opts.get("QuantizeBias", True)),
+            **_activation_rules(opts, act_sym, self._extended(act, wt), act.pof2),
             # Quark's XINT8 (power-of-2 weights): MinMSE scale search on
             # weights and int8 biases (``Int32Bias=True`` keeps int32)
             pof2_mode="minmse" if wt.pof2 else "ceil",
@@ -1633,7 +1831,7 @@ class ModelQuantizer:
             )
         else:
             quantized = quantize_full_qdq(work, **qkw)
-            if opts.get("Int32Bias", True) is False:
+            if opts.get("Int32Bias", True) is False and opts.get("QuantizeBias", True):
                 from onnxsim.quark_preset_graphs import requantize_biases_int8
 
                 self._approx(

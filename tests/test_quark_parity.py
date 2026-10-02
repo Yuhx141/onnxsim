@@ -2690,3 +2690,660 @@ def test_matmul_nbits_bits_other_than_four_is_a_quark_bug(tmp_path):
     assert _nb_inits(q)["w1_Q4"].shape == (96, 2, 16)  # still 4-bit sized
     with pytest.raises(NotImplementedError, match="4-bit"):
         _nb_mine(model, {"GroupSize": 32, "Bits": 8}, data=data)
+
+
+# == Quark's calibrators, Q/DQ removal and quantizer-level options ================
+#
+# Entropy / Distribution / Percentile / LayerwisePercentile ranges, the
+# RemoveQDQ* / FoldRelu / Align* / ActivationSymmetric / WeightSymmetric /
+# QuantizeBias options: same activation Q/DQ placement and the same scales,
+# zero points and constants as Quark, on parser-built models. Known, deliberate
+# deviations are spelled out in the tests that touch them.
+
+import copy as _copy  # noqa: E402
+
+
+def _quark_reset_globals():
+    """``RemoveQDQInstanceNorm`` appends to a module-level list Quark never
+    clears; restore its default so one test cannot leak into the next."""
+    import quark.onnx.quantization.quant_utils as qu
+
+    qu.annotate_op_type[:] = [
+        "Conv",
+        "Add",
+        "MaxPool",
+        "AveragePool",
+        "GlobalAveragePool",
+        "MatMul",
+        "Gemm",
+        "ConvTranspose",
+    ]
+
+
+def _quark_cfg(preset, extra=None, method=None):
+    """A private copy of Quark's preset (``get_default_config`` hands out a
+    shared object whose options would otherwise leak between tests)."""
+    from quark.onnx import QConfig
+
+    cfg = _copy.deepcopy(QConfig.get_default_config(preset))
+    g = cfg.global_quant_config
+    g.include_cle = False
+    if method is not None:
+        g.calibrate_method = method
+    g.extra_options.update(extra or {})
+    return cfg
+
+
+def _quark_run(model, preset, shape, tmp_path, extra=None, method=None, n=4, seed=3):
+    from quark.onnx import ModelQuantizer
+
+    _quark_reset_globals()
+    src, dst = str(tmp_path / "src.onnx"), str(tmp_path / "dst.onnx")
+    onnx.save(model, src)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        ModelQuantizer(_quark_cfg(preset, extra, method)).quantize_model(
+            src, dst, _reader(shape, n=n, seed=seed)()
+        )
+    return onnx.load(dst)
+
+
+def _mine_run(model, preset, shape, extra=None, method=None, n=4, seed=3):
+    cfg = qc.QConfig.get_default_config(preset)
+    cfg.extra_options.update(extra or {})
+    if method is not None:
+        cfg.global_config.activation.calibration_method = method
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=_reader(shape, n=n, seed=seed)()
+        )
+
+
+def _placement(model):
+    """Graph structure around the activations: the compute / activation nodes
+    in order, with every activation ``QuantizeLinear`` as ``(tensor, scale,
+    zero_point, dtype)`` (weight / bias DequantizeLinear nodes left out)."""
+    inits = {i.name: onnx.numpy_helper.to_array(i) for i in model.graph.initializer}
+    out = []
+    for n in model.graph.node:
+        if n.op_type == "QuantizeLinear" and n.input[1] in inits:
+            zp = inits[n.input[2]]
+            out.append(
+                (
+                    _norm_name(n.input[0]),
+                    float(inits[n.input[1]]),
+                    int(zp),
+                    str(zp.dtype),
+                )
+            )
+        elif n.op_type not in ("QuantizeLinear", "DequantizeLinear"):
+            out.append(n.op_type)
+    return out
+
+
+def _assert_same_placement(q, m, rtol=1e-5, msg=""):
+    pq, pm = _placement(q), _placement(m)
+    assert [e if isinstance(e, str) else e[0] for e in pm] == [
+        e if isinstance(e, str) else e[0] for e in pq
+    ], (msg, pq, pm)
+    for a, b in zip(pq, pm):
+        if not isinstance(a, str):
+            assert (b[2], b[3]) == (a[2], a[3]), (msg, a, b)
+            np.testing.assert_allclose(b[1], a[1], rtol=rtol, err_msg=f"{msg} {a[0]}")
+
+
+def _assert_same_constants(q, m, rtol=1e-5):
+    _, qc_ = _qparam_map(q)
+    _, mc_ = _qparam_map(m)
+    assert set(qc_) == set(mc_)
+    for name, (want, dt, scale) in qc_.items():
+        got, mdt, _ = mc_[name]
+        assert mdt == dt, name
+        atol = 2 * scale if dt == "int32" else 1e-4
+        np.testing.assert_allclose(got, want, rtol=rtol, atol=atol, err_msg=name)
+
+
+def _assert_parity(q, m, rtol=1e-5, msg=""):
+    _assert_same_placement(q, m, rtol, msg)
+    _assert_same_constants(q, m, rtol)
+
+
+# -- calibrators: the ranges themselves ---------------------------------------------
+
+_CALIB_CASES = {
+    "entropy": ("Entropy", "quark_entropy", {}, {}),
+    "entropy_512": (
+        "Entropy",
+        "quark_entropy",
+        {"NumBins": 512},
+        {"quark_num_bins": 512},
+    ),
+    "distribution": ("Distribution", "quark_distribution", {}, {}),
+    "distribution_1024": (
+        "Distribution",
+        "quark_distribution",
+        {"NumBins": 1024},
+        {"quark_num_bins": 1024},
+    ),
+    "percentile": ("Percentile", "quark_percentile", {}, {}),
+    "percentile_asym": (
+        "Percentile",
+        "quark_percentile:99.99",
+        {"CalibTensorRangeSymmetric": False, "Percentile": 99.99},
+        {"range_symmetric": False},
+    ),
+    "lwp": ("LayerwisePercentile", "quark_layerwise_percentile", {}, {}),
+    "lwp_mse": (
+        "LayerwisePercentile",
+        "quark_layerwise_percentile",
+        {"LWPMetric": "mse", "PercentileCandidates": [99.9, 99.99, 99.999]},
+        {"lwp_metric": "mse", "percentile_candidates": (99.9, 99.99, 99.999)},
+    ),
+}
+
+
+def _quark_method(name):
+    from onnxruntime.quantization import CalibrationMethod
+    from quark.onnx.calibration.methods import LayerWiseMethod
+
+    if name == "LayerwisePercentile":
+        return LayerWiseMethod.LayerWisePercentile
+    return getattr(CalibrationMethod, name)
+
+
+def _heavy_reader(shape, n, seed, df):
+    """Student-t calibration batches (heavy tails make the clipping choices
+    of Entropy / LayerwisePercentile matter), as a Quark reader + a list."""
+    from onnxruntime.quantization import CalibrationDataReader
+
+    rng = np.random.default_rng(seed)
+    data = [{"x": (rng.standard_t(df, shape) * 2).astype(np.float32)} for _ in range(n)]
+
+    class R(CalibrationDataReader):
+        def __init__(self):
+            self.it = iter(data)
+
+        def get_next(self):
+            return next(self.it, None)
+
+    return R(), data
+
+
+def _quark_ranges(model, reader, case):
+    from quark.onnx.calibration import interface
+    from quark.onnx.calibration.data_readers import CachedDataReader
+
+    name, _, extra, _ = _CALIB_CASES[case]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        res = interface.run_calibration(
+            model,
+            CachedDataReader(reader, None),
+            None,
+            calibrate_method=_quark_method(name),
+            extra_options=extra,
+        )
+    return {k: tuple(float(v) for v in res[k].range_value) for k in res.keys()}
+
+
+def _compare_ranges(want, got):
+    for k, (lo, hi) in want.items():
+        scale = max(abs(lo), abs(hi), 1e-12)
+        assert abs(got[k][0] - lo) / scale < 1e-6, (k, (lo, hi), got[k])
+        assert abs(got[k][1] - hi) / scale < 1e-6, (k, (lo, hi), got[k])
+
+
+@pytest.mark.parametrize("data_kind", ["normal", "heavy"])
+@pytest.mark.parametrize("seed", range(2))
+@pytest.mark.parametrize("model_name", sorted(CAL_MODELS))
+@pytest.mark.parametrize("case", sorted(_CALIB_CASES))
+def test_quark_calibrator_ranges_match_quark(case, model_name, seed, data_kind):
+    """Entropy, Distribution, Percentile and LayerwisePercentile compute the
+    same ``(min, max)`` per tensor as Quark's calibrators -- bit for bit up to
+    float32 rounding: the same histogram layout (growing bins), search and
+    clipping."""
+    from onnxsim.calibration import calibrate
+
+    model, shape = CAL_MODELS[model_name](seed)
+    model = onnx.shape_inference.infer_shapes(model)
+    n = 8
+    if data_kind == "normal":
+        reader, data = _heavy_reader(shape, n, seed + 5, 1e9)  # ~ Gaussian
+    else:
+        reader, data = _heavy_reader(shape, n, seed + 5, 1.5)
+    want = _quark_ranges(model, reader, case)
+    _, method, _, kw = _CALIB_CASES[case]
+    got = calibrate(
+        model,
+        data,
+        method=method,
+        tensor_names=list(want),
+        activation_type="int8",
+        **kw,
+    )
+    _compare_ranges(want, got)
+
+
+def test_layerwise_percentile_really_differs_from_percentile():
+    """The parity above is not vacuous: on heavy-tailed data LayerwisePercentile
+    picks a different candidate than plain Percentile for many tensors, and the
+    ranges still agree with Quark's."""
+    from onnxsim.calibration import calibrate
+
+    differing = 0
+    for model_name in sorted(CAL_MODELS):
+        model, shape = CAL_MODELS[model_name](0)
+        model = onnx.shape_inference.infer_shapes(model)
+        reader, data = _heavy_reader(shape, 8, 5, 1.5)
+        lwp = _quark_ranges(model, reader, "lwp")
+        reader, data = _heavy_reader(shape, 8, 5, 1.5)
+        pct = _quark_ranges(model, reader, "percentile")
+        differing += sum(lwp[k] != pct[k] for k in lwp)
+        mine = calibrate(
+            model,
+            data,
+            method="quark_layerwise_percentile",
+            tensor_names=list(lwp),
+            activation_type="int8",
+        )
+        _compare_ranges(lwp, mine)
+    assert differing >= 4
+
+
+# -- calibrators through the presets ----------------------------------------------------
+
+
+@pytest.mark.parametrize("model_name", sorted(CAL_MODELS))
+@pytest.mark.parametrize("preset", ["A8W8", "U8S8_AAWS", "A16W8"])
+@pytest.mark.parametrize(
+    "member", ["Entropy", "Distribution", "LayerwisePercentile", "Percentile"]
+)
+def test_calibrators_through_presets_match_quark_scale_for_scale(
+    member, preset, model_name, tmp_path
+):
+    """``CalibMethod.<member>`` on a preset's activations: identical scale,
+    zero point and dtype per tensor and identical weights / biases /
+    constants. (Quark's Distribution reports the symmetric histogram extent
+    even for a post-Relu tensor; with uint8 activations its Relu fold then
+    sits on a centred grid -- reproduced, see the test below.)"""
+    model, shape = CAL_MODELS[model_name](1)
+    q = _quark_run(
+        model, preset, shape, tmp_path, method=_quark_method(member), n=4, seed=3
+    )
+    m = _mine_run(model, preset, shape, method=qc.CalibMethod[member], n=4, seed=3)
+    _assert_parity(q, m, rtol=1e-5, msg=f"{preset} {member} {model_name}")
+
+
+def test_distribution_with_unsigned_relu_reproduces_quarks_centred_fold(tmp_path):
+    """Quark: Distribution + uint8 + Relu folds the Relu node onto the
+    symmetric ``(-T, T)`` grid (zero point 128), so negative pre-activations
+    survive. onnxsim reproduces that graph -- and says so."""
+    model, shape = CAL_MODELS["mlp"](1)
+    q = _quark_run(
+        model, "U8S8_AAWS", shape, tmp_path, method=_quark_method("Distribution")
+    )
+    cfg = qc.QConfig.get_default_config("U8S8_AAWS")
+    cfg.global_config.activation.calibration_method = qc.CalibMethod.Distribution
+    with pytest.warns(UserWarning, match="no longer clamps"):
+        m = qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=_reader(shape, n=4, seed=3)()
+        )
+    _assert_parity(q, m, msg="U8S8_AAWS Distribution")
+    assert "Relu" not in [n.op_type for n in m.graph.node]
+    assert _qparam_map(m)[0]["h1"][1] in (127, 128)
+
+
+_CALIB_OPTION_CASES = [
+    ("A8W8", "MinMax", {"CalibMovingAverage": True}),
+    ("INT8_CNN_DEFAULT", "MinMax", {"CalibTensorRangeSymmetric": True}),
+    ("U8S8_AAWS", "Percentile", {"CalibTensorRangeSymmetric": False}),
+    ("U8S8_AAWS", "Percentile", {"Percentile": 99.9}),
+    ("A8W8", "Percentile", {"Percentile": 99.99}),
+    ("A8W8", "Entropy", {"NumBins": 512, "NumQuantizedBins": 128}),
+    ("U8S8_AAWS", "Entropy", {"NumBins": 2048}),
+    ("A8W8", "Distribution", {"NumBins": 1024}),
+    ("A8W8", "LayerwisePercentile", {"LWPMetric": "mse"}),
+    (
+        "U8S8_AAWS",
+        "LayerwisePercentile",
+        {"PercentileCandidates": [99.9, 99.99, 99.999]},
+    ),
+    ("A8W8", "MinMax", {"CalibDataSize": 2}),
+]
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "conv", "attn"])
+@pytest.mark.parametrize("preset, member, extra", _CALIB_OPTION_CASES)
+def test_calibration_extra_options_match_quark(
+    preset, member, extra, model_name, tmp_path
+):
+    """CalibMovingAverage, CalibTensorRangeSymmetric, Percentile, NumBins,
+    NumQuantizedBins, LWPMetric, PercentileCandidates and CalibDataSize."""
+    model, shape = CAL_MODELS[model_name](0)
+    if member == "MinMax" and "CalibMovingAverage" in extra:
+        quark_member = _quark_method("MinMax")
+    else:
+        quark_member = _quark_method(member)
+    q = _quark_run(
+        model, preset, shape, tmp_path, extra=extra, method=quark_member, n=6, seed=7
+    )
+    m = _mine_run(
+        model, preset, shape, extra=extra, method=qc.CalibMethod[member], n=6, seed=7
+    )
+    q_acts, _ = _qparam_map(q)
+    m_acts, _ = _qparam_map(m)
+    assert set(q_acts) == set(m_acts)
+    for k, (scale, zp, dt) in q_acts.items():
+        assert m_acts[k][1:] == (zp, dt), k
+        np.testing.assert_allclose(m_acts[k][0], scale, rtol=1e-5, err_msg=k)
+
+
+# -- Q/DQ removal around activations ----------------------------------------------------
+
+
+def _removal_model(prod, cons):
+    """``x -> producer -> consumer -> (Gemm | Conv)``: the consumer's output
+    feeds a quantized node, so every placement choice is visible."""
+    rng = np.random.default_rng(0)
+
+    def w(name, *shape):
+        return onnx.numpy_helper.from_array(
+            (rng.standard_normal(shape) * 0.5).astype(np.float32), name
+        )
+
+    shapes = {
+        "Conv": (1, 3, 8, 8),
+        "ConvTranspose": (1, 3, 8, 8),
+        "MaxPool": (1, 3, 8, 8),
+        "AveragePool": (1, 3, 8, 8),
+        "GlobalAveragePool": (1, 3, 8, 8),
+        "InstanceNormalization": (1, 3, 8, 8),
+        "Gemm": (3, 16),
+        "MatMul": (3, 16),
+        "Add": (3, 16),
+    }
+    producers = {
+        "Conv": (
+            "t = Conv<pads=[1,1,1,1]>(x, w, b)",
+            [w("w", 4, 3, 3, 3), w("b", 4)],
+            4,
+        ),
+        "ConvTranspose": (
+            "t = ConvTranspose(x, w, b)",
+            [w("w", 3, 4, 3, 3), w("b", 4)],
+            4,
+        ),
+        "Gemm": ("t = Gemm(x, w, b)", [w("w", 16, 8), w("b", 8)], 8),
+        "MatMul": ("t = MatMul(x, w)", [w("w", 16, 8)], 8),
+        "Add": ("t = Add(x, w)", [w("w", 16)], 16),
+        "MaxPool": ("t = MaxPool<kernel_shape=[2,2], strides=[2,2]>(x)", [], 3),
+        "AveragePool": ("t = AveragePool<kernel_shape=[2,2], strides=[2,2]>(x)", [], 3),
+        "GlobalAveragePool": ("t = GlobalAveragePool(x)", [], 3),
+        "InstanceNormalization": (
+            "t = InstanceNormalization(x, w, b)",
+            [w("w", 3), w("b", 3)],
+            3,
+        ),
+    }
+    consumers = {
+        "Relu": "r = Relu(t)",
+        "LeakyRelu": "r = LeakyRelu<alpha=0.1>(t)",
+        "Clip6": "r = Clip(t, lo, hi6)",
+        "Clip1": "r = Clip(t, lo, hi1)",
+        "ClipM": "r = Clip(t, lom, hi1)",
+        "PRelu": "r = PRelu(t, sl)",
+        "Gelu": "r = Gelu(t)",
+    }
+    pdef, inits, cin = producers[prod]
+    twod = prod in ("Gemm", "MatMul", "Add")
+    tail = "y = Gemm(r, w2, b2)" if twod else "y = Conv(r, w2, b2)"
+    m = parser.parse_model(
+        f"""<ir_version: 9, opset_import: ["": {20 if cons == "Gelu" else 17}]>
+        g (float{list(shapes[prod])} x) => (float y) {{ {pdef}  {consumers[cons]}  {tail} }}"""
+    )
+    m.graph.initializer.extend(inits)
+    for n, v in (("lo", 0.0), ("hi6", 6.0), ("hi1", 1.0), ("lom", -1.0)):
+        m.graph.initializer.append(
+            onnx.numpy_helper.from_array(np.array(v, np.float32), n)
+        )
+    m.graph.initializer.append(w("sl", 1))
+    m.graph.initializer.extend(
+        [w("w2", cin, 5), w("b2", 5)] if twod else [w("w2", 2, cin, 1, 1), w("b2", 2)]
+    )
+    return onnx.shape_inference.infer_shapes(m), shapes[prod]
+
+
+_PRODUCERS = [
+    "Conv",
+    "ConvTranspose",
+    "Gemm",
+    "MatMul",
+    "Add",
+    "MaxPool",
+    "GlobalAveragePool",
+    "InstanceNormalization",
+]
+_CONSUMERS = ["Relu", "LeakyRelu", "Clip6", "Clip1", "ClipM", "PRelu", "Gelu"]
+
+
+@pytest.mark.parametrize("cons", _CONSUMERS)
+@pytest.mark.parametrize("prod", _PRODUCERS)
+@pytest.mark.parametrize("preset", ["A8W8", "U8S8_AAWS"])
+def test_qdq_removal_between_producer_and_activation_matches_quark(
+    preset, prod, cons, tmp_path
+):
+    """With the default options Quark drops the Q/DQ between a Conv / Add /
+    MaxPool / AveragePool / GlobalAveragePool / MatMul / Gemm / ConvTranspose and
+    a following Relu / LeakyRelu / PRelu / Clip(0, 6 | 0, 1) (not Gelu, not
+    InstanceNormalization, not Clip(-1, 1)) and, for asymmetric activations
+    under the plain quantizer, folds the Relu / Clip node itself. Same nodes,
+    scales, zero points and constants (the Relu input takes the output's
+    range where its Q/DQ stays)."""
+    model, shape = _removal_model(prod, cons)
+    q = _quark_run(model, preset, shape, tmp_path)
+    m = _mine_run(model, preset, shape)
+    _assert_parity(q, m, msg=f"{preset} {prod} {cons}")
+
+
+@pytest.mark.parametrize("cons", ["Relu", "LeakyRelu", "Clip6", "PRelu"])
+@pytest.mark.parametrize("prod", ["Conv", "Gemm", "InstanceNormalization"])
+@pytest.mark.parametrize("preset", ["A16W8", "U16S8_AAWS", "S8S8_AAWS"])
+def test_qdq_removal_matches_quark_for_the_other_quantizer_classes(
+    preset, prod, cons, tmp_path
+):
+    """The extended (16-bit) quantizer folds a Relu node only under
+    ``FoldRelu`` (so U16S8_AAWS keeps it); the plain one folds it for any
+    asymmetric preset (S8S8_AAWS as well)."""
+    model, shape = _removal_model(prod, cons)
+    q = _quark_run(model, preset, shape, tmp_path)
+    m = _mine_run(model, preset, shape)
+    _assert_parity(q, m, msg=f"{preset} {prod} {cons}")
+
+
+@pytest.mark.parametrize("prod", ["Conv", "Gemm", "Add"])
+@pytest.mark.parametrize("cons", ["Relu", "LeakyRelu", "Clip6", "PRelu"])
+def test_xint8_qdq_removal_matches_quark(prod, cons, tmp_path):
+    model, shape = _removal_model(prod, cons)
+    q = _quark_run(model, "XINT8", shape, tmp_path)
+    m = _mine_run(model, "XINT8", shape)
+    _assert_parity(q, m, rtol=0, msg=f"XINT8 {prod} {cons}")
+
+
+_REMOVAL_OPTIONS = [
+    ({"RemoveQDQConvRelu": False}, "Conv", "Relu"),
+    ({"RemoveQDQConvRelu": False}, "Gemm", "Relu"),
+    ({"RemoveQDQConvClip": False}, "Gemm", "Clip6"),
+    ({"RemoveQDQConvClip": False}, "Conv", "Relu"),  # unrelated: Relu unchanged
+    ({"RemoveQDQConvLeakyRelu": False}, "Conv", "LeakyRelu"),
+    ({"RemoveQDQConvLeakyRelu": False}, "Conv", "Relu"),
+    ({"RemoveQDQConvPRelu": False}, "Gemm", "PRelu"),
+    ({"RemoveQDQConvGelu": True}, "Conv", "Gelu"),
+    ({"RemoveQDQConvGelu": True}, "Gemm", "Gelu"),
+    ({"RemoveQDQInstanceNorm": True}, "InstanceNormalization", "Relu"),
+    ({"RemoveQDQInstanceNorm": True}, "InstanceNormalization", "LeakyRelu"),
+    ({"RemoveQDQInstanceNorm": False}, "InstanceNormalization", "Relu"),
+    ({"FoldRelu": True}, "Conv", "Relu"),
+    ({"FoldRelu": False}, "Conv", "Relu"),
+    ({"FoldRelu": True}, "Gemm", "Clip6"),
+]
+
+
+@pytest.mark.parametrize("extra, prod, cons", _REMOVAL_OPTIONS)
+@pytest.mark.parametrize("preset", ["A8W8", "U8S8_AAWS", "U16S8_AAWS"])
+def test_qdq_removal_options_match_quark(extra, prod, cons, preset, tmp_path):
+    """Each ``RemoveQDQ*`` / ``FoldRelu`` option, off or on, against Quark's
+    default (``RemoveQDQConvGelu`` and ``RemoveQDQInstanceNorm`` are opt-in)."""
+    model, shape = _removal_model(prod, cons)
+    q = _quark_run(model, preset, shape, tmp_path, extra=extra)
+    m = _mine_run(model, preset, shape, extra=extra)
+    _assert_parity(q, m, msg=f"{preset} {extra} {prod} {cons}")
+
+
+def test_removal_options_change_the_graph():
+    """... and are not vacuous: switching an option changes onnxsim's graph."""
+    model, shape = _removal_model("Gemm", "LeakyRelu")
+    default = _placement(_mine_run(model, "A8W8", shape))
+    off = _placement(_mine_run(model, "A8W8", shape, {"RemoveQDQConvLeakyRelu": False}))
+    assert len(off) == len(default) + 1  # the Q on the producer output stays
+    model, shape = _removal_model("Conv", "Gelu")
+    on = _placement(_mine_run(model, "A8W8", shape, {"RemoveQDQConvGelu": True}))
+    assert len(on) == len(_placement(_mine_run(model, "A8W8", shape))) - 1
+
+
+# -- ActivationSymmetric / WeightSymmetric / QuantizeBias ---------------------------------
+
+
+@pytest.mark.parametrize("model_spec", [("Gemm", "Relu"), ("Conv", "PRelu")])
+@pytest.mark.parametrize("value", [True, False])
+@pytest.mark.parametrize(
+    "preset", ["A8W8", "U8S8_AAWS", "A16W8", "U16S8_AAWS", "S8S8_AAWS"]
+)
+def test_activation_symmetric_option_matches_quark(preset, value, model_spec, tmp_path):
+    """``ActivationSymmetric`` overrides the preset's symmetry: signed types
+    centre at 0, unsigned ones at 128 / 32768 (scale ``2 * absmax / 255``),
+    and the Relu-folding rule follows it."""
+    model, shape = _removal_model(*model_spec)
+    extra = {"ActivationSymmetric": value}
+    q = _quark_run(model, preset, shape, tmp_path, extra=extra)
+    m = _mine_run(model, preset, shape, extra=extra)
+    _assert_parity(q, m, msg=f"{preset} {extra}")
+
+
+@pytest.mark.parametrize(
+    "model_spec", [("Gemm", "Relu"), ("Conv", "Relu"), ("Add", "Relu")]
+)
+@pytest.mark.parametrize(
+    "preset", ["A8W8", "U8U8_AAWA", "U8S8_AAWS", "A16W8", "S16S8_ASWS"]
+)
+def test_weight_symmetric_false_matches_quark(preset, model_spec, tmp_path):
+    """Asymmetric weights (int8, int16 or uint8 per the preset), biases scaled
+    ``input * weight`` and the constant operand of an Add."""
+    model, shape = _removal_model(*model_spec)
+    extra = {"WeightSymmetric": False}
+    q = _quark_run(model, preset, shape, tmp_path, extra=extra)
+    m = _mine_run(model, preset, shape, extra=extra)
+    _assert_parity(q, m, msg=f"{preset} {model_spec}")
+
+
+@pytest.mark.parametrize("model_name", sorted(CAL_MODELS))
+def test_u8u8_aawa_uint8_weights_match_quark(model_name, tmp_path):
+    """U8U8_AAWA's asymmetric uint8 weights (no longer an approximation)."""
+    model, shape = CAL_MODELS[model_name](0)
+    _check_cal_parity(model, shape, "U8U8_AAWA", tmp_path, rtol=1e-5, zp_atol=1)
+
+
+@pytest.mark.parametrize("prod", ["Gemm", "Conv"])
+@pytest.mark.parametrize("preset", ["A8W8", "U8S8_AAWS", "A16W8", "XINT8"])
+def test_quantize_bias_false_matches_quark(preset, prod, tmp_path):
+    model, shape = _removal_model(prod, "Relu")
+    extra = {"QuantizeBias": False}
+    q = _quark_run(model, preset, shape, tmp_path, extra=extra)
+    m = _mine_run(model, preset, shape, extra=extra)
+    _assert_parity(q, m, rtol=0 if preset == "XINT8" else 1e-5, msg=preset)
+    assert not any(
+        onnx.numpy_helper.to_array(i).dtype in (np.int32,) for i in m.graph.initializer
+    )
+
+
+# -- Align* options ---------------------------------------------------------------------
+
+
+def _align_model(kind):
+    """Models where an alignment is observable: its input / output ranges
+    differ, so copying the parameters changes a scale."""
+    consts = {
+        "k3": np.array(3.0, np.float32),
+        "st": np.array([0], np.int64),
+        "en": np.array([2], np.int64),
+        "ax": np.array([3], np.int64),
+        "pd": np.array([0, 0, 0, 0, 0, 0, 0, 1], np.int64),
+        "c5": np.array(5.0, np.float32),
+        "shp": np.array([1, 3, 4, 16], np.int64),
+    }
+    bodies = {
+        "Concat": "a = Sigmoid(x)  b = Tanh(x)  c0 = Mul(x, k3)  y = Concat<axis=3>(a, b, c0)",
+        "Slice": "x1 = Mul(x, k3)  s = Slice(x1, st, en, ax)  y = Sigmoid(s)",
+        "Pad": "x1 = Mul(x, k3)  s = Pad(x1, pd, c5)  y = Sigmoid(s)",
+        "MaxPool": "x1 = Mul(x, k3)  s = MaxPool<kernel_shape=[2,2], strides=[2,2]>(x1)  y = Sigmoid(s)",
+        "AveragePool": "x1 = Mul(x, k3)  s = AveragePool<kernel_shape=[2,2], strides=[2,2]>(x1)  y = Sigmoid(s)",
+        "GlobalAveragePool": "x1 = Mul(x, k3)  s = GlobalAveragePool(x1)  y = Sigmoid(s)",
+        "Transpose": "x1 = Mul(x, k3)  s = Transpose<perm=[0,1,3,2]>(x1)  y = Sigmoid(s)",
+        "Reshape": "x1 = Mul(x, k3)  s = Reshape(x1, shp)  y = Sigmoid(s)",
+    }
+    m = parser.parse_model(
+        '<ir_version: 9, opset_import: ["": 17]> g (float[1,3,8,8] x) => (float y) { '
+        + bodies[kind]
+        + " }"
+    )
+    for k, v in consts.items():
+        m.graph.initializer.append(onnx.numpy_helper.from_array(v, k))
+    return onnx.shape_inference.infer_shapes(m), (1, 3, 8, 8)
+
+
+_ALIGN_OPTION = {
+    "Concat": "AlignConcat",
+    "Slice": "AlignSlice",
+    "Pad": "AlignPad",
+    "MaxPool": "AlignPool",
+    "AveragePool": "AlignPool",
+    "GlobalAveragePool": "AlignPool",
+    "Transpose": "AlignTranspose",
+    "Reshape": "AlignReshape",
+}
+
+
+@pytest.mark.parametrize("value", [None, True, False])
+@pytest.mark.parametrize("kind", sorted(_ALIGN_OPTION))
+@pytest.mark.parametrize(
+    "preset", ["A16W8", "U16S8_AAWS", "A8W8", "U8S8_AAWS", "S8S8_AAWS"]
+)
+def test_align_options_match_quark(preset, kind, value, tmp_path):
+    """``Align{Concat,Slice,Pad,Pool,Transpose,Reshape}``: Concat / Pad /
+    Transpose / Reshape inputs take their output's quantization parameters,
+    Pool / Slice outputs their input's -- but only the extended quantizer runs
+    these passes (A8W8, A16W8, U16S8_AAWS; A8W8 sets AlignConcat itself). The
+    plain quantizer's Slice is calibrated on its own, its AveragePool shares
+    its input's parameters."""
+    model, shape = _align_model(kind)
+    extra = {} if value is None else {_ALIGN_OPTION[kind]: value}
+    q = _quark_run(model, preset, shape, tmp_path, extra=extra)
+    m = _mine_run(model, preset, shape, extra=extra)
+    _assert_same_placement(q, m, msg=f"{preset} {kind} {extra}")
+
+
+def test_align_concat_is_observable():
+    """Not vacuous: aligning a Concat moves its inputs' scales onto the
+    output's."""
+    model, shape = _align_model("Concat")
+    on = dict(
+        _scales_by_tensor(_mine_run(model, "A16W8", shape, {"AlignConcat": True}))
+    )
+    off = dict(
+        _scales_by_tensor(_mine_run(model, "A16W8", shape, {"AlignConcat": False}))
+    )
+    assert on["a"] == on["b"] == on["y"] and off["a"] != off["y"]
+
+
+def _scales_by_tensor(model):
+    return [(e[0], e[1]) for e in _placement(model) if not isinstance(e, str)]
