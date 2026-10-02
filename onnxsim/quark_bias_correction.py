@@ -296,10 +296,9 @@ def correct_bias_quark(
             q, new_scale, new_zp = quark_pof2_quantize(
                 new_f, bias_q.dtype, activation_symmetric
             )
-            if (
-                not np.array_equal(np.float32(new_scale), scale.reshape(-1)[:1])
-                or new_zp != int(zp.reshape(-1)[0])
-            ):
+            if not np.array_equal(
+                np.float32(new_scale), scale.reshape(-1)[:1]
+            ) or new_zp != int(zp.reshape(-1)[0]):
                 warnings.warn(
                     f"BiasCorrection of {qn.name or qn.output[0]!r} follows Quark's "
                     f"power-of-two flow: the corrected bias codes belong to scale "
