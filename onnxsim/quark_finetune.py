@@ -15,8 +15,8 @@ What a "block" is (Quark's ``Subgraph``): for every ``Conv`` / ``ConvTranspose``
 ``LayerNormalization`` in the quantized model, the sub-model from the float
 tensor in front of the layer's *input* ``QuantizeLinear`` to the layer's
 output: input Q/DQ, weight Q/DQ, the op, the (quantized) bias, an optional
-following activation (``Relu``, ``LeakyRelu``, ``Clip``, ``Sigmoid``,
-``Tanh``, ``Gelu``, ``Softmax``) and -- with ``output_qdq`` -- the output Q/DQ.
+following activation (``Relu``, ``PRelu``, ``LeakyRelu``, ``Clip``,
+``Sigmoid``, ``Tanh``, ``Gelu``, ``Softmax``) and -- with ``output_qdq`` -- the output Q/DQ.
 The training target is the *float* model's tensor at the same block output,
 the input is the quantized model's pre-quantization tensor (``drop_ratio`` mixes
 it element-wise with the float model's) and the loss is Quark's
@@ -43,27 +43,70 @@ iteration's loss is *not* accumulated; AdaRound compares the mean *rounding*
 loss, AdaQuant the reconstruction loss; the break happens before that
 iteration's optimizer step).
 
+Layers Quark's own torch modules cannot handle are skipped exactly where
+Quark skips them (its driver logs the failure and goes on; probed against
+``amd-quark`` 0.13, ``tests/test_quark_finetune_coverage_parity.py``):
+
+* ``auto_pad`` other than ``NOTSET``, any ``ConvTranspose`` that has an
+  ``output_padding`` or ``output_shape`` attribute (even an all-zero one),
+  ``LayerNormalization`` over an axis other than the last: its converter
+  raises. (``SelectMaxMemLayer`` converts every layer up front without a
+  guard, so there Quark aborts the whole run -- and so does this port.)
+* ``ConvTranspose`` with asymmetric ``pads``: Quark puts a ``ConstantPad`` in
+  front of a transposed convolution that has no padding, so its output no
+  longer has the float layer's shape and the first forward fails.
+* a layer whose first forward does not fit its target (``Gemm`` with ``transA``
+  only fits when there is one calibration batch whose two axes and the
+  mini-batch are all of the same size -- there it *trains*, the "samples" being
+  the rows of ``A``, and so does this port).
+
+What Quark *does* train, and this port reproduces bit for bit given its random
+stream: 1-D / 2-D / 3-D ``Conv`` and ``ConvTranspose`` (``ConvTranspose`` also
+with ``group > 1``), ``MatMul`` / ``Gemm`` on activations of any rank, ``PRelu`` blocks (Quark builds ``torch.nn.PReLU()`` whatever
+the node's slope is: the layer is trained with the slope 0.25), ``Clip`` whose
+bounds are not both initializers (``torch.nn.ReLU6``) or that has fewer than two
+bounds as attributes (the identity), bias-less ``Gemm`` (``torch.nn.Linear``
+owns a randomly initialized bias that is added to every forward), and 16-bit
+or ``uint8`` / asymmetric weight grids. Two Quark quirks come along: its
+asymmetric 3-D ``pads`` are scrambled across the three axes (its "swap H and W"
+step is only right for 2-D), and a >= 3-D ``Gemm`` output gets its bias along
+axis 1 whenever that axis has the bias' length. Activation fake-quantization is
+done in float32 like torch's, which keeps its rounding decisions for 16-bit
+codes (float64 would not).
+
+``MemOptLevel=2`` is a different training loop in Quark (its ``DataLoader``
+path): samples are whole calibration *batches* (``np.load(f).squeeze(0)``),
+epochs of ``len // batch_size`` shuffled mini-batches of which the last is never
+used, an early stop with patience two checked per epoch, no ``LRAdjust``, no
+``parallel`` capture, and ``NumWorkers=0`` with ``batch_size > 1`` fails in
+every layer (``DataLoader`` options); all of it is mirrored. ``DynamicBatch``
+only works in Quark for readers that yield one sample per batch (otherwise ONNX
+Runtime rejects the input for every layer) and is a no-op then.
+
 Not replicated (no effect on the numbers, or out of scope): ``optim_device`` /
-``infer_device`` / ``num_workers`` / ``pin_memory`` / ``use_gds`` /
-``log_period`` / ``cache_dir`` / ``dynamic_batch`` (all calibration data is
-always used as one set of samples) and ``mem_opt_level`` (only chooses
-between caching float activations up front or per layer); layers Quark itself
-cannot convert (``auto_pad``, ``ConvTranspose`` with ``output_padding`` /
-groups, 3-D convolutions, ``Gemm`` with ``transA``, activations such as
-``PRelu`` whose Quark module ignores the real parameters) are skipped and left
-as calibrated. The one deliberate addition is ``guard`` (default on): a layer's
-new codes are kept only if the block's reconstruction error on all samples did
-not get worse, which Quark has no equivalent of.
+``infer_device`` / ``pin_memory`` / ``use_gds`` / ``log_period`` / ``cache_dir``
+and ``mem_opt_level`` 0 vs 1 (only choose where tensors are cached and which
+device runs them; probed: identical codes), and ``SaveAndRestore`` (a
+checkpoint file of Quark's: when one exists Quark trains only the layers it
+lists). Calibration batches with a leading axis > 1 at ``MemOptLevel=2`` are
+mirrored only as far as the numpy ops reach (``Conv`` fails in Quark and is
+skipped here; ``MatMul`` / ``Gemm`` / norms train on the stacked batches). A
+bias-less ``Gemm`` draws its Linear bias from numpy's generator unless a test
+hands in torch's (``block_hook``). The one deliberate addition is ``guard``
+(default on): a layer's new codes are kept only if the block's reconstruction
+error on all samples did not get worse, which Quark has no equivalent of.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import onnx
+from numpy.lib.stride_tricks import sliding_window_view
 from onnx import TensorProto, numpy_helper
 
 from onnxsim.bias_correction import _add_probe_outputs
@@ -72,7 +115,6 @@ from onnxsim.quark_weight_rounding import (
     _attr,
     _avg_l2,
     _copy_tensor,
-    _im2col,
 )
 
 TARGET_OPS = (
@@ -126,6 +168,8 @@ class FinetuneOptions:
     output_qdq: bool = False
     parallel: bool = False
     mem_opt_level: int = 1
+    num_workers: int = 1
+    dynamic_batch: bool = False
     output_index: Optional[int] = None
     select_max_mem_layer: bool = False
     target_ops: Sequence[str] = TARGET_OPS
@@ -168,21 +212,32 @@ class _QConst:
 
 @dataclass
 class _ActQ:
+    """An activation Q/DQ pair. Torch's quantizer works in float32 (``x / scale``,
+    ``round`` half to even, ``+ zp``, ``clamp``, ``- zp``, ``* scale``); doing
+    the same keeps its rounding decisions -- they matter for 16-bit codes, where
+    float32 cannot tell ``x / scale`` from a half-way tie within ~0.004 of a
+    code."""
+
     scale: float
     zp: float
     lo: float
     hi: float
     pre: str = ""  # float tensor feeding the QuantizeLinear (input quantizers)
 
+    def _q(self, x: np.ndarray) -> np.ndarray:
+        f32 = np.float32
+        return np.round(x.astype(f32) / f32(self.scale)) + f32(self.zp)
+
     def fq(self, x: np.ndarray) -> np.ndarray:
-        q = np.clip(np.round(x / self.scale) + self.zp, self.lo, self.hi)
-        return (q - self.zp) * self.scale
+        f32 = np.float32
+        q = np.clip(self._q(x), f32(self.lo), f32(self.hi))
+        return ((q - f32(self.zp)) * f32(self.scale)).astype(np.float64)
 
     def fq_mask(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        q = np.round(x / self.scale) + self.zp
-        return (np.clip(q, self.lo, self.hi) - self.zp) * self.scale, (
-            (q >= self.lo) & (q <= self.hi)
-        )
+        f32 = np.float32
+        q = self._q(x)
+        y = (np.clip(q, f32(self.lo), f32(self.hi)) - f32(self.zp)) * f32(self.scale)
+        return y.astype(np.float64), (q >= self.lo) & (q <= self.hi)
 
 
 def _broadcast(
@@ -267,144 +322,243 @@ class _Op:
 
 
 class _MatMulOp(_Op):
-    def __init__(self, transposed: bool) -> None:
+    def __init__(self, transposed: bool, trans_a: bool = False) -> None:
         self.t = transposed  # weight stored [N, K]
+        self.ta = trans_a  # Gemm ``transA``: the input is used as ``x^T``
 
     def forward(self, x, w):
         wk = w.T if self.t else w
-        return x @ wk, x
+        xa = np.swapaxes(x, -1, -2) if self.ta else x
+        return xa @ wk, xa
 
     def backward(self, ctx, dy):
         x2 = ctx.reshape(-1, ctx.shape[-1])
         dw = x2.T @ dy.reshape(-1, dy.shape[-1])
         return dw.T if self.t else dw
 
+    # Quark's wrapper broadcasts a bias along axis 1 whenever the output's
+    # axis 1 happens to have the bias' length (``bias.view(1, -1, 1, ...)``),
+    # which for a >= 3-D Gemm output is not the last axis
+    @staticmethod
+    def _bias_axis(shape: Sequence[int], n: int) -> Optional[int]:
+        return 1 if len(shape) >= 3 and shape[1] == n else None
+
+    def add_bias(self, y, b):
+        axis = self._bias_axis(y.shape, b.shape[0])
+        if axis is None:
+            return y + b
+        shape = [1] * y.ndim
+        shape[axis] = -1
+        return y + b.reshape(shape)
+
+    def bias_grad(self, dy):
+        axis = self._bias_axis(dy.shape, dy.shape[-1]) if dy.ndim >= 3 else None
+        if axis is None:
+            return dy.reshape(-1, dy.shape[-1]).sum(axis=0)
+        return dy.sum(axis=tuple(i for i in range(dy.ndim) if i != axis))
+
+
+def _quark_is_symmetric(pads: Sequence[int]) -> bool:
+    idx = len(pads) // 2
+    return all(pads[i] == pads[idx + i] for i in range(idx))
+
+
+def _quark_pad_list(pads: Sequence[int]) -> List[int]:
+    """Quark's ``extract_padding_params``: the ONNX ``pads`` of an asymmetric
+    convolution as the argument list of ``torch.nn.ConstantPad{n}d`` (last
+    dimension first). Its "swap H and W" step is only right for 2-D pads: for
+    3-D ones it scrambles the three axes (and drops them to the last axis'
+    pair when the first four entries are zero), which is reproduced here."""
+    n = len(pads) // 2
+    if n == 0:
+        return []
+    p = np.array(pads).reshape(-1, n)
+    if n > 1:
+        p[:, [-2, -1]] = p[:, [-1, -2]]
+    p = p.T.flatten()
+    if n > 2 and (p[:4] == 0).all():
+        p = p[4:]
+    return [int(v) for v in p]
+
+
+def _pad_list_widths(pad_list: Sequence[int], nd: int) -> List[Tuple[int, int]]:
+    """``torch.nn.functional.pad`` argument list -> per-spatial-axis
+    ``(before, after)`` (the list starts at the last axis)."""
+    widths = [(0, 0)] * nd
+    for j in range(len(pad_list) // 2):
+        widths[nd - 1 - j] = (int(pad_list[2 * j]), int(pad_list[2 * j + 1]))
+    return widths
+
+
+def _conv_geometry(node: onnx.NodeProto, nd: int):
+    strides = tuple(int(v) for v in _attr(node, "strides", [1] * nd))
+    dil = tuple(int(v) for v in _attr(node, "dilations", [1] * nd))
+    pads = [int(v) for v in _attr(node, "pads", [0] * (2 * nd))]
+    return strides, dil, pads
+
 
 class _ConvOp(_Op):
+    """N-d ``Conv`` (any number of groups). With ``quark_pads`` the padding is
+    what Quark's torch module does: asymmetric pads become a separate
+    ``ConstantPad`` layer in front, built by :func:`_quark_pad_list`."""
+
     bias_axis = 1
 
-    def __init__(self, node: onnx.NodeProto, w_shape: Tuple[int, ...]) -> None:
+    def __init__(
+        self,
+        node: onnx.NodeProto,
+        w_shape: Tuple[int, ...],
+        quark_pads: bool = False,
+    ) -> None:
         nd = len(w_shape) - 2
-        self.one_d = nd == 1
-        strides = list(_attr(node, "strides", [1] * nd))
-        dil = list(_attr(node, "dilations", [1] * nd))
-        pads = list(_attr(node, "pads", [0] * (2 * nd)))
-        if self.one_d:
-            strides, dil = [1] + strides, [1] + dil
-            pads = [0, pads[0], 0, pads[1]]
-        self.strides, self.dil, self.pads = strides, dil, pads
+        self.nd = nd
+        self.strides, self.dil, pads = _conv_geometry(node, nd)
         self.group = int(_attr(node, "group", 1))
+        self.pad_layer: Optional[List[int]] = None  # Quark's ConstantPad argument
+        if len(pads) != 2 * nd or _quark_is_symmetric(pads):
+            self.widths = [(pads[i], pads[i]) for i in range(min(nd, len(pads) // 2))]
+            self.widths += [(0, 0)] * (nd - len(self.widths))
+        else:
+            self.pad_layer = _quark_pad_list(pads)
+            self.widths = (
+                _pad_list_widths(self.pad_layer, nd)
+                if quark_pads
+                else [(pads[i], pads[nd + i]) for i in range(nd)]
+            )
 
-    def _w4(self, w: np.ndarray) -> np.ndarray:
-        return w.reshape(w.shape[0], w.shape[1], 1, -1) if self.one_d else w
+    def pad_layer_shape(self, x_shape: Sequence[int]) -> Optional[List[int]]:
+        """The input shape after Quark's pad layer (``None``: it has none)."""
+        if self.pad_layer is None:
+            return None
+        shape = list(x_shape)
+        for i, (b, a) in enumerate(self.widths):
+            shape[2 + i] += b + a
+        return shape
 
     def forward(self, x, w):
-        w4 = self._w4(w)
-        if self.one_d:
-            x = x[:, :, None, :]
-        o, ig, kh, kw = w4.shape
-        og, g = o // self.group, self.group
-        pt, pl, pb, pr = self.pads
-        b, _, h, wd = x.shape
-        oh = (h + pt + pb - self.dil[0] * (kh - 1) - 1) // self.strides[0] + 1
-        ow = (wd + pl + pr - self.dil[1] * (kw - 1) - 1) // self.strides[1] + 1
+        nd, g = self.nd, self.group
+        o, ig = w.shape[0], w.shape[1]
+        ksize = w.shape[2:]
+        og = o // g
+        xp = np.pad(x, [(0, 0), (0, 0)] + list(self.widths))
+        eff = [(ksize[i] - 1) * self.dil[i] + 1 for i in range(nd)]
+        win = sliding_window_view(xp, eff, axis=tuple(range(2, 2 + nd)))
+        win = win[
+            (slice(None), slice(None))
+            + tuple(slice(None, None, s) for s in self.strides)
+            + tuple(slice(None, None, d) for d in self.dil)
+        ]  # [b, c, *out, *k]
+        b = x.shape[0]
+        out = win.shape[2 : 2 + nd]
+        perm = (0, *range(2, 2 + nd), 1, *range(2 + nd, 2 + 2 * nd))
         cols, ys = [], []
         for gi in range(g):
-            c = _im2col(
-                x[:, gi * ig : (gi + 1) * ig],
-                (kh, kw),
-                self.strides,
-                self.pads,
-                self.dil,
+            c = (
+                win[:, gi * ig : (gi + 1) * ig]
+                .transpose(perm)
+                .reshape(b * int(np.prod(out)), -1)
             )
             cols.append(c)
-            ys.append(c @ w4[gi * og : (gi + 1) * og].reshape(og, -1).T)
-        y = np.concatenate(ys, axis=1).reshape(b, oh, ow, o).transpose(0, 3, 1, 2)
-        if self.one_d:
-            y = y[:, :, 0, :]
-        return y, (cols, w4.shape)
+            ys.append(c @ w[gi * og : (gi + 1) * og].reshape(og, -1).T)
+        y = np.concatenate(ys, axis=1).reshape(b, *out, o)
+        return np.moveaxis(y, -1, 1), (cols, w.shape)
 
     def backward(self, ctx, dy):
-        cols, (o, ig, kh, kw) = ctx
-        if self.one_d:
-            dy = dy[:, :, None, :]
+        cols, wshape = ctx
+        o, ig = wshape[0], wshape[1]
         og = o // self.group
-        dyr = dy.transpose(0, 2, 3, 1).reshape(-1, o)
+        dyr = np.moveaxis(dy, 1, -1).reshape(-1, o)
         parts = [
-            (dyr[:, gi * og : (gi + 1) * og].T @ cols[gi]).reshape(og, ig, kh, kw)
+            (dyr[:, gi * og : (gi + 1) * og].T @ cols[gi]).reshape(og, ig, *wshape[2:])
             for gi in range(self.group)
         ]
-        dw = np.concatenate(parts, axis=0)
-        return dw[:, :, 0, :] if self.one_d else dw
+        return np.concatenate(parts, axis=0)
 
 
 class _ConvTransposeOp(_Op):
+    """N-d ``ConvTranspose`` (any number of groups); ``pads`` crop the full
+    output. (Quark cannot train it with asymmetric pads, see ``_make_block``.)"""
+
     bias_axis = 1
 
     def __init__(self, node: onnx.NodeProto, w_shape: Tuple[int, ...]) -> None:
         nd = len(w_shape) - 2
-        self.one_d = nd == 1
-        strides = list(_attr(node, "strides", [1] * nd))
-        dil = list(_attr(node, "dilations", [1] * nd))
-        pads = list(_attr(node, "pads", [0] * (2 * nd)))
-        if self.one_d:
-            strides, dil = [1] + strides, [1] + dil
-            pads = [0, pads[0], 0, pads[1]]
-        self.strides, self.dil, self.pads = strides, dil, pads
-
-    def _geometry(self, h: int, w: int, kh: int, kw: int):
-        sh, sw = self.strides
-        dh, dw = self.dil
-        return (
-            sh * (h - 1) + dh * (kh - 1) + 1,
-            sw * (w - 1) + dw * (kw - 1) + 1,
+        self.nd = nd
+        self.strides, self.dil, pads = _conv_geometry(node, nd)
+        self.group = int(_attr(node, "group", 1))
+        self.crop = [(pads[i], pads[nd + i]) for i in range(nd)]
+        self.pad_layer: Optional[List[int]] = (
+            None if _quark_is_symmetric(pads) else _quark_pad_list(pads)
         )
 
+    def pad_layer_shape(self, x_shape: Sequence[int]) -> Optional[List[int]]:
+        if self.pad_layer is None:
+            return None
+        shape = list(x_shape)
+        for i, (b, a) in enumerate(_pad_list_widths(self.pad_layer, self.nd)):
+            shape[2 + i] += b + a
+        return shape
+
+    def _slices(self, sp, ksize, kidx):
+        return tuple(
+            slice(
+                kidx[i] * self.dil[i],
+                kidx[i] * self.dil[i] + self.strides[i] * sp[i],
+                self.strides[i],
+            )
+            for i in range(self.nd)
+        )
+
+    def _full(self, sp, ksize):
+        return [
+            self.strides[i] * (sp[i] - 1) + self.dil[i] * (ksize[i] - 1) + 1
+            for i in range(self.nd)
+        ]
+
     def forward(self, x, w):
-        if self.one_d:
-            x, w = x[:, :, None, :], w[:, :, None, :]
-        b, c, h, wd = x.shape
-        _, co, kh, kw = w.shape
-        hp, wp = self._geometry(h, wd, kh, kw)
-        sh, sw = self.strides
-        dh, dw_ = self.dil
-        cols = np.einsum("bchw,cokl->bhwokl", x, w)
-        buf = np.zeros((b, co, hp, wp))
-        for i in range(kh):
-            for j in range(kw):
-                buf[
-                    :,
-                    :,
-                    i * dh : i * dh + sh * h : sh,
-                    j * dw_ : j * dw_ + sw * wd : sw,
-                ] += cols[:, :, :, :, i, j].transpose(0, 3, 1, 2)
-        pt, pl, pb, pr = self.pads
-        y = buf[:, :, pt : hp - pb, pl : wp - pr]
-        if self.one_d:
-            y = y[:, :, 0, :]
-        return y, (x, w.shape, (hp, wp))
+        nd, g = self.nd, self.group
+        b, c = x.shape[:2]
+        sp, ksize = x.shape[2:], w.shape[2:]
+        cg, og = c // g, w.shape[1]
+        full = self._full(sp, ksize)
+        buf = np.zeros((b, g * og, *full))
+        for gi in range(g):
+            cols = np.tensordot(
+                x[:, gi * cg : (gi + 1) * cg],
+                w[gi * cg : (gi + 1) * cg],
+                axes=([1], [0]),
+            )  # [b, *sp, og, *k]
+            view = buf[:, gi * og : (gi + 1) * og]
+            for kidx in itertools.product(*[range(k) for k in ksize]):
+                piece = cols[(slice(None),) * (nd + 2) + kidx]  # [b, *sp, og]
+                view[(slice(None), slice(None)) + self._slices(sp, ksize, kidx)] += (
+                    np.moveaxis(piece, -1, 1)
+                )
+        crop = tuple(slice(p0, full[i] - p1) for i, (p0, p1) in enumerate(self.crop))
+        return buf[(slice(None), slice(None)) + crop], (x, w.shape, full)
 
     def backward(self, ctx, dy):
-        x, (_, co, kh, kw), (hp, wp) = ctx
-        if self.one_d:
-            dy = dy[:, :, None, :]
-        b, c, h, wd = x.shape
-        pt, pl, pb, pr = self.pads
-        full = np.zeros((b, co, hp, wp))
-        full[:, :, pt : hp - pb, pl : wp - pr] = dy
-        sh, sw = self.strides
-        dh, dw_ = self.dil
-        dcols = np.empty((b, h, wd, co, kh, kw))
-        for i in range(kh):
-            for j in range(kw):
-                dcols[:, :, :, :, i, j] = full[
-                    :,
-                    :,
-                    i * dh : i * dh + sh * h : sh,
-                    j * dw_ : j * dw_ + sw * wd : sw,
-                ].transpose(0, 2, 3, 1)
-        dw = np.einsum("bchw,bhwokl->cokl", x, dcols)
-        return dw[:, :, 0, :] if self.one_d else dw
+        x, wshape, full = ctx
+        nd, g = self.nd, self.group
+        b, c = x.shape[:2]
+        sp, ksize = x.shape[2:], wshape[2:]
+        cg, og = c // g, wshape[1]
+        dfull = np.zeros((b, g * og, *full))
+        crop = tuple(slice(p0, full[i] - p1) for i, (p0, p1) in enumerate(self.crop))
+        dfull[(slice(None), slice(None)) + crop] = dy
+        axes = [0, *range(2, 2 + nd)]
+        dw = np.empty((c, og, *ksize))
+        for gi in range(g):
+            xg = x[:, gi * cg : (gi + 1) * cg]
+            dview = dfull[:, gi * og : (gi + 1) * og]
+            for kidx in itertools.product(*[range(k) for k in ksize]):
+                piece = dview[
+                    (slice(None), slice(None)) + self._slices(sp, ksize, kidx)
+                ]
+                dw[(slice(gi * cg, (gi + 1) * cg), slice(None)) + kidx] = np.tensordot(
+                    xg, piece, axes=(axes, axes)
+                )
+        return dw
 
 
 class _LayerNormOp(_Op):
@@ -476,14 +630,41 @@ class _LeakyRelu(_Act):
 
 
 class _Clip(_Act):
-    def __init__(self, lo: float, hi: float) -> None:
-        self.lo, self.hi = lo, hi
+    """``torch.clamp(z, lo, hi)`` (gradient where ``lo <= z <= hi``); with
+    ``strict`` it is ``torch.nn.ReLU6`` (``hardtanh``: ``lo < z < hi``)."""
+
+    def __init__(self, lo: float, hi: float, strict: bool = False) -> None:
+        self.lo, self.hi, self.strict = lo, hi, strict
 
     def forward(self, z):
         return np.clip(z, self.lo, self.hi)
 
     def backward(self, z, a, da):
+        if self.strict:
+            return da * ((z > self.lo) & (z < self.hi))
         return da * ((z >= self.lo) & (z <= self.hi))
+
+
+class _Identity(_Act):
+    def forward(self, z):
+        return z
+
+    def backward(self, z, a, da):
+        return da
+
+
+class _PRelu(_Act):
+    """Quark builds ``torch.nn.PReLU()`` whatever the node's slope input is: one
+    shared parameter at its initial value 0.25 that its optimizer never
+    touches, so that is the slope the layer is trained with."""
+
+    SLOPE = 0.25
+
+    def forward(self, z):
+        return np.where(z > 0, z, self.SLOPE * z)
+
+    def backward(self, z, a, da):
+        return da * np.where(z > 0, 1.0, self.SLOPE)
 
 
 class _Sigmoid(_Act):
@@ -527,9 +708,13 @@ class _Softmax(_Act):
 def _make_act(
     node: onnx.NodeProto, inits: Dict[str, onnx.TensorProto]
 ) -> Optional[_Act]:
+    """The torch module Quark's ``convert_act`` builds for an activation node
+    (``None``: it cannot convert it, the layer is skipped)."""
     t = node.op_type
     if t == "Relu":
         return _Relu()
+    if t == "PRelu":
+        return _PRelu()
     if t == "LeakyRelu":
         return _LeakyRelu(float(_attr(node, "alpha", 0.01)))
     if t == "Sigmoid":
@@ -541,16 +726,21 @@ def _make_act(
     if t == "Softmax":
         return _Softmax(int(_attr(node, "axis", -1)))
     if t == "Clip":
-        if len(node.input) == 3 and node.input[1] in inits and node.input[2] in inits:
-            lo = float(numpy_helper.to_array(inits[node.input[1]]).reshape(-1)[0])
-            hi = float(numpy_helper.to_array(inits[node.input[2]]).reshape(-1)[0])
-            return _Clip(lo, hi)
         if len(node.input) == 1:
             lo, hi = _attr(node, "min", None), _attr(node, "max", None)
             if lo is None or hi is None:
-                return None  # Quark's Clip module is the identity here
+                return _Identity()  # Quark's Clip module without both bounds
             return _Clip(float(lo), float(hi))
-    return None  # PRelu etc.: Quark's module ignores the real parameters
+        if len(node.input) == 3 and node.input[1] in inits and node.input[2] in inits:
+            lo_a = numpy_helper.to_array(inits[node.input[1]])
+            hi_a = numpy_helper.to_array(inits[node.input[2]])
+            if lo_a.size != 1 or hi_a.size != 1:
+                return None  # ``.item()`` fails: Quark cannot convert it
+            return _Clip(float(lo_a.reshape(-1)[0]), float(hi_a.reshape(-1)[0]))
+        # bounds that are not both initializers (empty input, a Constant node,
+        # only a min): Quark falls back to its ``Clip -> ReLU6`` table entry
+        return _Clip(0.0, 6.0, strict=True)
+    return None
 
 
 # -- finding the blocks ------------------------------------------------------------------------
@@ -574,6 +764,9 @@ class _Block:
     f_end: str
     act: Optional[_Act]
     out_q: Optional[_ActQ]
+    #: bound of the random bias Quark's Gemm module owns although the node has
+    #: none (``b_plain`` is filled with the draw before training)
+    phantom_bias: Optional[float] = None
 
 
 def _consumers(model: onnx.ModelProto) -> Dict[str, onnx.NodeProto]:
@@ -584,10 +777,17 @@ def _consumers(model: onnx.ModelProto) -> Dict[str, onnx.NodeProto]:
     return out
 
 
+class _QuarkConversionError(Exception):
+    """Quark's ``convert_onnx_to_torch`` raises for this layer: its driver logs
+    it and skips the layer (``SelectMaxMemLayer`` converts every layer up front
+    without a guard, so there it aborts the whole run)."""
+
+
 def _find_blocks(
     float_model: onnx.ModelProto,
     quant_model: onnx.ModelProto,
     opt: FinetuneOptions,
+    conversion_errors: Optional[List[str]] = None,
 ) -> List[_Block]:
     f_inits = {t.name: t for t in float_model.graph.initializer}
     q_inits = {t.name: t for t in quant_model.graph.initializer}
@@ -612,18 +812,23 @@ def _find_blocks(
             continue
         if len(qn.input) < 2 or qn.output[0] not in q_cons:
             continue
-        blk = _make_block(
-            qn,
-            q_prod,
-            q_inits,
-            q_cons,
-            f_inits,
-            f_cons,
-            f_by_name,
-            f_by_weight,
-            use_count,
-            opt,
-        )
+        try:
+            blk = _make_block(
+                qn,
+                q_prod,
+                q_inits,
+                q_cons,
+                f_inits,
+                f_cons,
+                f_by_name,
+                f_by_weight,
+                use_count,
+                opt,
+            )
+        except _QuarkConversionError as e:
+            if conversion_errors is not None:
+                conversion_errors.append(f"{qn.name or qn.output[0]}: {e}")
+            blk = None
         if blk is not None:
             blocks.append(blk)
     seen: Dict[str, int] = {}
@@ -694,29 +899,42 @@ def _make_block(
             return None
         op = _MatMulOp(False)
     elif t == "Gemm":
-        if _attr(qn, "transA", 0):
-            return None
         if w_float.ndim != 2:
             return None
-        op = _MatMulOp(bool(_attr(qn, "transB", 0)))
+        op = _MatMulOp(bool(_attr(qn, "transB", 0)), bool(_attr(qn, "transA", 0)))
         w_alpha, b_beta = float(_attr(qn, "alpha", 1.0)), float(_attr(qn, "beta", 1.0))
     elif t in ("Conv", "ConvTranspose"):
-        if w_float.ndim not in (3, 4):
+        if w_float.ndim not in (3, 4, 5):  # Quark has 1-D / 2-D / 3-D modules
             return None
-        if _attr(qn, "auto_pad", b"NOTSET") not in (b"NOTSET", "NOTSET"):
-            return None
+        # what Quark's ``convert_conv`` raises on (the layer is then skipped)
+        auto_pad = _attr(qn, "auto_pad", b"NOTSET")
+        if auto_pad not in (b"NOTSET", "NOTSET"):
+            raise _QuarkConversionError(
+                f"auto_pad={auto_pad.decode() if isinstance(auto_pad, bytes) else auto_pad}"
+                " functionality not implemented."
+            )
         if t == "Conv":
-            op = _ConvOp(qn, w_float.shape)
+            op = _ConvOp(qn, w_float.shape, quark_pads=True)
         else:
-            if (
-                int(_attr(qn, "group", 1)) != 1
-                or any(_attr(qn, "output_padding", [0]))
-                or _attr(qn, "output_shape", None)
-            ):
+            # Quark raises as soon as the attribute exists, whatever its value
+            for a in qn.attribute:
+                if a.name in ("output_padding", "output_shape"):
+                    raise _QuarkConversionError(
+                        f"ConvTranspose with {a.name} not implemented."
+                    )
+            cop = _ConvTransposeOp(qn, w_float.shape)
+            if cop.pad_layer is not None:
+                # asymmetric pads: Quark puts a ConstantPad in front of a
+                # ConvTranspose with no padding, whose output no longer has the
+                # float layer's shape -- its first forward fails, layer skipped
                 return None
-            op = _ConvTransposeOp(qn, w_float.shape)
+            op = cop
     elif t == "LayerNormalization":
-        if int(_attr(qn, "axis", -1)) != -1 or w_float.ndim != 1:
+        if int(_attr(qn, "axis", -1)) != -1:
+            raise _QuarkConversionError(
+                "LayerNorm whose axis is not -1 is not supported."
+            )
+        if w_float.ndim != 1:
             return None
         op = _LayerNormOp(float(_attr(qn, "epsilon", 1e-5)))
     else:  # InstanceNormalization
@@ -745,6 +963,15 @@ def _make_block(
             return None
     elif t == "InstanceNormalization":
         return None
+    phantom: Optional[float] = None
+    if t == "Gemm" and qb is None and b_plain is None:
+        # a bias-less Gemm still gets ``torch.nn.Linear``'s randomly initialized
+        # bias in Quark's module, which nothing overwrites and which is added
+        # to every forward: U(-1/sqrt(K), 1/sqrt(K)) over the N outputs
+        n_out = w_float.shape[0] if getattr(op, "t", False) else w_float.shape[1]
+        k_in = w_float.shape[1] if getattr(op, "t", False) else w_float.shape[0]
+        phantom = 1.0 / math.sqrt(k_in)
+        b_plain = np.zeros(n_out)
 
     # -- the end of the block ----------------------------------------------------------------------
     cons = q_cons.get(qn.output[0])
@@ -801,6 +1028,7 @@ def _make_block(
         f_end,
         act,
         out_q,
+        phantom,
     )
 
 
@@ -813,11 +1041,13 @@ def _capture(
     data: Sequence[Dict[str, np.ndarray]],
     providers: Optional[Sequence[str]],
     optimize: bool,
-) -> Dict[str, np.ndarray]:
+    split: bool = False,
+) -> Dict[str, Any]:
     """``{name: [samples, ...]}``: each tensor over all calibration batches,
-    concatenated along the leading axis. ``optimize=False`` runs ORT without
-    graph optimizations (Quark does for the quantized model: ORT would
-    otherwise fuse DQ -> op -> Q into integer kernels)."""
+    concatenated along the leading axis (``split``: the list of per-batch
+    arrays instead). ``optimize=False`` runs ORT without graph optimizations
+    (Quark does for the quantized model: ORT would otherwise fuse DQ -> op -> Q
+    into integer kernels)."""
     import onnxruntime as ort
 
     names = sorted(set(names))
@@ -836,7 +1066,20 @@ def _capture(
         res = dict(zip(outs, sess.run(outs, batch)))
         for n in names:
             acc[n].append(np.asarray(res[n], dtype=np.float64))
+    if split:
+        return acc
     return {n: np.concatenate(v, axis=0) for n, v in acc.items()}
+
+
+def _loader_samples(batches: Sequence[np.ndarray]) -> np.ndarray:
+    """What Quark's ``TrainDataset`` hands the ``DataLoader`` at ``MemOptLevel``
+    2: one sample per calibration *batch* (``torch.from_numpy(np.load(f))
+    .squeeze(0)``, which only drops a leading axis of size 1), stacked on a
+    new leading axis."""
+    if len({b.shape for b in batches}) != 1:
+        raise _SkipLayer("calibration batches of different shapes cannot be stacked")
+    st = np.stack(batches)
+    return st[:, 0] if st.shape[1] == 1 else st
 
 
 def _model_outputs(
@@ -864,6 +1107,11 @@ def _model_outputs(
 # -- training ------------------------------------------------------------------------------------------
 
 
+class _SkipLayer(Exception):
+    """Quark's torch module of this layer fails on its first forward (the
+    shapes do not fit), which its driver logs and skips."""
+
+
 def _adam_step(p, g, m, v, t, lr):
     m *= 0.9
     m += 0.1 * g
@@ -889,9 +1137,12 @@ def _block_forward(
     out_mask: bool = False,
 ):
     """``x_in`` is already fake-quantized. Returns ``(y, cache)``."""
-    z, ctx = blk.op.forward(x_in, w_hat * blk.w_alpha)
-    if bias is not None:
-        z = blk.op.add_bias(z, bias * blk.b_beta)
+    try:
+        z, ctx = blk.op.forward(x_in, w_hat * blk.w_alpha)
+        if bias is not None:
+            z = blk.op.add_bias(z, bias * blk.b_beta)
+    except ValueError as e:  # numpy's shape mismatch is torch's RuntimeError
+        raise _SkipLayer(str(e)) from e
     a = z if blk.act is None else blk.act.forward(z)
     mask = None
     y = a
@@ -906,6 +1157,8 @@ def _recon_grad(
     """Quark's loss ``mean(sum((y - y_ref)^2, dim=1))`` and the gradients of it
     w.r.t. the quantized-weight tensor and the bias."""
     ctx, z, a, mask = cache
+    if y.shape != y_ref.shape:
+        raise _SkipLayer(f"output {y.shape} vs target {y_ref.shape}")
     err = y - y_ref
     denom = err.size / err.shape[1]
     loss = float(np.sum(err * err) / denom)
@@ -929,6 +1182,8 @@ def _eval_error(
     tot, count = 0.0, 0
     for i in range(0, x_all.shape[0], 64):
         y, _ = _block_forward(blk, x_all[i : i + 64], w_hat, bias)
+        if y.shape != y_all[i : i + 64].shape:
+            raise _SkipLayer(f"output {y.shape} vs target {y_all[i : i + 64].shape}")
         d = y - y_all[i : i + 64]
         tot += float(np.sum(d * d))
         count += d.size
@@ -984,9 +1239,12 @@ def _train_block(
         w_init_hat = w_rtn
     else:
         w_init_hat = qw.ste(w)[0]
-    err0 = _eval_error(blk, x_eval, yf, w_init_hat, bias_fq)
+    err0 = 0.0
+    if opt.mem_opt_level != 2:  # (the DataLoader loop has no initial metrics)
+        err0 = _eval_error(blk, x_eval, yf, w_init_hat, bias_fq)
     if (
-        opt.lr_adjust is not None
+        opt.mem_opt_level != 2
+        and opt.lr_adjust is not None
         and len(opt.lr_adjust) == 2
         and err0 > opt.lr_adjust[0]
     ):
@@ -1021,9 +1279,8 @@ def _train_block(
     elif opt.drop_ratio <= 0:
         pre_mixed = in_fq(xf)
 
-    done = 0
-    for it in range(num_iter):
-        idx = perm_fn(s_total)[:bs]
+    def _compute(it: int, idx: np.ndarray):
+        """One iteration's mini-batch ``idx``: loss and gradients."""
         if pre_mixed is not None:
             x_in = pre_mixed[idx]
         else:
@@ -1071,24 +1328,67 @@ def _train_block(
             grads = [dw_hat * wmask]
             if len(params) > 1:
                 grads.append(db * bmask)  # type: ignore[operator]
-
         if trace is not None:
             trace.append((it, recons, round_loss))
-        # Quark's early-stop rule, verbatim (it reuses num_batches / warm_start)
-        if opt.early_stop and it >= ws_iter:
-            if it % es_window == es_window - 1:
-                mean_loss = mean_loss / es_window
-                if mean_loss < best_loss:
-                    best_loss = mean_loss
-                else:
-                    break
-                mean_loss = 0.0
-            else:
-                mean_loss += round_loss if adaround else recons
+        return recons, round_loss, grads
 
+    def _step(it: int, grads: List[np.ndarray]) -> None:
         for k, p in enumerate(params):
             params[k] = _adam_step(p, grads[k], ms[k], vs[k], it, lr)
-        done = it + 1
+
+    done = 0
+    if opt.mem_opt_level != 2:
+        for it in range(num_iter):
+            idx = perm_fn(s_total)[:bs]
+            recons, round_loss, grads = _compute(it, idx)
+            # Quark's early-stop rule, verbatim (it reuses num_batches / warm_start)
+            if opt.early_stop and it >= ws_iter:
+                if it % es_window == es_window - 1:
+                    mean_loss = mean_loss / es_window
+                    if mean_loss < best_loss:
+                        best_loss = mean_loss
+                    else:
+                        break
+                    mean_loss = 0.0
+                else:
+                    mean_loss += round_loss if adaround else recons
+            _step(it, grads)
+            done = it + 1
+    else:
+        # MemOptLevel 2 is Quark's torch ``DataLoader`` loop: shuffled epochs of
+        # ``len(samples) // batch_size`` mini-batches (the last one of an epoch is
+        # never used), the early stop is checked per epoch with a patience of
+        # two, and there is no LRAdjust
+        if bs > 1 and opt.num_workers == 0:
+            # DataLoader(persistent_workers=True, prefetch_factor=2) needs workers
+            raise _SkipLayer("DataLoader options need NumWorkers > 0")
+        num_steps = s_total // bs
+        num_epochs = (num_iter + num_steps - 1) // num_steps
+        it, no_improve = 0, 0
+        for _epoch in range(num_epochs):
+            mean_loss = 0.0
+            order = perm_fn(s_total)
+            for b_idx in range(num_steps):
+                if it >= num_iter or b_idx >= num_steps - 1:
+                    break
+                recons, round_loss, grads = _compute(
+                    it, order[b_idx * bs : (b_idx + 1) * bs]
+                )
+                _step(it, grads)
+                it += 1
+                mean_loss += round_loss if adaround else recons
+            if it >= num_iter:
+                break
+            if opt.early_stop and it >= num_iter * opt.warm_start:
+                mean_loss = mean_loss / num_steps
+                if mean_loss < best_loss:
+                    best_loss = mean_loss
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    if no_improve >= 2:
+                        break
+        done = it
 
     if adaround:
         new_codes = np.clip(floor_w + (params[0] >= 0) + zp, lo, hi)
@@ -1103,10 +1403,8 @@ def _train_block(
 
 def _shape_ok(blk: _Block, x: np.ndarray) -> bool:
     t = blk.op_type
-    if t == "Gemm":
-        return x.ndim == 2
-    if t == "MatMul":
-        return x.ndim in (2, 3)
+    if t in ("Gemm", "MatMul"):  # torch.matmul: any batch dims (a Gemm whose
+        return x.ndim >= 2  # samples are whole batches at MemOptLevel 2, too)
     if t in ("Conv", "ConvTranspose"):
         return x.ndim == blk.w_float.ndim
     if t == "InstanceNormalization":
@@ -1133,18 +1431,18 @@ def _estimate_memory(
         params = 2 * w.size
     else:  # Conv / ConvTranspose: a bias only if the node has one
         has_bias = blk.b_float is not None or blk.b_plain is not None
-        out_ch = w.shape[1] if t == "ConvTranspose" else w.shape[0]
+        out_ch = (
+            w.shape[1] * getattr(blk.op, "group", 1)
+            if t == "ConvTranspose"
+            else w.shape[0]
+        )
         params = w.size + (out_ch if has_bias else 0)
     n_out = int(np.prod(y_shape))
     acts = n_out * (1 + (blk.act is not None) + (blk.out_q is not None))
-    pads = getattr(blk.op, "pads", None)
-    if pads is not None and (pads[0] != pads[2] or pads[1] != pads[3]):
-        pt, pl, pb, pr = pads
-        x = list(x_shape)
-        x[-1] += pl + pr
-        if len(x) == 4:  # a 1-D conv's pads are symmetric or it has no H axis
-            x[-2] += pt + pb
-        acts += int(np.prod(x))
+    pad_layer = getattr(blk.op, "pad_layer_shape", None)
+    padded = None if pad_layer is None else pad_layer(x_shape)
+    if padded is not None:  # Quark's separate ConstantPad layer is a child too
+        acts += int(np.prod(padded))
     mib = 1024.0**2
     return (params * 4 + acts * 4 + 3 * params * 4) / mib
 
@@ -1158,7 +1456,7 @@ def finetune(
     perm_fn: Optional[Callable[[int], np.ndarray]] = None,
     trace: Optional[List[List[Tuple[int, float, float]]]] = None,
     rand_fn: Optional[Callable[[Tuple[int, ...]], np.ndarray]] = None,
-    block_hook: Optional[Callable[[int, str], None]] = None,
+    block_hook: Optional[Callable[[int, str], Optional[Dict[str, np.ndarray]]]] = None,
 ) -> Tuple[onnx.ModelProto, List[LayerReport]]:
     """Quark ``FastFinetune`` over a QDQ model (see the module docstring).
 
@@ -1174,7 +1472,9 @@ def finetune(
     ``(iteration, reconstruction loss, rounding loss)`` per trained block;
     ``rand_fn(shape)`` replaces the uniform draw behind ``drop_ratio`` mixing
     and ``block_hook(i, name)`` is called before each block trains (both let
-    a test replay Quark's torch random stream).
+    a test replay Quark's torch random stream); it may return
+    ``{"phantom_bias": array}``, the bias torch drew for a bias-less ``Gemm``
+    (otherwise numpy draws one).
     """
     opt = options or FinetuneOptions()
     if opt.algorithm not in ("adaround", "adaquant"):
@@ -1183,7 +1483,32 @@ def finetune(
         raise ValueError("calibration_data is required")
     out = onnx.ModelProto()
     out.CopyFrom(quant_model)
-    blocks = _find_blocks(float_model, quant_model, opt)
+    if opt.dynamic_batch:
+        # Quark makes every input's batch axis ``len(calibration batches)`` and
+        # runs all calibration data as one batch: that only fits readers that
+        # yield a single sample per batch, otherwise ONNX Runtime rejects the
+        # input for every layer (and ``SelectMaxMemLayer`` aborts on it)
+        n_batches = len(calibration_data)
+        rows = {
+            k: sum(np.asarray(b[k]).shape[0] for b in calibration_data if k in b)
+            for k in calibration_data[0]
+            if np.asarray(calibration_data[0][k]).ndim > 0
+        }
+        if any(r != n_batches for r in rows.values()):
+            if opt.select_max_mem_layer:
+                raise RuntimeError(
+                    "DynamicBatch: the concatenated calibration data does not "
+                    f"fit the model's batch axis of {n_batches} (Quark: ONNX "
+                    "Runtime InvalidArgument)"
+                )
+            return out, []
+    conversion_errors: List[str] = []
+    blocks = _find_blocks(float_model, quant_model, opt, conversion_errors)
+    if conversion_errors and opt.select_max_mem_layer:
+        raise NotImplementedError(
+            "SelectMaxMemLayer converts every layer up front and Quark cannot "
+            "convert: " + "; ".join(conversion_errors)
+        )
     if not blocks:
         return out, []
 
@@ -1217,7 +1542,7 @@ def finetune(
             True,
         )
     q_parallel: Dict[str, np.ndarray] = {}
-    if opt.parallel:
+    if opt.parallel and opt.mem_opt_level != 2:  # (the DataLoader path is sequential)
         q_parallel = _capture(
             quant_model,
             [b.q_start for b in blocks],
@@ -1240,25 +1565,50 @@ def finetune(
 
     reports: List[LayerReport] = []
     for blk in blocks:
+        level2 = opt.mem_opt_level == 2
         fc = f_cache or _capture(
-            float_model, [blk.f_start, blk.f_end], calibration_data, providers, True
+            float_model,
+            [blk.f_start, blk.f_end],
+            calibration_data,
+            providers,
+            True,
+            split=level2,
         )
         xf, yf = fc[blk.f_start], fc[blk.f_end]
         if blk.q_start in q_parallel:
             xq = q_parallel[blk.q_start]
         else:
-            xq = _capture(out, [blk.q_start], calibration_data, providers, False)[
-                blk.q_start
-            ]
+            xq = _capture(
+                out, [blk.q_start], calibration_data, providers, False, split=level2
+            )[blk.q_start]
+        try:
+            if level2:  # Quark's samples are whole calibration batches
+                xq, xf, yf = (_loader_samples(a) for a in (xq, xf, yf))
+        except _SkipLayer:
+            continue
         if xq.shape != xf.shape or not _shape_ok(blk, xq):
             continue
         layer_trace: Optional[List[Tuple[int, float, float]]] = None
         if trace is not None:
             layer_trace = []
             trace.append(layer_trace)
+        extras = None
         if block_hook is not None:
-            block_hook(blocks.index(blk), blk.name)
-        res = _train_block(blk, xq, xf, yf, opt, perm_fn, mix_rng, layer_trace, rand_fn)
+            extras = block_hook(blocks.index(blk), blk.name)
+        if blk.phantom_bias is not None:
+            drawn = extras.get("phantom_bias") if isinstance(extras, dict) else None
+            if drawn is None:
+                bound = blk.phantom_bias
+                drawn = mix_rng.uniform(-bound, bound, size=blk.b_plain.shape)  # type: ignore[union-attr]
+            blk.b_plain = np.asarray(drawn, dtype=np.float64).reshape(-1)
+        try:
+            res = _train_block(
+                blk, xq, xf, yf, opt, perm_fn, mix_rng, layer_trace, rand_fn
+            )
+        except _SkipLayer:  # Quark logs the failed module and moves on
+            if trace is not None:
+                trace.pop()
+            continue
 
         x_eval = xq if blk.in_q is None else blk.in_q.fq(xq)
         qw, qb = blk.qw, blk.qb

@@ -2163,11 +2163,9 @@ def _quantize_int_pair(preset, model_name, tmp_path):
     q = quark_quantize(model, preset, shape, tmp_path, f"{model_name}_{preset}")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        # INT16_CNN_ACCURATE's AdaRound cannot run on int16 weights
         m = qc.ModelQuantizer(qc.QConfig.get_default_config(preset)).quantize_model(
             model,
             calibration_data_reader=_reader(shape)(),
-            ignore_unsupported_algos=True,
         )
     return model, q, m, shape
 
@@ -2197,8 +2195,7 @@ def test_cnn_default_presets_match_quark_exactly(preset, model_name, tmp_path):
 def test_cnn_accurate_presets_match_quark_parameters(preset, model_name, tmp_path):
     """Percentile 99.9999 calibration: activation parameters agree up to
     histogram binning, weight scales exactly. AdaRound only changes weight
-    codes (and runs for int8 weights only: with int16 weights the preset
-    raises unless ``ignore_unsupported_algos``)."""
+    codes (for int8 and int16 weights alike, as Quark's FastFinetune does)."""
     model, q, m, shape = _quantize_int_pair(preset, model_name, tmp_path)
     q_acts, q_w, _ = _qdq_params(q)
     m_acts, m_w, _ = _qdq_params(m)
@@ -2219,13 +2216,20 @@ def test_cnn_accurate_presets_match_quark_parameters(preset, model_name, tmp_pat
     assert rel(_run(m, x)) < max(3 * rel(_run(q, x)), 0.05)
 
 
-def test_int16_cnn_accurate_needs_ignore_flag_for_adaround():
+def test_int16_cnn_accurate_runs_adaround_on_int16_weights():
     model, shape = _mlp()
     cfg = qc.QConfig.get_default_config("INT16_CNN_ACCURATE")
-    with pytest.raises(NotImplementedError, match="adaround"):
-        qc.ModelQuantizer(cfg).quantize_model(
-            model, calibration_data_reader=_reader(shape)()
-        )
+    quantizer = qc.ModelQuantizer(cfg)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = quantizer.quantize_model(model, calibration_data_reader=_reader(shape)())
+    assert quantizer.last_weight_rounding["adaround"]
+    assert {
+        t.data_type
+        for t in out.graph.initializer
+        if t.data_type in (onnx.TensorProto.INT8, onnx.TensorProto.INT16)
+        and len(t.dims) == 2
+    } == {onnx.TensorProto.INT16}
 
 
 @pytest.mark.parametrize("model_name", ["mlp", "conv", "gemm_transb", "branchy"])

@@ -115,8 +115,8 @@ names and preset *meanings*, not copied.
   returned unchanged (Quark: "No quantizable ops"). DEFAULT calibrates with the
   *mean over batches of each batch's min / max* (Quark's ``CalibMovingAverage``,
   ``method="minmax_mean"``); ACCURATE is percentile 99.9999 + AdaRound like
-  ``INT*_CNN_ACCURATE`` (int16 weights cannot run AdaRound here, so that
-  preset raises unless ``ignore_unsupported_algos=True``). Placement, scales,
+  ``INT*_CNN_ACCURATE`` (also on int16 weights, which Quark's FastFinetune
+  trains too). Placement, scales,
   zero points, weights and outputs equal Quark's for the probed models
   (MLP, attention + MLP block, Conv, residual Gemm chain), the ACCURATE ones to
   histogram binning. Not matched: Quark's pre-processing (``MatMul`` + ``Add``
@@ -192,8 +192,8 @@ names and preset *meanings*, not copied.
   AdaRound and AdaQuant are Quark's ``FastFinetune``
   (:mod:`onnxsim.quark_finetune`, a numpy port of ``quark.onnx.algorithm.
   finetuning``): per Conv / ConvTranspose / Gemm / MatMul / InstanceNorm /
-  LayerNorm *block* (input Q/DQ, op, bias, a following Relu / LeakyRelu / Clip /
-  Sigmoid / Tanh / Gelu / Softmax, optionally the output Q/DQ), in graph order,
+  LayerNorm *block* (input Q/DQ, op, bias, a following Relu / PRelu / LeakyRelu /
+  Clip / Sigmoid / Tanh / Gelu / Softmax, optionally the output Q/DQ), in graph order,
   the quantized model's layer input is re-captured after every update
   (``parallel=True``: once up front), mini-batches of ``batch_size`` samples are
   drawn each iteration, and Quark's loss, ``early_stop`` rule, cosine ``beta``
@@ -213,13 +213,24 @@ names and preset *meanings*, not copied.
   ``ref_model_path`` / ``dynamic_batch`` are *not* forwarded (only
   ``extra_options["FastFinetune"]`` reaches them) and ``update_bias`` only
   matters to AdaQuant; ``extra_options["FastFinetune"]`` keys override the
-  config. No effect on the numbers, so accepted and ignored: ``optim_device`` /
-  ``infer_device`` / ``num_workers`` / ``pin_memory`` / ``use_gds`` /
-  ``log_period`` / ``cache_dir`` / ``dynamic_batch`` / ``mem_opt_level`` /
-  ``SaveAndRestore``. ``ref_model_path`` must be a float model. Not replicated:
-  layers Quark cannot convert are skipped (``auto_pad``, ``ConvTranspose`` with
-  groups / ``output_padding``, 3-D convolutions, ``Gemm`` with ``transA``,
-  ``PRelu``); weights stay *per tensor* here too (Quark's default), unlike the
+  config. ``num_workers`` and ``dynamic_batch`` are modelled (``MemOptLevel=2``
+  is Quark's separate ``DataLoader`` loop, mirrored; ``DynamicBatch`` only
+  works there for readers that yield one sample per batch, otherwise Quark
+  trains nothing). No effect on the numbers, so accepted and ignored:
+  ``optim_device`` / ``infer_device`` / ``pin_memory`` / ``use_gds`` /
+  ``log_period`` / ``cache_dir`` and ``mem_opt_level`` 0 vs 1 (probed against
+  Quark: identical codes); ``SaveAndRestore`` is a Quark checkpoint file (when
+  one exists Quark trains only the layers recorded in it) and is not read.
+  ``ref_model_path`` must be a float model. Layers Quark's torch modules cannot
+  handle are skipped exactly where Quark skips them (``auto_pad``,
+  ``ConvTranspose`` with ``output_padding`` / ``output_shape`` or asymmetric
+  pads, a ``Gemm`` with ``transA`` unless its shapes line up -- see
+  :mod:`onnxsim.quark_finetune`; ``select_max_mem_layer`` raises there, as
+  Quark does) and what Quark does train is trained: 1-D / 2-D / 3-D ``Conv`` /
+  ``ConvTranspose`` (also grouped), ``PRelu`` blocks (with torch's fixed 0.25
+  slope, as Quark), bias-less ``Gemm`` (with Quark's random Linear bias) and
+  int16 / uint8 / asymmetric weights; weights stay *per tensor* here too
+  (Quark's default), unlike the
   GPTQ and legacy AdaQuant paths. onnxsim additions: ``guard`` (default on:
   keep a layer's new codes only if its block error did not rise; ``False`` is
   Quark's behaviour) and ``AdaQuantConfig(legacy_engine=True)`` for the older
@@ -969,6 +980,8 @@ _FASTFT_KEYS = {
     "OutputQDQ": "output_qdq",
     "DropRatio": "drop_ratio",
     "MemOptLevel": "mem_opt_level",
+    "NumWorkers": "num_workers",
+    "DynamicBatch": "dynamic_batch",
     "Parallel": "parallel",
     "RegParam": "reg_param",
     "BetaRange": "beta_range",
@@ -1056,10 +1069,9 @@ class ModelQuantizer:
 
         if wt.is_dynamic:
             raise NotImplementedError("dynamic weight quantization is not supported")
-        # the weight-rounding algorithms work on the int8 weight codes
-        can_run = _RUNNABLE_ALGOS - (
-            {"adaquant", "adaround", "gptq"} if wt.dtype == "int16" else set()
-        )
+        # GPTQ works on int8 weight codes; AdaRound / AdaQuant (Quark's
+        # FastFinetune) take any integer weight grid
+        can_run = _RUNNABLE_ALGOS - ({"gptq"} if wt.dtype == "int16" else set())
         unsupported = [a.name for a in cfg.algo_config if a.name not in can_run]
         if unsupported and not ignore_unsupported_algos:
             raise NotImplementedError(
@@ -1496,6 +1508,8 @@ class ModelQuantizer:
             output_qdq=bool(p.get("output_qdq", False)),
             parallel=bool(p.get("parallel", False)),
             mem_opt_level=int(p.get("mem_opt_level", 1)),
+            num_workers=int(p.get("num_workers", 1)),
+            dynamic_batch=bool(p.get("dynamic_batch", False)),
             output_index=p.get("output_index"),
             select_max_mem_layer=bool(p.get("select_max_mem_layer", False)),
             target_ops=targets,
@@ -1847,8 +1861,12 @@ class ModelQuantizer:
 
         if wt.dtype not in ("int8", "uint8", "int16"):
             raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
-        # the weight-rounding algorithms work on int8 weight codes
-        int8_only = bool({"adaquant", "adaround", "gptq"} & {a.name for a in algos})
+        # GPTQ and the legacy AdaQuant engine work on int8 weight codes; Quark's
+        # FastFinetune (AdaRound, AdaQuant) trains any integer weight grid
+        int8_only = any(
+            a.name == "gptq" or (a.name == "adaquant" and a.params.get("legacy_engine"))
+            for a in algos
+        )
         uint8_weights = wt.dtype == "uint8" and not int8_only
         if wt.dtype == "uint8" and not uint8_weights:
             self._approx("weights quantized int8-symmetric instead of uint8")

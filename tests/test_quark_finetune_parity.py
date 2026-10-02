@@ -79,6 +79,13 @@ from onnxsim import quark_compat as qc  # noqa: E402
 from onnxsim import quark_finetune as qf  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _scratch_dir(tmp_path, monkeypatch):
+    """Quark writes scratch files (sym_shape_infer_temp.onnx, quantized_info.csv,
+    ...) into the current directory."""
+    monkeypatch.chdir(tmp_path)
+
+
 class _Quiet(contextlib.AbstractContextManager):
     """Silences Quark and collects what it logs (to stdout when run by hand,
     through ``logging`` under pytest) into the returned buffer."""
@@ -757,10 +764,11 @@ def _quark_keys():
     return keys
 
 
-# keys with no effect on the numbers (devices, data loading, caching, logging)
+# keys with no effect on the numbers (devices, data loading, caching, logging);
+# MemOptLevel 2 / NumWorkers / DynamicBatch do change what Quark computes and are
+# modelled (tests/test_quark_finetune_coverage_parity.py)
 _NO_EFFECT = {
-    "OptimAlgorithm", "OptimDevice", "InferDevice", "NumWorkers", "PinMemory",
-    "LogPeriod", "UseGDS", "DynamicBatch", "MemOptLevel",
+    "OptimAlgorithm", "OptimDevice", "InferDevice", "PinMemory", "LogPeriod", "UseGDS",
 }  # fmt: skip
 
 
@@ -768,6 +776,7 @@ def test_every_fastfinetune_key_quark_reads_is_implemented_or_known_to_be_inert(
     keys = _quark_keys()
     assert {"BatchSize", "NumBatches", "EarlyStop", "OutputQDQ", "DropRatio"} <= keys
     handled = set(qc._FASTFT_KEYS) | _NO_EFFECT | {"SaveAndRestore", "TmpDir"}
+    assert {"MemOptLevel", "NumWorkers", "DynamicBatch"} <= set(qc._FASTFT_KEYS)
     assert keys <= handled, sorted(keys - handled)
     # the keys listed as inert really are read by Quark only for non-numeric reasons
     assert _NO_EFFECT <= keys | {"OptimAlgorithm"}
@@ -797,7 +806,7 @@ def test_algo_config_fields_defaults_and_forwarding_match_quark(cfg_cls, name):
     assert mine.lr() == q.learning_rate
     for attr in ("batch_size", "num_batches", "early_stop", "drop_ratio", "reg_param", "warm_start",
                  "selective_update", "output_qdq", "update_bias", "mem_opt_level", "parallel",
-                 "select_max_mem_layer"):  # fmt: skip
+                 "select_max_mem_layer", "num_workers", "dynamic_batch"):  # fmt: skip
         assert getattr(mine, attr) == getattr(q, attr), attr
     assert tuple(mine.beta_range) == tuple(q.beta_range)
     assert tuple(mine.target_ops) == tuple(q.target_op_type) or set(
