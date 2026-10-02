@@ -919,10 +919,7 @@ def _rope_model(
         # inputs are then genuinely different, so fuse_rope must decline
         # rather than assume this is duplication.
         inputs += f", float[{B},{S},{half}] angle2"
-    outputs = (
-        f"float[{B},{NH},{S},{Dh}] q_embed, "
-        f"float[{B},{NH},{S},{Dh}] k_embed"
-    )
+    outputs = f"float[{B},{NH},{S},{Dh}] q_embed, float[{B},{NH},{S},{Dh}] k_embed"
     if expose_embedding:
         outputs += f", float[{B},{S},{Dh}] emb"
     body = f"""

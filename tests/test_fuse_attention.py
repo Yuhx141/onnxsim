@@ -241,9 +241,7 @@ def test_fuse_attention_mul_scale():
 
 def test_fuse_attention_declines_zero_scale():
     B, S, H = 2, 4, 16
-    model = _attention_model(
-        B=B, S=S, H=H, NH=2, bias=True, scale_op="Mul", scale=0.0
-    )
+    model = _attention_model(B=B, S=S, H=H, NH=2, bias=True, scale_op="Mul", scale=0.0)
     simplified, ok = onnxsim.simplify(model)
     assert ok
     assert _op_counts(simplified)["Attention"] == 0
