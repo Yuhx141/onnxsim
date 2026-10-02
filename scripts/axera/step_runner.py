@@ -2063,6 +2063,7 @@ class StepRunner:
                         env.uploaded.add(t)
                     names.append("h:" + t)
             outs = [f"{self.prefix}:" + t for t in seg.outputs]
+            self.session.tag = seg.name
             pc = self.post_chain.get(seg.name)
             if pc is None:
                 self.session.run_t(m, names, outs)
@@ -2822,6 +2823,38 @@ def _chain_samples(info: Mapping, outs: Mapping[str, np.ndarray]) -> dict:
     }
 
 
+def apply_chain_scales(
+    runner: "StepRunner",
+    u16_info: Mapping[str, Mapping],
+    templates: Mapping,
+    ranges: Mapping[str, Mapping],
+    margin: float,
+) -> tuple[int, int]:
+    """Move every recalibratable chain onto the scales predicted from ``ranges``
+    (widened by ``margin``); a chain the emitter refuses keeps its template.
+    Returns (moved, refused)."""
+    import matmul_record_emit as mre
+    import u16_chain
+
+    moved = refused = 0
+    for name, info in u16_info.items():
+        tmpl, tscales = templates[name]
+        new = u16_chain.predict_scales16(info["path"] + ".quant.json", ranges[name], margin)
+        try:
+            # a constant (a gather mask, an index) has a scale in the template but no
+            # range to predict from: it keeps the template's
+            out, _ = mre.recalibrate(tmpl, tscales, {t: new.get(t, tscales[t]) for t in tscales})
+            runner._emitted[name] = out.SerializeToString()
+            moved += 1
+        except Exception as exc:
+            with open(info["path"], "rb") as f:
+                runner._emitted[name] = f.read()
+            refused += 1
+            if refused <= 5:
+                print(f"  recalibrate {name}: {type(exc).__name__}: {exc}"[:200])
+    return moved, refused
+
+
 def run_recal_steps(
     runner: "StepRunner",
     model: onnx.ModelProto,
@@ -3016,6 +3049,9 @@ def run_train_loop(
     ref: Mapping,
     steps: Sequence[int],
     validate: bool,
+    recal: str = "static",
+    u16_info: Mapping[str, Mapping] | None = None,
+    margin: float = 1.3,
 ) -> list[dict]:
     """Train on the device across ``steps`` of the calibration dataset with the
     weights and Adam state staying on the device: step k's updated state tensors
@@ -3033,12 +3069,46 @@ def run_train_loop(
     prev_w: dict[str, np.ndarray] = {}
     results = []
     runner.resident = True
+    session.exec_by_tag = {}
+    import matmul_record_emit as mre
+    import u16_chain
+
+    u16_info = u16_info or {}
+    templates = {
+        n: (mre.load_model(i["path"]), mre.load_scales(i["path"] + ".quant.json"))
+        for n, i in u16_info.items()
+    }
+    prev_ranges: dict = {}
     for i, k in enumerate(steps):
         data = load_step_feeds(k)
         feeds: dict = {t: v for t, v in data.items() if t not in sm}
         feeds.update(dev_state if i else {w: data[w] for w in sm})
         runner.prefix = f"d{i % 2}"
         keep = [loss_name] + (list(grad_names.values()) if validate else [])
+        chains_moved = chains_refused = 0
+        if recal != "static" and u16_info:
+            # ranges of every chain tensor at the state this step starts from: a
+            # float step on that state (the state is downloaded for it). exact uses
+            # them now; delayed uses the previous step's, widened by ``margin``.
+            cur = (
+                {w: session.tget(t.name, t.dtype, t.shape) for w, t in dev_state.items()}
+                if i
+                else {w: data[w] for w in sm}
+            )
+            rfeeds = {t: v for t, v in data.items() if t not in sm}
+            rfeeds.update(cur)
+            need = {t for inf in u16_info.values() for t in inf["inputs"]}
+            routs, _ = StepRunner(model, []).run(rfeeds, "float", keep=sorted(need))
+            ranges = {
+                n: u16_chain.chain_ranges(inf["sub"], _chain_samples(inf, routs))
+                for n, inf in u16_info.items()
+            }
+            if recal == "exact" or prev_ranges:
+                use = ranges if recal == "exact" else prev_ranges
+                chains_moved, chains_refused = apply_chain_scales(
+                    runner, u16_info, templates, use, 1.0 if recal == "exact" else margin
+                )
+            prev_ranges = ranges
         t0 = time.time()
         outs, _ = runner.run(
             feeds,
@@ -3049,6 +3119,10 @@ def run_train_loop(
         )
         wall = time.time() - t0
         timing = {k: (v[0], round(v[1], 2)) for k, v in session.timing.items()}
+        if i == len(steps) - 1 and session.exec_by_tag is not None:
+            top = sorted(session.exec_by_tag.items(), key=lambda kv: -kv[1])
+            print("  engine ms by segment (all steps):", json.dumps({k: round(v / 1000, 1) for k, v in top[:25]}), flush=True)
+            print("  engine ms total %.0f" % (sum(session.exec_by_tag.values()) / 1000), flush=True)
         if i == len(steps) - 1:
             print("  staged segments (cumulative s):", json.dumps({k: round(v, 2) for k, v in sorted(runner.staged_time.items(), key=lambda kv: -kv[1])}), flush=True)
         new_state = {w: outs[sm[w]] for w in sm}
@@ -3057,6 +3131,8 @@ def run_train_loop(
             "wall_s": round(wall, 2),
             "loss": float(np.ravel(outs[loss_name])[0]),
             "session_timing_cumulative": timing,
+            "chains_moved": chains_moved,
+            "chains_refused": chains_refused,
         }
         if validate:
             ffeeds = {t: v for t, v in data.items() if t not in sm}
@@ -3395,6 +3471,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "the weights and Adam state staying on the device",
     )
     p.add_argument(
+        "--train-recal",
+        default="static",
+        choices=["static", "delayed", "exact"],
+        help="with --train-steps: move the 16-bit MatMul/Conv chains per step onto "
+        "scales from the ranges of the state the step starts from (exact), the "
+        "previous step's ranges times --u16-margin-factor (delayed), or keep the "
+        "reference-batch templates (static). Evaluates the ranges with a float step "
+        "on the downloaded state, so it is a measurement, not a fast path",
+    )
+    p.add_argument(
         "--train-validate",
         action="store_true",
         help="with --train-steps: also run a float chain and report how the "
@@ -3560,7 +3646,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.u16_margin,
                 args.u16_margin_factor,
                 args.u16_fp32,
-                args.u16_recal != "",
+                args.u16_recal != "" or args.train_recal != "static",
                 u16_info,
                 post_blobs,
             )
@@ -3597,6 +3683,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ref,
                 [int(x) for x in args.train_steps.split(",")],
                 args.train_validate,
+                args.train_recal,
+                u16_info,
+                args.u16_margin_factor,
             )
             runner.release_models()
         with open(args.out, "w") as f:

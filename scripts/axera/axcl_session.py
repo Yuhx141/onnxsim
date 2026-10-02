@@ -250,6 +250,10 @@ class AXSession:
         self.runs = 0
         self.timing: dict[str, list[float]] = {}  # command -> [calls, seconds]
         self._pending: collections.deque = collections.deque()  # replies not yet read
+        # optional engine-time accounting: RUNT microseconds by the caller's tag
+        self.exec_by_tag: dict[str, int] | None = None
+        self.tag = ""
+        self._pending_tags: collections.deque = collections.deque()
         self.bytes = {"put": 0, "get": 0}
         self._resident_inputs: dict[int, set[int]] = {}
 
@@ -340,6 +344,8 @@ class AXSession:
         self._proc.stdin.write(text + "\n")
         self._proc.stdin.flush()
         self._pending.append(text.split(" ", 1)[0])
+        if self.exec_by_tag is not None and text.startswith("RUNT"):
+            self._pending_tags.append(self.tag)
         if len(self._pending) >= self._MAX_PENDING:
             self.sync()
 
@@ -353,8 +359,12 @@ class AXSession:
             if line.startswith("ERR"):
                 err = err or DeviceError(f"{verb}: {line}")
             elif verb == "RUNT":
-                self.exec_us += int(line.split()[1])
+                us = int(line.split()[1])
+                self.exec_us += us
                 self.runs += 1
+                if self.exec_by_tag is not None and self._pending_tags:
+                    tag = self._pending_tags.popleft()
+                    self.exec_by_tag[tag] = self.exec_by_tag.get(tag, 0) + us
         rec = self.timing.setdefault("(drain)", [0, 0.0])
         rec[0] += 1
         rec[1] += time.perf_counter() - t0

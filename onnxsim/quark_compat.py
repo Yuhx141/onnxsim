@@ -59,6 +59,27 @@ names and preset *meanings*, not copied.
   Quark's ``^...*`` regular expressions (subgraph tuples raise). Weight dtypes
   other than int8 raise; ``bias`` specs are ignored (biases stay int32).
   Scales / zero points match Quark's (``tests/test_quark_parity.py``).
+- ``INT8_TRANSFORMER_DEFAULT`` / ``INT16_TRANSFORMER_DEFAULT`` /
+  ``INT8_TRANSFORMER_ACCURATE`` / ``INT16_TRANSFORMER_ACCURATE`` (Quark's
+  ``enable_npu_transformer``): asymmetric uint8 / uint16 activations, per-tensor
+  symmetric int8 / int16 weights, int32 biases, and -- the whole difference to
+  the CNN presets -- *only* ``Gemm`` and ``MatMul`` nodes whose second operand
+  is a constant are quantized (``MatMulConstBOnly=False`` adds the
+  activation x activation MatMuls). Softmax, LayerNormalization, Gelu, Add,
+  Mul, Transpose, ... stay float, with Q/DQ only on the inputs and outputs of
+  the quantized nodes (a Gemm / MatMul feeding a sole Relu-like consumer keeps
+  a float output, as Quark's Q/DQ removal does). A model with no such node is
+  returned unchanged (Quark: "No quantizable ops"). DEFAULT calibrates with the
+  *mean over batches of each batch's min / max* (Quark's ``CalibMovingAverage``,
+  ``method="minmax_mean"``); ACCURATE is percentile 99.9999 + AdaRound like
+  ``INT*_CNN_ACCURATE`` (int16 weights cannot run AdaRound here, so that
+  preset raises unless ``ignore_unsupported_algos=True``). Placement, scales,
+  zero points, weights and outputs equal Quark's for the probed models
+  (MLP, attention + MLP block, Conv, residual Gemm chain), the ACCURATE ones to
+  histogram binning. Not matched: Quark's pre-processing (``MatMul`` + ``Add``
+  -> ``Gemm`` fusion, Gelu fusion at opset >= 20 -- a model that relies on it
+  quantizes differently), its implicit CLE, and the AdaRound weight codes
+  themselves (a different optimizer run; the same objective).
 - ``UINT8_DYNAMIC_QUANT``: :mod:`onnxsim.quark_dynamic` emits Quark's /
   ONNX Runtime's dynamic pattern (``DynamicQuantizeLinear`` +
   ``MatMulInteger`` / ``ConvInteger``); no calibration data is needed.
@@ -139,7 +160,9 @@ names and preset *meanings*, not copied.
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
-  ``Int32Bias``, ``AlignEltwiseQuantType`` and the block-format options above.
+  ``Int32Bias``, ``AlignEltwiseQuantType``, ``CalibMovingAverage`` (integer
+  presets only), ``MatMulConstBOnly`` (the transformer presets) and the
+  block-format options above.
 """
 
 from __future__ import annotations
@@ -487,6 +510,20 @@ def _cnn_accurate(act: type, wt: type) -> QConfig:
     )
 
 
+def _transformer(act: type, wt: type, accurate: bool = False) -> QConfig:
+    """Quark's ``INT{8,16}_TRANSFORMER_{DEFAULT,ACCURATE}``: asymmetric
+    uint8 / uint16 activations, per-tensor symmetric int8 / int16 weights,
+    quantization restricted to Gemm / weight MatMul (``NPUTransformer``)."""
+    if accurate:
+        cfg = _cnn_accurate(act, wt)
+    else:
+        cfg = QConfig(
+            _layer(act, wt, symmetric=False, calibration_method="minmax_mean")
+        )
+    cfg.extra_options["NPUTransformer"] = True
+    return cfg
+
+
 def _s16s16_mixed_s8s8() -> QConfig:
     """int16 activations / weights (asymmetric, percentile 99.9999), every
     Conv / Gemm / MatMul promoted to int8 (Quark: AutoMixprecision, threshold
@@ -559,6 +596,19 @@ _PRESETS.update(
         ),
         "INT8_CNN_ACCURATE": lambda: _cnn_accurate(UInt8Spec, Int8Spec),
         "INT16_CNN_ACCURATE": lambda: _cnn_accurate(UInt16Spec, Int16Spec),
+        # Quark's NPU transformer presets (``enable_npu_transformer``): only
+        # Gemm and weight-carrying MatMul nodes are quantized (see
+        # ``_transformer_scope``); DEFAULT calibrates with the mean of the
+        # per-batch min / max (``CalibMovingAverage``), ACCURATE with the
+        # CNN-ACCURATE percentile + AdaRound recipe.
+        "INT8_TRANSFORMER_DEFAULT": lambda: _transformer(UInt8Spec, Int8Spec),
+        "INT16_TRANSFORMER_DEFAULT": lambda: _transformer(UInt16Spec, Int16Spec),
+        "INT8_TRANSFORMER_ACCURATE": lambda: _transformer(
+            UInt8Spec, Int8Spec, accurate=True
+        ),
+        "INT16_TRANSFORMER_ACCURATE": lambda: _transformer(
+            UInt16Spec, Int16Spec, accurate=True
+        ),
     }
 )
 
@@ -1206,6 +1256,39 @@ class ModelQuantizer:
         self.last_auto_mixprecision = res
         return res.model
 
+    def _calib_method(self, act: QSpec) -> str:
+        """The activation calibration method, with Quark's
+        ``CalibMovingAverage`` extra option applied to min / max calibration
+        (the mean of the per-batch ranges instead of the global range)."""
+        method = act.calibration_method
+        moving = self.config.extra_options.get("CalibMovingAverage")
+        if method == "minmax" and moving:
+            return "minmax_mean"
+        if method == "minmax_mean" and moving is False:
+            return "minmax"
+        return str(method)
+
+    def _transformer_scope(
+        self, model: onnx.ModelProto
+    ) -> "tuple[Optional[set[str]], List[str]]":
+        """``(op types, nodes to keep float)`` of Quark's NPU transformer
+        scheme: only ``Gemm`` and ``MatMul`` are quantized, and (unless
+        ``MatMulConstBOnly=False``) only MatMuls whose second operand is a
+        constant. ``(None, [])`` for every other preset."""
+        opts = self.config.extra_options
+        if not opts.get("NPUTransformer"):
+            return None, []
+        consts = {i.name for i in model.graph.initializer}
+        consts |= {n.output[0] for n in model.graph.node if n.op_type == "Constant"}
+        skip = []
+        if opts.get("MatMulConstBOnly", True):
+            skip = [
+                n.name or n.output[0]
+                for n in model.graph.node
+                if n.op_type == "MatMul" and n.input[1] not in consts
+            ]
+        return {"Gemm", "MatMul"}, skip
+
     def _quantize_int(
         self,
         model: onnx.ModelProto,
@@ -1232,6 +1315,14 @@ class ModelQuantizer:
         self._overrides_applied = True
         exclude += type_excluded
         opts = self.config.extra_options
+        op_types, scope_excluded = self._transformer_scope(model)
+        exclude += scope_excluded
+        if op_types is not None and not any(
+            n.op_type in op_types and (n.name or n.output[0]) not in set(exclude)
+            for n in model.graph.node
+        ):
+            # Quark: "No quantizable ops in this model" -- returned unchanged
+            return model
         by_name = {a.name: a for a in algos}
 
         # Quark's presets quantize weights per tensor; the weight-rounding
@@ -1266,8 +1357,10 @@ class ModelQuantizer:
         qkw: Dict[str, Any] = dict(
             calibration_data=calibration,
             activation_dtype=act_dtype,
+            op_types=op_types,
+            float_clamp_input=op_types is not None,
             exclude_nodes=exclude,
-            method=act.calibration_method,
+            method=self._calib_method(act),
             symmetric_activations=act.symmetric,
             power_of_two=act.pof2 or wt.pof2,
             per_channel=per_channel,
