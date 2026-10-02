@@ -772,6 +772,9 @@ class CalibrationStats:
         #: Quark-layout histograms of ``method="minmse_pof2"`` (see
         #: :func:`collect_calibration_stats`), empty otherwise
         self.pof2_histograms: Dict[str, _Pof2Histogram] = {}
+        #: per-tensor mean over batches of each batch's (min, max) -- the
+        #: ``"minmax_mean"`` method (filled by :func:`collect_calibration_stats`)
+        self.mean_observed: Dict[str, Tuple[float, float]] = {}
         # (tensor, method, *params) -> range: "auto" and a model-level pick
         # ask for the same thresholds (entropy's search is the slow one)
         self._range_cache: Dict[Tuple, Tuple[float, float]] = {}
@@ -789,7 +792,9 @@ class CalibrationStats:
         obs_min, obs_max = self.observed[name]
         h = self.histograms.get(name)
         base, arg = _parse_method(method)
-        if base == "minmax" or h is None:
+        if base == "minmax_mean" and name in self.mean_observed:
+            return self.mean_observed[name]
+        if base == "minmax" or h is None or base == "minmax_mean":
             return obs_min, obs_max
         if base == "percentile":
             p = percentile if arg is None else arg
@@ -852,9 +857,13 @@ class CalibrationStats:
                 entropy_min_coverage=entropy_min_coverage,
                 **auto_kwargs,
             )[0]
-        if _parse_method(method)[0] not in ("minmax",) + _HIST_METHODS:
+        if _parse_method(method)[0] not in ("minmax", "minmax_mean") + _HIST_METHODS:
             raise ValueError(f"unknown calibration method: {method!r}")
-        if method != "minmax" and not self.histograms and self.observed:
+        if (
+            method not in ("minmax", "minmax_mean")
+            and not self.histograms
+            and self.observed
+        ):
             raise ValueError(
                 f"method {method!r} needs histograms: collect with histograms=True"
             )
@@ -1083,10 +1092,15 @@ def collect_calibration_stats(
     # Pass 1: exact running (min, max) -- all "minmax" needs, and the fixed
     # histogram range for the others.
     ranges = stats.observed
+    sums: Dict[str, List[float]] = {}  # name -> [sum min, sum max, batches]
     for batch in calibration_data:
         for name, arr in outputs_of(batch):
             batch_min = float(arr.min())
             batch_max = float(arr.max())
+            acc = sums.setdefault(name, [0.0, 0.0, 0.0])
+            acc[0] += batch_min
+            acc[1] += batch_max
+            acc[2] += 1
             if pof2_histograms:
                 stats.pof2_histograms.setdefault(name, _Pof2Histogram()).add(arr)
             if name in ranges:
@@ -1094,6 +1108,7 @@ def collect_calibration_stats(
                 ranges[name] = (min(prev_min, batch_min), max(prev_max, batch_max))
             else:
                 ranges[name] = (batch_min, batch_max)
+    stats.mean_observed = {n: (a / c, b / c) for n, (a, b, c) in sums.items()}
     if not histograms:
         return stats
 
@@ -1145,7 +1160,10 @@ def calibrate(
             since QOperator format needs a calibrated range for a quantized
             node's output too, not just its activation (see
             ``onnxsim_cpp2py_export.list_qoperator_quantizable_outputs``).
-    :param method: ``"minmax"`` (default) uses each tensor's observed
+    :param method: ``"minmax_mean"`` is ``"minmax"`` with each tensor's range
+            the *mean over batches* of every batch's (min, max) instead of the
+            global extremes (what Quark's ``CalibMovingAverage`` computes);
+            ``"minmax"`` (default) uses each tensor's observed
             ``(min, max)`` directly -- simple, and enough calibration data to
             cover the real range is all it needs. ``"entropy"`` instead finds,
             per tensor, the symmetric clip threshold minimizing the KL
@@ -1239,7 +1257,7 @@ def calibrate(
     base, _ = _parse_method(method)
     if (
         method not in ("auto", "minmse_pof2")
-        and base not in ("minmax",) + _HIST_METHODS
+        and base not in ("minmax", "minmax_mean") + _HIST_METHODS
     ):
         raise ValueError(f"unknown calibration method: {method!r}")
     if method == "percentile" and not 50.0 < percentile <= 100.0:
@@ -1251,7 +1269,7 @@ def calibrate(
         providers=providers,
         tensor_names=tensor_names,
         extra_tensor_names=extra_tensor_names,
-        histograms=method not in ("minmax", "minmse_pof2"),
+        histograms=method not in ("minmax", "minmax_mean", "minmse_pof2"),
         num_bins=num_bins,
         pof2_histograms=method == "minmse_pof2",
     )
