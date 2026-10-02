@@ -1112,19 +1112,39 @@ def _shape_ok(blk: _Block, x: np.ndarray) -> bool:
     return x.ndim >= 2  # LayerNormalization
 
 
-def _estimate_memory(blk: _Block, y_shape: Tuple[int, ...]) -> float:
-    """Quark's ``estimate_memory`` for one block (MiB): weights + bias, the
-    outputs of its torch children (compute, activation, output Q/DQ) and the
-    Adam state (3 x parameters), all float32."""
-    params = blk.w_float.size
-    if blk.b_float is not None:
-        params += blk.b_float.size
-    elif blk.b_plain is not None:
-        params += blk.b_plain.size
+def _estimate_memory(
+    blk: _Block, y_shape: Tuple[int, ...], x_shape: Tuple[int, ...]
+) -> float:
+    """Quark's ``estimate_memory`` for one block, in MiB: the torch module's
+    parameters (what *its* constructors create: Gemm and the norms always own a
+    bias, MatMul never), the outputs of the module's direct children (the op
+    after its bias, a pad layer for asymmetric conv pads, the activation, the
+    output Q/DQ) for one float *calibration batch*, and Adam's state (3 x
+    parameters), all float32."""
+    t = blk.op_type
+    w = blk.w_float
+    if t == "MatMul":
+        params = w.size
+    elif t == "Gemm":
+        params = w.size + (w.shape[0] if getattr(blk.op, "t", False) else w.shape[1])
+    elif t in ("LayerNormalization", "InstanceNormalization"):
+        params = 2 * w.size
+    else:  # Conv / ConvTranspose: a bias only if the node has one
+        has_bias = blk.b_float is not None or blk.b_plain is not None
+        out_ch = w.shape[1] if t == "ConvTranspose" else w.shape[0]
+        params = w.size + (out_ch if has_bias else 0)
     n_out = int(np.prod(y_shape))
-    children = 1 + (blk.act is not None) + (blk.out_q is not None)
+    acts = n_out * (1 + (blk.act is not None) + (blk.out_q is not None))
+    pads = getattr(blk.op, "pads", None)
+    if pads is not None and (pads[0] != pads[2] or pads[1] != pads[3]):
+        pt, pl, pb, pr = pads
+        x = list(x_shape)
+        x[-1] += pl + pr
+        if len(x) == 4:  # a 1-D conv's pads are symmetric or it has no H axis
+            x[-2] += pt + pb
+        acts += int(np.prod(x))
     mib = 1024.0**2
-    return params * 4 / mib + children * n_out * 4 / mib + 3 * params * 4 / mib
+    return (params * 4 + acts * 4 + 3 * params * 4) / mib
 
 
 def finetune(
@@ -1172,16 +1192,19 @@ def finetune(
 
     f_cache: Dict[str, np.ndarray] = {}
     if opt.select_max_mem_layer:
-        # Quark estimates every block from one float sample and finetunes the
-        # most memory-hungry one only
+        # Quark estimates every block from the first float calibration batch
+        # and finetunes the most memory-hungry one only
         probe = _capture(
             float_model,
-            sorted({b.f_end for b in blocks}),
+            sorted({n for b in blocks for n in (b.f_start, b.f_end)}),
             calibration_data[:1],
             providers,
             True,
         )
-        mems = [_estimate_memory(b, (1,) + probe[b.f_end].shape[1:]) for b in blocks]
+        mems = [
+            _estimate_memory(b, probe[b.f_end].shape, probe[b.f_start].shape)
+            for b in blocks
+        ]
         blocks = [blocks[int(np.argmax(mems))]]
     if opt.mem_opt_level == 0:
         f_cache = _capture(
