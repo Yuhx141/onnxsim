@@ -182,6 +182,63 @@ _CALIB_NAMES = {
 }
 
 
+# Quark's Align* options -> the op types whose parameters they align
+_ALIGN_OPTIONS = (
+    ("AlignConcat", ("Concat",)),
+    ("AlignPool", ("MaxPool", "AveragePool", "GlobalAveragePool")),
+    ("AlignPad", ("Pad",)),
+    ("AlignSlice", ("Slice",)),
+    ("AlignTranspose", ("Transpose",)),
+    ("AlignReshape", ("Reshape",)),
+)
+
+
+def _activation_rules(
+    opts: Dict[str, Any], symmetric: bool, extended: bool, pof2: bool
+) -> Dict[str, Any]:
+    """:func:`onnxsim.full_qdq.quantize_full_qdq` keywords for Quark's
+    Q/DQ-removal options: ``RemoveQDQConvRelu`` / ``ConvClip`` (default on),
+    ``ConvLeakyRelu`` / ``ConvPRelu`` (on), ``ConvGelu`` (off) choose the
+    consumers whose producer output stays float, ``RemoveQDQInstanceNorm``
+    (off) adds InstanceNormalization to the producers. A Relu / Clip node is
+    itself folded into its producer for asymmetric activations -- under the
+    extended quantizer (see ``QConfig.quant_format``) only with ``FoldRelu``.
+    The ``Align*`` options are only run by the extended quantizer."""
+    from onnxsim.full_qdq import QUARK_QDQ_PRODUCERS
+
+    after = [
+        op
+        for op, key, default in (
+            ("Relu", "RemoveQDQConvRelu", True),
+            ("Clip", "RemoveQDQConvClip", True),
+            ("LeakyRelu", "RemoveQDQConvLeakyRelu", True),
+            ("PRelu", "RemoveQDQConvPRelu", True),
+            ("Gelu", "RemoveQDQConvGelu", False),
+        )
+        if opts.get(key, default)
+    ]
+    producers: "tuple[str, ...]" = QUARK_QDQ_PRODUCERS
+    if opts.get("RemoveQDQInstanceNorm", False):
+        producers = producers + ("InstanceNormalization",)
+    return {
+        "remove_qdq_after": after,
+        "remove_qdq_producers": producers,
+        "fold_activation": (not symmetric)
+        and (bool(opts.get("FoldRelu", False)) if extended else True),
+        "adjust_activation_ranges": True,
+        "quantize_prelu_slope": extended or pof2,
+        "align_ops": [
+            op
+            for key, ops in _ALIGN_OPTIONS
+            if extended and opts.get(key, False)
+            for op in ops
+        ],
+        # outputs calibrated on their own: Slice always, Split except under the
+        # plain quantizer (ONNX Runtime's Split shares the input's parameters)
+        "unshared_ops": ("Slice", "Split") if extended or pof2 else ("Slice",),
+    }
+
+
 def _calibration_args(
     method: str, opts: Dict[str, Any]
 ) -> "tuple[str, Dict[str, Any]]":
@@ -415,8 +472,13 @@ class QConfig:
         exclude: Optional[List[Any]] = None,
         algo_config: Optional[List[AlgoConfig]] = None,
         use_external_data_format: bool = False,
+        quant_format: Optional[str] = None,
         **extra_options: Any,
     ) -> None:
+        #: ``"extended"`` for Quark's ExtendedQuantFormat quantizer (its A8W8 /
+        #: 16-bit presets), ``"qdq"`` for the plain one; ``None`` derives it from
+        #: the dtypes like Quark's own QConfig mapping (8-bit both -> plain)
+        self.quant_format = quant_format
         self.global_config = global_config
         self.specific_layer_config = specific_layer_config or {}
         self.layer_type_config = layer_type_config or {}
@@ -449,20 +511,32 @@ _PCT = dict(symmetric=False, calibration_method="percentile:99.999")
 _PCT4 = dict(symmetric=False, calibration_method="percentile:99.9999")
 
 
+# extra_options Quark's A8W8 / A16W8 presets carry (the ones onnxsim reads)
+_A8_EXTRAS: Dict[str, Any] = dict(
+    ActivationSymmetric=True, FoldRelu=True, AlignConcat=True, AlignSlice=False
+)
+
 _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "XINT8": lambda: QConfig(_layer(XUInt8Spec, XInt8Spec)),
     "UINT8_DYNAMIC_QUANT": lambda: QConfig(
         _layer(Int8Spec, UInt8Spec, is_dynamic=True)
     ),
-    "A8W8": lambda: QConfig(_layer(Int8Spec, Int8Spec, calibration_method="minmax")),
+    "A8W8": lambda: QConfig(
+        _layer(Int8Spec, Int8Spec, calibration_method="minmax"),
+        quant_format="extended",
+        **_A8_EXTRAS,
+    ),
     "S8S8_AAWS": lambda: QConfig(_layer(Int8Spec, Int8Spec, **_PCT4)),
     "U8S8_AAWS": lambda: QConfig(_layer(UInt8Spec, Int8Spec, **_PCT)),
     "U8U8_AAWA": lambda: QConfig(_layer(UInt8Spec, UInt8Spec, **_PCT)),
     "A16W8": lambda: QConfig(
         _layer(Int16Spec, Int8Spec, calibration_method="minmax"),
         AlignEltwiseQuantType=True,
+        **_A8_EXTRAS,
     ),
-    "S16S8_ASWS": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
+    "S16S8_ASWS": lambda: QConfig(
+        _layer(Int16Spec, Int8Spec), ActivationSymmetric=True
+    ),
     "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec, **_PCT)),
     "FP16": lambda: QConfig(_layer(Float16Spec, Float16Spec)),
     "BF16": lambda: QConfig(_layer(BFloat16Spec, BFloat16Spec)),
@@ -880,6 +954,14 @@ class ModelQuantizer:
             const_dtype=wt.dtype if mixed and quantize_acts and not fold else None,
         )
 
+    def _extended(self, act: QSpec, wt: QSpec) -> bool:
+        """Whether Quark would use its extended QDQ quantizer (see
+        ``QConfig.quant_format``)."""
+        fmt = self.config.quant_format
+        if fmt is not None:
+            return fmt == "extended"
+        return not (act.dtype in ("int8", "uint8") and wt.dtype in ("int8", "uint8"))
+
     def _approx(self, msg: str) -> None:
         self.last_approximations.append(msg)
 
@@ -1264,6 +1346,7 @@ class ModelQuantizer:
         else:
             cal_method, cal_options = _calibration_args(act.calibration_method, opts)
             cal_size = int(opts.get("CalibDataSize") or 0)
+            act_sym = bool(opts.get("ActivationSymmetric", act.symmetric))
             quantized = quantize_full_qdq(
                 work,
                 calibration_data=calibration[:cal_size] if cal_size else calibration,
@@ -1271,11 +1354,11 @@ class ModelQuantizer:
                 exclude_nodes=exclude,
                 method=cal_method,
                 calibrate_options=cal_options,
-                symmetric_activations=act.symmetric,
+                symmetric_activations=act_sym,
                 power_of_two=act.pof2 or wt.pof2,
                 per_channel=per_channel,
                 weight_dtype="int16" if wt.dtype == "int16" else "int8",
-                fold_relu=bool(opts.get("RemoveQDQConvRelu", True)),
+                **_activation_rules(opts, act_sym, self._extended(act, wt), act.pof2),
                 # Quark's XINT8 (power-of-2 weights): MinMSE scale search on
                 # weights and int8 biases (``Int32Bias=True`` keeps int32)
                 pof2_mode="minmse" if wt.pof2 else "ceil",
