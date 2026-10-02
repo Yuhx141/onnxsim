@@ -213,6 +213,9 @@ def evaluate(role: Role, scales: Scales) -> int:
         return _bits(s[role[1]] / s[role[2]])
     if kind == "mult":
         return _bits(s[role[1]] * s[role[2]] / s[role[3]])
+    if kind == "mult256":
+        # the 16-bit path's npu_params lane: 256 * s_a * s_b / s_y
+        return _bits(256 * s[role[1]] * s[role[2]] / s[role[3]])
     if kind == "meanr":
         # float32 arithmetic: in float64 the Gemm chain's lane comes out one
         # ulp high (0x3d84030f for the native 0x3d84030e).
@@ -226,6 +229,16 @@ def evaluate(role: Role, scales: Scales) -> int:
         return int(scales[role[1]][1]) & 0xFFFFFFFF
     if kind == "zpk":
         return int(scales[role[1]][1]) * role[2] & 0xFFFFFFFF
+    if kind == "zp16h":
+        z = int(scales[role[1]][1])
+        if not 0 < z < 1 << 16:
+            raise CalibrationError(f"zero point {z} of {role[1]} is not 16 bits")
+        return z
+    if kind == "zp16":
+        z = int(scales[role[1]][1])
+        if not 0 < z < 1 << 16:
+            raise CalibrationError(f"zero point {z} of {role[1]} is not 16 bits")
+        return z | z << 16
     if kind == "zp8":
         z = int(scales[role[1]][1])
         if not 0 < z < 256:
@@ -337,7 +350,10 @@ def _add(kind: str, x: str, z: str, y: str, scales: Scales) -> int:
     ``mm_add`` (``k = 0``)."""
     (sx, zx), (sz, zz), (sy, zy) = scales[x], scales[z], scales[y]
     k = 0
-    while max(sx / sy, sz / sy) * 2.0**-k >= 1.0:
+    # A ratio of exactly 1 keeps k = 0 (shift 15): a 16-bit 3x3 Conv chain whose
+    # MatMul output and biased sum share a scale writes shift 0x0f; ``>= 1`` took
+    # k = 1 and was refused.
+    while max(sx / sy, sz / sy) * 2.0**-k > 1.0:
         k += 1
         if k > 15:
             raise CalibrationError(f"Add ratios of {y} do not fit Q15")
@@ -361,6 +377,11 @@ def float_roles(tensors: Iterable[str]) -> list[Role]:
     roles += [("ratio", a, b) for a, b in itertools.permutations(ts, 2)]
     roles += [
         ("mult", a, b, c)
+        for a, b in itertools.combinations_with_replacement(ts, 2)
+        for c in ts
+    ]
+    roles += [
+        ("mult256", a, b, c)
         for a, b in itertools.combinations_with_replacement(ts, 2)
         for c in ts
     ]
@@ -425,6 +446,7 @@ def locate(model: onnx.ModelProto, scales: Scales) -> dict:
     if offsets:
         recs, lanes = _locate_bias_add(segs, scales, offsets, recs, params, lanes)
     lanes = sorted(lanes + _zp8_lanes(params, scales, lanes))
+    lanes = sorted(lanes + _zp16_lanes(params, scales, lanes))
     return {
         "segments": segs,
         "params_bytes": params,
@@ -467,6 +489,49 @@ def _zp8_lanes(params: bytes, scales: Scales, taken_lanes: list) -> list:
             ]
         i = j
     return out
+
+
+def _zp16_lanes(params: bytes, scales: Scales, taken_lanes: list) -> list:
+    """16-bit zero points in ``npu_params``: a run of identical words holding
+    the zero point in both halves (``z | z << 16``), as a 16-bit chain's
+    asymmetric input leaves them (0x99999999 for 39321)."""
+    zps: dict[int, list[Role]] = {}
+    for t, (_, z) in scales.items():
+        if 0 < z < 1 << 16:
+            zps.setdefault(int(z) | int(z) << 16, []).append(("zp16", t))
+    taken = {o + d for o, _, _ in taken_lanes for d in range(4)}
+    out = []
+    # 4-byte aligned words only: a run of identical bytes would otherwise also
+    # read as overlapping words at the other three phases
+    for phase in (0,):
+        words = [
+            (off, struct.unpack_from("<I", params, off)[0])
+            for off in range(phase, len(params) - 3, 4)
+        ]
+        i = 0
+        while i < len(words):
+            j = i
+            while j < len(words) and words[j][1] == words[i][1]:
+                j += 1
+            if words[i][1] in zps and j - i >= MIN_LANE_RUN:
+                out += [
+                    (off, words[i][1], zps[words[i][1]])
+                    for off, _ in words[i:j]
+                    if not any(off + d in taken for d in range(4))
+                ]
+                # the table ends in a half-word: the next word's low 16 bits
+                if j < len(words):
+                    tail_off, tail = words[j]
+                    z = words[i][1] & 0xFFFF
+                    if tail & 0xFFFF == z and not any(
+                        tail_off + d in taken for d in range(2)
+                    ):
+                        out.append(
+                            (tail_off, z, [("zp16h", r[1]) for r in zps[words[i][1]]])
+                        )
+            i = j
+    seen: set[int] = set()
+    return [x for x in sorted(out) if not (x[0] in seen or seen.add(x[0]))]
 
 
 def _param_lanes(params: bytes, ftable: dict[int, list[Role]]) -> list:
@@ -648,6 +713,8 @@ def _locate_cat_header(scales, rq_pairs, params, taken_lanes):
 PRECEDENCE = (
     "zp",
     "zp8",
+    "zp16",
+    "zp16h",
     "zpk",
     "zpf",
     "nzpf",
@@ -656,6 +723,7 @@ PRECEDENCE = (
     "inv",
     "ratio",
     "mult",
+    "mult256",
     "meanr",
     "zpoff",
     "qshift",
@@ -672,15 +740,55 @@ double-rounding tie. So the simplest formula wins, and within a kind the
 formula must be unique."""
 
 
-def _new_value(where: str, value: int, roles: list[Role], new: Scales) -> int:
+FIXED_LANE_REGS = frozenset(range(0x0FD0, 0x1010, 0x10))
+"""In a 16-bit build the four lanes at ``0x0fd0..0x1000`` hold the constant 1.0. A
+template whose MatMul output and biased sum share a scale also explains them as a
+ratio of those two tensors (also 1.0), which then moves them at a new calibration
+where the native build keeps 1.0."""
+
+FIXED_LANES = frozenset({0x43800000, 0x3F800000})
+"""Float32 lanes (256.0 and 1.0) that a U16/S16 MatMul carries at
+``0x0f50..0x1000`` next to its scale lanes. They match no scale formula and are
+identical in every 16-bit build of a shape, so they are left as they are."""
+
+
+def _new_value(
+    where: str,
+    value: int,
+    roles: list[Role],
+    new: Scales,
+    add_outputs: frozenset[str] = frozenset(),
+    add_inputs: frozenset[str] = frozenset(),
+    fixed_one: bool = False,
+) -> int:
+    if not roles and value in FIXED_LANES:
+        return value
+    if fixed_one and value == 0x3F800000:
+        return value
     if not roles:
         raise CalibrationError(f"{where}: value {value:#010x} matches no scale formula")
     kind = min((r[0] for r in roles), key=PRECEDENCE.index)
-    got = {evaluate(r, new) for r in roles if r[0] == kind}
+    same = [r for r in roles if r[0] == kind]
+    if kind in ("mult", "mult256") and len(same) > 1:
+        # the MatMul's own multiplier lane, s_x * s_w / s_out: its output is the
+        # located Add's input (x or z), not the Add's output
+        from_matmul = [r for r in same if r[3] in add_inputs]
+        if from_matmul:
+            same = from_matmul
+    out_arg = {"s": 1, "ratio": 2}.get(kind)
+    if out_arg is not None and len(same) > 1:
+        # tensors that share a scale tie their roles: s(y) with s(mm), ratio(a, b)
+        # with ratio(b, a). The lanes of a fused Add are in terms of the Add's own
+        # output (its output scale, x's scale over it), so the role whose output
+        # argument is a located Add output wins.
+        into_add = [r for r in same if r[out_arg] in add_outputs]
+        if into_add:
+            same = into_add
+    got = {evaluate(r, new) for r in same}
     if len(got) != 1:
         raise CalibrationError(
             f"{where}: value {value:#010x} is ambiguous; {kind} roles "
-            f"{[r for r in roles if r[0] == kind][:4]} disagree at the new scales"
+            f"{same[:4]} disagree at the new scales"
         )
     return got.pop()
 
@@ -735,20 +843,42 @@ def recalibrate(
         )
     path = _MODEL_PATHS.get(id(model))
     found = _located(path, _scales_key(old)) if path is not None else locate(model, old)
+    add_roles = [
+        r
+        for *_, roles in (*found["records"], *found["params"])
+        for r in roles
+        if r[0] == "zpoff"
+    ]
+    is_16bit = any(
+        value == 0x43800000 and reg in LANE_REGS
+        for _, _, reg, value, _ in found["records"]
+    )
+    add_outputs = frozenset(r[3] for r in add_roles)
+    add_inputs = frozenset(t for r in add_roles for t in r[1:3])
     segs = [bytearray(s) for s in found["segments"]]
     changed: set[int] = set()
     for si, off, reg, value, roles in found["records"]:
         nv = _new_value(
-            f"segment {si} record {off // 8} reg {reg:#06x}", value, roles, new
+            f"segment {si} record {off // 8} reg {reg:#06x}",
+            value,
+            roles,
+            new,
+            add_outputs,
+            add_inputs,
+            fixed_one=is_16bit and reg in FIXED_LANE_REGS,
         )
         if nv != value:
             struct.pack_into("<I", segs[si], off + 4, nv)
             changed.add(si)
     params = bytearray(found["params_bytes"])
     for off, value, roles in found["params"]:
-        nv = _new_value(f"npu_params byte {off}", value, roles, new)
+        nv = _new_value(
+            f"npu_params byte {off}", value, roles, new, add_outputs, add_inputs
+        )
         if roles[0][0] == "zp8":  # one byte, not a word
             params[off] = nv
+        elif roles[0][0] == "zp16h":  # a half-word
+            struct.pack_into("<H", params, off, nv)
         else:
             struct.pack_into("<I", params, off, nv)
     mc = sr.get_mcode(model)

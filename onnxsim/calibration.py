@@ -529,6 +529,124 @@ def _mse_threshold_from_hist(
     return best_threshold
 
 
+# -- Quark-style power-of-two MinMSE ("minmse_pof2") ----------------------------
+#
+# AMD Quark's ``PowerOfTwoMethod.MinMSE`` (what its XINT8 preset calibrates
+# with): a per-tensor symmetric power-of-two scale, picked among five
+# candidates around the min/max scale by the quantization error measured on a
+# 2048-bin histogram (bin centres weighted by counts). Reimplemented from its
+# observable behaviour; the numeric dtypes (float32 centres, int32 codes,
+# float64 sums) follow it so the same data picks the same scale.
+
+# Quark's symmetric integer ranges (``get_qmin_qmax_for_qType(symmetric=True)``)
+_POF2_QRANGE = {
+    "int8": (-127, 127),
+    "uint8": (0, 255),
+    "int16": (-32767, 32767),
+    "uint16": (0, 65535),
+}
+_POF2_CANDIDATES = 5  # scales 2^-(p-1) ... 2^-(p+3) around the min/max position p
+
+
+def _pof2_position(scale: float) -> int:
+    """The fixed-point position nearest to ``scale``: ``round(-log2(scale))``."""
+    scale = min(max(scale, float(2.0**-127)), float(2.0**127))
+    return int(np.rint(-np.log2(scale)))
+
+
+def _pof2_base(rmin: Any, rmax: Any, qmin: int, qmax: int) -> Tuple[int, int]:
+    """``(position, zero_point)`` of the symmetric min/max scale rounded to a
+    power of two (float32 arithmetic, as the reference does)."""
+    lo, hi = np.float32(min(rmin, 0.0)), np.float32(max(rmax, 0.0))
+    absmax = np.maximum(np.abs(lo), np.abs(hi))
+    scale = np.float64(absmax + absmax) / np.float64(qmax - qmin)
+    if scale < np.finfo(np.float32).tiny:
+        return _pof2_position(1.0), 0
+    zp = int(np.round(qmin + np.float64(absmax) / scale))
+    pos = _pof2_position(float(np.float32(scale)))
+    s = np.float32(2.0**-pos)
+    new_rmin = min((np.float32(qmin) - np.float32(zp)) * s, np.float32(0))
+    zp = int(np.round(qmin - new_rmin / s))
+    if qmin == 0 and qmax == 255 and zp == 127:  # keep the zero point centred
+        zp = 128
+    return pos, zp
+
+
+class _Pof2Histogram:
+    """Per-tensor histogram laid out like Quark's: ``num_bins`` uniform bins
+    over the first batch's ``[min, max]``, extended with bins of the same
+    width when a later batch exceeds it. Accumulated one batch at a time."""
+
+    def __init__(self, num_bins: int = 2048):
+        self.num_bins = num_bins
+        self.counts: Optional[np.ndarray] = None
+        self.edges: Optional[np.ndarray] = None
+        self.rmin = np.float32(0)
+        self.rmax = np.float32(0)
+
+    def add(self, arr: np.ndarray) -> None:
+        data = np.nan_to_num(np.asarray(arr).ravel().astype(np.float32), nan=0.0)
+        if not data.size:
+            return
+        lo, hi = np.float32(data.min()), np.float32(data.max())
+        d64 = data.astype(np.float64)
+        if self.counts is None or self.edges is None:
+            self.counts, self.edges = np.histogram(d64, bins=self.num_bins)
+            self.rmin, self.rmax = lo, hi
+            return
+        e0, e1 = self.edges[0], self.edges[-1]
+        width = float(self.edges[1] - self.edges[0])
+        if float(lo) >= e0 and float(hi) <= e1:
+            self.counts = self.counts + np.histogram(d64, bins=self.edges)[0]
+        else:
+            left = max(0, int(np.ceil((e0 - float(lo)) / width)))
+            right = max(0, int(np.ceil((float(hi) - e1) / width)))
+            n = self.counts.size + left + right
+            edges = np.linspace(e0 - left * width, e1 + right * width, n + 1)
+            grown = np.zeros(n, dtype=self.counts.dtype)
+            grown[left : left + self.counts.size] = self.counts
+            self.counts = grown + np.histogram(d64, bins=edges)[0]
+            self.edges = edges
+        self.rmin, self.rmax = min(self.rmin, lo), max(self.rmax, hi)
+
+    def scale(self, dtype: str = "uint8") -> float:
+        """The MinMSE power-of-two scale for quantizing to ``dtype``."""
+        if self.counts is None or self.edges is None or not self.counts.sum():
+            return 1.0
+        qmin, qmax = _POF2_QRANGE[dtype]
+        pos, zp = _pof2_base(self.rmin, self.rmax, qmin, qmax)
+        c32 = ((self.edges[:-1] + self.edges[1:]) / 2).astype(np.float32)
+        c64, h64 = c32.astype(np.float64), self.counts.astype(np.float64)
+        best, best_s = float("inf"), np.float32(2.0**-pos)
+        for i in range(_POF2_CANDIDATES):
+            s = np.float32(2.0 ** -(pos + i - 1))
+            q = np.clip(np.round(c32 / s).astype(np.int32) + zp, qmin, qmax)
+            dq = (q.astype(np.float64) - zp) * float(s)
+            diff = float(np.sum(h64 * (c64 - dq) ** 2))
+            if diff < best:
+                best, best_s = diff, s
+        return float(best_s)
+
+
+def pof2_minmse_weight_scale(w: np.ndarray, qmin: int = -127, qmax: int = 127) -> float:
+    """MinMSE power-of-two scale of one weight tensor (symmetric, per tensor):
+    the candidate among ``2^-(p-1) ... 2^-(p+3)`` -- ``p`` the position of the
+    min/max scale -- with the least squared error over the weight values
+    themselves (what Quark's XINT8 does to weights and biases)."""
+    data = np.asarray(w, dtype=np.float32).ravel()
+    if not data.size:
+        return 1.0
+    pos, zp = _pof2_base(float(data.min()), float(data.max()), qmin, qmax)
+    best, best_s = np.float32("inf"), np.float32(2.0**-pos)
+    for i in range(_POF2_CANDIDATES):
+        s = np.float32(2.0 ** -(pos + i - 1))
+        q = np.clip(np.round(data / s) + np.float32(zp), qmin, qmax)
+        diff = np.sum(((q - np.float32(zp)) * s - data) ** 2, dtype=np.float32)
+        if diff < best:
+            best, best_s = diff, s
+    return float(best_s)
+
+
 class _StreamingHistogram:
     """Per-tensor signed histogram over a fixed ``[-A, A]`` (``A`` = the
     tensor's observed ``max(|min|, |max|)`` from :func:`calibrate`'s first,
@@ -651,6 +769,15 @@ class CalibrationStats:
         self.bounded_outputs = bounded_outputs
         self.tail_sensitive = tail_sensitive
         self._upstream = upstream
+        #: Quark-layout histograms of ``method="minmse_pof2"`` (see
+        #: :func:`collect_calibration_stats`), empty otherwise
+        self.pof2_histograms: Dict[str, _Pof2Histogram] = {}
+        #: Quark-layout histograms of the ``"quark_*"`` methods (see
+        #: :mod:`onnxsim.quark_calibration`), empty otherwise
+        self.quark_histograms: Dict[str, Any] = {}
+        #: per-tensor mean over batches of each batch's (min, max) -- the
+        #: ``"minmax_mean"`` method (filled by :func:`collect_calibration_stats`)
+        self.mean_observed: Dict[str, Tuple[float, float]] = {}
         # (tensor, method, *params) -> range: "auto" and a model-level pick
         # ask for the same thresholds (entropy's search is the slow one)
         self._range_cache: Dict[Tuple, Tuple[float, float]] = {}
@@ -668,7 +795,9 @@ class CalibrationStats:
         obs_min, obs_max = self.observed[name]
         h = self.histograms.get(name)
         base, arg = _parse_method(method)
-        if base == "minmax" or h is None:
+        if base == "minmax_mean" and name in self.mean_observed:
+            return self.mean_observed[name]
+        if base == "minmax" or h is None or base == "minmax_mean":
             return obs_min, obs_max
         if base == "percentile":
             p = percentile if arg is None else arg
@@ -716,7 +845,12 @@ class CalibrationStats:
     ) -> Dict[str, Tuple[float, float]]:
         """``{tensor: (min, max)}`` for ``method`` -- any :func:`calibrate`
         method, ``"percentile:<p>"``, or ``"auto"`` (see :meth:`auto_ranges`,
-        which ``auto_kwargs`` go to)."""
+        which ``auto_kwargs`` go to; ``"minmse_pof2"`` takes ``dtype`` and
+        ``tensor_dtypes``, see :meth:`pof2_ranges`)."""
+        if method == "minmse_pof2":
+            return self.pof2_ranges(
+                minmax_tensor_names=minmax_tensor_names, **auto_kwargs
+            )
         if method == "auto":
             return self.auto_ranges(
                 minmax_tensor_names=minmax_tensor_names,
@@ -726,9 +860,13 @@ class CalibrationStats:
                 entropy_min_coverage=entropy_min_coverage,
                 **auto_kwargs,
             )[0]
-        if _parse_method(method)[0] not in ("minmax",) + _HIST_METHODS:
+        if _parse_method(method)[0] not in ("minmax", "minmax_mean") + _HIST_METHODS:
             raise ValueError(f"unknown calibration method: {method!r}")
-        if method != "minmax" and not self.histograms and self.observed:
+        if (
+            method not in ("minmax", "minmax_mean")
+            and not self.histograms
+            and self.observed
+        ):
             raise ValueError(
                 f"method {method!r} needs histograms: collect with histograms=True"
             )
@@ -749,6 +887,38 @@ class CalibrationStats:
             )
             for name in self.observed
         }
+
+    def pof2_ranges(
+        self,
+        dtype: str = "uint8",
+        tensor_dtypes: Optional[Dict[str, str]] = None,
+        minmax_tensor_names: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Tuple[float, float]]:
+        """Quark's ``PowerOfTwoMethod.MinMSE`` (needs
+        ``collect_calibration_stats(..., pof2_histograms=True)``): each
+        tensor's symmetric power-of-two scale ``s`` for ``dtype`` (or its
+        ``tensor_dtypes`` override), expressed as the range ``(-s * half,
+        s * half)`` -- ``half`` the dtype's positive half range -- so that a
+        symmetric power-of-two quantizer recovers exactly ``s``."""
+        if not self.pof2_histograms and self.observed:
+            raise ValueError(
+                "method 'minmse_pof2' needs pof2_histograms=True when collecting"
+            )
+        tensor_dtypes = tensor_dtypes or {}
+        keep = set(minmax_tensor_names or ())
+        out: Dict[str, Tuple[float, float]] = {}
+        for name, h in self.pof2_histograms.items():
+            if name in keep:
+                out[name] = self.observed[name]
+                continue
+            dt = tensor_dtypes.get(name, dtype)
+            if dt not in _POF2_QRANGE:
+                raise ValueError(f"minmse_pof2 does not support dtype {dt!r}")
+            lo, hi = _POF2_QRANGE[dt]
+            half = hi if lo < 0 else (hi - lo) // 2
+            absmax = h.scale(dt) * half
+            out[name] = (-absmax, absmax)
+        return out
 
     def auto_ranges(
         self,
@@ -846,6 +1016,9 @@ def collect_calibration_stats(
     extra_tensor_names: Optional[Sequence[str]] = None,
     histograms: bool = True,
     num_bins: int = 2048,
+    pof2_histograms: bool = False,
+    quark_hist: Optional[Tuple[bool, int]] = None,
+    exact_session: bool = False,
 ) -> CalibrationStats:
     """Run the float ``model`` over ``calibration_data`` once and record what
     every calibration method needs (see :class:`CalibrationStats`): pass 1
@@ -853,7 +1026,15 @@ def collect_calibration_stats(
     ``2 * num_bins``-bin signed histogram over ``[-max|x|, max|x|]`` per
     tensor, streamed one batch at a time -- memory is #tensors x bins however
     much data is used. Tensors are ``tensor_names`` if given, else
-    ``list_quantizable_activations``' list, plus ``extra_tensor_names``."""
+    ``list_quantizable_activations``' list, plus ``extra_tensor_names``.
+    ``pof2_histograms=True`` also records, in pass 1, the Quark-layout
+    histograms ``method="minmse_pof2"`` needs. ``quark_hist=(absolute,
+    num_bins)`` records :class:`onnxsim.quark_calibration.QuarkHistogram`
+    histograms of that layout (the ``"quark_*"`` methods).
+    ``exact_session=True`` runs the model with ONNX Runtime's graph
+    optimizations off (as Quark's calibrators do): fused kernels differ from
+    the unfused ones in the last float bit, which can move a histogram count
+    across a bin edge."""
     import onnxruntime as ort
 
     if isinstance(model, str):
@@ -903,8 +1084,12 @@ def collect_calibration_stats(
         if name not in existing_outputs:
             calib_model.graph.output.append(onnx.ValueInfoProto(name=name))
 
+    so = ort.SessionOptions()
+    if exact_session:
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     sess = ort.InferenceSession(
         calib_model.SerializeToString(),
+        so,
         providers=list(providers) if providers else None,
     )
     output_names = [o.name for o in sess.get_outputs()]
@@ -922,15 +1107,29 @@ def collect_calibration_stats(
     # Pass 1: exact running (min, max) -- all "minmax" needs, and the fixed
     # histogram range for the others.
     ranges = stats.observed
+    sums: Dict[str, List[float]] = {}  # name -> [sum min, sum max, batches]
     for batch in calibration_data:
         for name, arr in outputs_of(batch):
             batch_min = float(arr.min())
             batch_max = float(arr.max())
+            acc = sums.setdefault(name, [0.0, 0.0, 0.0])
+            acc[0] += batch_min
+            acc[1] += batch_max
+            acc[2] += 1
+            if pof2_histograms:
+                stats.pof2_histograms.setdefault(name, _Pof2Histogram()).add(arr)
+            if quark_hist is not None:
+                from onnxsim.quark_calibration import QuarkHistogram
+
+                stats.quark_histograms.setdefault(
+                    name, QuarkHistogram(quark_hist[1], quark_hist[0])
+                ).add(arr)
             if name in ranges:
                 prev_min, prev_max = ranges[name]
                 ranges[name] = (min(prev_min, batch_min), max(prev_max, batch_max))
             else:
                 ranges[name] = (batch_min, batch_max)
+    stats.mean_observed = {n: (a / c, b / c) for n, (a, b, c) in sums.items()}
     if not histograms:
         return stats
 
@@ -961,6 +1160,12 @@ def calibrate(
     minmax_tensor_names: Optional[Sequence[str]] = None,
     entropy_min_coverage: float = 0.999,
     auto_options: Optional[Dict] = None,
+    activation_type: str = "uint8",
+    tensor_dtypes: Optional[Dict[str, str]] = None,
+    range_symmetric: Optional[bool] = None,
+    quark_num_bins: Optional[int] = None,
+    percentile_candidates: Sequence[float] = (99.99, 99.999, 99.99999),
+    lwp_metric: str = "mae",
 ) -> Dict[str, Tuple[float, float]]:
     """
     Run the float ``model`` over every batch in ``calibration_data`` through
@@ -980,7 +1185,10 @@ def calibrate(
             since QOperator format needs a calibrated range for a quantized
             node's output too, not just its activation (see
             ``onnxsim_cpp2py_export.list_qoperator_quantizable_outputs``).
-    :param method: ``"minmax"`` (default) uses each tensor's observed
+    :param method: ``"minmax_mean"`` is ``"minmax"`` with each tensor's range
+            the *mean over batches* of every batch's (min, max) instead of the
+            global extremes (what Quark's ``CalibMovingAverage`` computes);
+            ``"minmax"`` (default) uses each tensor's observed
             ``(min, max)`` directly -- simple, and enough calibration data to
             cover the real range is all it needs. ``"entropy"`` instead finds,
             per tensor, the symmetric clip threshold minimizing the KL
@@ -1021,6 +1229,12 @@ def calibrate(
             Cheaper and more predictable than entropy/mse: a fixed fraction
             of outliers is clipped, whatever the distribution.
             ``"percentile:<p>"`` is the same with ``percentile=p``.
+            ``"minmse_pof2"`` is AMD Quark's ``PowerOfTwoMethod.MinMSE``: a
+            symmetric power-of-two scale per tensor (``activation_type``),
+            the least-error one of five candidates around the min/max scale on
+            a 2048-bin histogram. The returned range is ``(-s * half, s *
+            half)`` for the chosen scale ``s``, so a symmetric power-of-two
+            quantizer recovers ``s`` exactly.
             ``"auto"`` picks one of those per tensor, by the expected
             quantization error on that tensor's own histogram, and never
             clips graph outputs, Sigmoid/Softmax outputs and inputs, or
@@ -1053,15 +1267,57 @@ def calibrate(
             (normalized pixels are exactly ``[0, 1]``)
     :param entropy_min_coverage: (``"entropy"`` only) the search's floor --
             see :func:`_entropy_threshold`'s ``min_coverage``
+    :param activation_type: (``"minmse_pof2"`` only) the integer dtype the
+            power-of-two scale is searched for: ``"uint8"`` (default), ``"int8"``,
+            ``"uint16"`` or ``"int16"``
+    :param tensor_dtypes: (``"minmse_pof2"`` only) per-tensor overrides of
+            ``activation_type``
     :param auto_options: (``"auto"`` only) keyword arguments for
             :meth:`CalibrationStats.auto_ranges`, e.g.
             ``{"protect_head_depth": 2}``
+    :param range_symmetric: Quark's ``CalibTensorRangeSymmetric`` (``"minmax"``
+            and the ``"quark_*"`` methods): the range of every tensor is
+            ``(-r, r)``. ``None`` is each method's own default (Quark's:
+            ``"minmax"`` False, ``"quark_percentile"`` / ``"quark_layerwise_
+            percentile"`` True, ``"quark_entropy"`` / ``"quark_distribution"``
+            ignore it)
+    :param quark_num_bins: histogram bins of a ``"quark_*"`` method (default:
+            128 for ``"quark_entropy"``, else 2048)
+    :param percentile_candidates: (``"quark_layerwise_percentile"``) the
+            percentiles to choose between, per tensor
+    :param lwp_metric: (``"quark_layerwise_percentile"``) ``"mae"`` or ``"mse"``
+
+            ``"quark_percentile[:p]"``, ``"quark_entropy"``,
+            ``"quark_distribution"`` and ``"quark_layerwise_percentile"`` are
+            AMD Quark's calibrators of those names, scale-for-scale (see
+            :mod:`onnxsim.quark_calibration`); ``"entropy"`` / ``"percentile"``
+            above are onnxsim's own variants and differ from them.
     :returns: ``{tensor_name: (min, max)}`` for every tensor
             ``onnxsim_cpp2py_export.list_quantizable_activations`` reports
             (or ``tensor_names``), plus ``extra_tensor_names`` if given
     """
+    if method.split(":", 1)[0] in _QUARK_METHODS:
+        return _calibrate_quark(
+            model,
+            calibration_data,
+            method,
+            providers=providers,
+            tensor_names=tensor_names,
+            extra_tensor_names=extra_tensor_names,
+            minmax_tensor_names=minmax_tensor_names,
+            percentile=percentile,
+            activation_type=activation_type,
+            range_symmetric=range_symmetric,
+            num_bins=quark_num_bins,
+            num_quantized_bins=num_quantized_bins,
+            percentile_candidates=percentile_candidates,
+            lwp_metric=lwp_metric,
+        )
     base, _ = _parse_method(method)
-    if method != "auto" and base not in ("minmax",) + _HIST_METHODS:
+    if (
+        method not in ("auto", "minmse_pof2")
+        and base not in ("minmax", "minmax_mean") + _HIST_METHODS
+    ):
         raise ValueError(f"unknown calibration method: {method!r}")
     if method == "percentile" and not 50.0 < percentile <= 100.0:
         raise ValueError(f"percentile must be in (50, 100], got {percentile}")
@@ -1072,9 +1328,25 @@ def calibrate(
         providers=providers,
         tensor_names=tensor_names,
         extra_tensor_names=extra_tensor_names,
-        histograms=method != "minmax",
+        histograms=method not in ("minmax", "minmax_mean", "minmse_pof2"),
         num_bins=num_bins,
+        pof2_histograms=method == "minmse_pof2",
     )
+    if method in ("minmax", "minmax_mean") and range_symmetric:
+        out = dict(stats.mean_observed if method == "minmax_mean" else stats.observed)
+        for name in stats.observed:
+            if name in set(minmax_tensor_names or ()):
+                out[name] = stats.observed[name]
+            elif range_symmetric:
+                r = max(abs(out[name][0]), abs(out[name][1]))
+                out[name] = (-r, r)
+        return out
+    if method == "minmse_pof2":
+        return stats.pof2_ranges(
+            activation_type,
+            tensor_dtypes,
+            minmax_tensor_names=minmax_tensor_names,
+        )
     kw: Dict[str, Any] = dict(
         num_quantized_bins=num_quantized_bins,
         num_mse_candidates=num_mse_candidates,
@@ -1085,6 +1357,84 @@ def calibrate(
     if method == "auto":
         return stats.auto_ranges(**kw, **(auto_options or {}))[0]
     return stats.ranges(method, percentile=percentile, **kw)
+
+
+_QUARK_METHODS = (
+    "quark_percentile",
+    "quark_entropy",
+    "quark_distribution",
+    "quark_layerwise_percentile",
+)
+
+
+def _calibrate_quark(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Sequence[Tensors],
+    method: str,
+    providers: Optional[Sequence[str]],
+    tensor_names: Optional[Sequence[str]],
+    extra_tensor_names: Optional[Sequence[str]],
+    minmax_tensor_names: Optional[Sequence[str]],
+    percentile: float,
+    activation_type: str,
+    range_symmetric: Optional[bool],
+    num_bins: Optional[int],
+    num_quantized_bins: int,
+    percentile_candidates: Sequence[float],
+    lwp_metric: str,
+) -> Dict[str, Tuple[float, float]]:
+    """The ``"quark_*"`` methods of :func:`calibrate`."""
+    from onnxsim.quark_calibration import lwp_select
+
+    base, _, arg = method.partition(":")
+    if arg and base != "quark_percentile":
+        raise ValueError(f"unknown calibration method: {method!r}")
+    if base == "quark_percentile" and arg:
+        percentile = float(arg)
+    if base in ("quark_percentile", "quark_layerwise_percentile"):
+        symmetric = True if range_symmetric is None else bool(range_symmetric)
+        absolute, bins = symmetric, num_bins or 2048
+        if not 0.0 <= percentile <= 100.0:
+            raise ValueError(f"percentile must be in [0, 100], got {percentile}")
+    else:
+        symmetric, absolute = True, False
+        bins = num_bins or (128 if base == "quark_entropy" else 2048)
+    if base == "quark_distribution" and bins < 512:
+        raise ValueError("quark_distribution needs num_bins >= 512")
+    if base == "quark_layerwise_percentile" and activation_type not in (
+        "int8",
+        "uint8",
+        "int16",
+        "uint16",
+    ):
+        raise ValueError(f"unsupported activation_type: {activation_type!r}")
+    stats = collect_calibration_stats(
+        model,
+        calibration_data,
+        providers=providers,
+        tensor_names=tensor_names,
+        extra_tensor_names=extra_tensor_names,
+        histograms=False,
+        quark_hist=(absolute, bins),
+        exact_session=True,
+    )
+    keep = set(minmax_tensor_names or ())
+    out: Dict[str, Tuple[float, float]] = {}
+    for name, observed in stats.observed.items():
+        h = stats.quark_histograms.get(name)
+        if name in keep or h is None or h.hist is None:
+            out[name] = observed
+        elif base == "quark_percentile":
+            out[name] = h.percentile_range(percentile, symmetric)
+        elif base == "quark_entropy":
+            out[name] = h.entropy_range(num_quantized_bins)
+        elif base == "quark_distribution":
+            out[name] = h.distribution_range()
+        else:
+            out[name] = lwp_select(
+                h, percentile_candidates, activation_type, lwp_metric, symmetric
+            )
+    return out
 
 
 def quantize_static(

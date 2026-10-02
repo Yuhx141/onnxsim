@@ -352,12 +352,20 @@ def legalized(model: onnx.ModelProto) -> onnx.ModelProto:
 def calibrate(onnx_path: str, config_path: str, legalize: bool = True) -> dict:
     """The JSON ``coverage_report(..., calibration=)`` reads: every tensor's
     predicted quantization, over the legalized graph by default."""
-    model = onnx.load(onnx_path)
+    return calibrate_model(onnx.load(onnx_path), config_path, legalize, os.path.basename(onnx_path))
+
+
+def calibrate_model(
+    model: onnx.ModelProto,
+    config_path: str,
+    legalize: bool = True,
+    name: str = "step.onnx",
+) -> dict:
     if legalize:
         model = legalized(model)
     ranges = collect_ranges(model, load_pulsar2_dataset(config_path))
     return {
-        "model": os.path.basename(onnx_path),
+        "model": name,
         "rule": "pulsar2-7.0-lite MinMax (step_calibration.py)",
         "tensors": assign(model, ranges),
         "ranges": {k: list(v) for k, v in ranges.items()},

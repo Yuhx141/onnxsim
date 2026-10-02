@@ -141,7 +141,13 @@ def _find_static_qdq_candidates(
     for out_name, qn in q_by_output.items():
         if qn.op_type not in ("MatMul", "Gemm") or len(qn.input) < 2:
             continue
+        # quantize_static keeps the layer's output name; quantize_full_qdq
+        # renames the pre-requantize tensor ``<name>/f``. (A layer whose Relu
+        # full_qdq folded into the output Q is renamed after the Relu's
+        # output, matches no float layer here, and is skipped.)
         fn = f_by_output.get(out_name)
+        if fn is None and out_name.endswith("/f"):
+            fn = f_by_output.get(out_name[: -len("/f")])
         if fn is None or fn.op_type != qn.op_type or len(fn.input) < 2:
             continue
 

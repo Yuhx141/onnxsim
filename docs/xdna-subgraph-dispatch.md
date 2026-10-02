@@ -337,11 +337,321 @@ loop -- every call then pays a ~1.8 ms context switch, which produced bogus numb
   joining outputs across columns is not possible (an objectfifo cannot sit in two links and a
   memtile has ~6 input channels), so one drain per column remains.
 
+Full-size weight-volume run (`--layers 64 -k 1536 -n 256 -p 8 --once`, verified bit-exact, compute
+included): 64 layers x 393 KB = **25.2 MB streamed in 1.015 ms total (16 us/layer, 24.9 GB/s)**,
+with or without the broadcast activation stream. That is the ResNet-50 weight volume moved at
+Vitis-AI-like layer granularity in *less* than Vitis AI's whole 1.55 ms, so a layer-sequential
+engine's floor is ~1.0 ms and the remaining budget (~0.5 ms) is the real per-layer compute
+(3x3 im2col gather, residual adds, stem/pool). Design constraints found while sizing it: a core
+program unrolled over 53 different layers overflows program memory by 4.6 KB (a per-layer
+acquire/release sequence is ~300 B), so jobs must be uniform (loop over identical jobs, layer
+shape from the descriptor) or grouped per stage with `range_`; and FIFO objects are fixed-size,
+so a layer's per-core weight slice must be split into passes of at most one slot (K-split with an
+accumulator kept across jobs for the widest 3x3 layers).
+
 Projection for a full layer-sequential ResNet-50 engine: 55 conv layers x ~16 us sync (~0.9 ms)
-+ streaming (~0.75 ms, partly overlapped) + compute + launch, roughly 2-2.5 ms versus ~3.5 ms
-now, i.e. a ~1.5x gain that still trails Vitis' 1.55 ms. It needs runtime-shaped kernels (per-
-shape code does not fit 16 KB of program memory across all block kinds), a generic 3x3/1x1/skip/
-residual engine and a per-layer parameter header, so it is a substantial rewrite; not started.
++ streaming (~0.75 ms, partly overlapped) + compute + launch, roughly 2-2.5 ms. It was built (next
+section) and came out better than projected.
+
+### Layer-sequential engine (`layer_engine_design.py`, `kernels/layer_engine.cc`)
+
+Vitis-style: every conv layer of layer1..layer4 is one *job* spread over all 32 cores (8 columns x 4
+rows); layers run one after the other, activations round-trip through a small DDR arena.
+
+- **Work split.** A layer's output channel blocks (8 channels) are dealt to cores in order; core `s` owns
+  `nbc = ceil(NB/32)` consecutive blocks, so narrow layers simply leave cores idle. Each core writes its
+  blocks to a fixed 512-byte *region* of the layer's arena slot (32 regions = 16 KB), so the next layer's
+  input is "NCP regions of NBP blocks of P pixels" and the packed weights follow that reduction order.
+- **Kernel.** One runtime-shaped function (`layer_chunk`) serves every layer: a 192-byte descriptor at the
+  start of each per-core weight chunk carries the geometry, taps, K-chunk range, shifts, residual mode
+  and the (tap, region) decomposition of the chunk start (no divide on the core). Weights that do not
+  fit one 4 KB slot are K-split over several chunks with the int32 partial sums kept in core memory.
+  Paths: direct GEMM (1x1), a zero-padded-copy path for stride-1 3x3 (the copy is built once, in each input
+  region's unused bytes or the activation object's tail; a tile is then 1/2/4 contiguous row segments), and
+  a masked 8-row gather for strided 1x1/3x3.
+- **Data movement.** One broadcast activation stream (a residual map is queued as a second object one job
+  early), one weight stream per column carrying its four cores' chunks (each core keeps its own; all
+  weights issued once), one output drain per column. Program memory (16 KB) rules out a per-layer
+  unrolled core program (~450 B per job), so the core runs 4 stages x (projection block + `nid[s]`
+  identity blocks) as `range_` loops whose chunk counts come from a small table in core memory: 7 job
+  bodies for 52 jobs.
+- **Arena.** 4 reused slots (64 KB): `assign_slots` reuses a slot once its last reader (a residual is read a
+  job early) has run.
+
+Results (32x32 quicktest model; weights come from the model's block bindings via
+`layer_engine_net.jobs_from_bindings`, the artifact only needs the job structure):
+
+| configuration | pooled map -> layer4 | notes |
+|---|---|---|
+| stage-column body (previous best) | ~2.4 ms | one active column per stage |
+| engine, broadcast weights (`--net bodyr --looped`) | 1.60 ms | 0.97 ms with every kernel call skipped |
+| engine, memtile-staged weights (`--l2 2`) | **1.03 ms** | 0.82 ms with every kernel call skipped |
+| engine + stem/pool jobs (`--net full --looped --l2 2`) | **1.11 ms image -> layer4** | pooled map and all 16 blocks bit-exact vs ORT |
+
+Through the graph runner (`--layer-engine XCLBIN INSTS STAGES_JSON --layer-engine-stem`, RPC
+`resnet_engine` / `layer_engine`) the full graph takes **1.65 ms** (1.7-2.0 ms in noisier windows), logits
+identical to ORT (max abs error 0.0; `--dump-output` saves them), versus 3.55-3.84 ms for the best
+stage-column network and 1.55 ms for Vitis AI. Device call ~1.2 ms; the host part is image quantize +
+im2col (~0.1 ms) and the classifier tail (~0.15 ms) plus Python.
+
+What made the difference, and what did not:
+- **Memtile staging with per-core distribution (`--l2`) was the biggest single win (1.59 -> 1.03 ms).**
+  With broadcast, every core received all four cores' slices and looped over four acquires per chunk
+  round; now the shim streams whole 4-slice objects into the column's memtile and the memtile hands each
+  core only its own slice (`ObjectFifoLink` with destination offsets). Streaming is ~40 GB/s, the
+  per-round core loop is 4x shorter, and compute overlaps with streaming (kernel time went from +0.63 ms
+  to +0.2 ms over the floor). L2 depth 4 needs too many memtile BDs (24 per channel); depth 2 is best.
+- The first 3x3 version gathered every 8-pixel tile per (tap, input block) with 64-bit copies: ~290
+  cycles per tile, 1.03 ms for the 3x3 layers. The padded-copy segment path cut stride-1 3x3 layers from
+  ~60 us to a few us each. Masks were not the cost (removing them changed nothing); the per-tile scalar
+  loop control was.
+- Loops over (tap, region) steps pay ~60-100 cycles of scalar control per step on this core; making the inner
+  loop a uniform-stride pointer walk (`run` blocks of one tap) lets the compiler emit a zero-overhead loop.
+- With broadcast weights, more FIFO depth (3, 4) did not help (depth 3 was 15% slower: acquire index
+  rotation); slots above 4 KB do not fit the data banks once the L2 distribution FIFOs are added.
+- Memory is bank-structured: two 16 KB activation objects take two of the four 16 KB data banks, the rest
+  (weights, out, partial sums, stack) shares the remainder; the padded 3x3 copy therefore lives inside the
+  activation objects' unused bytes.
+- Host: the runner's `_max_pool` looped per output pixel in Python (0.5 ms); one strided slice per kernel
+  tap is 0.08 ms. With the stem and pool on the device nothing but quantize + im2col remains before the
+  device call.
+- Stem and pool as jobs: the 7x7 stem is four 1x1 GEMM jobs (host im2col chunks of 64 pixels, K padded to
+  152) draining into one dense 64 KB stem map with a strided output pattern (block `s`, chunk `c` at
+  `s*2048 + c*512`), then a pool job (mode 2 in the kernel) over that map; slots 0-8 are reserved for
+  these, the body reuses 4.
+
+### Other models: layer engine vs Vitis AI, and how close to ideal
+
+Both runtimes were run on the same models on the same host (Ryzen AI 1.8 Vitis AI EP, `real_npu`, 32x32
+input, batch 1, min of 3 x 300 timed iterations; ours through the graph runner, min of 3 x 100, stem/pool/
+all convs on the device, classifier tail on the host). The quicktest model is one Quark-quantized net, so
+the other depths come from `quantize_pow2_resnet.py` (torchvision, random weights with non-trivial BN
+statistics, same QDQ pattern: uint8 zero point 128 activations, int8 power-of-two weights/biases,
+quantized head), which both runtimes accept; `compare_models.py` runs the whole comparison. Every row is
+bit-exact against ONNX Runtime CPU (max abs logit error 0.0):
+
+| model | weights MB | MMACs | Vitis AI ms | ours ms (device call) | ours / Vitis | streaming floor ms | MAC floor us |
+|---|---|---|---|---|---|---|---|
+| ResNet-18 (basic blocks) | 11.7 | 37.5 | 0.83 | 0.89 (0.58) | 1.08 | 0.27 | 2 |
+| ResNet-34 | 21.8 | 75.3 | 1.42 | 1.17 (0.85) | 0.82 | 0.51 | 3 |
+| ResNet-50 | 25.5 | 85.5 | 1.63 | 1.70 (1.18) | 1.04 | 0.59 | 3 |
+| ResNet-101 | 44.4 | 161.2 | 2.90 | 2.64 (1.89) | 0.91 | 1.03 | 6 |
+| ResNet-152 | 60.0 | 237.0 | 4.08 | 3.12 (2.48) | 0.76 | 1.40 | 9 |
+| Wide-ResNet-50-2 | 68.8 | 234.6 | 26.3 | 2.89 (2.30) | 0.11 | 1.60 | 9 |
+
+- The engine supports bottleneck nets of any depth/width (`--arch 3,4,23,3`, `--arch 3,4,6,3:2`) and basic-block
+  nets (`--arch basic:2,2,2,2`, ResNet-18/34; `layer_engine_basic.py`); one artifact per architecture, weights
+  are packed at run time. Not supported: grouped/depthwise convs (ResNeXt, MobileNet, EfficientNet) and input
+  sizes whose activations no longer fit a 16 KB object (about 32x32 today), so those models only have Vitis
+  numbers. Vitis AI's Wide-ResNet time (26 ms) is ~9x its ResNet-50-scaled expectation; the reason (probably
+  layers left on the CPU) was not investigated. It handles 224x224 models, which the engine does not.
+- The engine wins from ResNet-34 up because per-job overhead is fixed while weight bytes grow; it is
+  slightly behind on the two smallest nets, where the ~0.3 ms of host work (image quantize, im2col, tail,
+  Python) is a larger share.
+- **Ideal**: at 32x32 these nets are weight-bandwidth bound, not compute bound: even at the NPU's 25 TMAC/s
+  (50 TOPS int8) the MACs take 2-9 us. The "streaming floor" is weights / 43 GB/s (the best rate the engine
+  reached with every kernel call skipped: 28.8 MB in 0.65 ms). The engine's device time is 1.4-2.2x that
+  floor: for ResNet-50, 0.82 ms is the floor of the current job structure (launch ~0.17 ms + 57 jobs, kernels
+  skipped) and the kernels add 0.31 ms (28%) that does not overlap with streaming. DDR itself (256-bit
+  LPDDR5X) would allow far more, so the remaining gap to a true roofline is per-job synchronization
+  (~10 us: one activation fill + eight column drains through one control processor, ~1.3 us per DMA task)
+  and the 8 shim weight streams.
+- What the remaining ideas can buy (bounded by the skipped-kernel run): conv1+skip fusion saves 4 of 57
+  jobs (~40 us), a faster stride-2 gather touches 6 jobs (~50 us of the 310 us kernel time), and a second
+  weight channel per column cannot help while the floor is per-job bound and the activation stream already
+  takes the 16th shim MM2S channel (17 would be needed). None is worth its complexity next to the host
+  overhead (~0.5 ms on ResNet-50) or a design that keeps activations in L2 between layers.
+#### Non-ResNet vision models (same generator, 32x32, Vitis AI only)
+
+`quantize_pow2_resnet.py` also handles ReLU6 (`Clip`), `Concat`, `AveragePool` and linear residual Adds, so
+a few other torchvision families were built and timed on the Vitis AI EP (random weights):
+
+| model | Vitis AI ms | vs CPU logits | what the engine / codegen would still need |
+|---|---|---|---|
+| GoogLeNet | 1.12 | exact | branch outputs concatenated along channels (jobs writing block ranges of one slot), 5x5/3x3 branches, stride-1 max pool; the generic per-conv codegen plans it (82 dispatches) |
+| RegNet-X 400MF | 1.74 | exact | grouped 3x3 (group width 16: a 2-block reduction per output block instead of all input blocks), a 3x3 stride-2 stem, and 16x16 maps (the kernel assumes <= 64 pixels per layer); the generic codegen plans it (118 dispatches) |
+| MobileNetV2 | 3.08 | argmax differs (max abs 0.105) | depthwise 3x3 (vector MACs, not MMUL), ReLU6 clamp in the epilogue, add-only jobs, and 16x16..96-channel maps (24 KB > the 16 KB activation object); the generic codegen rejects `Clip` |
+
+The engine stops at ResNet-style nets for three structural reasons rather than one missing kernel: activation
+maps are limited to 16 KB / 64 pixels per layer (larger maps need pixel tiling, which changes the region
+layout), there is no grouped/depthwise reduction (per-output-block input ranges), and no channel-range
+placement for Concat. Each is a design change to the arena layout, so they were not attempted here; Vitis AI
+handles all of these models and shows that the same NPU sustains ~1-3 ms on them at 32x32. Models that did not
+export through the generator (SqueezeNet: shared bias initializers; EfficientNet/MobileNetV3: SiLU/HardSwish;
+DenseNet: standalone BatchNorm; ShuffleNet: Split/Transpose; AlexNet/VGG at 32x32: too small / huge FC) have no
+numbers.
+
+#### Operator expansion through tinygrad lowering (`tinygrad_lower.py`, `layer_engine_graph.py`)
+
+The engine used to stop at ResNet-shaped graphs. Three additions widen it, and tinygrad supplies the semantics
+for everything the engine has no kernel of its own for:
+
+- **Table jobs (`kind="lut"`)**: activations are 8-bit, so any pointwise unary op (HardSwish, Sigmoid, Tanh, GELU,
+  Erf, Softplus, Mish, LeakyRelu, ...) is one 256-entry byte table. The table is built by executing the op's
+  single-node ONNX model through tinygrad's ONNX frontend (`OnnxRunner`, pure-Python device, no host compiler)
+  on the 256 dequantized inputs and requantizing; `is_pointwise_unary` finds such ops *by execution* (permuting
+  the input must permute the output), so no per-op list is needed (Softmax is correctly rejected). The core
+  runs the table over its own blocks; cost is negligible.
+- **Depthwise 3x3 (`kind="dw"`, kernel mode 4)**: every output block reads only its own input block, so it is
+  one elementwise multiply-accumulate per tap with the channel weights replicated over the tile's eight pixel
+  rows (masked gather of the shifted tile, stride 1 or 2), plus the usual bias/requant epilogue.
+- **ReLU6 as an int8 clamp** (`clamp` field in the epilogue), and a **graph compiler** for straight-line QDQ
+  graphs: Conv 1x1/3x3/depthwise + Relu/Clip + QuantizeLinear, an Add of a conv result and an earlier tensor
+  fused into the conv's residual epilogue (MobileNet's linear bottleneck), and unary ops as table jobs. The core
+  program for such nets is one table-driven loop over jobs (`--net onnx:MODEL.onnx`).
+
+Result: a MobileNetV3-style mini network (8x8 maps; six pointwise+ReLU6/HardSwish layers, three depthwise
+layers including stride 2, two fused residual adds; 20 jobs) is **bit-exact against ONNX Runtime** on the
+NPU (0 of 1024 output bytes differ) in 0.45 ms for the engine part (Vitis AI runs the whole model, tail
+included, in 1.50 ms and differs from CPU logits by up to 0.14). The 256-entry-table approach relies on the
+activation being 8-bit; 16-bit activations would need interpolation. Still missing for real MobileNet/EfficientNet
+inputs: maps larger than 64 pixels / 16 KB (pixel tiling), Concat, grouped convs other than depthwise,
+Squeeze-and-Excite (a GAP -> FC -> Sigmoid -> broadcast Mul: needs a reduce job and a broadcast multiply job).
+
+#### YOLO and more operators (`layer_engine_graph.py`, `quantize_pow2_graph.py`)
+
+The graph compiler was generalized from a chain to a DAG and grew the data-movement operators a YOLO
+backbone/neck/head needs. New job kinds (all runtime-shaped, one kernel):
+
+| job | operator | notes |
+|---|---|---|
+| `copy` | Split, Concat (channel axis) | per-output-block source (object A or B), block and scale exponent in the payload; a Concat of n tensors is n-1 pairwise jobs with each source re-scaled to the output's power-of-two scale |
+| `up` | Resize nearest x N | pixel replication, optional re-scale |
+| `maxpool` | MaxPool k x k "same" | any odd k / stride (SPPF's k=5, the stem's k=3 stride 2 replaces the old pool mode) |
+| `add` | Add of two activations | the residual epilogue arithmetic on two objects (YOLO's bottleneck Add sits after the SiLU, so it cannot fuse into the conv) |
+| `gap` | GlobalAveragePool | power-of-two pixel counts, round-half-even shift |
+| `bmul` | Mul by a 1x1 gate | squeeze-and-excite: activation x per-channel gate |
+| `dw` | depthwise 3x3 and 5x5 | all K*K tap vectors packed |
+
+- **SiLU** is `Sigmoid -> Mul` in ONNX: `quantize_pow2_graph.py` leaves the pair unquantized between one Q/DQ
+  pair, and the compiler collects *any pointwise chain* between a DequantizeLinear and a QuantizeLinear into one
+  table job built by running the chain through tinygrad (`tinygrad_lower.subgraph_table`).
+- **Large early maps run on the host.** A job whose output map does not fit a core's 512-byte region (the first
+  high-resolution layers, YOLOv5's 6x6 stride-2 stem) is marked host: the compiler emits it separately, the
+  harness runs it with the same numpy reference the tests use (float64 BLAS, exact for these integer sums) and
+  writes the result into the arena with a wide-region layout (`D_REG`) that the first engine job reads.
+- **Host tail**: everything after the last engine operator (Reshape, Softmax, the box decode) consumes the
+  *boundary* tensors the engine leaves in the arena (`Compiled.boundaries`).
+- A residual/second operand is prefetched a job early unless the previous job produces it (then it is queued
+  right before the job's input); the generic core program takes two act objects per job and loops over a table
+  of chunk counts.
+
+Results (32x32 input, Ultralytics YAML models with random weights and unit-variance init, quantized to power-of-two
+QDQ; all engine outputs **bit-exact against ONNX Runtime** on the detection-head Conv outputs, and the decoded
+detections from the host tail equal ORT's exactly):
+
+| model | engine jobs (host jobs) | engine call | prefix + engine + read-back | host tail (ORT) | Vitis AI |
+|---|---|---|---|---|---|
+| YOLOv8n | 170 (2) | 1.71 ms | 2.02 ms | 0.05 ms | 3.29 ms |
+| YOLOv5nu | 169 (2) | 1.69 ms | 2.44 ms | 0.05 ms | 4.42 ms |
+| YOLOv8n at 64x64 | 155 (17) | 1.83 ms | 2.96 ms | 0.06 ms | 3.75 ms |
+| MobileNetV3-style with 5x5 depthwise + SE (8x8) | 35 (0) | 0.54 ms | 0.55 ms | - | (mini model: 1.5 ms class) |
+
+Vitis AI's outputs differ from CPU on these models (decoded coordinates by up to 10 px at 32x32 and 148 at 64x64,
+argmax flips), so it is faster only when it is also less accurate; our numbers are for exactly ORT's arithmetic.
+Engine time per job is ~10 us, so a 170-job network is bound by per-job synchronization, not by compute.
+
+Other Ultralytics families at 32x32, compile coverage (engine jobs before the first unsupported operator):
+
+| model | engine jobs | verdict |
+|---|---|---|
+| YOLOv8n-seg | 187 (10 boundaries incl. the mask prototype head) | runs on the device, bit-exact, 2.1 ms |
+| YOLOv10n | 206 (2) | two launches like YOLO11n; bit-exact boundaries, decoded output within 1e-7 of ORT, 5.8 ms |
+| YOLO11n | 223 (2) | runs on the device in **two launches** (host C2PSA attention between them), bit-exact boundaries, decoded output within 1e-7 of ORT, 7.0 ms total (4.6 ms engine) |
+| YOLOv6n | 27+ | `ConvTranspose` as conv + depth-to-space jobs; exact, 1.19 ms (Vitis AI 1.955 ms) |
+| YOLOv9t | 4+ | ADown slices folded by onnxsim before codegen; exact, 4.6 ms (Vitis AI 11.06 ms) |
+| YOLOv3-tiny | 0 | MaxPool k=2 (even kernel) is not a "same"-padded odd pool |
+
+Float regions in the middle of a network (YOLO11's C2PSA attention: Reshape/Transpose/MatMul/Softmax) run on the
+host between engine launches (`layer_engine_host.py`): each level is one full launch of the same xclbin and arena
+(earlier levels just recompute identical values, so no xclbin switch), the host evaluates the float nodes with onnx's
+reference evaluator and quantizes the re-entering tensors into pinned arena slots. The depthwise kernel has no fused
+residual, so an Add after a depthwise conv stays a separate `add` job.
+
+Not supported yet: real detector resolutions (640x640): maps of hundreds of pixels need pixel-split layouts and larger output
+objects, which is the "activation-tiled" engine this weight-streaming design deliberately is not. At 64x64 the
+host already computes 17 of 172 jobs.
+
+- Host findings worth keeping: OpenBLAS defaulted to one thread per core, and a 2048x1000 Gemm took 2.9 ms on
+  this 64-thread host versus 0.05-0.1 ms with 1-2 threads (the runner now sets `OPENBLAS_NUM_THREADS=2`
+  before numpy loads); a 1000-class head made the runner 3x slower before that fix.
+#### More vision models through the graph compiler (32x32 inputs, bit-exact vs ORT on every engine boundary)
+
+`run_graph_engine.py MODEL.onnx` (quantize with `quantize_pow2_graph.py` / `quantize_pow2_resnet.py`); device
+call + host prefix/tail, median of 10-50 runs on a busy host (+-0.2 ms):
+
+| model | engine jobs (host jobs) | ours | Vitis AI |
+|---|---|---|---|
+| ResNet-18 / 34 / 50 through `compile_graph` | 21 / 37 / 54 (1) | 1.5 / 1.7 / 2.2-2.8 ms | 0.83 / 1.42 / 1.63 ms |
+| MobileNetV2 | 48 (5) | 1.65 ms | 3.08 ms |
+| RegNetX-400MF (group-16 convs) | 70 (2) | 1.6-2.0 ms | 1.74 ms |
+| GoogLeNet | 97 (1) | 2.4 ms | 1.12 ms |
+| SqueezeNet 1.1 | 37 (1) | 1.03 ms | - |
+| MnasNet 1.0 (5x5 depthwise) | 73 (4) | 2.3 ms | - |
+| MobileNetV3-Small (SE, hard-swish) | 104 (2) | 2.2 ms | - |
+
+What these needed: grouped (non-depthwise) convs run as dense convs with a block-diagonal weight; a depthwise
+job whose per-core weights overflow the 4 KB slot is split into channel-block slice / dw / concat parts; maps
+larger than an arena slot keep their producers *and* consumers on the host until they shrink (MobileNetV2's first
+layers); max pools take any kernel/padding/`ceil_mode` (GoogLeNet, SqueezeNet); residual blocks `Add -> ReLU` fuse
+into the conv and a downsample skip fuses the Add itself; 3x3 convs on maps whose width is not 1/2/4/multiple of 8
+(SqueezeNet's 7x7) use the gather path (the padded-copy path assumed whole 8-pixel row segments).
+
+Not supported: ShuffleNet (channel shuffle = Reshape/Transpose on unaligned channel counts, 14 host round trips),
+DenseNet (BatchNorm not folded into a conv: 66), EfficientNet / ConvNeXt (maps over 64 pixels per channel block
+in the middle of the network: the SE / LayerNorm ops would need the host to read engine outputs back in the same
+launch), and any 224x224 input (needs the pixel-tiled layouts noted above). GoogLeNet is where Vitis AI is ahead
+(9 inception blocks of 1x1/3x3/5x5 branches: 97 sequential jobs at ~10 us each versus Vitis's fused subgraphs).
+
+#### Transformers: layer engine vs Vitis AI vs Hexagon HTP
+
+`tiny_transformer.py` builds a pre-LN encoder as a power-of-two QDQ graph in "tokens are pixels" form
+(`[1, hidden, 1, tokens]`), every operator of which is an engine job, so a whole encoder is **one launch**:
+
+| transformer op | engine jobs |
+|---|---|
+| Linear (Q/K/V/O, FFN) | 1x1 conv; LayerNorm's gamma/beta and the 1/sqrt(d) are folded into the next conv |
+| residual Add | fused into the o-proj / FFN2 conv epilogue (the residual stream is a uint8 tensor) |
+| LayerNorm | `x - mean` = one dense conv with `I - 1/C`; `d*d` = elementwise product job (`bmul`, same-shape mode); variance = conv of `1/C`; rsqrt = table job; `d * rsqrt` = product job |
+| GELU, exp, reciprocal | table jobs (tinygrad-lowered pointwise chains) |
+| attention scores `K^T Q` and context `V P` | new `amm` job (kernel mode 15): per-head int8 tile matmul of two activation maps; B is transposed in-kernel for the scores |
+| softmax | exp table, per-head key sum (block-diagonal ones conv), reciprocal table, product job |
+
+The previous version of this section kept LayerNorm, attention and the residual stream in float on the host
+(3 launches per layer); `--ln host --attn host` still builds that form. A network input that is float (no leading
+Q) and a network output that is an engine tensor are both supported now. The C = power of two requirement keeps
+the `1/C` conv weights exact in int8; other widths run but the mean/variance are then approximate.
+
+Same model (32 tokens, hidden 128, 4 heads, FFN 512), ms per inference, all bit-exact on the engine against ORT on
+the quantized graph:
+
+| layers | engine launches | our engine (host LN/attention, before) | **our engine (all ops on device)** | Vitis AI EP (bf16) | Hexagon HTP V69 (fp16) |
+|---|---|---|---|---|---|
+| 1 | 1 | 1.8 (4 launches) | **0.58** | 2.35 | 0.23 |
+| 2 | 1 | 3.7 (7) | **0.76** | 4.25 | 0.31 |
+| 4 | 1 | 9.0 (13) | **1.56** | 7.75 | 0.45 |
+| 6 | 1 | 15.9 (19) | **2.08** | 11.3 | 0.61 |
+
+Accuracy of the int8 power-of-two graph (activations uint8, per-tensor weights, no calibration tuning, 8-bit
+softmax/LayerNorm statistics) against the fp32 graph with the same weights: token cosine 0.998 / 0.994 / 0.989 /
+0.980 for 1 / 2 / 4 / 6 layers; Vitis AI's bf16 is 0.999 and Hexagon fp16 0.999998.
+
+The real MiniLM-L6 (`scripts/android/llm_tinygrad`, seq 128, hidden 384; ~1.4 GMAC) still cannot run on the engine:
+a channel block's tokens must fit one 512 B core region (<= 64 tokens at the narrowest width, 32 at the 4x FFN
+width). Same weights, encoder body only (embeddings and the mask bias fed in), measured:
+
+| | ms / inference | accuracy vs fp32 |
+|---|---|---|
+| Hexagon HTP fp16 (full graph incl. embeddings + pooling, phone) | **1.92** | cos 0.999998 |
+| Vitis AI EP on XDNA2 (bf16 kernels, 197-node body) | 5.30 | token cos 0.9991 (min 0.9986) |
+| this host's CPU, ORT fp32 | 12.9 | exact |
+| phone CPU, ORT fp32 4 threads (busy phone; README's quiet-phone number was 24.7) | 86 | exact |
+
+Reading it: with every op on the device, the engine is 4-5x faster than Vitis AI on the small encoder and within
+2.5-3.5x of Hexagon, whose per-model cost is a fixed few tenths of a millisecond (fp16 vector/HMX matmuls, one fused
+graph). Remaining engine cost is ~10 us per job (143 jobs for 6 layers) plus one launch, so it scales with depth;
+fewer, wider jobs (fusing the LayerNorm chain into the next conv, a per-head softmax kernel) are the next levers.
+The size limit (tokens per channel block) and int8 accuracy (vs fp16/bf16) are what keep it from MiniLM-scale models.
 
 ### Runtime-shaped kernels (`kernels/fused_bottleneck_rt.cc`, `resnet_body_design.py --rt`)
 

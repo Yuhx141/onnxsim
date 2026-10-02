@@ -188,6 +188,29 @@ def test_eliminate_shape_op_pass_matches_start_end_subrange():
     assert list(numpy_helper.to_array(z_init)) == _X_SHAPE[1:3] == [3, 4]
 
 
+def test_eliminate_shape_op_clamps_start_beyond_rank():
+    model = _model(
+        """
+        g (float[2,3,4] X) => (int64[0] Z)
+        {
+          Z = Shape<start=5>(X)
+        }
+        """,
+        opset=15,
+    )
+    sim_model, check_ok = onnxsim.simplify(
+        model,
+        check_n=3,
+        skipped_optimizers=isolate("eliminate_shape_op"),
+        skip_constant_folding=True,
+    )
+    assert check_ok
+    assert not sim_model.graph.node
+    out_name = sim_model.graph.output[0].name
+    z_init = next(i for i in sim_model.graph.initializer if i.name == out_name)
+    assert list(numpy_helper.to_array(z_init)) == []
+
+
 def test_eliminate_shape_op_declines_when_x_rank_is_unresolvable():
     # X is itself Squeeze(Y, axes) where axes comes from an Add of two
     # initializers rather than being a constant (or Constant node) itself --

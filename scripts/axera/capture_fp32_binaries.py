@@ -51,7 +51,7 @@ def _shape_map(model: onnx.ModelProto) -> dict[str, tuple[int, ...]]:
     return shapes
 
 
-def required_signatures() -> list[dict]:
+def required_signatures(nodes: tuple[str, ...] = ()) -> list[dict]:
     model = step_runner.load_step()
     records = step_runner.load_records()
     calib = step_runner.axb.load_calibration(step_runner.STEP_CALIB)
@@ -79,6 +79,39 @@ def required_signatures() -> list[dict]:
         }
         key = signature_key(item)
         signatures.setdefault(key, item)["source_nodes"].append(node.name)
+    if nodes:
+        graph_nodes = {node.name: node for node in model.graph.node}
+        for node_name in nodes:
+            node = graph_nodes.get(node_name)
+            record = records_by_name.get(node_name)
+            if (
+                node is None
+                or record is None
+                or node.op_type not in ("Add", "Sub", "Mul", "Div")
+                or len(record.get("inputs", ())) != 2
+                or len(node.output) != 1
+            ):
+                raise ValueError(f"{node_name} is not a supported binary step node")
+            item = {
+                "op": node.op_type,
+                "input_shapes": [list(shapes[name]) for name in record["inputs"]],
+                "output_shape": list(shapes[node.output[0]]),
+                "source_nodes": [node_name],
+                "prefer_fp32_nodes": [node_name],
+            }
+            item["template_input_shapes"] = [
+                shape if shape else [1] for shape in item["input_shapes"]
+            ]
+            key = signature_key(item)
+            if key in signatures:
+                signatures[key]["source_nodes"] = sorted(
+                    set(signatures[key]["source_nodes"] + [node_name])
+                )
+                signatures[key]["prefer_fp32_nodes"] = sorted(
+                    {*signatures[key].get("prefer_fp32_nodes", ()), node_name}
+                )
+            else:
+                signatures[key] = item
     return sorted(signatures.values(), key=signature_key)
 
 
@@ -86,6 +119,26 @@ def signature_key(item: Mapping) -> str:
     return json.dumps(
         [item["op"], item["input_shapes"], item["output_shape"]],
         separators=(",", ":"),
+    )
+
+
+def merge_entry(previous: Mapping | None, current: Mapping) -> dict:
+    """Keep all node associations when a signature is captured again."""
+    merged = dict(current)
+    for field in ("source_nodes", "prefer_fp32_nodes"):
+        values = set((previous or {}).get(field, ())) | set(current.get(field, ()))
+        if values:
+            merged[field] = sorted(values)
+        else:
+            merged.pop(field, None)
+    return merged
+
+
+def template_input_shapes(item: Mapping) -> list[list[int]]:
+    """Use a length-one input for scalar operands (Pulsar2 rejects rank zero)."""
+    return item.get(
+        "template_input_shapes",
+        [shape if shape else [1] for shape in item["input_shapes"]],
     )
 
 
@@ -100,7 +153,7 @@ def _write_model(item: Mapping, work: str) -> None:
     os.makedirs(os.path.join(work, "config"), exist_ok=True)
     inputs = [
         helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
-        for name, shape in zip(("x", "z"), item["input_shapes"])
+        for name, shape in zip(("x", "z"), template_input_shapes(item))
     ]
     output = helper.make_tensor_value_info("y", TensorProto.FLOAT, item["output_shape"])
     graph = helper.make_graph(
@@ -114,7 +167,7 @@ def _write_model(item: Mapping, work: str) -> None:
     onnx.save(model, os.path.join(work, "binary.onnx"))
 
     input_configs = []
-    for name, shape in zip(("x", "z"), item["input_shapes"]):
+    for name, shape in zip(("x", "z"), template_input_shapes(item)):
         sample = os.path.join(work, f"{name}.npy")
         # FP32 overrides do not depend on calibration statistics. A one-sample
         # zero tensor avoids allocating a second copy of the largest state
@@ -149,7 +202,10 @@ def _write_model(item: Mapping, work: str) -> None:
 
 def _inputs(item: Mapping, seed: int) -> list[np.ndarray]:
     rng = np.random.default_rng(seed)
-    xs = [rng.normal(size=shape).astype(np.float32) for shape in item["input_shapes"]]
+    xs = [
+        rng.normal(size=shape).astype(np.float32)
+        for shape in template_input_shapes(item)
+    ]
     if item["op"] == "Div":
         xs[1] = np.abs(xs[1]) + np.float32(0.5)
     return xs
@@ -193,7 +249,7 @@ def capture_and_profile(item: dict, destination: str, runs: int) -> dict:
                     raise ValueError("capture IO is not binary")
                 if any(spec.dtype != np.float32 for spec in (*model.inputs, *model.outputs)):
                     raise ValueError("Pulsar2 did not preserve FP32 IO")
-                if [list(s.shape) for s in model.inputs] != item["input_shapes"]:
+                if [list(s.shape) for s in model.inputs] != template_input_shapes(item):
                     raise ValueError(f"captured input shapes changed: {model.inputs}")
                 if list(model.outputs[0].shape) != item["output_shape"]:
                     raise ValueError(f"captured output shape changed: {model.outputs}")
@@ -250,6 +306,11 @@ def main(argv=None) -> int:
     parser.add_argument("--runs", type=int, default=30, help="device profile repetitions per template")
     parser.add_argument("--limit", type=int, default=0, help="capture only the first N signatures")
     parser.add_argument(
+        "--nodes",
+        default="",
+        help="also capture named step binaries, even when covered by another emitter",
+    )
+    parser.add_argument(
         "--refresh", action="store_true",
         help="recapture and reprofile every signature already in the index",
     )
@@ -258,7 +319,7 @@ def main(argv=None) -> int:
     if args.runs < 1:
         parser.error("--runs must be positive")
     os.makedirs(FIXTURE_DIR, exist_ok=True)
-    items = required_signatures()
+    items = required_signatures(tuple(filter(None, args.nodes.split(","))))
     if args.limit:
         items = items[: args.limit]
     requested = len(items)
@@ -288,7 +349,7 @@ def main(argv=None) -> int:
             failures += 1
             print(f"  FAILED: {type(exc).__name__}: {exc}", flush=True)
             continue
-        entries[key] = entry
+        entries[key] = merge_entry(entries.get(key), entry)
         index = {"schema_version": 1, "templates": sorted(entries.values(), key=signature_key)}
         with open(args.output, "w", encoding="utf-8") as stream:
             json.dump(index, stream, indent=2)

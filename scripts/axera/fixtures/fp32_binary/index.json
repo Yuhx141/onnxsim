@@ -2,6 +2,553 @@
   "schema_version": 1,
   "templates": [
     {
+      "op": "Add",
+      "input_shapes": [
+        [
+          1000,
+          512
+        ],
+        [
+          1000,
+          512
+        ]
+      ],
+      "output_shape": [
+        1000,
+        512
+      ],
+      "source_nodes": [
+        "Add_758"
+      ],
+      "prefer_fp32_nodes": [
+        "Add_758"
+      ],
+      "file": "add_1000x512_7db371cdb57f.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 7,
+      "device_exec_us": {
+        "mean": 642.0,
+        "median": 645,
+        "p95": 668.3
+      },
+      "host_roundtrip_ms": {
+        "mean": 17.82706772376384,
+        "median": 17.702181939966977,
+        "p95": 18.68433359777555
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          1000
+        ],
+        [
+          1000
+        ]
+      ],
+      "output_shape": [
+        1000
+      ],
+      "source_nodes": [
+        "Add_772"
+      ],
+      "prefer_fp32_nodes": [
+        "Add_772"
+      ],
+      "file": "add_1000_f3124fbdbac6.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 284.4,
+        "median": 283.0,
+        "p95": 311.19999999999993
+      },
+      "host_roundtrip_ms": {
+        "mean": 1.9954027025960386,
+        "median": 1.986139512155205,
+        "p95": 2.1710128465201706
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          128,
+          128,
+          3,
+          3
+        ],
+        [
+          128,
+          128,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        128,
+        128,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Add_590"
+      ],
+      "prefer_fp32_nodes": [
+        "Add_590"
+      ],
+      "file": "add_128x128x3x3_f26a257e13ef.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 27,
+      "device_exec_us": {
+        "mean": 587.9629629629629,
+        "median": 578,
+        "p95": 662.6999999999999
+      },
+      "host_roundtrip_ms": {
+        "mean": 6.321045173401082,
+        "median": 6.327037001028657,
+        "p95": 6.600699224509299
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          128,
+          64,
+          3,
+          3
+        ],
+        [
+          128,
+          64,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        128,
+        64,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Add_562"
+      ],
+      "prefer_fp32_nodes": [
+        "Add_562"
+      ],
+      "file": "add_128x64x3x3_38823c8a7f33.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 430.53333333333336,
+        "median": 433.0,
+        "p95": 442.75
+      },
+      "host_roundtrip_ms": {
+        "mean": 4.366438769890617,
+        "median": 4.205887496937066,
+        "p95": 4.8526724393013865
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          128
+        ],
+        [
+          128
+        ]
+      ],
+      "output_shape": [
+        128
+      ],
+      "source_nodes": [
+        "Add_895"
+      ],
+      "prefer_fp32_nodes": [
+        "Add_895"
+      ],
+      "file": "add_128_f29c94c1f411.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 288.4,
+        "median": 288.0,
+        "p95": 315.65
+      },
+      "host_roundtrip_ms": {
+        "mean": 1.8528685633403559,
+        "median": 1.719867519568652,
+        "p95": 2.1886684058699757
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          16,
+          128,
+          28,
+          28
+        ],
+        [
+          16,
+          128,
+          28,
+          28
+        ]
+      ],
+      "output_shape": [
+        16,
+        128,
+        28,
+        28
+      ],
+      "source_nodes": [
+        "resnetv15_stage2__plus0",
+        "resnetv15_stage2__plus1"
+      ],
+      "prefer_fp32_nodes": [
+        "resnetv15_stage2__plus0",
+        "resnetv15_stage2__plus1"
+      ],
+      "file": "add_16x128x28x28_a4d776667f41.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 1519.0,
+        "median": 1512,
+        "p95": 1586.4
+      },
+      "host_roundtrip_ms": {
+        "mean": 55.23353356402367,
+        "median": 54.82201790437102,
+        "p95": 57.07640333566815
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          16,
+          256,
+          14,
+          14
+        ],
+        [
+          16,
+          256,
+          14,
+          14
+        ]
+      ],
+      "output_shape": [
+        16,
+        256,
+        14,
+        14
+      ],
+      "source_nodes": [
+        "resnetv15_stage3__plus1"
+      ],
+      "prefer_fp32_nodes": [
+        "resnetv15_stage3__plus1"
+      ],
+      "file": "add_16x256x14x14_5ab2ee2cbfe4.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 1082.4,
+        "median": 1086,
+        "p95": 1155.2
+      },
+      "host_roundtrip_ms": {
+        "mean": 27.9654024168849,
+        "median": 27.992486022412777,
+        "p95": 28.621154627762735
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          16,
+          512,
+          7,
+          7
+        ],
+        [
+          16,
+          512,
+          7,
+          7
+        ]
+      ],
+      "output_shape": [
+        16,
+        512,
+        7,
+        7
+      ],
+      "source_nodes": [
+        "resnetv15_stage4__plus0",
+        "resnetv15_stage4__plus1"
+      ],
+      "prefer_fp32_nodes": [
+        "resnetv15_stage4__plus0",
+        "resnetv15_stage4__plus1"
+      ],
+      "file": "add_16x512x7x7_496880912df3.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 9,
+      "device_exec_us": {
+        "mean": 848.8888888888889,
+        "median": 847,
+        "p95": 914.1999999999999
+      },
+      "host_roundtrip_ms": {
+        "mean": 15.573324247573813,
+        "median": 15.104509075172246,
+        "p95": 17.894247034564614
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          16,
+          64,
+          56,
+          56
+        ],
+        [
+          16,
+          64,
+          56,
+          56
+        ]
+      ],
+      "output_shape": [
+        16,
+        64,
+        56,
+        56
+      ],
+      "source_nodes": [
+        "resnetv15_stage1__plus0",
+        "resnetv15_stage1__plus1"
+      ],
+      "prefer_fp32_nodes": [
+        "resnetv15_stage1__plus0",
+        "resnetv15_stage1__plus1"
+      ],
+      "file": "add_16x64x56x56_e01c3d4fc6a3.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 2246.2,
+        "median": 2259,
+        "p95": 2302.8
+      },
+      "host_roundtrip_ms": {
+        "mean": 107.9198484076187,
+        "median": 107.64038795605302,
+        "p95": 109.10638642963022
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          256
+        ],
+        [
+          256
+        ]
+      ],
+      "output_shape": [
+        256
+      ],
+      "source_nodes": [
+        "Add_976"
+      ],
+      "prefer_fp32_nodes": [
+        "Add_976"
+      ],
+      "file": "add_256_b47afd1bd509.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 295.06666666666666,
+        "median": 295.5,
+        "p95": 313.29999999999995
+      },
+      "host_roundtrip_ms": {
+        "mean": 2.046629743805776,
+        "median": 2.0578369731083512,
+        "p95": 2.220993966329843
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          512,
+          256,
+          3,
+          3
+        ],
+        [
+          512,
+          256,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        512,
+        256,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Add_702"
+      ],
+      "prefer_fp32_nodes": [
+        "Add_702"
+      ],
+      "file": "add_512x256x3x3_4a79af25a999.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 2786.4,
+        "median": 2769,
+        "p95": 2866.0
+      },
+      "host_roundtrip_ms": {
+        "mean": 43.23685800191015,
+        "median": 43.074341025203466,
+        "p95": 44.56735721323639
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          512,
+          512,
+          3,
+          3
+        ],
+        [
+          512,
+          512,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        512,
+        512,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Add_730"
+      ],
+      "template_input_shapes": [
+        [
+          512,
+          512,
+          3,
+          3
+        ],
+        [
+          512,
+          512,
+          3,
+          3
+        ]
+      ],
+      "file": "add_512x512x3x3_7bed101078b2.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 5257.8,
+        "median": 5329,
+        "p95": 5388.2
+      },
+      "host_roundtrip_ms": {
+        "mean": 82.5643413932994,
+        "median": 82.01012201607227,
+        "p95": 84.41566897090524
+      }
+    },
+    {
+      "op": "Add",
+      "input_shapes": [
+        [
+          512
+        ],
+        [
+          512
+        ]
+      ],
+      "output_shape": [
+        512
+      ],
+      "source_nodes": [
+        "Add_1043"
+      ],
+      "prefer_fp32_nodes": [
+        "Add_1043"
+      ],
+      "file": "add_512_9881cbf06494.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 273.1666666666667,
+        "median": 275.5,
+        "p95": 291.75
+      },
+      "host_roundtrip_ms": {
+        "mean": 1.9675366619291406,
+        "median": 1.8220640486106277,
+        "p95": 2.6561299862805736
+      }
+    },
+    {
       "op": "Div",
       "input_shapes": [
         [
@@ -2126,6 +2673,593 @@
         "mean": 1.8342561088502407,
         "median": 1.718968036584556,
         "p95": 2.297989925136789
+      }
+    },
+    {
+      "op": "Mul",
+      "input_shapes": [
+        [],
+        [
+          512,
+          256,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        512,
+        256,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Mul_703",
+        "Mul_705"
+      ],
+      "prefer_fp32_nodes": [
+        "Mul_703"
+      ],
+      "template_input_shapes": [
+        [
+          1
+        ],
+        [
+          512,
+          256,
+          3,
+          3
+        ]
+      ],
+      "file": "mul_512x256x3x3_7a874cf12681.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 1931.4,
+        "median": 1931,
+        "p95": 1946.8
+      },
+      "host_roundtrip_ms": {
+        "mean": 28.137011802755296,
+        "median": 27.843412943184376,
+        "p95": 29.21788825187832
+      }
+    },
+    {
+      "op": "Mul",
+      "input_shapes": [
+        [],
+        [
+          512,
+          512,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        512,
+        512,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Mul_715"
+      ],
+      "prefer_fp32_nodes": [
+        "Mul_715"
+      ],
+      "template_input_shapes": [
+        [
+          1
+        ],
+        [
+          512,
+          512,
+          3,
+          3
+        ]
+      ],
+      "file": "mul_512x512x3x3_64a32de30876.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 3674.8,
+        "median": 3651,
+        "p95": 3751.2
+      },
+      "host_roundtrip_ms": {
+        "mean": 52.541503589600325,
+        "median": 52.96653194818646,
+        "p95": 54.09330620896071
+      }
+    },
+    {
+      "op": "Mul",
+      "input_shapes": [
+        [],
+        [
+          512
+        ]
+      ],
+      "output_shape": [
+        512
+      ],
+      "source_nodes": [
+        "Mul_989"
+      ],
+      "prefer_fp32_nodes": [
+        "Mul_989"
+      ],
+      "template_input_shapes": [
+        [
+          1
+        ],
+        [
+          512
+        ]
+      ],
+      "file": "mul_512_80b26d54c20f.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 290.03333333333336,
+        "median": 278.5,
+        "p95": 306.75
+      },
+      "host_roundtrip_ms": {
+        "mean": 1.8440490239299834,
+        "median": 1.789206056855619,
+        "p95": 2.151122118812054
+      }
+    },
+    {
+      "op": "Mul",
+      "input_shapes": [
+        [],
+        [
+          64,
+          3,
+          7,
+          7
+        ]
+      ],
+      "output_shape": [
+        64,
+        3,
+        7,
+        7
+      ],
+      "source_nodes": [
+        "Mul_477"
+      ],
+      "prefer_fp32_nodes": [
+        "Mul_477"
+      ],
+      "template_input_shapes": [
+        [
+          1
+        ],
+        [
+          64,
+          3,
+          7,
+          7
+        ]
+      ],
+      "file": "mul_64x3x7x7_59466e578dce.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 274.56666666666666,
+        "median": 264.5,
+        "p95": 296.1
+      },
+      "host_roundtrip_ms": {
+        "mean": 2.0255122954646745,
+        "median": 1.8302789540030062,
+        "p95": 3.41385449282825
+      }
+    },
+    {
+      "op": "Mul",
+      "input_shapes": [
+        [],
+        [
+          64
+        ]
+      ],
+      "output_shape": [
+        64
+      ],
+      "source_nodes": [
+        "Mul_785"
+      ],
+      "prefer_fp32_nodes": [
+        "Mul_785"
+      ],
+      "template_input_shapes": [
+        [
+          1
+        ],
+        [
+          64
+        ]
+      ],
+      "file": "mul_64_f45740a9b356.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 272.23333333333335,
+        "median": 271.0,
+        "p95": 287.2
+      },
+      "host_roundtrip_ms": {
+        "mean": 1.8782970029860735,
+        "median": 1.7687674844637513,
+        "p95": 2.151837048586457
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          1000,
+          512
+        ],
+        [
+          1000,
+          512
+        ]
+      ],
+      "output_shape": [
+        1000,
+        512
+      ],
+      "source_nodes": [
+        "Sub_769"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_769"
+      ],
+      "file": "sub_1000x512_0313b0e5e3a1.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 7,
+      "device_exec_us": {
+        "mean": 678.0,
+        "median": 684,
+        "p95": 736.1999999999999
+      },
+      "host_roundtrip_ms": {
+        "mean": 17.364447587169707,
+        "median": 17.230659956112504,
+        "p95": 17.890752060338855
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          1000
+        ],
+        [
+          1000
+        ]
+      ],
+      "output_shape": [
+        1000
+      ],
+      "source_nodes": [
+        "Sub_783"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_783"
+      ],
+      "file": "sub_1000_ab4a757f2758.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 289.8666666666667,
+        "median": 288.5,
+        "p95": 312.29999999999995
+      },
+      "host_roundtrip_ms": {
+        "mean": 2.020874475905051,
+        "median": 1.9040965125896037,
+        "p95": 2.615045761922372
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          128,
+          128,
+          3,
+          3
+        ],
+        [
+          128,
+          128,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        128,
+        128,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Sub_601"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_601"
+      ],
+      "file": "sub_128x128x3x3_90f5315e2378.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 27,
+      "device_exec_us": {
+        "mean": 583.0,
+        "median": 576,
+        "p95": 612.3
+      },
+      "host_roundtrip_ms": {
+        "mean": 6.459569709409994,
+        "median": 6.454730988480151,
+        "p95": 6.752273614984006
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          128,
+          64,
+          3,
+          3
+        ],
+        [
+          128,
+          64,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        128,
+        64,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Sub_573"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_573"
+      ],
+      "file": "sub_128x64x3x3_b02135fd1d9d.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 446.8,
+        "median": 447.5,
+        "p95": 476.95
+      },
+      "host_roundtrip_ms": {
+        "mean": 4.321451225162794,
+        "median": 4.334251512773335,
+        "p95": 4.669416986871511
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          128
+        ],
+        [
+          128
+        ]
+      ],
+      "output_shape": [
+        128
+      ],
+      "source_nodes": [
+        "Sub_906"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_906"
+      ],
+      "file": "sub_128_eee58f61c263.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 284.06666666666666,
+        "median": 279.0,
+        "p95": 299.2
+      },
+      "host_roundtrip_ms": {
+        "mean": 1.8226228072308004,
+        "median": 1.7793599981814623,
+        "p95": 2.0474590186495334
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          256
+        ],
+        [
+          256
+        ]
+      ],
+      "output_shape": [
+        256
+      ],
+      "source_nodes": [
+        "Sub_987"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_987"
+      ],
+      "file": "sub_256_d0f64a7a17ea.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 288.53333333333336,
+        "median": 286.0,
+        "p95": 304.9
+      },
+      "host_roundtrip_ms": {
+        "mean": 1.8838922415549557,
+        "median": 1.8285390106029809,
+        "p95": 2.2156383434776212
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          512,
+          256,
+          3,
+          3
+        ],
+        [
+          512,
+          256,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        512,
+        256,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Sub_713"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_713"
+      ],
+      "file": "sub_512x256x3x3_ea93f5299202.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 2812.8,
+        "median": 2806,
+        "p95": 2873.4
+      },
+      "host_roundtrip_ms": {
+        "mean": 41.43628356978297,
+        "median": 41.539607918821275,
+        "p95": 42.055724398233
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          512,
+          512,
+          3,
+          3
+        ],
+        [
+          512,
+          512,
+          3,
+          3
+        ]
+      ],
+      "output_shape": [
+        512,
+        512,
+        3,
+        3
+      ],
+      "source_nodes": [
+        "Sub_755"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_755"
+      ],
+      "file": "sub_512x512x3x3_3de2f9e272e0.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 5,
+      "device_exec_us": {
+        "mean": 5528.4,
+        "median": 5500,
+        "p95": 5839.0
+      },
+      "host_roundtrip_ms": {
+        "mean": 86.20297701563686,
+        "median": 86.9753600563854,
+        "p95": 87.3524752445519
+      }
+    },
+    {
+      "op": "Sub",
+      "input_shapes": [
+        [
+          512
+        ],
+        [
+          512
+        ]
+      ],
+      "output_shape": [
+        512
+      ],
+      "source_nodes": [
+        "Sub_1054"
+      ],
+      "prefer_fp32_nodes": [
+        "Sub_1054"
+      ],
+      "file": "sub_512_4480885d27a7.axmodel.gz",
+      "validated": true,
+      "max_abs_error": 0.0,
+      "warmup_runs": 3,
+      "profile_runs": 30,
+      "device_exec_us": {
+        "mean": 280.3,
+        "median": 274.5,
+        "p95": 322.0499999999999
+      },
+      "host_roundtrip_ms": {
+        "mean": 1.6932713527542849,
+        "median": 1.6404885100200772,
+        "p95": 2.10322187631391
       }
     }
   ]
