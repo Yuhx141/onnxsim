@@ -227,8 +227,10 @@ names and preset *meanings*, not copied.
   ``r_config_path``; R2-R4 do not exist, as in Quark's ONNX flow -- its
   ``transform`` has them as TODO). The R1 weights are bit-identical to
   Quark's for the same matrix, and the power-of-two Hadamard matrix is the
-  same; for other sizes Quark tabulates Hadamard matrices (12, 20, 28, ...
-  times a power of two) where onnxsim uses a random orthogonal one. An
+  same, and so are the tabulated Hadamard matrices Quark uses for sizes 12, 20,
+  28, 36, 40, 52, 60, 108, 140, 156, 172 times a power of two
+  (:mod:`onnxsim.quark_hadamard`; any other size raises the same error as
+  Quark). ``UseRandomHad`` draws its row signs from numpy, not torch's RNG. An
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
 - ``MATMUL_NBITS`` (``UseMatMulNBits``): weight-only 4-bit quantization to
@@ -1304,15 +1306,29 @@ class ModelQuantizer:
                 "QuarotConfig.r_config_path is required (a JSON file with "
                 '"R1_pairs": [{"prev_nodes", "next_nodes", "norm_node"}, ...])'
             )
-        self._approx(
-            "Quarot: only the R1 (residual-stream) rotation is applied; the matrix "
-            "is a (random) Hadamard for power-of-two sizes, else random orthogonal"
-        )
+        dim = p.get("r_matrix_dim", 4096)
+        use_random_had = bool(p.get("use_random_had", False))
+        from onnxsim.quark_hadamard import hadamard_factor
+
+        try:
+            hadamard_factor(dim)
+        except ValueError as e:
+            # Quark's `apply_QuaRot` wraps the failure like this.
+            raise AssertionError(
+                f"Error! The dim of the target R1 matrix is not support due to {e}."
+            ) from e
+        if use_random_had:
+            self._approx(
+                "Quarot: only the R1 (residual-stream) rotation is applied; the "
+                "random-Hadamard row signs come from a numpy seed, not torch's RNG"
+            )
+        else:
+            self._approx("Quarot: only the R1 (residual-stream) rotation is applied")
         return rotate_model(
             model,
             p["r_config_path"],
-            r_matrix_dim=p.get("r_matrix_dim", 4096),
-            use_random_had=bool(p.get("use_random_had", False)),
+            r_matrix_dim=dim,
+            use_random_had=use_random_had,
         )
 
     def _finetune(

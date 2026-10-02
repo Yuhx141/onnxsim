@@ -51,25 +51,37 @@ import onnx
 from onnx import numpy_helper
 
 
-def make_rotation(dim: int, random_hadamard: bool = False, seed: int = 0) -> np.ndarray:
-    """An orthogonal ``[dim, dim]`` float64 matrix.
+def make_rotation(
+    dim: int,
+    random_hadamard: bool = False,
+    seed: int = 0,
+    signs: Optional[np.ndarray] = None,
+    orthogonal_fallback: bool = False,
+) -> np.ndarray:
+    """An orthogonal ``[dim, dim]`` float64 matrix, Quark's R1 matrix.
 
-    Power-of-two ``dim``: the normalized Sylvester Hadamard matrix, times a
-    random +-1 diagonal when ``random_hadamard`` (a "random Hadamard"). Any
-    other ``dim``: the Q of a seeded Gaussian's QR decomposition (Haar-random
-    orthogonal).
+    Exactly Quark's: the normalized Hadamard matrix of :mod:`onnxsim.quark_hadamard`
+    (Sylvester for a power of two, else ``kron(H_K, H_{dim/K})`` with the
+    tabulated ``H_K`` for ``K`` in 12, 20, 28, 36, 40, 52, 60, 108, 140, 156,
+    172). With ``random_hadamard`` its rows are multiplied by a random +-1
+    vector (a "random Hadamard"): ``signs`` when given (the ``dim`` signs
+    Quark draws with ``torch.randint``, which numpy cannot reproduce), else a
+    seeded one. A ``dim`` without a Hadamard matrix raises ``ValueError`` as in
+    Quark, unless ``orthogonal_fallback``: then the Q of a seeded Gaussian's QR
+    decomposition (Haar-random orthogonal, not a Quark matrix).
     """
+    from onnxsim.quark_hadamard import hadamard_rotation, supports
+
     if dim < 1:
         raise ValueError("dim must be >= 1")
     rng = np.random.default_rng(seed)
-    if dim & (dim - 1) == 0:
-        h = np.ones((1, 1))
-        while h.shape[0] < dim:
-            h = np.block([[h, h], [h, -h]])
-        h = h / np.sqrt(dim)
-        if random_hadamard:
-            h = h * rng.choice([-1.0, 1.0], size=dim)[None, :]
-        return h
+    if supports(dim):
+        if random_hadamard and signs is None:
+            signs = rng.choice([-1.0, 1.0], size=dim)
+        return hadamard_rotation(dim, signs if random_hadamard else None)
+    if not orthogonal_fallback:
+        # same message as Quark's `Could not find an Hadamard matrix ...`
+        hadamard_rotation(dim)
     q, r = np.linalg.qr(rng.standard_normal((dim, dim)))
     return q * np.sign(np.diag(r))[None, :]
 
@@ -166,11 +178,17 @@ class _Rotator:
             raise ValueError(
                 f"{node.name!r}: input dimension {w.shape[in_axis]} != rotation size {self.d}"
             )
-        # in_axis == -2: W [.., in, out] -> R^T W ;  in_axis == -1: W [out, in] -> W R
-        w2 = self.r.T @ w if in_axis == -2 else w @ self.r
+        # in_axis == -2: W [.., in, out] -> R^T W ;  in_axis == -1: W [out, in] -> W R.
+        # The products are evaluated on the same operand layouts as Quark's (the
+        # [in, out] case through a transposed view), so the float64 sums run in
+        # the same BLAS order and round to the same float32 weights.
+        if in_axis == -2:
+            w2 = np.swapaxes(np.matmul(np.swapaxes(w, -1, -2), self.r), -1, -2)
+        else:
+            w2 = np.matmul(w, self.r)
         self.put(self.weight_name(node), w2)
 
-    def rotate_writer(self, node: onnx.NodeProto) -> None:
+    def rotate_writer(self, node: onnx.NodeProto, direct: bool = False) -> None:
         if node.name in self.writers_done:
             raise ValueError(
                 f"{node.name!r} is a prev_node of more than one pair (it would be rotated twice)"
@@ -184,12 +202,19 @@ class _Rotator:
                 f"{node.name!r}: output dimension {w.shape[out_axis]} != rotation size {self.d}"
             )
         # out_axis == -1: W [.., in, out] -> W R ;  out_axis == -2: W [out, in] -> R^T W
-        self.put(wname, w @ self.r if out_axis == -1 else self.r.T @ w)
+        if out_axis == -1 and direct:
+            # Quark rotates the first pair's embedding table as W @ R, untransposed
+            w2 = np.matmul(w, self.r)
+        elif out_axis == -1:
+            w2 = np.swapaxes(np.matmul(self.r.T, np.swapaxes(w, -1, -2)), -1, -2)
+        else:
+            w2 = np.matmul(self.r.T, w)
+        self.put(wname, w2)
         b = self.bias_name(node)
         if b is not None:
             bias = self.get(b)
             if bias.shape[-1] == self.d:
-                self.put(b, bias @ self.r)
+                self.put(b, np.matmul(self.r.T, bias))
 
     def fold_norm(self, norm: onnx.NodeProto, nexts: List[onnx.NodeProto]) -> None:
         vecs = self._float_inits(norm, 1)
@@ -226,7 +251,7 @@ class _Rotator:
 
     def run(self, pairs: List[Dict[str, Any]]) -> onnx.ModelProto:
         readers_seen: set = set()
-        for pair in pairs:
+        for pair_idx, pair in enumerate(pairs):
             prevs = [self.node(n) for n in pair.get("prev_nodes", [])]
             nexts = [self.node(n) for n in pair.get("next_nodes", [])]
             for n in nexts:
@@ -235,8 +260,9 @@ class _Rotator:
                 readers_seen.add(n.name)
             if pair.get("norm_node"):
                 self.fold_norm(self.node(pair["norm_node"]), nexts)
-            for n in prevs:
-                self.rotate_writer(n)
+            for node_idx, n in enumerate(prevs):
+                first_gather = pair_idx == 0 and node_idx == 0 and n.op_type == "Gather"
+                self.rotate_writer(n, direct=first_gather)
             for n in nexts:
                 self.rotate_reader(n)
         return self.m
