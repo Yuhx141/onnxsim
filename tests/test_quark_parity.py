@@ -62,6 +62,13 @@ _HALF = ["FP16", "BF16"]
 # -- helpers ---------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _run_in_tmp_dir(tmp_path, monkeypatch):
+    """Quark's fine-tuning presets and ``quantized_info.csv`` write scratch files
+    into the current directory; keep them out of the checkout."""
+    monkeypatch.chdir(tmp_path)
+
+
 def _reader(shape, n=4, seed=3, name="x"):
     from onnxruntime.quantization import CalibrationDataReader
 
