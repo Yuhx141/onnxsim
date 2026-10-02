@@ -438,9 +438,9 @@ def _conv_model():
         <ir_version: 10, opset_import: ["": 17]>
         agraph (float[1,3,8,8] x) => (float[1,4,8,8] y)
         {
-            h = Conv<pads=[1,1,1,1]>(x, w1, b1)
+            h = Conv<group=1, pads=[1,1,1,1]>(x, w1, b1)
             r = Relu(h)
-            y = Conv<pads=[1,1,1,1]>(r, w2, b2)
+            y = Conv<group=1, pads=[1,1,1,1]>(r, w2, b2)
         }
         """
     )
@@ -468,13 +468,35 @@ def _batches(shape, n=4):
     return [{"x": rng.standard_normal(shape).astype(np.float32)} for _ in range(n)]
 
 
-@pytest.mark.parametrize(
-    "algo", [qc.SmoothQuantConfig(alpha=0.5), qc.BiasCorrectionConfig()]
-)
-def test_runnable_algo_changes_the_quantized_model(algo):
+def test_smooth_quant_changes_the_quantized_model():
     batches = _batches((4, 8))
     base = _quantize(_two_layer_model(), [], batches)
-    out = _quantize(_two_layer_model(), [algo], batches)
+    out = _quantize(_two_layer_model(), [qc.SmoothQuantConfig(alpha=0.5)], batches)
+    assert out.SerializeToString() != base.SerializeToString()
+
+
+def test_bias_correction_changes_the_quantized_gemm_biases():
+    # like Quark's, it rewrites the quantized bias of Conv / Gemm layers
+    # (MatMul without a bias is left alone)
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        agraph (float[N,8] x) => (float[N,8] y)
+        {
+            h = Gemm(x, w1, b1)
+            r = Relu(h)
+            y = Gemm(r, w2, b2)
+        }
+        """
+    )
+    rng = np.random.default_rng(1)
+    model.graph.initializer.extend(
+        onnx.numpy_helper.from_array(rng.standard_normal(s).astype(np.float32), n)
+        for n, s in (("w1", (8, 8)), ("b1", (8,)), ("w2", (8, 8)), ("b2", (8,)))
+    )
+    batches = _batches((4, 8))
+    base = _quantize(model, [], batches)
+    out = _quantize(model, [qc.BiasCorrectionConfig()], batches)
     assert out.SerializeToString() != base.SerializeToString()
 
 
@@ -625,21 +647,11 @@ def test_auto_mixprecision_threshold_none_is_sensitivity_only():
 @pytest.mark.parametrize(
     "params, error, match",
     [
-        (
-            {
-                "target_layer_config": {
-                    qc.QLayerConfig(qc.UInt16Spec(), qc.Int8Spec()): []
-                }
-            },
-            NotImplementedError,
-            "single QLayerConfig",
-        ),
-        ({"subgraph_json": "x.json"}, NotImplementedError, "subgraph_json"),
-        (
-            {"sensitivity_cache_file": "c.json"},
-            NotImplementedError,
-            "sensitivity_cache_file",
-        ),
+        ({"target_layer_config": {}}, ValueError, "dict must not be empty"),
+        ({"target_layer_config": []}, ValueError, "list must not be empty"),
+        ({"target_layer_config": "uint16"}, TypeError, "must be a QLayerConfig"),
+        ({"shared_param_mode": "nope"}, ValueError, "shared_param_mode"),
+        ({"subgraph_json": "does-not-exist.json"}, FileNotFoundError, "does-not"),
         (
             {"target_layer_config": qc.QLayerConfig(qc.UInt8Spec(), qc.Int8Spec())},
             ValueError,
@@ -647,7 +659,7 @@ def test_auto_mixprecision_threshold_none_is_sensitivity_only():
         ),
     ],
 )
-def test_auto_mixprecision_unsupported_forms_are_refused(params, error, match):
+def test_auto_mixprecision_invalid_forms_are_refused(params, error, match):
     q = qc.ModelQuantizer(_amp_config(**params))
     with pytest.raises(error, match=match):
         q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
