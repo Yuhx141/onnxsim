@@ -1196,59 +1196,31 @@ def test_fuse_reshape_family_declines_zero_with_inferred_dimension():
 
 
 def test_loop_with_nested_capture_is_not_unrolled():
-    def branch(name):
-        one = onnx.helper.make_tensor("one", onnx.TensorProto.FLOAT, [1], [1.0])
-        return onnx.helper.make_graph(
-            [onnx.helper.make_node("Add", ["v_in", "one"], [f"{name}_out"])],
-            name,
-            [],
-            [
-                onnx.helper.make_tensor_value_info(
-                    f"{name}_out", onnx.TensorProto.FLOAT, [1]
-                )
-            ],
-            [one],
-        )
-
-    body = onnx.helper.make_graph(
-        [
-            onnx.helper.make_node(
-                "If",
-                ["cond_in"],
-                ["v_out"],
-                then_branch=branch("then"),
-                else_branch=branch("else"),
-            )
-        ],
-        "loop_body",
-        [
-            onnx.helper.make_tensor_value_info("iter", onnx.TensorProto.INT64, []),
-            onnx.helper.make_tensor_value_info("cond_in", onnx.TensorProto.BOOL, []),
-            onnx.helper.make_tensor_value_info("v_in", onnx.TensorProto.FLOAT, [1]),
-        ],
-        [
-            onnx.helper.make_tensor_value_info("cond_in", onnx.TensorProto.BOOL, []),
-            onnx.helper.make_tensor_value_info("v_out", onnx.TensorProto.FLOAT, [1]),
-        ],
+    model = _model(
+        """
+        g (float[1] x) => (float[1] y)
+        <int64 trip_count = {2}, bool cond = {1}>
+        {
+          y = Loop<
+            body = loop_body (int64 iter, bool cond_in, float[1] v_in)
+              => (bool cond_in, float[1] v_out) {
+                v_out = If<
+                  then_branch = then_g () => (float[1] then_out)
+                  <float[1] one = {1.0}>
+                  {
+                    then_out = Add(v_in, one)
+                  },
+                  else_branch = else_g () => (float[1] else_out)
+                  <float[1] one = {1.0}>
+                  {
+                    else_out = Add(v_in, one)
+                  }
+                >(cond_in)
+              }
+          >(trip_count, cond, x)
+        }
+        """
     )
-    graph = onnx.helper.make_graph(
-        [
-            onnx.helper.make_node(
-                "Loop", ["trip_count", "cond", "x"], ["y"], body=body
-            )
-        ],
-        "g",
-        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])],
-        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])],
-        [
-            onnx.helper.make_tensor("trip_count", onnx.TensorProto.INT64, [], [2]),
-            onnx.helper.make_tensor("cond", onnx.TensorProto.BOOL, [], [True]),
-        ],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
-    )
-    model.ir_version = 10
     onnx.checker.check_model(model)
     simplified, check_ok = onnxsim.simplify(model)
     assert check_ok
