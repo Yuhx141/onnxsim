@@ -1877,11 +1877,20 @@ class ModelQuantizer:
         if "bias_correction" in by_name:
             from onnxsim.quark_bias_correction import correct_bias_quark
 
+            cm = self._calib_method(act)
             quantized = correct_bias_quark(
                 float_model,
                 quantized,
                 calibration,
-                activation_symmetric=bool(opts.get("ActivationSymmetric", False)),
+                activation_symmetric=bool(opts.get("ActivationSymmetric", act_sym)),
+                method=(
+                    "pof2"
+                    if act.pof2 or cm in ("minmse_pof2", "nonoverflow")
+                    else "minmax"
+                    if cm.startswith(("minmax", "percentile", "onnxsim:percentile"))
+                    else "none"
+                ),
+                quark_scale=not opts.get("BiasCorrectionStoredScale", False),
             )
         return quantized
 
