@@ -208,17 +208,13 @@ def test_minmax_mean_is_the_mean_of_batch_extremes():
     )
 
 
-def test_adaround_runs_for_int8_and_needs_ignore_flag_for_int16():
+@pytest.mark.parametrize("preset", ["INT8", "INT16"])
+def test_adaround_runs_for_int8_and_int16_weights(preset):
     model = _attention_block()
-    cfg = qc.QConfig.get_default_config("INT8_TRANSFORMER_ACCURATE")
+    cfg = qc.QConfig.get_default_config(f"{preset}_TRANSFORMER_ACCURATE")
+    quantizer = qc.ModelQuantizer(cfg)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        q = qc.ModelQuantizer(cfg).quantize_model(
-            model, calibration_data_reader=_Reader(_data())
-        )
+        q = quantizer.quantize_model(model, calibration_data_reader=_Reader(_data()))
     onnx.checker.check_model(q)
-    cfg = qc.QConfig.get_default_config("INT16_TRANSFORMER_ACCURATE")
-    with pytest.raises(NotImplementedError, match="adaround"):
-        qc.ModelQuantizer(cfg).quantize_model(
-            model, calibration_data_reader=_Reader(_data())
-        )
+    assert quantizer.last_weight_rounding["adaround"]
