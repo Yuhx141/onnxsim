@@ -29,31 +29,7 @@ import pytest
 from onnx import parser
 
 import onnxsim
-
-ort = pytest.importorskip("onnxruntime")
-
-
-def _run(model, feeds):
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    options.intra_op_num_threads = 1
-    options.inter_op_num_threads = 1
-    session = ort.InferenceSession(
-        model.SerializeToString(),
-        sess_options=options,
-        providers=["CPUExecutionProvider"],
-    )
-    return session.run(None, feeds)
-
-
-def _assert_ort_equivalent(model, simplified, feeds, *, rtol=1e-5, atol=1e-6):
-    expected = _run(model, feeds)
-    actual = _run(simplified, feeds)
-    assert len(actual) == len(expected)
-    for expected_value, actual_value in zip(expected, actual):
-        np.testing.assert_allclose(
-            actual_value, expected_value, rtol=rtol, atol=atol, equal_nan=True
-        )
+from onnxsim import model_checking
 
 
 def _simplify(model):
@@ -993,7 +969,9 @@ def test_fuse_rope_preserves_public_shared_embedding():
         "k": rng.standard_normal((2, 4, 6, 8)).astype(np.float32),
         "angle": rng.standard_normal((2, 6, 4)).astype(np.float32),
     }
-    _assert_ort_equivalent(model, simplified, feeds)
+    assert model_checking.compare(
+        simplified, model, n_times=1, input_data=feeds, verbose=False
+    )
 
 
 def test_fuse_rope_below_opset_23_untouched():
@@ -1225,8 +1203,12 @@ def test_fuse_reshape_family_declines_zero_with_inferred_dimension():
     assert ops["Unsqueeze"] == 1
     assert ops["Flatten"] == 1
     assert ops["Reshape"] == 0
-    _assert_ort_equivalent(
-        model, simplified, {"X": np.empty((0, 2, 3, 4), dtype=np.float32)}
+    assert model_checking.compare(
+        simplified,
+        model,
+        n_times=1,
+        input_data={"X": np.empty((0, 2, 3, 4), dtype=np.float32)},
+        verbose=False,
     )
 
 
@@ -1261,8 +1243,12 @@ def test_loop_with_nested_capture_is_not_unrolled():
     assert check_ok
     onnx.checker.check_model(simplified)
     assert any(n.op_type == "Loop" for n in simplified.graph.node)
-    _assert_ort_equivalent(
-        model, simplified, {"x": np.array([2.0], dtype=np.float32)}
+    assert model_checking.compare(
+        simplified,
+        model,
+        n_times=1,
+        input_data={"x": np.array([2.0], dtype=np.float32)},
+        verbose=False,
     )
 
 
@@ -1662,7 +1648,9 @@ def test_fuse_gelu_declines_nearby_formula_constant():
     assert ops["Gelu"] == 0
     assert ops["Erf"] == 1
     x = np.random.default_rng(22).standard_normal((4, 8)).astype(np.float32)
-    _assert_ort_equivalent(model, simplified, {"X": x})
+    assert model_checking.compare(
+        simplified, model, n_times=1, input_data={"X": x}, verbose=False
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1768,7 +1756,9 @@ def test_fuse_layer_norm_declines_nearby_exponent():
     ops = collections.Counter(n.op_type for n in simplified.graph.node)
     assert ops["LayerNormalization"] == 0
     x = np.random.default_rng(23).standard_normal((2, 4, 8)).astype(np.float32)
-    _assert_ort_equivalent(model, simplified, {"X": x})
+    assert model_checking.compare(
+        simplified, model, n_times=1, input_data={"X": x}, verbose=False
+    )
 
 
 def test_normalization_fusions_decline_unrepresentable_double_epsilon():
@@ -1817,7 +1807,9 @@ def test_normalization_fusions_decline_unrepresentable_double_epsilon():
         onnx.checker.check_model(simplified)
         assert all(n.op_type != fused_op for n in simplified.graph.node)
         x = np.random.default_rng(24).standard_normal((2, 4, 8))
-        _assert_ort_equivalent(model, simplified, {"X": x})
+        assert model_checking.compare(
+            simplified, model, n_times=1, input_data={"X": x}, verbose=False
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -22,6 +22,7 @@ import pytest
 from onnx import parser
 
 import onnxsim
+from onnxsim import model_checking
 
 # A bare ``import onnxruntime`` would fail collection (not skip the test) on
 # platforms onnxruntime doesn't ship wheels for; the fused output is a
@@ -144,14 +145,8 @@ def _op_counts(model):
 
 
 def _run(model, feeds):
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    options.intra_op_num_threads = 1
-    options.inter_op_num_threads = 1
     sess = ort.InferenceSession(
-        model.SerializeToString(),
-        sess_options=options,
-        providers=["CPUExecutionProvider"],
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
     )
     return sess.run(None, feeds)
 
@@ -217,7 +212,9 @@ def test_fuse_gqa_declines_zero_scale():
     assert ok
     assert _op_counts(simplified)["GroupQueryAttention"] == 0
     x = np.random.default_rng(8).standard_normal((B, S, NH * Dh)).astype(np.float32)
-    _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
+    assert model_checking.compare(
+        simplified, model, n_times=1, input_data={"x": x}, verbose=False
+    )
 
 
 def test_fuse_gqa_declines_without_mask():
@@ -260,7 +257,9 @@ def test_fuse_gqa_declines_finite_causal_penalty():
     assert ok
     assert _op_counts(simplified)["GroupQueryAttention"] == 0
     x = np.random.default_rng(9).standard_normal((B, S, NH * Dh)).astype(np.float32)
-    _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
+    assert model_checking.compare(
+        simplified, model, n_times=1, input_data={"x": x}, verbose=False
+    )
 
 
 def test_fuse_gqa_declines_runtime_mask():
