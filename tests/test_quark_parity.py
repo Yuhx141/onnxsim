@@ -46,12 +46,7 @@ from onnxsim.quark_fakequant_graph import apply_fake_quant_format  # noqa: E402
 
 # Quark presets onnxsim does not implement (NPU CNN/transformer quantizers,
 # MatMulNBits, dynamic/VINT8, mixed block formats, ...).
-KNOWN_MISSING = {
-    "INT16_TRANSFORMER_ACCURATE",
-    "INT16_TRANSFORMER_DEFAULT",
-    "INT8_TRANSFORMER_ACCURATE",
-    "INT8_TRANSFORMER_DEFAULT",
-}
+KNOWN_MISSING: set = set()
 # onnxsim-only presets (Quark has no ADAROUND/ADAQUANT variant for U8U8_AAWA).
 KNOWN_EXTRA = {"U8U8_AAWA_ADAQUANT", "U8U8_AAWA_ADAROUND"}
 # Ops whose single-op graph Quark rewrites before quantizing (ReduceMean ->
@@ -2285,6 +2280,69 @@ def test_vint8_matches_quark(model_name, tmp_path):
     ref = _run(model, x)
     err = float(np.linalg.norm(_run(m, x) - _run(q, x)) / np.linalg.norm(ref))
     assert err < 0.1
+
+
+# -- INT{8,16}_TRANSFORMER_{DEFAULT,ACCURATE}: Quark's NPU transformer quantizer ------
+# (``enable_npu_transformer``): only Gemm and MatMul-with-constant-B nodes are
+# quantized (Q/DQ on their inputs and outputs, int8 / int16 per-tensor weights,
+# int32 biases); every other op -- Softmax, LayerNormalization, Gelu, Add, Mul, a
+# MatMul of two activations -- stays float; a model with no such node comes back
+# unchanged. DEFAULT calibrates with the mean of the per-batch min / max.
+
+_TRANSFORMER_PRESETS = []
+
+
+@pytest.mark.parametrize("model_name", sorted(MIXED_MODELS))
+@pytest.mark.parametrize(
+    "preset", ["INT8_TRANSFORMER_DEFAULT", "INT16_TRANSFORMER_DEFAULT"]
+)
+def test_transformer_default_presets_match_quark_exactly(preset, model_name, tmp_path):
+    """Same Q/DQ placement and graph, the same activation / weight
+    parameters, the same outputs."""
+    _, q, m, shape = _quantize_int_pair(preset, model_name, tmp_path)
+    assert _op_counts(m) == _op_counts(q)
+    q_acts, q_w, _ = _qdq_params(q)
+    m_acts, m_w, _ = _qdq_params(m)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_array_equal([a[1] for a in m_acts], [a[1] for a in q_acts])
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=1e-5
+    )
+    assert [w[1] for w in m_w] == [w[1] for w in q_w]
+    np.testing.assert_allclose([w[0] for w in m_w], [w[0] for w in q_w], rtol=1e-6)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    np.testing.assert_allclose(_run(m, x), _run(q, x), rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("model_name", sorted(MIXED_MODELS))
+@pytest.mark.parametrize(
+    "preset", ["INT8_TRANSFORMER_ACCURATE", "INT16_TRANSFORMER_ACCURATE"]
+)
+def test_transformer_accurate_presets_match_quark_parameters(
+    preset, model_name, tmp_path
+):
+    """Percentile 99.9999 calibration (activation parameters agree up to
+    histogram binning, weight scales exactly) and AdaRound, which only changes
+    weight codes -- and runs for int8 weights only."""
+    model, q, m, shape = _quantize_int_pair(preset, model_name, tmp_path)
+    assert _op_counts(m) == _op_counts(q)
+    q_acts, q_w, _ = _qdq_params(q)
+    m_acts, m_w, _ = _qdq_params(m)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_allclose(
+        [a[1] for a in m_acts], [a[1] for a in q_acts], atol=40 if "16" in preset else 2
+    )
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
+    )
+    np.testing.assert_allclose([w[0] for w in m_w], [w[0] for w in q_w], rtol=1e-6)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    ref = _run(model, x)
+
+    def rel(a):
+        return float(np.linalg.norm(a - ref) / np.linalg.norm(ref))
+
+    assert rel(_run(m, x)) < max(3 * rel(_run(q, x)), 0.05)
 
 
 # =============================================================================
