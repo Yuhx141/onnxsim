@@ -46,9 +46,7 @@ from onnxsim.quark_fakequant_graph import apply_fake_quant_format  # noqa: E402
 
 # Quark presets onnxsim does not implement (NPU CNN/transformer quantizers,
 # MatMulNBits, dynamic/VINT8, mixed block formats, ...).
-KNOWN_MISSING = {
-    "MATMUL_NBITS",
-}
+KNOWN_MISSING: set = set()
 # onnxsim-only presets (Quark has no ADAROUND/ADAQUANT variant for U8U8_AAWA).
 KNOWN_EXTRA = {"U8U8_AAWA_ADAQUANT", "U8U8_AAWA_ADAROUND"}
 # Ops whose single-op graph Quark rewrites before quantizing (ReduceMean ->
@@ -2352,6 +2350,346 @@ def test_transformer_accurate_presets_match_quark_parameters(
         return float(np.linalg.norm(a - ref) / np.linalg.norm(ref))
 
     assert rel(_run(m, x)) < max(3 * rel(_run(q, x)), 0.05)
+
+
+# =============================================================================
+# MATMUL_NBITS: weight-only MatMulNBits (onnxsim.quark_matmul_nbits)
+# =============================================================================
+# Quark (like onnxsim) rewrites constant-weight MatMuls to com.microsoft::
+# MatMulNBits. Quark first runs ONNX Runtime graph optimizations that fuse
+# MatMul + Add into an unquantized Gemm (``SkipPreprocess``); the parity runs set
+# ``SkipPreprocess=True``, which is what onnxsim reproduces.
+
+
+def _nb_model(body, shapes, inputs, seed=0):
+    model = parser.parse_model(
+        f'<ir_version: 9, opset_import: ["": 17]> g ({inputs}) => (float y) '
+        f"{{ {body} }}"
+    )
+    rng = np.random.default_rng(seed)
+    model.graph.initializer.extend(
+        onnx.numpy_helper.from_array(
+            (rng.standard_normal(s) * 0.5).astype(np.float32), n
+        )
+        for n, s in shapes
+    )
+    for i, node in enumerate(model.graph.node):
+        node.name = f"n{i}"
+    return model
+
+
+def _nb_models():
+    return {
+        "mlp": (
+            _nb_model(
+                "h = MatMul(x, w1)\n h2 = Relu(h)\n h3 = MatMul(h2, w2)\n"
+                " h4 = Relu(h3)\n y = MatMul(h4, w3)",
+                [("w1", (64, 96)), ("w2", (96, 64)), ("w3", (64, 8))],
+                "float[3,64] x",
+            ),
+            (3, 64),
+        ),
+        "attention": (
+            _nb_model(
+                "q = MatMul(x, wq)\n k = MatMul(x, wk)\n v = MatMul(x, wv)\n"
+                " kt = Transpose<perm=[1,0]>(k)\n s = MatMul(q, kt)\n"
+                " p = Softmax<axis=-1>(s)\n a = MatMul(p, v)\n"
+                " o = MatMul(a, wo)\n y = Relu(o)",
+                [(n, (48, 48)) for n in ("wq", "wk", "wv", "wo")],
+                "float[6,48] x",
+            ),
+            (6, 48),
+        ),
+        # K and N not multiples of the block size, odd block counts
+        "ragged": (
+            _nb_model(
+                "h = MatMul(x, w1)\n h2 = Relu(h)\n y = MatMul(h2, w2)",
+                [("w1", (100, 130)), ("w2", (130, 20))],
+                "float[3,100] x",
+            ),
+            (3, 100),
+        ),
+        "batched": (
+            _nb_model(
+                "h = MatMul(x, w1)\n h2 = Relu(h)\n y = MatMul(h2, w2)",
+                [("w1", (64, 160)), ("w2", (160, 32))],
+                "float[2,5,64] x",
+            ),
+            (2, 5, 64),
+        ),
+    }
+
+
+_NB_MODELS = _nb_models()
+
+
+def _nb_quark(model, shape, tmp_path, mm=None, gptq=None, algo=None, skip=True):
+    import copy
+
+    from onnxruntime.quantization import CalibrationDataReader
+    from quark.onnx import ModelQuantizer, QConfig
+
+    rng = np.random.default_rng(1)
+    data = [{"x": rng.standard_normal(shape).astype(np.float32)} for _ in range(4)]
+
+    class R(CalibrationDataReader):
+        def __init__(self):
+            self.it = iter(data)
+
+        def get_next(self):
+            return next(self.it, None)
+
+        def __iter__(self):
+            return iter(data)
+
+    src, dst = str(tmp_path / "nb.onnx"), str(tmp_path / "nb_q.onnx")
+    onnx.save(model, src)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        # get_default_config hands out one shared object: never edit it in place
+        cfg = copy.deepcopy(QConfig.get_default_config("MATMUL_NBITS"))
+        g = cfg.global_quant_config
+        g.include_cle = False
+        eo = dict(g.extra_options)
+        eo["SkipPreprocess"] = skip
+        eo["MatMulNBitsParams"] = {**eo["MatMulNBitsParams"], **(mm or {})}
+        if gptq is not None:
+            eo["GPTQParams"] = dict(gptq)
+        g.extra_options = eo
+        if algo:
+            g.algo_config = algo
+        ModelQuantizer(cfg).quantize_model(src, dst, R())
+    return onnx.load(dst), data
+
+
+def _nb_mine(model, mm=None, gptq=None, data=None, algo=None, **opts):
+    cfg = qc.QConfig.get_default_config("MATMUL_NBITS")
+    cfg.extra_options["MatMulNBitsParams"].update(mm or {})
+    cfg.extra_options["SkipPreprocess"] = True
+    cfg.extra_options.update(opts)
+    if gptq is not None:
+        cfg.extra_options["GPTQParams"] = dict(gptq)
+    if algo:
+        cfg.algo_config = algo
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=data
+        )
+
+
+def _nb_nodes(model):
+    return [
+        (n.op_type, n.domain, n.name, tuple(n.input), tuple(n.output), _attrs(n))
+        for n in model.graph.node
+    ]
+
+
+def _nb_inits(model):
+    return {t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer}
+
+
+def _assert_nb_equal(q, m, zero_point_atol=None):
+    """Same nodes / attributes / tensors; ``zero_point_atol`` relaxes float
+    zero points (HQQ) to a tolerance, everything else must be bit-identical."""
+    assert _nb_nodes(m) == _nb_nodes(q)
+    assert ("com.microsoft", 1) in {(o.domain, o.version) for o in m.opset_import}
+    qi, mi = _nb_inits(q), _nb_inits(m)
+    assert set(mi) == set(qi)
+    for name, a in qi.items():
+        b = mi[name]
+        assert (a.shape, a.dtype) == (b.shape, b.dtype), name
+        if zero_point_atol is not None and name.endswith("_zero_points"):
+            np.testing.assert_allclose(b, a, atol=zero_point_atol, err_msg=name)
+        else:
+            np.testing.assert_array_equal(b, a, err_msg=name)
+
+
+def _assert_nb_outputs_equal(q, m, shape):
+    sizes = [
+        _attrs(n)["block_size"] for n in q.graph.node if n.op_type == "MatMulNBits"
+    ]
+    if any(s < 16 or s & (s - 1) for s in sizes):
+        return  # GPTQ's default block is K; MatMulNBits only runs power-of-two blocks
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    np.testing.assert_array_equal(_run(m, x), _run(q, x))
+
+
+def _nb_id(d):
+    return "-".join(f"{k}{v}" for k, v in d.items()) or "defaults"
+
+
+def test_matmul_nbits_preset_registered_like_quark():
+    q = DefaultConfigMapping["MATMUL_NBITS"].extra_options
+    m = qc.QConfig.get_default_config("MATMUL_NBITS").extra_options
+    assert m["UseMatMulNBits"] == q["UseMatMulNBits"]
+    assert m["MatMulNBitsParams"] == q["MatMulNBitsParams"]
+
+
+@pytest.mark.parametrize("model_name", sorted(_NB_MODELS))
+@pytest.mark.parametrize(
+    "mm",
+    [
+        {},
+        {"GroupSize": 32},
+        {"GroupSize": 64, "Symmetric": False},
+        {"GroupSize": 32, "Symmetric": False, "AccuracyLevel": 4},
+        {"GroupSize": 16, "AccuracyLevel": 0},
+    ],
+    ids=_nb_id,
+)
+def test_matmul_nbits_default_matches_quark(model_name, mm, tmp_path):
+    """Identical node placement, attributes, packed weights, scales and zero
+    points, and (so) identical ONNX Runtime outputs."""
+    model, shape = _NB_MODELS[model_name]
+    q, data = _nb_quark(model, shape, tmp_path, mm)
+    m = _nb_mine(model, mm, data=data)
+    assert "MatMulNBits" in [n.op_type for n in q.graph.node]
+    _assert_nb_equal(q, m)
+    _assert_nb_outputs_equal(q, m, shape)
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "ragged", "batched"])
+def test_matmul_nbits_hqq_matches_quark(model_name, tmp_path):
+    """HQQ: float (unpacked) zero points, no accuracy_level. Quark runs torch
+    float32; the zero points agree to float rounding."""
+    model, shape = _NB_MODELS[model_name]
+    mm = {"GroupSize": 32, "Algorithm": "HQQ"}
+    q, data = _nb_quark(model, shape, tmp_path, mm)
+    m = _nb_mine(model, mm, data=data)
+    assert "accuracy_level" not in _attrs(m.graph.node[0])
+    _assert_nb_equal(q, m, zero_point_atol=1e-5)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    ref = _run(model, x)
+    assert np.linalg.norm(_run(m, x) - _run(q, x)) / np.linalg.norm(ref) < 0.01
+
+
+_NB_GPTQ = [
+    {},
+    {"GroupSize": 32},
+    {"GroupSize": 32, "PerChannel": True},
+    {"PerChannel": True},
+    {"WeightSymmetric": False, "PerChannel": True},
+    {"WeightSymmetric": False, "GroupSize": 32},
+    {"ActOrder": True, "PerChannel": True},
+    {"ActOrder": True, "GroupSize": 32, "PerChannel": True},
+    {"MSE": True, "PerChannel": True},
+    {"MSE": True, "GroupSize": 64, "WeightSymmetric": False},
+    {"BlockSize": 32, "PercDamp": 0.1, "GroupSize": 32},
+]
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "ragged", "batched"])
+@pytest.mark.parametrize("gptq", _NB_GPTQ, ids=_nb_id)
+def test_matmul_nbits_gptq_matches_quark(model_name, gptq, tmp_path):
+    """Quark's GPTQ path (Hessian from the first batch, Quark's grid, then a
+    re-derived block grid is packed; error propagation off, as in Quark 0.13):
+    bit-identical tensors."""
+    model, shape = _NB_MODELS[model_name]
+    mm = {"Algorithm": "GPTQ"}
+    q, data = _nb_quark(model, shape, tmp_path, mm, gptq)
+    m = _nb_mine(model, mm, gptq, data=data)
+    _assert_nb_equal(q, m)
+    _assert_nb_outputs_equal(q, m, shape)
+
+
+def test_matmul_nbits_gptq_config_alone_does_not_select_gptq(tmp_path):
+    """Quark: a GPTQConfig only feeds GPTQParams; MatMulNBitsParams.Algorithm
+    decides, so this is the plain DEFAULT quantization."""
+    from quark.onnx import GPTQConfig as QuarkGPTQConfig
+
+    model, shape = _NB_MODELS["mlp"]
+    mm = {"GroupSize": 32}
+    q, data = _nb_quark(
+        model, shape, tmp_path, mm, algo=[QuarkGPTQConfig(bits=4, group_size=32)]
+    )
+    m = _nb_mine(model, mm, data=data, algo=[qc.GPTQConfig(bits=4, group_size=32)])
+    _assert_nb_equal(q, m)
+    plain, _ = _nb_quark(model, shape, tmp_path, mm)
+    _assert_nb_equal(plain, m)
+
+
+def test_matmul_nbits_gptq_config_is_ignored_like_quark(tmp_path):
+    """Even with ``Algorithm=GPTQ`` Quark does not read a GPTQConfig (only
+    ``GPTQParams``): same tensors as the GPTQ defaults."""
+    from quark.onnx import GPTQConfig as QuarkGPTQConfig
+
+    model, shape = _NB_MODELS["mlp"]
+    mm = {"Algorithm": "GPTQ"}
+    kw = dict(bits=4, group_size=32, per_channel=True, act_order=True)
+    q, data = _nb_quark(model, shape, tmp_path, mm, algo=[QuarkGPTQConfig(**kw)])
+    m = _nb_mine(model, mm, data=data, algo=[qc.GPTQConfig(**kw)])
+    _assert_nb_equal(q, m)
+    plain, _ = _nb_quark(model, shape, tmp_path, mm)
+    _assert_nb_equal(plain, q)
+
+
+def test_matmul_nbits_shared_weight_matches_quark(tmp_path):
+    model = _nb_model(
+        "h = MatMul(x, w1)\n h2 = Relu(h)\n h3 = MatMul(h2, w2)\n y = MatMul(h3, w1)",
+        [("w1", (64, 64)), ("w2", (64, 64))],
+        "float[3,64] x",
+    )
+    q, data = _nb_quark(model, (3, 64), tmp_path, {"GroupSize": 32})
+    m = _nb_mine(model, {"GroupSize": 32}, data=data)
+    _assert_nb_equal(q, m)
+
+
+def test_matmul_nbits_selection_matches_quark(tmp_path):
+    """Gemm, 3-D-weight and non-constant MatMuls are left alone."""
+    model = _nb_model(
+        "a = MatMul(x, w)\n"
+        "b = MatMul(a, w3)\n"
+        "g = Gemm(a, gw)\n"
+        "at = Transpose<perm=[1,0]>(a)\n"
+        "c = MatMul(g, at)\n"
+        "y = Add(b, c)",
+        [("w", (64, 16)), ("w3", (2, 16, 3)), ("gw", (16, 16))],
+        "float[3,64] x",
+    )
+    q, data = _nb_quark(model, (3, 64), tmp_path, {"GroupSize": 32})
+    m = _nb_mine(model, {"GroupSize": 32}, data=data)
+    assert [n.op_type for n in m.graph.node] == [n.op_type for n in q.graph.node]
+    _assert_nb_equal(q, m)
+
+
+def test_matmul_nbits_quark_default_fuses_matmul_add_into_gemm(tmp_path):
+    """The documented difference: Quark's default pre-processing (ORT
+    MatMulAddFusion) turns MatMul + Add into a Gemm that is not quantized;
+    onnxsim converts the MatMul and keeps the Add. Everything else matches."""
+    model = _nb_model(
+        "h = MatMul(x, w1)\n h2 = Add(h, b)\n h3 = Relu(h2)\n y = MatMul(h3, w2)",
+        [("w1", (64, 96)), ("b", (96,)), ("w2", (96, 8))],
+        "float[3,64] x",
+    )
+    q, data = _nb_quark(model, (3, 64), tmp_path, {"GroupSize": 32}, skip=False)
+    assert [n.op_type for n in q.graph.node] == ["Gemm", "Relu", "MatMulNBits"]
+    cfg = qc.QConfig.get_default_config("MATMUL_NBITS")
+    cfg.extra_options["MatMulNBitsParams"]["GroupSize"] = 32
+    with pytest.warns(UserWarning, match="Gemm"):
+        m = qc.ModelQuantizer(cfg).quantize_model(model, calibration_data_reader=data)
+    assert [n.op_type for n in m.graph.node] == [
+        "MatMulNBits",
+        "Add",
+        "Relu",
+        "MatMulNBits",
+    ]
+    # ... and its last layer is Quark's, tensor for tensor
+    for k in ("w2_Q4", "w2_scales"):
+        np.testing.assert_array_equal(_nb_inits(m)[k], _nb_inits(q)[k])
+    x = np.random.default_rng(7).standard_normal((3, 64)).astype(np.float32)
+    ref = _run(model, x)
+    assert np.linalg.norm(_run(m, x) - ref) / np.linalg.norm(ref) < 0.3
+
+
+def test_matmul_nbits_bits_other_than_four_is_a_quark_bug(tmp_path):
+    """Quark packs 4-bit codes whatever ``Bits`` says; onnxsim refuses."""
+    model, shape = _NB_MODELS["mlp"]
+    q, data = _nb_quark(model, shape, tmp_path, {"GroupSize": 32, "Bits": 8})
+    assert _attrs(q.graph.node[0])["bits"] == 8
+    assert _nb_inits(q)["w1_Q4"].shape == (96, 2, 16)  # still 4-bit sized
+    with pytest.raises(NotImplementedError, match="4-bit"):
+        _nb_mine(model, {"GroupSize": 32, "Bits": 8}, data=data)
 
 
 # == Quark's calibrators, Q/DQ removal and quantizer-level options ================

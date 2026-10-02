@@ -180,9 +180,23 @@ names and preset *meanings*, not copied.
   ``r_config_path``; R2-R4 do not exist, as in Quark's ONNX flow). An
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
+- ``MATMUL_NBITS`` (``UseMatMulNBits``): weight-only 4-bit quantization to
+  ``com.microsoft::MatMulNBits`` (:mod:`onnxsim.quark_matmul_nbits`, which
+  documents the layout, numerics and limits); no activation calibration.
+  ``MatMulNBitsParams`` (``GroupSize`` 128, ``Symmetric`` True, ``Bits`` 4,
+  ``AccuracyLevel`` 1, ``Algorithm`` DEFAULT / HQQ / GPTQ) and ``GPTQParams``
+  are read (a ``GPTQConfig`` in ``algo_config`` is ignored, as in Quark);
+  packed weights, scales, zero points and attributes are identical to Quark's
+  for all three algorithms
+  (``tests/test_quark_parity.py``). Differences: ``Bits != 4`` raises (Quark
+  emits an unrunnable model), MatMul + Add pairs that Quark's ONNX Runtime
+  pre-processing would fuse into an unquantized Gemm are converted
+  (``SkipPreprocess=True`` in Quark equals this), ``exclude`` is honoured, GPTQ
+  error propagation is Quark's no-op unless ``GPTQParams["Compensate"]``, and
+  other ``algo_config`` entries raise.
 - ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
   ``Int32Bias``, ``AlignEltwiseQuantType``, ``MatMulConstBOnly`` (the
-  transformer presets), the block-format options above, and, for the integer
+  transformer presets), the block-format options above, the ``MATMUL_NBITS`` ones, and, for the integer
   presets, the calibration options (``Percentile``, ``CalibTensorRangeSymmetric``,
   ``CalibMovingAverage``, ``CalibDataSize``, ``NumBins``, ``NumQuantizedBins``,
   ``LWPMetric``, ``PercentileCandidates``), ``RemoveQDQConv{Relu,Clip,LeakyRelu,
@@ -478,6 +492,20 @@ def _activation_inputs(node: onnx.NodeProto, inits: "set[str]") -> List[str]:
     return out
 
 
+def _matmul_add_consumers(model: onnx.ModelProto, converted: List[str]) -> List[str]:
+    """Converted MatMul nodes (by their new ``*_Q4`` names) whose only consumer
+    is an ``Add`` -- the pattern ONNX Runtime fuses into a Gemm."""
+    adds = [n for n in model.graph.node if n.op_type == "Add"]
+    out: List[str] = []
+    for n in model.graph.node:
+        if n.op_type != "MatMul" or (n.name + "_Q4" if n.name else "") not in converted:
+            continue
+        users = [m for m in model.graph.node if n.output[0] in m.input]
+        if len(users) == 1 and users[0] in adds:
+            out.append(n.name or n.output[0])
+    return out
+
+
 def _match_nodes(model: onnx.ModelProto, patterns: List[Any]) -> List[str]:
     """Node names selected by ``patterns``: plain names, and Quark's
     ``^...*``-style regular expressions (must contain ``.*``)."""
@@ -612,6 +640,16 @@ _PRESETS: Dict[str, Callable[[], QConfig]] = {
     "S16S8_ASWS": lambda: QConfig(
         _layer(Int16Spec, Int8Spec), ActivationSymmetric=True
     ),
+    "MATMUL_NBITS": lambda: QConfig(
+        _layer(Int8Spec, Int8Spec, calibration_method="minmax"),
+        UseMatMulNBits=True,
+        MatMulNBitsParams={
+            "GroupSize": 128,
+            "Symmetric": True,
+            "Bits": 4,
+            "AccuracyLevel": 1,
+        },
+    ),
     "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec, **_PCT)),
     "FP16": lambda: QConfig(_layer(Float16Spec, Float16Spec)),
     "BF16": lambda: QConfig(_layer(BFloat16Spec, BFloat16Spec)),
@@ -637,7 +675,7 @@ def _algo_variant(base: str, cls: type) -> Callable[[], QConfig]:
 
 for _n in list(_PRESETS):
     _block = _n.startswith(("BFP", "MX"))
-    if _n in ("BF16", "UINT8_DYNAMIC_QUANT") or _n.startswith("FP16"):
+    if _n in ("BF16", "UINT8_DYNAMIC_QUANT", "MATMUL_NBITS") or _n.startswith("FP16"):
         continue
     if not _block:
         _PRESETS[f"{_n}_ADAROUND"] = _algo_variant(_n, AdaRoundConfig)
@@ -839,6 +877,9 @@ class ModelQuantizer:
         self.last_auto_mixprecision: Any = None
         #: ``{"adaround" | "gptq": [LayerReport, ...]}`` of the last run
         self.last_weight_rounding: Dict[str, Any] = {}
+        #: :class:`~onnxsim.quark_matmul_nbits.MatMulNBitsReport` of the last
+        #: ``MATMUL_NBITS`` run, if any
+        self.last_matmul_nbits: Any = None
 
     def quantize_model(
         self,
@@ -856,6 +897,16 @@ class ModelQuantizer:
         cfg.global_config = cfg.global_config.resolved()
         act, wt = cfg.global_config.activation, cfg.global_config.weight
         assert act is not None and wt is not None  # resolved() fills both
+
+        if cfg.extra_options.get("UseMatMulNBits"):  # the MATMUL_NBITS preset
+            result = self._quantize_matmul_nbits(
+                model_input, calibration_data_reader, ignore_unsupported_algos
+            )
+            for msg in self.last_approximations:
+                warnings.warn(f"onnxsim.quark_compat: {msg}", UserWarning, stacklevel=2)
+            if model_output:
+                onnx.save(result, model_output)
+            return result
 
         if wt.is_dynamic:
             raise NotImplementedError("dynamic weight quantization is not supported")
@@ -918,6 +969,74 @@ class ModelQuantizer:
             warnings.warn(f"onnxsim.quark_compat: {msg}", UserWarning, stacklevel=2)
         if model_output:
             onnx.save(result, model_output)
+        return result
+
+    def _quantize_matmul_nbits(
+        self,
+        model: Union[str, onnx.ModelProto],
+        reader: Any,
+        ignore_unsupported: bool,
+    ) -> onnx.ModelProto:
+        """``MATMUL_NBITS``: constant-weight MatMuls -> ``MatMulNBits`` (see
+        :mod:`onnxsim.quark_matmul_nbits`). Options as Quark reads them:
+        ``MatMulNBitsParams`` (``GroupSize``, ``Symmetric``, ``Bits``,
+        ``AccuracyLevel``, ``Algorithm`` = DEFAULT / HQQ / GPTQ) and, for GPTQ,
+        ``GPTQParams``; a ``GPTQConfig`` in ``algo_config`` is ignored, as in
+        Quark."""
+        from onnxsim.quark_matmul_nbits import quantize_matmul_nbits
+
+        cfg = self.config
+        opts = cfg.extra_options
+        if isinstance(model, str):
+            model = onnx.load(model)
+        mm = dict(opts.get("MatMulNBitsParams", {}))
+        gptq = dict(opts.get("GPTQParams", {}))
+        others = [a.name for a in cfg.algo_config if a.name != "gptq"]
+        if others and not ignore_unsupported:
+            raise NotImplementedError(
+                f"algo_config [{', '.join(others)}] is not applied to MatMulNBits; "
+                "pass ignore_unsupported_algos=True to quantize without it"
+            )
+        if any(a.name == "gptq" for a in cfg.algo_config):
+            self._approx(
+                "GPTQConfig is not read by MATMUL_NBITS (as in Quark): set "
+                "extra_options['GPTQParams'] and MatMulNBitsParams['Algorithm']"
+            )
+        algorithm = str(mm.get("Algorithm", "DEFAULT"))
+        calibration = None
+        if algorithm.upper() == "GPTQ":
+            calibration = _drain_reader(reader, limit=1)  # Quark: first batch only
+            if not calibration:
+                raise ValueError("calibration_data_reader is required for GPTQ")
+            if gptq.get("Compensate"):
+                self._approx(
+                    "GPTQ propagates the rounding error (Quark 0.13's propagation "
+                    "is a no-op, so its codes are round-to-nearest)"
+                )
+        exclude = _match_nodes(
+            model, [e for e in cfg.exclude if isinstance(e, (str, tuple))]
+        )
+        result, report = quantize_matmul_nbits(
+            model,
+            group_size=int(mm.get("GroupSize", 128)),
+            symmetric=bool(mm.get("Symmetric", True)),
+            bits=int(mm.get("Bits", 4)),
+            accuracy_level=mm.get("AccuracyLevel", 0),
+            algorithm=algorithm,
+            exclude_nodes=exclude,
+            gptq_params=gptq,
+            calibration=calibration,
+        )
+        self.last_matmul_nbits = report
+        if cfg.specific_layer_config or cfg.layer_type_config:
+            self._approx("per-layer / per-type overrides ignored for MatMulNBits")
+        if not opts.get("SkipPreprocess", False):
+            fused = _matmul_add_consumers(model, report.converted)
+            if fused:
+                self._approx(
+                    "Quark's pre-processing fuses MatMul + Add into a Gemm, which it "
+                    f"does not quantize; converted anyway: {', '.join(fused)}"
+                )
         return result
 
     def _mixed_block_target(self, act: QSpec) -> Optional[AlgoConfig]:
