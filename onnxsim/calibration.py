@@ -775,9 +775,9 @@ class CalibrationStats:
         #: Quark-layout histograms of the ``"quark_*"`` methods (see
         #: :mod:`onnxsim.quark_calibration`), empty otherwise
         self.quark_histograms: Dict[str, Any] = {}
-        #: mean over the batches of each tensor's per-batch ``(min, max)``
-        #: (Quark's ``CalibMovingAverage``), when collected
-        self.mean_ranges: Dict[str, Tuple[float, float]] = {}
+        #: per-tensor mean over batches of each batch's (min, max) -- the
+        #: ``"minmax_mean"`` method (filled by :func:`collect_calibration_stats`)
+        self.mean_observed: Dict[str, Tuple[float, float]] = {}
         # (tensor, method, *params) -> range: "auto" and a model-level pick
         # ask for the same thresholds (entropy's search is the slow one)
         self._range_cache: Dict[Tuple, Tuple[float, float]] = {}
@@ -795,7 +795,9 @@ class CalibrationStats:
         obs_min, obs_max = self.observed[name]
         h = self.histograms.get(name)
         base, arg = _parse_method(method)
-        if base == "minmax" or h is None:
+        if base == "minmax_mean" and name in self.mean_observed:
+            return self.mean_observed[name]
+        if base == "minmax" or h is None or base == "minmax_mean":
             return obs_min, obs_max
         if base == "percentile":
             p = percentile if arg is None else arg
@@ -858,9 +860,13 @@ class CalibrationStats:
                 entropy_min_coverage=entropy_min_coverage,
                 **auto_kwargs,
             )[0]
-        if _parse_method(method)[0] not in ("minmax",) + _HIST_METHODS:
+        if _parse_method(method)[0] not in ("minmax", "minmax_mean") + _HIST_METHODS:
             raise ValueError(f"unknown calibration method: {method!r}")
-        if method != "minmax" and not self.histograms and self.observed:
+        if (
+            method not in ("minmax", "minmax_mean")
+            and not self.histograms
+            and self.observed
+        ):
             raise ValueError(
                 f"method {method!r} needs histograms: collect with histograms=True"
             )
@@ -1012,7 +1018,6 @@ def collect_calibration_stats(
     num_bins: int = 2048,
     pof2_histograms: bool = False,
     quark_hist: Optional[Tuple[bool, int]] = None,
-    moving_average: bool = False,
     exact_session: bool = False,
 ) -> CalibrationStats:
     """Run the float ``model`` over ``calibration_data`` once and record what
@@ -1025,8 +1030,7 @@ def collect_calibration_stats(
     ``pof2_histograms=True`` also records, in pass 1, the Quark-layout
     histograms ``method="minmse_pof2"`` needs. ``quark_hist=(absolute,
     num_bins)`` records :class:`onnxsim.quark_calibration.QuarkHistogram`
-    histograms of that layout (the ``"quark_*"`` methods) and
-    ``moving_average=True`` the per-batch mean of each tensor's min / max.
+    histograms of that layout (the ``"quark_*"`` methods).
     ``exact_session=True`` runs the model with ONNX Runtime's graph
     optimizations off (as Quark's calibrators do): fused kernels differ from
     the unfused ones in the last float bit, which can move a histogram count
@@ -1103,11 +1107,15 @@ def collect_calibration_stats(
     # Pass 1: exact running (min, max) -- all "minmax" needs, and the fixed
     # histogram range for the others.
     ranges = stats.observed
-    per_batch: Dict[str, List[Tuple[Any, Any]]] = {}
+    sums: Dict[str, List[float]] = {}  # name -> [sum min, sum max, batches]
     for batch in calibration_data:
         for name, arr in outputs_of(batch):
             batch_min = float(arr.min())
             batch_max = float(arr.max())
+            acc = sums.setdefault(name, [0.0, 0.0, 0.0])
+            acc[0] += batch_min
+            acc[1] += batch_max
+            acc[2] += 1
             if pof2_histograms:
                 stats.pof2_histograms.setdefault(name, _Pof2Histogram()).add(arr)
             if quark_hist is not None:
@@ -1116,21 +1124,12 @@ def collect_calibration_stats(
                 stats.quark_histograms.setdefault(
                     name, QuarkHistogram(quark_hist[1], quark_hist[0])
                 ).add(arr)
-            if moving_average:
-                per_batch.setdefault(name, []).append(
-                    (np.float32(arr.min()), np.float32(arr.max()))
-                )
             if name in ranges:
                 prev_min, prev_max = ranges[name]
                 ranges[name] = (min(prev_min, batch_min), max(prev_max, batch_max))
             else:
                 ranges[name] = (batch_min, batch_max)
-    for name, mm in per_batch.items():
-        mins, maxs = zip(*mm)
-        stats.mean_ranges[name] = (
-            float(np.mean(np.array(mins, np.float32))),
-            float(np.mean(np.array(maxs, np.float32))),
-        )
+    stats.mean_observed = {n: (a / c, b / c) for n, (a, b, c) in sums.items()}
     if not histograms:
         return stats
 
@@ -1164,7 +1163,6 @@ def calibrate(
     activation_type: str = "uint8",
     tensor_dtypes: Optional[Dict[str, str]] = None,
     range_symmetric: Optional[bool] = None,
-    moving_average: bool = False,
     quark_num_bins: Optional[int] = None,
     percentile_candidates: Sequence[float] = (99.99, 99.999, 99.99999),
     lwp_metric: str = "mae",
@@ -1187,7 +1185,10 @@ def calibrate(
             since QOperator format needs a calibrated range for a quantized
             node's output too, not just its activation (see
             ``onnxsim_cpp2py_export.list_qoperator_quantizable_outputs``).
-    :param method: ``"minmax"`` (default) uses each tensor's observed
+    :param method: ``"minmax_mean"`` is ``"minmax"`` with each tensor's range
+            the *mean over batches* of every batch's (min, max) instead of the
+            global extremes (what Quark's ``CalibMovingAverage`` computes);
+            ``"minmax"`` (default) uses each tensor's observed
             ``(min, max)`` directly -- simple, and enough calibration data to
             cover the real range is all it needs. ``"entropy"`` instead finds,
             per tensor, the symmetric clip threshold minimizing the KL
@@ -1280,9 +1281,6 @@ def calibrate(
             ``"minmax"`` False, ``"quark_percentile"`` / ``"quark_layerwise_
             percentile"`` True, ``"quark_entropy"`` / ``"quark_distribution"``
             ignore it)
-    :param moving_average: (``"minmax"`` only) Quark's ``CalibMovingAverage``:
-            the range is the mean over the batches of each batch's min / max
-            instead of the global min / max
     :param quark_num_bins: histogram bins of a ``"quark_*"`` method (default:
             128 for ``"quark_entropy"``, else 2048)
     :param percentile_candidates: (``"quark_layerwise_percentile"``) the
@@ -1318,7 +1316,7 @@ def calibrate(
     base, _ = _parse_method(method)
     if (
         method not in ("auto", "minmse_pof2")
-        and base not in ("minmax",) + _HIST_METHODS
+        and base not in ("minmax", "minmax_mean") + _HIST_METHODS
     ):
         raise ValueError(f"unknown calibration method: {method!r}")
     if method == "percentile" and not 50.0 < percentile <= 100.0:
@@ -1330,13 +1328,12 @@ def calibrate(
         providers=providers,
         tensor_names=tensor_names,
         extra_tensor_names=extra_tensor_names,
-        histograms=method not in ("minmax", "minmse_pof2"),
+        histograms=method not in ("minmax", "minmax_mean", "minmse_pof2"),
         num_bins=num_bins,
         pof2_histograms=method == "minmse_pof2",
-        moving_average=moving_average and method == "minmax",
     )
-    if method == "minmax" and (moving_average or range_symmetric):
-        out = dict(stats.mean_ranges if moving_average else stats.observed)
+    if method in ("minmax", "minmax_mean") and range_symmetric:
+        out = dict(stats.mean_observed if method == "minmax_mean" else stats.observed)
         for name in stats.observed:
             if name in set(minmax_tensor_names or ()):
                 out[name] = stats.observed[name]

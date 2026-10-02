@@ -286,6 +286,25 @@ def _data_inputs(n: onnx.NodeProto) -> List[str]:
     return [x for i, x in enumerate(n.input) if x and (idx is None or i in idx)]
 
 
+def _is_clamp(n: onnx.NodeProto, inits: Dict[str, TensorProto]) -> bool:
+    """Relu-like: Relu / LeakyRelu / PRelu, or Clip to [0, 6] / [0, 1]."""
+    if n.op_type in ("Relu", "LeakyRelu", "PRelu"):
+        return True
+    if n.op_type != "Clip":
+        return False
+    if len(n.input) >= 3:
+        vals = [
+            float(numpy_helper.to_array(inits[x]))
+            if x in inits and inits[x].dims == []
+            else None
+            for x in n.input[1:3]
+        ]
+    else:
+        at = {a.name: a.f for a in n.attribute}
+        vals = [at.get("min"), at.get("max")]
+    return vals[0] == 0.0 and vals[1] in (6.0, 1.0)
+
+
 def quantize_full_qdq(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -320,6 +339,7 @@ def quantize_full_qdq(
     quantize_bias: bool = True,
     weight_symmetric: bool = True,
     shared_ops: Iterable[str] = (),
+    float_clamp_input: bool = False,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -429,6 +449,11 @@ def quantize_full_qdq(
     :param shared_ops: further op types whose output reuses the input's
             quantization parameters (on top of the data-movement ops), e.g.
             ``AveragePool`` under ONNX Runtime's plain QDQ quantizer
+    :param float_clamp_input: leave the output of a quantized node float when
+            its only consumer is a Relu / LeakyRelu / PRelu / Clip(0, 6 or 1)
+            that is *not* itself quantized (outside ``op_types``) -- Quark's
+            "remove Q/DQ between Gemm and Relu" in its NPU transformer
+            scheme. (``fold_relu`` handles the quantized-Relu case.)
     :returns: the quantized ModelProto
     """
     if weight_dtype not in ("int8", "int16", "uint8"):
@@ -605,6 +630,23 @@ def quantize_full_qdq(
             src = r.input[0] if r.op_type == "Relu" else None
             p = producer.get(src) if src else None
             if p is not None and len(consumers[src]) == 1 and src not in graph_outputs:
+                skip.add(src)
+        acts = [a for a in acts if a not in skip]
+
+    if float_clamp_input:
+        producer = {o: n for n in g.node for o in n.output}
+        skip = set()
+        for r in g.node:
+            if id(r) in qnode_ids or not _is_clamp(r, inits):
+                continue
+            src = r.input[0]
+            p = producer.get(src)
+            if (
+                p is not None
+                and id(p) in qnode_ids
+                and len(consumers[src]) == 1
+                and src not in graph_outputs
+            ):
                 skip.add(src)
         acts = [a for a in acts if a not in skip]
 
