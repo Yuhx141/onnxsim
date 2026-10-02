@@ -59,6 +59,27 @@ names and preset *meanings*, not copied.
   Quark's ``^...*`` regular expressions (subgraph tuples raise). Weight dtypes
   other than int8 raise; ``bias`` specs are ignored (biases stay int32).
   Scales / zero points match Quark's (``tests/test_quark_parity.py``).
+- ``INT8_TRANSFORMER_DEFAULT`` / ``INT16_TRANSFORMER_DEFAULT`` /
+  ``INT8_TRANSFORMER_ACCURATE`` / ``INT16_TRANSFORMER_ACCURATE`` (Quark's
+  ``enable_npu_transformer``): asymmetric uint8 / uint16 activations, per-tensor
+  symmetric int8 / int16 weights, int32 biases, and -- the whole difference to
+  the CNN presets -- *only* ``Gemm`` and ``MatMul`` nodes whose second operand
+  is a constant are quantized (``MatMulConstBOnly=False`` adds the
+  activation x activation MatMuls). Softmax, LayerNormalization, Gelu, Add,
+  Mul, Transpose, ... stay float, with Q/DQ only on the inputs and outputs of
+  the quantized nodes (a Gemm / MatMul feeding a sole Relu-like consumer keeps
+  a float output, as Quark's Q/DQ removal does). A model with no such node is
+  returned unchanged (Quark: "No quantizable ops"). DEFAULT calibrates with the
+  *mean over batches of each batch's min / max* (Quark's ``CalibMovingAverage``,
+  ``method="minmax_mean"``); ACCURATE is percentile 99.9999 + AdaRound like
+  ``INT*_CNN_ACCURATE`` (int16 weights cannot run AdaRound here, so that
+  preset raises unless ``ignore_unsupported_algos=True``). Placement, scales,
+  zero points, weights and outputs equal Quark's for the probed models
+  (MLP, attention + MLP block, Conv, residual Gemm chain), the ACCURATE ones to
+  histogram binning. Not matched: Quark's pre-processing (``MatMul`` + ``Add``
+  -> ``Gemm`` fusion, Gelu fusion at opset >= 20 -- a model that relies on it
+  quantizes differently), its implicit CLE, and the AdaRound weight codes
+  themselves (a different optimizer run; the same objective).
 - ``UINT8_DYNAMIC_QUANT``: :mod:`onnxsim.quark_dynamic` emits Quark's /
   ONNX Runtime's dynamic pattern (``DynamicQuantizeLinear`` +
   ``MatMulInteger`` / ``ConvInteger``); no calibration data is needed.
@@ -117,7 +138,9 @@ names and preset *meanings*, not copied.
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
-  ``Int32Bias``, ``AlignEltwiseQuantType`` and the block-format options above.
+  ``Int32Bias``, ``AlignEltwiseQuantType``, ``CalibMovingAverage`` (integer
+  presets only), ``MatMulConstBOnly`` (the transformer presets) and the
+  block-format options above.
 """
 
 from __future__ import annotations
@@ -1176,6 +1199,18 @@ class ModelQuantizer:
         self.last_auto_mixprecision = res
         return res.model
 
+    def _calib_method(self, act: QSpec) -> str:
+        """The activation calibration method, with Quark's
+        ``CalibMovingAverage`` extra option applied to min / max calibration
+        (the mean of the per-batch ranges instead of the global range)."""
+        method = act.calibration_method
+        moving = self.config.extra_options.get("CalibMovingAverage")
+        if method == "minmax" and moving:
+            return "minmax_mean"
+        if method == "minmax_mean" and moving is False:
+            return "minmax"
+        return str(method)
+
     def _transformer_scope(
         self, model: onnx.ModelProto
     ) -> "tuple[Optional[set[str]], List[str]]":
@@ -1187,9 +1222,7 @@ class ModelQuantizer:
         if not opts.get("NPUTransformer"):
             return None, []
         consts = {i.name for i in model.graph.initializer}
-        consts |= {
-            n.output[0] for n in model.graph.node if n.op_type == "Constant"
-        }
+        consts |= {n.output[0] for n in model.graph.node if n.op_type == "Constant"}
         skip = []
         if opts.get("MatMulConstBOnly", True):
             skip = [
@@ -1278,7 +1311,7 @@ class ModelQuantizer:
                 op_types=op_types,
                 float_clamp_input=op_types is not None,
                 exclude_nodes=exclude,
-                method=act.calibration_method,
+                method=self._calib_method(act),
                 symmetric_activations=act.symmetric,
                 power_of_two=act.pof2 or wt.pof2,
                 per_channel=per_channel,

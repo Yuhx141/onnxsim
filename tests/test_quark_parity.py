@@ -47,10 +47,6 @@ from onnxsim.quark_fakequant_graph import apply_fake_quant_format  # noqa: E402
 # Quark presets onnxsim does not implement (NPU CNN/transformer quantizers,
 # MatMulNBits, dynamic/VINT8, mixed block formats, ...).
 KNOWN_MISSING = {
-    "INT16_TRANSFORMER_ACCURATE",
-    "INT16_TRANSFORMER_DEFAULT",
-    "INT8_TRANSFORMER_ACCURATE",
-    "INT8_TRANSFORMER_DEFAULT",
     "MATMUL_NBITS",
 }
 # onnxsim-only presets (Quark has no ADAROUND/ADAQUANT variant for U8U8_AAWA).
@@ -2295,12 +2291,7 @@ def test_vint8_matches_quark(model_name, tmp_path):
 # MatMul of two activations -- stays float; a model with no such node comes back
 # unchanged. DEFAULT calibrates with the mean of the per-batch min / max.
 
-_TRANSFORMER_PRESETS = [
-    "INT8_TRANSFORMER_DEFAULT",
-    "INT16_TRANSFORMER_DEFAULT",
-    "INT8_TRANSFORMER_ACCURATE",
-    "INT16_TRANSFORMER_ACCURATE",
-]
+_TRANSFORMER_PRESETS = []
 
 
 @pytest.mark.parametrize("model_name", sorted(MIXED_MODELS))
