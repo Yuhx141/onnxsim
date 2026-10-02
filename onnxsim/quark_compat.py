@@ -634,6 +634,18 @@ _FASTFT_KEYS = {
     "TargetOpType": "target_op_type",
     "RefModelPath": "ref_model_path",
 }
+# AdaRoundConfig / AdaQuantConfig fields that Quark 0.13's ``_get_config`` never
+# copies into ``extra_options["FastFinetune"]`` (it stores them on the config and
+# stops there), so there they only take effect through extra_options.
+_FASTFT_NOT_FORWARDED = (
+    "output_index",
+    "reg_param",
+    "beta_range",
+    "warm_start",
+    "parallel",
+    "dynamic_batch",
+    "ref_model_path",
+)
 # What Quark's ``*_ADAROUND`` / ``*_ADAQUANT`` presets put in
 # ``extra_options["FastFinetune"]`` (read from the amd-quark 0.13 wheel).
 _FASTFT_PRESET = {
@@ -924,6 +936,14 @@ class ModelQuantizer:
         from onnxsim.quark_finetune import TARGET_OPS, FinetuneOptions, finetune
 
         p = dict(algo.params)
+        dropped = [k for k in _FASTFT_NOT_FORWARDED if k in p]
+        for k in dropped:
+            del p[k]
+        if dropped:
+            self._approx(
+                f"{name}: Quark's config does not forward {', '.join(dropped)} "
+                "(only extra_options['FastFinetune'] does), so they are ignored here too"
+            )
         ff = self.config.extra_options.get("FastFinetune")
         if isinstance(ff, dict):
             p.update({_FASTFT_KEYS[k]: v for k, v in ff.items() if k in _FASTFT_KEYS})

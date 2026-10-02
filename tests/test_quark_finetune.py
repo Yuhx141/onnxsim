@@ -741,15 +741,14 @@ def test_algo_config_params_reach_the_engine_with_quarks_defaults(monkeypatch, c
     assert not seen["opt"].update_bias
 
 
-def test_every_adaround_param_is_forwarded(monkeypatch, cnn):
+def test_every_forwarded_adaround_param_reaches_the_engine(monkeypatch, cnn):
     seen = _spy(monkeypatch)
     cfg = qc.QConfig.get_default_config("A8W8")
     cfg.algo_config = [
         qc.AdaRoundConfig(
             num_iterations=11, learning_rate=0.5, batch_size=3, num_batches=4,
-            early_stop=True, reg_param=0.5, beta_range=(10, 1), warm_start=0.3,
-            drop_ratio=0.25, selective_update=True, output_qdq=True, parallel=True,
-            mem_opt_level=0, output_index=0, select_max_mem_layer=True,
+            early_stop=True, drop_ratio=0.25, selective_update=True, output_qdq=True,
+            mem_opt_level=0, select_max_mem_layer=True,
             target_op_type=["Conv", "MatMul"], fixed_seed=5, data_size=2,
         )
     ]  # fmt: skip
@@ -762,21 +761,46 @@ def test_every_adaround_param_is_forwarded(monkeypatch, cnn):
         3,
         4,
     )
-    assert (o.early_stop, o.reg_param, o.beta_range, o.warm_start) == (
+    assert (o.early_stop, o.drop_ratio, o.selective_update, o.output_qdq) == (
         True,
-        0.5,
-        (10, 1),
-        0.3,
-    )
-    assert (o.drop_ratio, o.selective_update, o.output_qdq, o.parallel) == (
         0.25,
         True,
         True,
-        True,
     )
-    assert (o.mem_opt_level, o.output_index, o.select_max_mem_layer) == (0, 0, True)
+    assert (o.mem_opt_level, o.select_max_mem_layer) == (0, True)
     assert tuple(o.target_ops) == ("Conv", "MatMul") and o.seed == 5
     assert seen["n"] == 2  # data_size caps the calibration batches
+
+
+def test_config_fields_quark_never_forwards_are_ignored_but_extra_options_work(
+    monkeypatch, cnn
+):
+    # Quark 0.13's AdaRoundConfig._get_config drops these seven (checked
+    # against the real package in test_quark_finetune_parity.py)
+    seen = _spy(monkeypatch)
+    cfg = qc.QConfig.get_default_config("A8W8")
+    cfg.algo_config = [
+        qc.AdaRoundConfig(
+            reg_param=0.5, beta_range=(10, 1), warm_start=0.3, parallel=True,
+            output_index=0, ref_model_path="x.onnx", dynamic_batch=True,
+        )
+    ]  # fmt: skip
+    q = qc.ModelQuantizer(cfg)
+    with pytest.warns(UserWarning, match="does not forward"):
+        _quantize_with(q, cnn)
+    o = seen["opt"]
+    assert (o.reg_param, o.beta_range, o.warm_start, o.parallel, o.output_index) == (
+        0.01, (20.0, 2.0), 0.2, False, None
+    )  # fmt: skip
+    cfg.extra_options["FastFinetune"] = {
+        "RegParam": 0.5, "BetaRange": (10, 1), "WarmStart": 0.3, "Parallel": True, "OutputIndex": 0,
+    }  # fmt: skip
+    with pytest.warns(UserWarning):
+        _quantize_with(q, cnn)
+    o = seen["opt"]
+    assert (o.reg_param, o.beta_range, o.warm_start, o.parallel, o.output_index) == (
+        0.5, (10, 1), 0.3, True, 0
+    )  # fmt: skip
 
 
 def test_extra_options_fastfinetune_wins_over_the_algo_config(monkeypatch, cnn):
