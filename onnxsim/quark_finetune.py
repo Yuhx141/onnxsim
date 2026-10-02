@@ -692,35 +692,35 @@ def _make_block(
             return None
         op = _MatMulOp(False)
     elif t == "Gemm":
-        if _attr(fn, "transA", 0):
+        if _attr(qn, "transA", 0):
             return None
         if w_float.ndim != 2:
             return None
-        op = _MatMulOp(bool(_attr(fn, "transB", 0)))
-        w_alpha, b_beta = float(_attr(fn, "alpha", 1.0)), float(_attr(fn, "beta", 1.0))
+        op = _MatMulOp(bool(_attr(qn, "transB", 0)))
+        w_alpha, b_beta = float(_attr(qn, "alpha", 1.0)), float(_attr(qn, "beta", 1.0))
     elif t in ("Conv", "ConvTranspose"):
         if w_float.ndim not in (3, 4):
             return None
-        if _attr(fn, "auto_pad", b"NOTSET") not in (b"NOTSET", "NOTSET"):
+        if _attr(qn, "auto_pad", b"NOTSET") not in (b"NOTSET", "NOTSET"):
             return None
         if t == "Conv":
-            op = _ConvOp(fn, w_float.shape)
+            op = _ConvOp(qn, w_float.shape)
         else:
             if (
-                int(_attr(fn, "group", 1)) != 1
-                or any(_attr(fn, "output_padding", [0]))
-                or _attr(fn, "output_shape", None)
+                int(_attr(qn, "group", 1)) != 1
+                or any(_attr(qn, "output_padding", [0]))
+                or _attr(qn, "output_shape", None)
             ):
                 return None
-            op = _ConvTransposeOp(fn, w_float.shape)
+            op = _ConvTransposeOp(qn, w_float.shape)
     elif t == "LayerNormalization":
-        if int(_attr(fn, "axis", -1)) != -1 or w_float.ndim != 1:
+        if int(_attr(qn, "axis", -1)) != -1 or w_float.ndim != 1:
             return None
-        op = _LayerNormOp(float(_attr(fn, "epsilon", 1e-5)))
+        op = _LayerNormOp(float(_attr(qn, "epsilon", 1e-5)))
     else:  # InstanceNormalization
         if w_float.ndim != 1:
             return None
-        op = _InstanceNormOp(float(_attr(fn, "epsilon", 1e-5)))
+        op = _InstanceNormOp(float(_attr(qn, "epsilon", 1e-5)))
 
     # -- bias ------------------------------------------------------------------------------------
     qb: Optional[_QConst] = None
@@ -968,13 +968,16 @@ def _train_block(
     w = blk.w_float
     scale, zp, lo, hi = qw.scale, qw.zp, qw.lo, qw.hi
 
+    # Quark computes w / scale in float32; an element sitting exactly on the
+    # grid (every channel's largest weight) lands on either side of the
+    # floor, and the rectified sigmoid there on either side of 0, by ULP
+    # noise that decides whether it is ever allowed to move -- so mirror it
+    f32 = np.float32
+    wd32 = w.astype(f32) / scale.astype(f32)
+    floor_w = np.floor(wd32).astype(np.float64)
+    diff32 = wd32 - np.floor(wd32)
     # initial (hard-rounded float weight) error: drives LRAdjust
-    w_rtn = (
-        np.clip(
-            np.floor(w / scale) + (w / scale - np.floor(w / scale) >= 0.5) + zp, lo, hi
-        )
-        - zp
-    ) * scale
+    w_rtn = (np.clip(floor_w + (diff32 >= 0.5) + zp, lo, hi) - zp) * scale
     if adaround:
         w_init_hat = w_rtn
     else:
@@ -993,9 +996,8 @@ def _train_block(
 
     # parameters
     if adaround:
-        diff = w / scale - np.floor(w / scale)
-        alpha = -np.log((_ZETA - _GAMMA) / (diff - _GAMMA) - 1.0)
-        params = [alpha]
+        alpha = -np.log(f32(_ZETA - _GAMMA) / (diff32 - f32(_GAMMA)) - f32(1.0))
+        params = [alpha.astype(np.float64)]
     else:
         wv = w.copy()
         bv = (
@@ -1029,10 +1031,11 @@ def _train_block(
         y_ref = yf[idx]
 
         if adaround:
-            sig = 1.0 / (1.0 + np.exp(-params[0]))
-            raw_h = sig * (_ZETA - _GAMMA) + _GAMMA
+            sig32 = f32(1.0) / (f32(1.0) + np.exp(-params[0].astype(f32)))
+            raw_h = (sig32 * f32(_ZETA - _GAMMA) + f32(_GAMMA)).astype(np.float64)
+            sig = sig32.astype(np.float64)
             h = np.clip(raw_h, 0.0, 1.0)
-            raw_q = np.floor(w / scale) + h + zp
+            raw_q = floor_w + h + zp
             w_hat = (np.clip(raw_q, lo, hi) - zp) * scale
             bias = bias_fq
         else:
@@ -1050,7 +1053,7 @@ def _train_block(
         if adaround:
             dq_mask = (raw_q >= lo) & (raw_q <= hi)
             dh = dw_hat * scale * dq_mask
-            h_mask = (raw_h >= 0.0) & (raw_h <= 1.0)
+            h_mask = (raw_h > 0.0) & (raw_h < 1.0)
             dh_dalpha = np.where(h_mask, sig * (1.0 - sig) * (_ZETA - _GAMMA), 0.0)
             if it >= ws_iter:
                 beta = _beta(num_iter, it, opt.beta_range, opt.warm_start)
@@ -1086,7 +1089,7 @@ def _train_block(
         done = it + 1
 
     if adaround:
-        new_codes = np.clip(np.floor(w / scale) + (params[0] >= 0) + zp, lo, hi)
+        new_codes = np.clip(floor_w + (params[0] >= 0) + zp, lo, hi)
         return _Trained(new_codes, None, err0, done)
     codes = qw.encode(params[0])
     bcodes = blk.qb.encode(params[1]) if len(params) > 1 else None  # type: ignore[union-attr]

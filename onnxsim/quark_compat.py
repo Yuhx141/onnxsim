@@ -122,6 +122,7 @@ names and preset *meanings*, not copied.
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -438,9 +439,20 @@ _PRESETS: Dict[str, Callable[[], QConfig]] = {
 }
 
 
+def _preset_finetune_params(cls: type) -> Dict[str, Any]:
+    """The ``FastFinetune`` options Quark's ``*_ADAROUND`` / ``*_ADAQUANT``
+    presets carry. Their dict has no ``UpdateBias`` key, so Quark's training
+    default (on) applies to AdaQuant, unlike ``AdaQuantConfig()`` (off)."""
+    if cls is AdaQuantConfig:
+        return dict(_FASTFT_PRESET, learning_rate=1e-5, update_bias=True)
+    if cls is AdaRoundConfig:
+        return dict(_FASTFT_PRESET, learning_rate=0.1)
+    return {}
+
+
 def _algo_variant(base: str, cls: type) -> Callable[[], QConfig]:
     def make() -> QConfig:
-        return _with_algo(_PRESETS[base](), cls())
+        return _with_algo(_PRESETS[base](), cls(**_preset_finetune_params(cls)))
 
     return make
 
@@ -461,7 +473,7 @@ for _n in list(_PRESETS):
 def _cnn_accurate(act: type, wt: type) -> QConfig:
     return QConfig(
         _layer(act, wt, symmetric=False, calibration_method="percentile:99.9999"),
-        algo_config=[AdaRoundConfig(num_iterations=1000, learning_rate=0.1)],
+        algo_config=[AdaRoundConfig(**_preset_finetune_params(AdaRoundConfig))],
     )
 
 
@@ -591,11 +603,45 @@ _RUNNABLE_ALGOS = {
     "bias_correction",
     "auto_mixprecision",
 }
-# Quark AdaQuant param -> onnxsim.apply_adaquant kwarg.
+# Quark AdaQuant param -> onnxsim.apply_adaquant kwarg (``legacy_engine=True``).
 _ADAQUANT_PARAMS = {
     "num_iterations": "num_iterations",
     "learning_rate": "weight_learning_rate",
     "reg_param": "reg_param",
+}
+# ``extra_options["FastFinetune"]`` keys (they win over the algo config's
+# values, as in Quark) -> AdaRoundConfig / AdaQuantConfig params.
+_FASTFT_KEYS = {
+    "DataSize": "data_size",
+    "FixedSeed": "fixed_seed",
+    "BatchSize": "batch_size",
+    "NumBatches": "num_batches",
+    "NumIterations": "num_iterations",
+    "LearningRate": "learning_rate",
+    "EarlyStop": "early_stop",
+    "OutputIndex": "output_index",
+    "LRAdjust": "lr_adjust",
+    "SelectiveUpdate": "selective_update",
+    "UpdateBias": "update_bias",
+    "OutputQDQ": "output_qdq",
+    "DropRatio": "drop_ratio",
+    "MemOptLevel": "mem_opt_level",
+    "Parallel": "parallel",
+    "RegParam": "reg_param",
+    "BetaRange": "beta_range",
+    "WarmStart": "warm_start",
+    "SelectMaxMemLayer": "select_max_mem_layer",
+    "TargetOpType": "target_op_type",
+    "RefModelPath": "ref_model_path",
+}
+# What Quark's ``*_ADAROUND`` / ``*_ADAQUANT`` presets put in
+# ``extra_options["FastFinetune"]`` (read from the amd-quark 0.13 wheel).
+_FASTFT_PRESET = {
+    "data_size": 1000,
+    "fixed_seed": 1705472343,
+    "batch_size": 2,
+    "num_iterations": 1000,
+    "early_stop": True,
 }
 
 
@@ -862,47 +908,65 @@ class ModelQuantizer:
             use_random_had=bool(p.get("use_random_had", False)),
         )
 
-    def _adaround(
+    def _finetune(
         self,
+        name: str,
         float_model: onnx.ModelProto,
         quantized: onnx.ModelProto,
         calibration: List[Dict[str, np.ndarray]],
         algo: AlgoConfig,
     ) -> onnx.ModelProto:
-        from onnxsim.quark_weight_rounding import adaround_int8
+        """Quark's FastFinetune (``AdaRoundConfig`` / ``AdaQuantConfig``) via
+        :mod:`onnxsim.quark_finetune`; ``extra_options["FastFinetune"]`` keys
+        override the config's params, and ``QuantizationPreference="accuracy"``
+        applies Quark's own overrides (``EarlyStop`` off, ``UpdateBias`` and
+        ``OutputQDQ`` on)."""
+        from onnxsim.quark_finetune import TARGET_OPS, FinetuneOptions, finetune
 
-        p = algo.params
-        # update_bias: Quark's AdaRound never reads it (only AdaQuant does).
-        self._approx(
-            "AdaRound is layer-wise against the float model's activations "
-            "(Quark optimizes subgraph blocks)"
-        )
-        kwargs: Dict[str, Any] = {
-            k: p[k]
-            for k in (
-                "num_iterations",
-                "learning_rate",
-                "reg_param",
-                "warm_start",
-                "drop_ratio",
-                "selective_update",
-            )
-            if k in p
-        }
-        if p.get("lr_adjust"):
-            kwargs["lr_adjust"] = tuple(p["lr_adjust"])
+        p = dict(algo.params)
+        ff = self.config.extra_options.get("FastFinetune")
+        if isinstance(ff, dict):
+            p.update({_FASTFT_KEYS[k]: v for k, v in ff.items() if k in _FASTFT_KEYS})
+        if self.config.extra_options.get("QuantizationPreference") == "accuracy":
+            p.update(early_stop=False, update_bias=True, output_qdq=True)
         if "data_size" in p:
             calibration = calibration[: int(p["data_size"])]
-        if "beta_range" in p:
-            kwargs["beta_range"] = tuple(p["beta_range"])
-        if "fixed_seed" in p:
-            kwargs["seed"] = int(p["fixed_seed"]) % (2**32)
-        if p.get("target_op_type"):
-            kwargs["target_ops"] = tuple(
-                o for o in p["target_op_type"] if o in ("Conv", "Gemm", "MatMul")
-            )
-        out, self.last_weight_rounding["adaround"] = adaround_int8(
-            float_model, quantized, calibration, **kwargs
+        ref = p.get("ref_model_path")
+        if isinstance(ref, str) and os.path.exists(ref):
+            float_model = onnx.load(ref)
+        adaquant = name == "adaquant"
+        targets = tuple(p.get("target_op_type") or TARGET_OPS)
+        opt = FinetuneOptions(
+            algorithm=name,
+            num_iterations=int(p.get("num_iterations", 3000 if adaquant else 1000)),
+            learning_rate=p.get("learning_rate"),
+            batch_size=int(p.get("batch_size", 1)),
+            num_batches=int(p.get("num_batches", 1)),
+            early_stop=bool(p.get("early_stop", False)),
+            reg_param=float(p.get("reg_param", 0.01)),
+            beta_range=tuple(p.get("beta_range", (20.0, 2.0))),  # type: ignore[arg-type]
+            warm_start=float(p.get("warm_start", 0.2)),
+            drop_ratio=float(p.get("drop_ratio", 1.0)),
+            lr_adjust=tuple(p["lr_adjust"]) if p.get("lr_adjust") else None,  # type: ignore[arg-type]
+            selective_update=bool(p.get("selective_update", False)),
+            update_bias=bool(p.get("update_bias", False)) and adaquant,
+            output_qdq=bool(p.get("output_qdq", False)),
+            parallel=bool(p.get("parallel", False)),
+            mem_opt_level=int(p.get("mem_opt_level", 1)),
+            output_index=p.get("output_index"),
+            select_max_mem_layer=bool(p.get("select_max_mem_layer", False)),
+            target_ops=targets,
+            seed=int(p.get("fixed_seed", 1705472343)),
+        )
+        self._approx(
+            f"{name} is a numpy port of Quark's FastFinetune loop: mini-batches "
+            "come from numpy's generator instead of torch.randperm and the "
+            "arithmetic is float64, so results match Quark statistically "
+            "(bit for bit given the same mini-batch indices)"
+        )
+        # update_bias: only AdaQuant reads it, as in Quark.
+        out, self.last_weight_rounding[name] = finetune(
+            float_model, quantized, calibration, opt
         )
         return out
 
@@ -1180,7 +1244,10 @@ class ModelQuantizer:
         # Quark's presets quantize weights per tensor; the weight-rounding
         # algorithms below work per output channel.
         per_channel = bool(self.config.extra_options.get("PerChannel", False))
-        if not per_channel and {"adaquant", "adaround", "gptq"} & set(by_name):
+        legacy_adaquant = "adaquant" in by_name and by_name["adaquant"].params.get(
+            "legacy_engine"
+        )
+        if not per_channel and ("gptq" in by_name or legacy_adaquant):
             per_channel = True
             self._approx("weights quantized per channel (needed by the algorithm)")
 
@@ -1255,7 +1322,7 @@ class ModelQuantizer:
                 quantized = dedicate_qdq_pairs(quantized)
 
         # Post-quantization passes, which compare against the float model.
-        if "adaquant" in by_name:
+        if "adaquant" in by_name and by_name["adaquant"].params.get("legacy_engine"):
             from onnxsim.adaquant import apply_adaquant
 
             params = by_name["adaquant"].params
@@ -1269,9 +1336,13 @@ class ModelQuantizer:
                     if key in params
                 },
             )
+        elif "adaquant" in by_name:
+            quantized = self._finetune(
+                "adaquant", float_model, quantized, calibration, by_name["adaquant"]
+            )
         if "adaround" in by_name:
-            quantized = self._adaround(
-                float_model, quantized, calibration, by_name["adaround"]
+            quantized = self._finetune(
+                "adaround", float_model, quantized, calibration, by_name["adaround"]
             )
         if "gptq" in by_name:
             quantized = self._gptq(float_model, quantized, calibration, by_name["gptq"])
