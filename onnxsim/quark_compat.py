@@ -79,22 +79,40 @@ names and preset *meanings*, not copied.
   offline (via :mod:`onnxsim.quark_block_formats`) instead of leaving a node on
   them. ``algo_config`` is not applied to block formats.
   Dynamic quantization raises ``NotImplementedError``.
-- ``algo_config``: SmoothQuant (``alpha``) and CLE (Conv chains plus Gemm /
-  MatMul chains, :mod:`onnxsim.quark_cle`) run on the float model before
-  quantization. Note Quark enables CLE implicitly in *every* preset
-  (``include_cle=True``) while onnxsim only runs it when ``CLEConfig`` is
-  listed, so a preset's weights differ from Quark's wherever a CLE pattern
-  exists; AdaQuant (``num_iterations``, ``learning_rate``,
-  ``reg_param``) and BiasCorrection run after it, against the float model.
-  AdaQuant only reoptimizes MatMul/Gemm layers whose output is not folded
-  with a following Relu, and leaves the rest as calibrated.
+- ``algo_config``: the float -> float passes run in Quark's order (stem
+  equalization + CLE, SmoothQuant, Quarot) before quantization, and are
+  *bit-identical* to Quark's (``tests/test_quark_algo_parity.py``):
+  CLE (:mod:`onnxsim.quark_equalization`) with ``CLESteps`` /
+  ``CLEWeightThreshold`` / ``CLEScaleAppendBias`` / ``CLEScaleUseThreshold`` /
+  ``CLETotalLayerDiffThreshold`` (``CLEBalanceMethod`` only has ``"max"``, as in
+  Quark; ``ReplaceClip6Relu``; ``CLEConfig`` fields or the same-named
+  ``extra_options``, which win), Conv / Gemm pairs and Conv - depthwise Conv -
+  pointwise Conv triples. A Conv without an explicit ``group`` attribute is
+  skipped, as in Quark. SmoothQuant (:mod:`onnxsim.quark_smoothquant`, ``alpha``
+  or ``extra_options["SmoothAlpha"]``) smooths constant-weight ``MatMul``
+  nodes only -- no ``Gemm``, no LayerNorm folding (it inserts a ``Mul`` per
+  MatMul) -- over activations of any rank. Quark enables CLE implicitly in
+  *every* preset (``include_cle=True``) while onnxsim only runs it when
+  ``CLEConfig`` is listed, so a preset's weights differ from Quark's wherever a
+  CLE pattern exists. AdaQuant (``num_iterations``, ``learning_rate``,
+  ``reg_param``) runs after quantization, against the float model; AdaQuant
+  only reoptimizes MatMul/Gemm layers whose output is not folded with a
+  following Relu, and leaves the rest as calibrated. BiasCorrection
+  (:mod:`onnxsim.quark_bias_correction`) rewrites the quantized *bias* of
+  every Conv / Gemm that has one, from the layer-local float - quantized
+  output mean, exactly as Quark does (integer biases equal Quark's for
+  ``MinMax`` / ``Percentile`` calibration; with power-of-two calibration Quark
+  re-derives the bias scale without storing it, which is not reproduced).
   AutoMixprecision replaces the plain quantization step with
-  :func:`onnxsim.quark_auto_mixprecision.auto_mixprecision`: a single
-  ``target_layer_config`` whose *activation* is the other of ``uint8`` /
-  ``uint16`` (weights stay int8); the dict/list multi-config forms,
-  ``subgraph_json`` and ``sensitivity_cache_file`` raise, and ``dual_quant_nodes``
-  / ``no_input_qdq_shared`` / ``shared_param_mode`` / ``worker_num`` have no
-  effect (every tensor already has its own Q/DQ pair; analysis is serial).
+  :func:`onnxsim.quark_auto_mixprecision.auto_mixprecision` (activation
+  precision only, weights stay int8): ``target_layer_config`` as one
+  ``QLayerConfig``, a list (each candidate takes its best-scoring config) or
+  ``{QLayerConfig: [node names]}``; ``subgraph_json`` partitions, a
+  ``sensitivity_cache_file`` (Quark's JSON schema; ``"enabled": false`` pins a
+  layer), ``worker_num`` threads, ``no_input_qdq_shared`` and
+  ``dual_quant_nodes``; the layers it moves match Quark's, and a candidate
+  ranking can differ where two precisions score within quantizer noise.
+  ``shared_param_mode`` is validated and otherwise meaningless here.
   AdaRound and GPTQ refine the weight codes layer by layer
   (:mod:`onnxsim.quark_weight_rounding`; Conv / Gemm / MatMul, guarded so a
   layer's reconstruction error never gets worse). AdaRound honours
@@ -113,7 +131,11 @@ names and preset *meanings*, not copied.
   triangular factor by column), so Quark's result is round-to-nearest on its
   grid; onnxsim really propagates the error (and is never worse). Quarot folds the R1 residual-stream rotation into the float
   weights before quantization (:mod:`onnxsim.quark_quarot`; needs
-  ``r_config_path``; R2-R4 do not exist, as in Quark's ONNX flow). An
+  ``r_config_path``; R2-R4 do not exist, as in Quark's ONNX flow -- its
+  ``transform`` has them as TODO). The R1 weights are bit-identical to
+  Quark's for the same matrix, and the power-of-two Hadamard matrix is the
+  same; for other sizes Quark tabulates Hadamard matrices (12, 20, 28, ...
+  times a power of two) where onnxsim uses a random orthogonal one. An
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
