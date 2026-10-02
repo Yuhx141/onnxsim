@@ -1276,6 +1276,7 @@ class ModelQuantizer:
                 calibration_data=calibration,
                 activation_dtype=act_dtype,
                 op_types=op_types,
+                float_clamp_input=op_types is not None,
                 exclude_nodes=exclude,
                 method=act.calibration_method,
                 symmetric_activations=act.symmetric,
