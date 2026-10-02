@@ -468,13 +468,35 @@ def _batches(shape, n=4):
     return [{"x": rng.standard_normal(shape).astype(np.float32)} for _ in range(n)]
 
 
-@pytest.mark.parametrize(
-    "algo", [qc.SmoothQuantConfig(alpha=0.5), qc.BiasCorrectionConfig()]
-)
-def test_runnable_algo_changes_the_quantized_model(algo):
+def test_smooth_quant_changes_the_quantized_model():
     batches = _batches((4, 8))
     base = _quantize(_two_layer_model(), [], batches)
-    out = _quantize(_two_layer_model(), [algo], batches)
+    out = _quantize(_two_layer_model(), [qc.SmoothQuantConfig(alpha=0.5)], batches)
+    assert out.SerializeToString() != base.SerializeToString()
+
+
+def test_bias_correction_changes_the_quantized_gemm_biases():
+    # like Quark's, it rewrites the quantized bias of Conv / Gemm layers
+    # (MatMul without a bias is left alone)
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21]>
+        agraph (float[N,8] x) => (float[N,8] y)
+        {
+            h = Gemm(x, w1, b1)
+            r = Relu(h)
+            y = Gemm(r, w2, b2)
+        }
+        """
+    )
+    rng = np.random.default_rng(1)
+    model.graph.initializer.extend(
+        onnx.numpy_helper.from_array(rng.standard_normal(s).astype(np.float32), n)
+        for n, s in (("w1", (8, 8)), ("b1", (8,)), ("w2", (8, 8)), ("b2", (8,)))
+    )
+    batches = _batches((4, 8))
+    base = _quantize(model, [], batches)
+    out = _quantize(model, [qc.BiasCorrectionConfig()], batches)
     assert out.SerializeToString() != base.SerializeToString()
 
 

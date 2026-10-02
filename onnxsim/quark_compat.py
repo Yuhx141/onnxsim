@@ -1279,10 +1279,13 @@ class ModelQuantizer:
         if "gptq" in by_name:
             quantized = self._gptq(float_model, quantized, calibration, by_name["gptq"])
         if "bias_correction" in by_name:
-            from onnxsim.bias_correction import correct_bias
+            from onnxsim.quark_bias_correction import correct_bias_quark
 
-            quantized = correct_bias(
-                float_model, quantized, calibration_data=calibration
+            quantized = correct_bias_quark(
+                float_model,
+                quantized,
+                calibration,
+                activation_symmetric=bool(opts.get("ActivationSymmetric", False)),
             )
         return quantized
 
