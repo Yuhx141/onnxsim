@@ -41,6 +41,13 @@ from onnxsim import quark_compat as qc  # noqa: E402
 from onnxsim import quark_weight_rounding as wr  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _run_in_tmp_dir(tmp_path, monkeypatch):
+    """Quark's fine-tuning presets and ``quantized_info.csv`` write scratch files
+    into the current directory; keep them out of the checkout."""
+    monkeypatch.chdir(tmp_path)
+
+
 class _Quiet(contextlib.AbstractContextManager):
     def __enter__(self):
         self._stack = contextlib.ExitStack()

@@ -115,10 +115,7 @@ names and preset *meanings*, not copied.
   MatMul) -- over activations of any rank. Quark enables CLE implicitly in
   *every* preset (``include_cle=True``) while onnxsim only runs it when
   ``CLEConfig`` is listed, so a preset's weights differ from Quark's wherever a
-  CLE pattern exists. AdaQuant (``num_iterations``, ``learning_rate``,
-  ``reg_param``) runs after quantization, against the float model; AdaQuant
-  only reoptimizes MatMul/Gemm layers whose output is not folded with a
-  following Relu, and leaves the rest as calibrated. BiasCorrection
+  CLE pattern exists. BiasCorrection
   (:mod:`onnxsim.quark_bias_correction`) rewrites the quantized *bias* of
   every Conv / Gemm that has one, from the layer-local float - quantized
   output mean, exactly as Quark does (integer biases equal Quark's for
@@ -134,13 +131,45 @@ names and preset *meanings*, not copied.
   ``dual_quant_nodes``; the layers it moves match Quark's, and a candidate
   ranking can differ where two precisions score within quantizer noise.
   ``shared_param_mode`` is validated and otherwise meaningless here.
-  AdaRound and GPTQ refine the weight codes layer by layer
-  (:mod:`onnxsim.quark_weight_rounding`; Conv / Gemm / MatMul, guarded so a
-  layer's reconstruction error never gets worse). AdaRound honours
-  ``drop_ratio`` (QDrop-style mixing of quantized and float layer inputs),
-  ``selective_update``, ``lr_adjust`` and ``data_size``; ``update_bias`` is
-  accepted and ignored, as in Quark (only AdaQuant reads it); ``early_stop`` /
-  ``output_qdq`` / ``batch_size`` / ``num_batches`` have no effect. GPTQ with
+  AdaRound and AdaQuant are Quark's ``FastFinetune``
+  (:mod:`onnxsim.quark_finetune`, a numpy port of ``quark.onnx.algorithm.
+  finetuning``): per Conv / ConvTranspose / Gemm / MatMul / InstanceNorm /
+  LayerNorm *block* (input Q/DQ, op, bias, a following Relu / LeakyRelu / Clip /
+  Sigmoid / Tanh / Gelu / Softmax, optionally the output Q/DQ), in graph order,
+  the quantized model's layer input is re-captured after every update
+  (``parallel=True``: once up front), mini-batches of ``batch_size`` samples are
+  drawn each iteration, and Quark's loss, ``early_stop`` rule, cosine ``beta``
+  schedule, ``lr_adjust``, ``drop_ratio`` (default 1.0, as in Quark),
+  ``selective_update`` (end-to-end L2 over ``output_index``), ``output_qdq``,
+  ``num_batches``, ``data_size``, ``target_op_type``, ``select_max_mem_layer``,
+  ``fixed_seed`` and ``QuantizationPreference="accuracy"`` are implemented;
+  AdaQuant trains the float weight (and, with ``update_bias``, the quantized
+  bias) straight-through at ``learning_rate=1e-5`` and re-quantizes it. The
+  presets carry the ``FastFinetune`` dict of Quark's (``batch_size=2``,
+  ``early_stop=True``, ``data_size=1000``, ...). Given Quark's own random
+  stream the integer codes are identical to Quark's for AdaRound (and for short
+  AdaQuant runs), see ``tests/test_quark_finetune_parity.py``; with numpy's
+  stream the result agrees statistically (the optimization is stochastic in
+  Quark too). Exactly like Quark 0.13, the config fields ``reg_param`` /
+  ``beta_range`` / ``warm_start`` / ``parallel`` / ``output_index`` /
+  ``ref_model_path`` / ``dynamic_batch`` are *not* forwarded (only
+  ``extra_options["FastFinetune"]`` reaches them) and ``update_bias`` only
+  matters to AdaQuant; ``extra_options["FastFinetune"]`` keys override the
+  config. No effect on the numbers, so accepted and ignored: ``optim_device`` /
+  ``infer_device`` / ``num_workers`` / ``pin_memory`` / ``use_gds`` /
+  ``log_period`` / ``cache_dir`` / ``dynamic_batch`` / ``mem_opt_level`` /
+  ``SaveAndRestore``. ``ref_model_path`` must be a float model. Not replicated:
+  layers Quark cannot convert are skipped (``auto_pad``, ``ConvTranspose`` with
+  groups / ``output_padding``, 3-D convolutions, ``Gemm`` with ``transA``,
+  ``PRelu``); weights stay *per tensor* here too (Quark's default), unlike the
+  GPTQ and legacy AdaQuant paths. onnxsim additions: ``guard`` (default on:
+  keep a layer's new codes only if its block error did not rise; ``False`` is
+  Quark's behaviour) and ``AdaQuantConfig(legacy_engine=True)`` for the older
+  :func:`onnxsim.apply_adaquant` (a different algorithm: rounding relaxation
+  plus a learnable activation range). GPTQ is in
+  :mod:`onnxsim.quark_weight_rounding` (Conv / Gemm / MatMul, guarded so a
+  layer's reconstruction error never gets worse).
+  GPTQ with
   ``bits`` / ``group_size`` / ``per_channel`` / ``mse`` / ``weight_symmetric``
   set re-grids the weights the way Quark's GPTQ does (``bits``-bit codes,
   per-tensor / per-channel / per-group scales, scales and zero points written
@@ -159,14 +188,29 @@ names and preset *meanings*, not copied.
   times a power of two) where onnxsim uses a random orthogonal one. An
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
+- ``MATMUL_NBITS`` (``UseMatMulNBits``): weight-only 4-bit quantization to
+  ``com.microsoft::MatMulNBits`` (:mod:`onnxsim.quark_matmul_nbits`, which
+  documents the layout, numerics and limits); no activation calibration.
+  ``MatMulNBitsParams`` (``GroupSize`` 128, ``Symmetric`` True, ``Bits`` 4,
+  ``AccuracyLevel`` 1, ``Algorithm`` DEFAULT / HQQ / GPTQ) and ``GPTQParams``
+  are read (a ``GPTQConfig`` in ``algo_config`` is ignored, as in Quark);
+  packed weights, scales, zero points and attributes are identical to Quark's
+  for all three algorithms
+  (``tests/test_quark_parity.py``). Differences: ``Bits != 4`` raises (Quark
+  emits an unrunnable model), MatMul + Add pairs that Quark's ONNX Runtime
+  pre-processing would fuse into an unquantized Gemm are converted
+  (``SkipPreprocess=True`` in Quark equals this), ``exclude`` is honoured, GPTQ
+  error propagation is Quark's no-op unless ``GPTQParams["Compensate"]``, and
+  other ``algo_config`` entries raise.
 - ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
   ``Int32Bias``, ``AlignEltwiseQuantType``, ``CalibMovingAverage`` (integer
-  presets only), ``MatMulConstBOnly`` (the transformer presets) and the
-  block-format options above.
+  presets only), ``MatMulConstBOnly`` (the transformer presets), the
+  block-format options above and the ``MATMUL_NBITS`` ones.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -350,6 +394,20 @@ def _activation_inputs(node: onnx.NodeProto, inits: "set[str]") -> List[str]:
     return out
 
 
+def _matmul_add_consumers(model: onnx.ModelProto, converted: List[str]) -> List[str]:
+    """Converted MatMul nodes (by their new ``*_Q4`` names) whose only consumer
+    is an ``Add`` -- the pattern ONNX Runtime fuses into a Gemm."""
+    adds = [n for n in model.graph.node if n.op_type == "Add"]
+    out: List[str] = []
+    for n in model.graph.node:
+        if n.op_type != "MatMul" or (n.name + "_Q4" if n.name else "") not in converted:
+            continue
+        users = [m for m in model.graph.node if n.output[0] in m.input]
+        if len(users) == 1 and users[0] in adds:
+            out.append(n.name or n.output[0])
+    return out
+
+
 def _match_nodes(model: onnx.ModelProto, patterns: List[Any]) -> List[str]:
     """Node names selected by ``patterns``: plain names, and Quark's
     ``^...*``-style regular expressions (must contain ``.*``)."""
@@ -466,6 +524,16 @@ _PRESETS: Dict[str, Callable[[], QConfig]] = {
         _layer(Int16Spec, Int8Spec, calibration_method="minmax"),
         AlignEltwiseQuantType=True,
     ),
+    "MATMUL_NBITS": lambda: QConfig(
+        _layer(Int8Spec, Int8Spec, calibration_method="minmax"),
+        UseMatMulNBits=True,
+        MatMulNBitsParams={
+            "GroupSize": 128,
+            "Symmetric": True,
+            "Bits": 4,
+            "AccuracyLevel": 1,
+        },
+    ),
     "S16S8_ASWS": lambda: QConfig(_layer(Int16Spec, Int8Spec)),
     "U16S8_AAWS": lambda: QConfig(_layer(UInt16Spec, Int8Spec, **_PCT)),
     "FP16": lambda: QConfig(_layer(Float16Spec, Float16Spec)),
@@ -483,16 +551,27 @@ _PRESETS: Dict[str, Callable[[], QConfig]] = {
 }
 
 
+def _preset_finetune_params(cls: type) -> Dict[str, Any]:
+    """The ``FastFinetune`` options Quark's ``*_ADAROUND`` / ``*_ADAQUANT``
+    presets carry. Their dict has no ``UpdateBias`` key, so Quark's training
+    default (on) applies to AdaQuant, unlike ``AdaQuantConfig()`` (off)."""
+    if cls is AdaQuantConfig:
+        return dict(_FASTFT_PRESET, learning_rate=1e-5, update_bias=True)
+    if cls is AdaRoundConfig:
+        return dict(_FASTFT_PRESET, learning_rate=0.1)
+    return {}
+
+
 def _algo_variant(base: str, cls: type) -> Callable[[], QConfig]:
     def make() -> QConfig:
-        return _with_algo(_PRESETS[base](), cls())
+        return _with_algo(_PRESETS[base](), cls(**_preset_finetune_params(cls)))
 
     return make
 
 
 for _n in list(_PRESETS):
     _block = _n.startswith(("BFP", "MX"))
-    if _n in ("BF16", "UINT8_DYNAMIC_QUANT") or _n.startswith("FP16"):
+    if _n in ("BF16", "UINT8_DYNAMIC_QUANT", "MATMUL_NBITS") or _n.startswith("FP16"):
         continue
     if not _block:
         _PRESETS[f"{_n}_ADAROUND"] = _algo_variant(_n, AdaRoundConfig)
@@ -506,7 +585,7 @@ for _n in list(_PRESETS):
 def _cnn_accurate(act: type, wt: type) -> QConfig:
     return QConfig(
         _layer(act, wt, symmetric=False, calibration_method="percentile:99.9999"),
-        algo_config=[AdaRoundConfig(num_iterations=1000, learning_rate=0.1)],
+        algo_config=[AdaRoundConfig(**_preset_finetune_params(AdaRoundConfig))],
     )
 
 
@@ -663,11 +742,57 @@ _RUNNABLE_ALGOS = {
     "bias_correction",
     "auto_mixprecision",
 }
-# Quark AdaQuant param -> onnxsim.apply_adaquant kwarg.
+# Quark AdaQuant param -> onnxsim.apply_adaquant kwarg (``legacy_engine=True``).
 _ADAQUANT_PARAMS = {
     "num_iterations": "num_iterations",
     "learning_rate": "weight_learning_rate",
     "reg_param": "reg_param",
+}
+# ``extra_options["FastFinetune"]`` keys (they win over the algo config's
+# values, as in Quark) -> AdaRoundConfig / AdaQuantConfig params.
+_FASTFT_KEYS = {
+    "DataSize": "data_size",
+    "FixedSeed": "fixed_seed",
+    "BatchSize": "batch_size",
+    "NumBatches": "num_batches",
+    "NumIterations": "num_iterations",
+    "LearningRate": "learning_rate",
+    "EarlyStop": "early_stop",
+    "OutputIndex": "output_index",
+    "LRAdjust": "lr_adjust",
+    "SelectiveUpdate": "selective_update",
+    "UpdateBias": "update_bias",
+    "OutputQDQ": "output_qdq",
+    "DropRatio": "drop_ratio",
+    "MemOptLevel": "mem_opt_level",
+    "Parallel": "parallel",
+    "RegParam": "reg_param",
+    "BetaRange": "beta_range",
+    "WarmStart": "warm_start",
+    "SelectMaxMemLayer": "select_max_mem_layer",
+    "TargetOpType": "target_op_type",
+    "RefModelPath": "ref_model_path",
+}
+# AdaRoundConfig / AdaQuantConfig fields that Quark 0.13's ``_get_config`` never
+# copies into ``extra_options["FastFinetune"]`` (it stores them on the config and
+# stops there), so there they only take effect through extra_options.
+_FASTFT_NOT_FORWARDED = (
+    "output_index",
+    "reg_param",
+    "beta_range",
+    "warm_start",
+    "parallel",
+    "dynamic_batch",
+    "ref_model_path",
+)
+# What Quark's ``*_ADAROUND`` / ``*_ADAQUANT`` presets put in
+# ``extra_options["FastFinetune"]`` (read from the amd-quark 0.13 wheel).
+_FASTFT_PRESET = {
+    "data_size": 1000,
+    "fixed_seed": 1705472343,
+    "batch_size": 2,
+    "num_iterations": 1000,
+    "early_stop": True,
 }
 
 
@@ -694,6 +819,9 @@ class ModelQuantizer:
         self.last_auto_mixprecision: Any = None
         #: ``{"adaround" | "gptq": [LayerReport, ...]}`` of the last run
         self.last_weight_rounding: Dict[str, Any] = {}
+        #: :class:`~onnxsim.quark_matmul_nbits.MatMulNBitsReport` of the last
+        #: ``MATMUL_NBITS`` run, if any
+        self.last_matmul_nbits: Any = None
 
     def quantize_model(
         self,
@@ -711,6 +839,16 @@ class ModelQuantizer:
         cfg.global_config = cfg.global_config.resolved()
         act, wt = cfg.global_config.activation, cfg.global_config.weight
         assert act is not None and wt is not None  # resolved() fills both
+
+        if cfg.extra_options.get("UseMatMulNBits"):  # the MATMUL_NBITS preset
+            result = self._quantize_matmul_nbits(
+                model_input, calibration_data_reader, ignore_unsupported_algos
+            )
+            for msg in self.last_approximations:
+                warnings.warn(f"onnxsim.quark_compat: {msg}", UserWarning, stacklevel=2)
+            if model_output:
+                onnx.save(result, model_output)
+            return result
 
         if wt.is_dynamic:
             raise NotImplementedError("dynamic weight quantization is not supported")
@@ -773,6 +911,74 @@ class ModelQuantizer:
             warnings.warn(f"onnxsim.quark_compat: {msg}", UserWarning, stacklevel=2)
         if model_output:
             onnx.save(result, model_output)
+        return result
+
+    def _quantize_matmul_nbits(
+        self,
+        model: Union[str, onnx.ModelProto],
+        reader: Any,
+        ignore_unsupported: bool,
+    ) -> onnx.ModelProto:
+        """``MATMUL_NBITS``: constant-weight MatMuls -> ``MatMulNBits`` (see
+        :mod:`onnxsim.quark_matmul_nbits`). Options as Quark reads them:
+        ``MatMulNBitsParams`` (``GroupSize``, ``Symmetric``, ``Bits``,
+        ``AccuracyLevel``, ``Algorithm`` = DEFAULT / HQQ / GPTQ) and, for GPTQ,
+        ``GPTQParams``; a ``GPTQConfig`` in ``algo_config`` is ignored, as in
+        Quark."""
+        from onnxsim.quark_matmul_nbits import quantize_matmul_nbits
+
+        cfg = self.config
+        opts = cfg.extra_options
+        if isinstance(model, str):
+            model = onnx.load(model)
+        mm = dict(opts.get("MatMulNBitsParams", {}))
+        gptq = dict(opts.get("GPTQParams", {}))
+        others = [a.name for a in cfg.algo_config if a.name != "gptq"]
+        if others and not ignore_unsupported:
+            raise NotImplementedError(
+                f"algo_config [{', '.join(others)}] is not applied to MatMulNBits; "
+                "pass ignore_unsupported_algos=True to quantize without it"
+            )
+        if any(a.name == "gptq" for a in cfg.algo_config):
+            self._approx(
+                "GPTQConfig is not read by MATMUL_NBITS (as in Quark): set "
+                "extra_options['GPTQParams'] and MatMulNBitsParams['Algorithm']"
+            )
+        algorithm = str(mm.get("Algorithm", "DEFAULT"))
+        calibration = None
+        if algorithm.upper() == "GPTQ":
+            calibration = _drain_reader(reader, limit=1)  # Quark: first batch only
+            if not calibration:
+                raise ValueError("calibration_data_reader is required for GPTQ")
+            if gptq.get("Compensate"):
+                self._approx(
+                    "GPTQ propagates the rounding error (Quark 0.13's propagation "
+                    "is a no-op, so its codes are round-to-nearest)"
+                )
+        exclude = _match_nodes(
+            model, [e for e in cfg.exclude if isinstance(e, (str, tuple))]
+        )
+        result, report = quantize_matmul_nbits(
+            model,
+            group_size=int(mm.get("GroupSize", 128)),
+            symmetric=bool(mm.get("Symmetric", True)),
+            bits=int(mm.get("Bits", 4)),
+            accuracy_level=mm.get("AccuracyLevel", 0),
+            algorithm=algorithm,
+            exclude_nodes=exclude,
+            gptq_params=gptq,
+            calibration=calibration,
+        )
+        self.last_matmul_nbits = report
+        if cfg.specific_layer_config or cfg.layer_type_config:
+            self._approx("per-layer / per-type overrides ignored for MatMulNBits")
+        if not opts.get("SkipPreprocess", False):
+            fused = _matmul_add_consumers(model, report.converted)
+            if fused:
+                self._approx(
+                    "Quark's pre-processing fuses MatMul + Add into a Gemm, which it "
+                    f"does not quantize; converted anyway: {', '.join(fused)}"
+                )
         return result
 
     def _mixed_block_target(self, act: QSpec) -> Optional[AlgoConfig]:
@@ -934,47 +1140,76 @@ class ModelQuantizer:
             use_random_had=bool(p.get("use_random_had", False)),
         )
 
-    def _adaround(
+    def _finetune(
         self,
+        name: str,
         float_model: onnx.ModelProto,
         quantized: onnx.ModelProto,
         calibration: List[Dict[str, np.ndarray]],
         algo: AlgoConfig,
     ) -> onnx.ModelProto:
-        from onnxsim.quark_weight_rounding import adaround_int8
+        """Quark's FastFinetune (``AdaRoundConfig`` / ``AdaQuantConfig``) via
+        :mod:`onnxsim.quark_finetune`; ``extra_options["FastFinetune"]`` keys
+        override the config's params, and ``QuantizationPreference="accuracy"``
+        applies Quark's own overrides (``EarlyStop`` off, ``UpdateBias`` and
+        ``OutputQDQ`` on). ``guard`` (an onnxsim addition, default on) keeps a
+        layer's new codes only if its block reconstruction error did not get
+        worse; ``guard=False`` is Quark's behaviour."""
+        from onnxsim.quark_finetune import TARGET_OPS, FinetuneOptions, finetune
 
-        p = algo.params
-        # update_bias: Quark's AdaRound never reads it (only AdaQuant does).
-        self._approx(
-            "AdaRound is layer-wise against the float model's activations "
-            "(Quark optimizes subgraph blocks)"
-        )
-        kwargs: Dict[str, Any] = {
-            k: p[k]
-            for k in (
-                "num_iterations",
-                "learning_rate",
-                "reg_param",
-                "warm_start",
-                "drop_ratio",
-                "selective_update",
+        p = dict(algo.params)
+        dropped = [k for k in _FASTFT_NOT_FORWARDED if k in p]
+        for k in dropped:
+            del p[k]
+        if dropped:
+            self._approx(
+                f"{name}: Quark's config does not forward {', '.join(dropped)} "
+                "(only extra_options['FastFinetune'] does), so they are ignored here too"
             )
-            if k in p
-        }
-        if p.get("lr_adjust"):
-            kwargs["lr_adjust"] = tuple(p["lr_adjust"])
+        ff = self.config.extra_options.get("FastFinetune")
+        if isinstance(ff, dict):
+            p.update({_FASTFT_KEYS[k]: v for k, v in ff.items() if k in _FASTFT_KEYS})
+        if self.config.extra_options.get("QuantizationPreference") == "accuracy":
+            p.update(early_stop=False, update_bias=True, output_qdq=True)
         if "data_size" in p:
             calibration = calibration[: int(p["data_size"])]
-        if "beta_range" in p:
-            kwargs["beta_range"] = tuple(p["beta_range"])
-        if "fixed_seed" in p:
-            kwargs["seed"] = int(p["fixed_seed"]) % (2**32)
-        if p.get("target_op_type"):
-            kwargs["target_ops"] = tuple(
-                o for o in p["target_op_type"] if o in ("Conv", "Gemm", "MatMul")
-            )
-        out, self.last_weight_rounding["adaround"] = adaround_int8(
-            float_model, quantized, calibration, **kwargs
+        ref = p.get("ref_model_path")
+        if isinstance(ref, str) and os.path.exists(ref):
+            float_model = onnx.load(ref)
+        adaquant = name == "adaquant"
+        targets = tuple(p.get("target_op_type") or TARGET_OPS)
+        opt = FinetuneOptions(
+            algorithm=name,
+            num_iterations=int(p.get("num_iterations", 3000 if adaquant else 1000)),
+            learning_rate=p.get("learning_rate"),
+            batch_size=int(p.get("batch_size", 1)),
+            num_batches=int(p.get("num_batches", 1)),
+            early_stop=bool(p.get("early_stop", False)),
+            reg_param=float(p.get("reg_param", 0.01)),
+            beta_range=tuple(p.get("beta_range", (20.0, 2.0))),  # type: ignore[arg-type]
+            warm_start=float(p.get("warm_start", 0.2)),
+            drop_ratio=float(p.get("drop_ratio", 1.0)),
+            lr_adjust=tuple(p["lr_adjust"]) if p.get("lr_adjust") else None,  # type: ignore[arg-type]
+            selective_update=bool(p.get("selective_update", False)),
+            update_bias=bool(p.get("update_bias", False)) and adaquant,
+            output_qdq=bool(p.get("output_qdq", False)),
+            parallel=bool(p.get("parallel", False)),
+            mem_opt_level=int(p.get("mem_opt_level", 1)),
+            output_index=p.get("output_index"),
+            select_max_mem_layer=bool(p.get("select_max_mem_layer", False)),
+            target_ops=targets,
+            seed=int(p.get("fixed_seed", 1705472343)),
+            guard=bool(p.get("guard", True)),
+        )
+        self._approx(
+            f"{name} is a numpy port of Quark's FastFinetune loop: mini-batches "
+            "come from numpy's generator instead of torch.randperm and the "
+            "arithmetic is float64, so results match Quark statistically "
+            "(bit for bit given the same mini-batch indices)"
+        )
+        # update_bias: only AdaQuant reads it, as in Quark.
+        out, self.last_weight_rounding[name] = finetune(
+            float_model, quantized, calibration, opt
         )
         return out
 
@@ -1328,7 +1563,10 @@ class ModelQuantizer:
         # Quark's presets quantize weights per tensor; the weight-rounding
         # algorithms below work per output channel.
         per_channel = bool(self.config.extra_options.get("PerChannel", False))
-        if not per_channel and {"adaquant", "adaround", "gptq"} & set(by_name):
+        legacy_adaquant = "adaquant" in by_name and by_name["adaquant"].params.get(
+            "legacy_engine"
+        )
+        if not per_channel and ("gptq" in by_name or legacy_adaquant):
             per_channel = True
             self._approx("weights quantized per channel (needed by the algorithm)")
 
@@ -1414,7 +1652,7 @@ class ModelQuantizer:
                 quantized = dedicate_qdq_pairs(quantized)
 
         # Post-quantization passes, which compare against the float model.
-        if "adaquant" in by_name:
+        if "adaquant" in by_name and by_name["adaquant"].params.get("legacy_engine"):
             from onnxsim.adaquant import apply_adaquant
 
             params = by_name["adaquant"].params
@@ -1428,9 +1666,13 @@ class ModelQuantizer:
                     if key in params
                 },
             )
+        elif "adaquant" in by_name:
+            quantized = self._finetune(
+                "adaquant", float_model, quantized, calibration, by_name["adaquant"]
+            )
         if "adaround" in by_name:
-            quantized = self._adaround(
-                float_model, quantized, calibration, by_name["adaround"]
+            quantized = self._finetune(
+                "adaround", float_model, quantized, calibration, by_name["adaround"]
             )
         if "gptq" in by_name:
             quantized = self._gptq(float_model, quantized, calibration, by_name["gptq"])

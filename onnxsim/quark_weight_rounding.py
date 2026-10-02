@@ -25,6 +25,9 @@ MatMul / Gemm / Conv layer with a constant float weight:
 Differences from Quark, on purpose: reconstruction is layer-wise against the
 float model's activations (Quark's AdaRound optimizes subgraph blocks inside
 its fine-tuning engine, full-batch Adam here rather than random mini-batches).
+:func:`adaround_int8` is therefore onnxsim's own variant; what
+:mod:`onnxsim.quark_compat` runs for ``AdaRoundConfig`` / ``AdaQuantConfig`` is
+the faithful port of Quark's fine-tuning in :mod:`onnxsim.quark_finetune`.
 GPTQ keeps the scales ``quantize_full_qdq`` chose unless asked for Quark's own
 grid: :func:`gptq_int8` with ``bits`` / ``group_size`` / ``per_channel`` /
 ``mse`` / ``weight_symmetric`` re-grids the weights exactly like Quark's GPTQ

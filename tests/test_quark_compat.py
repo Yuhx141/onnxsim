@@ -558,7 +558,7 @@ def test_adaround_preset_runs_and_reports_layers(preset):
     cfg = qc.QConfig.get_default_config(preset)
     cfg.algo_config[0].params["num_iterations"] = 30
     q = qc.ModelQuantizer(cfg)
-    with pytest.warns(UserWarning, match="AdaRound is layer-wise"):
+    with pytest.warns(UserWarning, match="numpy port of Quark.s FastFinetune"):
         out = q.quantize_model(
             _two_layer_model(), calibration_data_reader=_batches((4, 8))
         )
