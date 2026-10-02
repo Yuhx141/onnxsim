@@ -100,7 +100,7 @@ IDS = {"ids": np.array([1, 5, 7, 3, 0, 19, 2, 11], dtype=np.int64)}
 # -- make_rotation ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dim", [1, 2, 16, 12, 30])
+@pytest.mark.parametrize("dim", [1, 2, 16, 12, 24, 172])
 @pytest.mark.parametrize("random_had", [False, True])
 def test_make_rotation_is_orthogonal(dim, random_had):
     r = qr.make_rotation(dim, random_had, seed=1)
