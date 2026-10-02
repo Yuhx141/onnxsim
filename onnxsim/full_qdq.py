@@ -200,6 +200,26 @@ def _clip_bounds(
     return (lo, hi)
 
 
+def _weight_qparams(
+    lo: object, hi: object, qmin: int, qmax: int, symmetric: bool
+) -> Tuple[np.float32, int]:
+    """``(scale, zero_point)`` of a weight tensor (or channel) on the
+    ``[qmin, qmax]`` grid, in the dtypes Quark's ``compute_scale_zp`` uses:
+    float32 range, float64 scale and zero point, float32 scale stored."""
+    lo32 = np.minimum(np.float32(lo), np.float32(0))
+    hi32 = np.maximum(np.float32(hi), np.float32(0))
+    if symmetric:
+        a = np.maximum(np.abs(lo32), np.abs(hi32))
+        lo32, hi32 = -a, a
+    scale = np.float64(hi32 - lo32) / np.float64(qmax - qmin)
+    if scale < np.finfo(np.float32).tiny:
+        return np.float32(1.0), 0
+    zp = int(np.round(np.float64(qmin) - np.float64(lo32) / scale))
+    if symmetric and qmin == 0 and qmax == 255 and zp == 127:
+        zp = 128
+    return np.float32(scale), zp
+
+
 def _weight_axis(node: onnx.NodeProto, rank: int) -> Optional[int]:
     if node.op_type == "Conv":
         return 0
@@ -297,6 +317,8 @@ def quantize_full_qdq(
     quantize_prelu_slope: bool = False,
     align_ops: Optional[Iterable[str]] = None,
     unshared_ops: Iterable[str] = (),
+    quantize_bias: bool = True,
+    weight_symmetric: bool = True,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -333,7 +355,7 @@ def quantize_full_qdq(
             ``tensor_dtypes``
     :param power_of_two: round every activation and weight scale up to a
             power of two (fixed-point friendly, as Quark's ``XINT8``)
-    :param weight_dtype: ``"int8"`` (default) or ``"int16"`` for the symmetric
+    :param weight_dtype: ``"int8"`` (default), ``"int16"`` or ``"uint8"`` for the
             Conv / ConvTranspose / Gemm / MatMul weights (int16 weights use
             ``com.microsoft`` Q/DQ below opset 21, like the 16-bit activations)
     :param convert_inputs: re-quantize an input whose dtype differs from its
@@ -396,9 +418,16 @@ def quantize_full_qdq(
     :param unshared_ops: ops that would reuse their input's parameters (the
             data-movement ops) but calibrate their output on its own instead --
             Quark's behaviour for ``Slice`` and ``Split``
+    :param quantize_bias: False leaves Conv / ConvTranspose / Gemm biases float
+            (Quark's ``QuantizeBias=False``)
+    :param weight_symmetric: False quantizes the Conv / ConvTranspose / Gemm /
+            MatMul weights asymmetrically (scale over the observed range,
+            non-zero zero point; Quark's ``WeightSymmetric=False``).
+            ``weight_dtype="uint8"`` is asymmetric unsigned like Quark's
+            ``U8U8_AAWA`` weights, or the centred unsigned grid when symmetric
     :returns: the quantized ModelProto
     """
-    if weight_dtype not in ("int8", "int16"):
+    if weight_dtype not in ("int8", "int16", "uint8"):
         raise ValueError(f"unsupported weight_dtype: {weight_dtype!r}")
     if activation_dtype not in _DTYPES:
         raise ValueError(f"unsupported activation_dtype: {activation_dtype!r}")
@@ -747,7 +776,28 @@ def quantize_full_qdq(
 
     def int8_tensor_dq(x: str, w: np.ndarray) -> str:
         """``int8`` + per-tensor symmetric scale (+ DQ) for a weight-like
-        constant ``x``; returns the DQ output name."""
+        constant ``x``; returns the DQ output name. With asymmetric (or uint8)
+        weights it is the weights' grid instead (Quark treats these constants
+        as weights)."""
+        if not p2 and (not weight_symmetric or weight_dtype == "uint8"):
+            dt = "uint8" if weight_dtype == "uint8" else "int8"
+            lo, hi = _DTYPES[dt][2:]
+            s32, z = _weight_qparams(w.min(), w.max(), lo, hi, weight_symmetric)
+            q = np.clip(np.round(w / s32) + z, lo, hi).astype(_DTYPES[dt][1])
+            base = fresh(x)
+            add_init(base + f"/{dt}", q)
+            add_init(base + "/scale", np.array(s32, np.float32))
+            add_init(base + "/zp", np.array(z, _DTYPES[dt][1]))
+            out = base + "/dq"
+            act_nodes.append(
+                helper.make_node(
+                    "DequantizeLinear",
+                    [base + f"/{dt}", base + "/scale", base + "/zp"],
+                    [out],
+                    name=out,
+                )
+            )
+            return out
         if p2_search:
             s = pof2_minmse_weight_scale(w)
         else:
@@ -795,6 +845,12 @@ def quantize_full_qdq(
             if slope_only and k != 1:
                 continue
             if (
+                not quantize_bias
+                and k == 2
+                and n.op_type in ("Conv", "ConvTranspose", "Gemm")
+            ):
+                continue  # the bias stays float
+            if (
                 x not in inits
                 or x not in data
                 or inits[x].data_type != TensorProto.FLOAT
@@ -807,7 +863,32 @@ def quantize_full_qdq(
                 if key not in cache:
                     w_np = _DTYPES[weight_dtype][1]
                     w_max = _DTYPES[weight_dtype][3]
-                    if axis is None:
+                    if not weight_symmetric or weight_dtype == "uint8":
+                        wmin, wmax = _DTYPES[weight_dtype][2:]
+                        if axis is None:
+                            s32, z = _weight_qparams(
+                                w.min(), w.max(), wmin, wmax, weight_symmetric
+                            )
+                            s, zp = np.array(s32, np.float32), np.array(z, w_np)
+                            q = np.clip(np.round(w / s) + z, wmin, wmax).astype(w_np)
+                        else:
+                            chans = np.moveaxis(w, axis, 0).reshape(w.shape[axis], -1)
+                            sz = [
+                                _weight_qparams(
+                                    c.min(), c.max(), wmin, wmax, weight_symmetric
+                                )
+                                for c in chans
+                            ]
+                            s = np.array([a for a, _ in sz], np.float32)
+                            zp = np.array([b for _, b in sz], w_np)
+                            shape = [1] * w.ndim
+                            shape[axis] = -1
+                            q = np.clip(
+                                np.round(w / s.reshape(shape)) + zp.reshape(shape),
+                                wmin,
+                                wmax,
+                            ).astype(w_np)
+                    elif axis is None:
                         s = np.array(max(np.abs(w).max(), 1e-12) / w_max, np.float32)
                         if p2_search and weight_dtype == "int8":
                             s = np.array(pof2_minmse_weight_scale(w), np.float32)
@@ -912,7 +993,9 @@ def quantize_full_qdq(
             else:
                 key = ("c", x, None)
                 if key not in cache:
-                    s, zp = _qparams(w.min(), w.max(), qmin, qmax, sym, p2)
+                    s, zp = _qparams(
+                        w.min(), w.max(), qmin, qmax, sym and weight_symmetric, p2
+                    )
                     q = np.clip(np.round(w / s) + zp, qmin, qmax).astype(act_np)
                     base = fresh(x)
                     add_init(base + "/q", q)

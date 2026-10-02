@@ -1292,7 +1292,10 @@ class ModelQuantizer:
 
         if wt.dtype not in ("int8", "uint8", "int16"):
             raise NotImplementedError(f"weight dtype {wt.dtype} unsupported")
-        if wt.dtype == "uint8":
+        # the weight-rounding algorithms work on int8 weight codes
+        int8_only = bool({"adaquant", "adaround", "gptq"} & {a.name for a in algos})
+        uint8_weights = wt.dtype == "uint8" and not int8_only
+        if wt.dtype == "uint8" and not uint8_weights:
             self._approx("weights quantized int8-symmetric instead of uint8")
         act_dtype = self._int_act_dtype(act)
 
@@ -1357,7 +1360,17 @@ class ModelQuantizer:
                 symmetric_activations=act_sym,
                 power_of_two=act.pof2 or wt.pof2,
                 per_channel=per_channel,
-                weight_dtype="int16" if wt.dtype == "int16" else "int8",
+                weight_dtype=(
+                    "int16"
+                    if wt.dtype == "int16"
+                    else "uint8"
+                    if uint8_weights
+                    else "int8"
+                ),
+                weight_symmetric=bool(
+                    opts.get("WeightSymmetric", wt.symmetric or int8_only)
+                ),
+                quantize_bias=bool(opts.get("QuantizeBias", True)),
                 **_activation_rules(opts, act_sym, self._extended(act, wt), act.pof2),
                 # Quark's XINT8 (power-of-2 weights): MinMSE scale search on
                 # weights and int8 biases (``Int32Bias=True`` keeps int32)
@@ -1371,7 +1384,7 @@ class ModelQuantizer:
                 tensor_dtypes=t_dtypes or None,
                 tensor_symmetric=t_sym or None,
             )
-            if opts.get("Int32Bias", True) is False:
+            if opts.get("Int32Bias", True) is False and opts.get("QuantizeBias", True):
                 from onnxsim.quark_preset_graphs import requantize_biases_int8
 
                 self._approx(
