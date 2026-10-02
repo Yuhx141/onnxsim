@@ -7,7 +7,6 @@ Their parity with Quark is checked in ``tests/test_quark_parity.py``."""
 import warnings
 
 import numpy as np
-import onnx
 import pytest
 from onnx import numpy_helper, parser
 
