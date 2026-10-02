@@ -20,8 +20,10 @@ installed ``amd-quark`` in CI) and reading its source for the axis rule:
   ``Transpose``, ``Squeeze``, ``Unsqueeze``, ``Resize``) get their output
   quantized only when their input already is -- so a lone ``Relu`` is left
   alone but ``Conv -> Relu`` is quantized end to end.
-- Everything else (``Abs``, ``Exp``, ``Clip``, ``BatchNormalization``,
-  ``LayerNormalization``, ...) is not quantized.
+- ``LayerNormalization`` is quantized end to end (scale and bias too) when its
+  input already is; otherwise left alone.
+- Everything else (``Abs``, ``Exp``, ``Clip``, ``BatchNormalization``, ...) is
+  not quantized.
 
 Block formats get one ``com.amd.quark`` node per tensor; ``float16`` /
 ``bfloat16`` get an ``ExtendedQuantizeLinear`` / ``ExtendedDequantizeLinear``
@@ -72,6 +74,9 @@ ACTIVE_OPS = {
     "GlobalAveragePool",
     "InstanceNormalization",
 }
+# Quantized end to end (inputs, constants, outputs) when -- and only when --
+# their data input already is quantized.
+FOLLOWING_ACTIVE_OPS = {"LayerNormalization"}
 PASS_THROUGH_OPS = {
     "Relu",
     "MaxPool",
@@ -226,6 +231,12 @@ class _Plan:
             elif n.op_type in PASS_THROUGH_OPS and n.input and n.input[0] in seen:
                 for y in n.output:
                     add(y)
+            elif n.op_type in FOLLOWING_ACTIVE_OPS and n.input and n.input[0] in seen:
+                # active, but only behind an already quantized activation
+                for x in n.input:
+                    add(x)
+                for y in n.output:
+                    add(y)
         # A pass-through op feeding an active op: its output was added above as
         # that op's input; nothing to do for its own input (not quantized).
         return q
@@ -322,6 +333,8 @@ def apply_fake_quant_format(
     fold_weights: bool = False,
     fold_fn: Optional[Callable[[np.ndarray, int], np.ndarray]] = None,
     exclude: Sequence[str] = (),
+    const_dtype: Optional[str] = None,
+    quantize_all_ops: bool = True,
 ) -> onnx.ModelProto:
     """Return ``model`` with fake-quantization nodes inserted (see the module
     docstring).
@@ -335,10 +348,23 @@ def apply_fake_quant_format(
             instead of inserting a node on them
     :param fold_fn: ``f(array, axis) -> array``, the numpy fake-quantizer
     :param exclude: node names / first-output names left entirely alone
+    :param const_dtype: a block format for the *constants* (weights and biases)
+            while the activations use ``dtype`` -- Quark's ``BF16_BFP16`` /
+            ``BF16_MXINT8`` (bfloat16 activations, block-format constants).
+            Axes are refined as for that block format.
+    :param quantize_all_ops: for ``float16`` / ``bfloat16``: also quantize the
+            wider op set of Quark's ``FP16`` / ``BF16`` presets
+            (``QuantizeAllOpTypes``); False gives the block formats' op
+            coverage with half-precision quantizers. Always off with
+            ``const_dtype``.
     """
     half = dtype in HALF_DTYPES
     if not half:
         node_spec(dtype)  # validates the block format
+    if const_dtype is not None:
+        node_spec(const_dtype)
+        if fold_weights or not activations:
+            raise ValueError("const_dtype nodes cannot be combined with folding")
     m = onnx.ModelProto()
     m.CopyFrom(model)
     fold = fold_weights or not activations
@@ -358,7 +384,8 @@ def apply_fake_quant_format(
         work.graph.node.extend(keep)
 
     plan = _Plan(m)
-    quantized = plan.quantized_tensors(work, HALF_EXTRA_OPS.get(dtype))
+    extra = HALF_EXTRA_OPS.get(dtype) if quantize_all_ops and not const_dtype else None
+    quantized = plan.quantized_tensors(work, extra)
     if half:
         fused = _fused_activation_inputs(work, plan.inits)
         quantized = [t for t in quantized if t not in fused]
@@ -368,6 +395,8 @@ def apply_fake_quant_format(
 
     def fake_quant(t: str, src: str, dst: str) -> List[onnx.NodeProto]:
         """The node(s) quantizing tensor ``t``: ``src`` -> ``dst``."""
+        if const_dtype is not None and t in plan.inits:
+            return [_make_node(const_dtype, src, dst, axes[t], t + "_DequantizeLinear")]
         if half:
             nodes, extra = _make_half_pair(dtype, src, dst, t)
             g.initializer.extend(extra)

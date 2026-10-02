@@ -1,0 +1,629 @@
+"""Graph builders for the Quark presets that combine two number formats
+(``MX9_INT8`` and the ``BF16_MIXED_*`` presets), on top of
+:mod:`onnxsim.quark_fakequant_graph`.
+
+Everything here was derived by running AMD Quark on probe graphs and is
+re-checked against the installed ``amd-quark`` by ``tests/test_quark_parity.py``
+(the "preset combinations" section).
+
+``MX9_INT8``
+    Activations get the same ``BFPQuantizeDequantize`` (``to_bfp_prime``, 16
+    bits) nodes as the plain ``MX9`` preset; every constant that preset would
+    quantize (weights *and* biases) is instead stored as an ``int8`` initializer
+    with a symmetric per-tensor scale ``max|w| / 127`` and read through a
+    ``com.microsoft`` ``DequantizeLinear`` -- the offline-quantized form Quark's
+    int8 path emits.
+
+``BF16_MIXED_BFP16`` / ``BF16_MIXED_MXINT8``
+    A bfloat16 model (weights, activations; biases are *not* quantized) in which
+    every ``Conv`` / ``ConvTranspose`` / ``Gemm`` / ``MatMul`` is promoted to a
+    block format (Quark runs its AutoMixprecision with the threshold disabled,
+    so every candidate is promoted -- there is no sensitivity ranking to
+    reproduce). Promoting a node replaces the bfloat16 quantizers on its
+    activation inputs and weight with block-format nodes (default block axis 1,
+    no axis refinement); its outputs stay bfloat16. Wherever a promoted node
+    meets a bfloat16 quantizer on the other side of a tensor ("precision
+    boundary") an extra node of the promoted format is inserted -- Quark's
+    ``DualQuantNodes``. See :func:`apply_mixed_block_format` for the exact rule.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+import onnx
+from onnx import numpy_helper
+
+from onnxsim.quark_fakequant_graph import (
+    COP_DOMAIN,
+    DQ_SUFFIX,
+    _make_node,
+    _Plan,
+    apply_fake_quant_format,
+)
+
+MS_DOMAIN = "com.microsoft"
+PROMOTABLE_OPS = ("Conv", "ConvTranspose", "Gemm", "MatMul")
+
+
+def _add_opset(model: onnx.ModelProto, domain: str) -> None:
+    if not any(o.domain == domain for o in model.opset_import):
+        model.opset_import.append(onnx.helper.make_opsetid(domain, 1))
+
+
+# -- MX9_INT8 --------------------------------------------------------------------
+
+
+def apply_block_activations_int8_constants(
+    model: onnx.ModelProto,
+    act_dtype: str,
+    exclude: Sequence[str] = (),
+) -> onnx.ModelProto:
+    """``act_dtype`` (a block format) fake-quantization on the activations,
+    int8 symmetric per-tensor constants (see the module docstring).
+    Quark's BatchNormalization -> Conv folding is not replicated."""
+    plan = _Plan(model)
+    work = onnx.ModelProto()
+    work.CopyFrom(model)
+    consts = [t for t in plan.quantized_tensors(work) if t in plan.inits]
+    m = apply_fake_quant_format(
+        model,
+        act_dtype,
+        activations=True,
+        fold_weights=True,
+        fold_fn=lambda a, ax: a,  # constants are handled below, not folded
+        exclude=exclude,
+    )
+    g = m.graph
+    inits = {t.name: t for t in g.initializer}
+    rename: Dict[str, str] = {}
+    new_nodes: List[onnx.NodeProto] = []
+    for c in consts:
+        w = numpy_helper.to_array(inits[c]).astype(np.float32)
+        amax = float(np.max(np.abs(w))) if w.size else 0.0
+        scale = np.float32(amax / 127.0) if amax > 0 else np.float32(1.0)
+        q = np.clip(np.round(w / scale), -128, 127).astype(np.int8)
+        g.initializer.extend(
+            [
+                numpy_helper.from_array(q, c + "_quantized"),
+                numpy_helper.from_array(np.array(scale, np.float32), c + "_scale"),
+                numpy_helper.from_array(np.array(0, np.int8), c + "_zero_point"),
+            ]
+        )
+        rename[c] = c + DQ_SUFFIX
+        new_nodes.append(
+            onnx.helper.make_node(
+                "DequantizeLinear",
+                [c + "_quantized", c + "_scale", c + "_zero_point"],
+                [rename[c]],
+                name=c + "_DequantizeLinear",
+                domain=MS_DOMAIN,
+            )
+        )
+    for n in g.node:
+        for i, x in enumerate(n.input):
+            if x in rename:
+                n.input[i] = rename[x]
+    used = {x for n in g.node for x in n.input} | {o.name for o in g.output}
+    keep = [t for t in g.initializer if t.name not in rename or t.name in used]
+    del g.initializer[:]
+    g.initializer.extend(keep)
+    nodes = list(g.node)
+    del g.node[:]
+    g.node.extend(new_nodes + nodes)
+    if new_nodes:
+        _add_opset(m, MS_DOMAIN)
+    return m
+
+
+# -- BF16_MIXED_* -----------------------------------------------------------------
+
+_Q_OPS = ("QuantizeLinear", "ExtendedQuantizeLinear")
+_DQ_OPS = ("DequantizeLinear", "ExtendedDequantizeLinear")
+_FN_OPS = ("BFPQuantizeDequantize", "MXQuantizeDequantize")
+_BIAS_OPS = ("Conv", "ConvTranspose", "Gemm", "InstanceNormalization")
+
+
+def _drop_bias_quantizers(model: onnx.ModelProto) -> None:
+    """Remove the bfloat16 Q/DQ pairs on Conv / ConvTranspose / Gemm bias
+    constants (Quark's mixed presets set ``QuantizeBias=False``)."""
+    g = model.graph
+    nodes = list(g.node)
+    inits = {t.name for t in g.initializer}
+    biases = {  # tensors read in a bias slot (the DQ outputs of the bias constants)
+        n.input[2] for n in nodes if n.op_type in _BIAS_OPS and len(n.input) > 2
+    }
+    q_by_out = {n.output[0]: n for n in nodes if n.op_type in _Q_OPS}
+    drop: Set[int] = set()
+    rename: Dict[str, str] = {}
+    gone: Set[str] = set()
+    for n in nodes:
+        if n.op_type in _DQ_OPS and n.input[0] in q_by_out:
+            q = q_by_out[n.input[0]]
+            if n.output[0] in biases and q.input[0] in inits:
+                rename[n.output[0]] = q.input[0]
+                drop.update((id(n), id(q)))
+                gone.update(n.input[1:3])
+    if not drop:
+        return
+    keep = [n for n in nodes if id(n) not in drop]
+    for n in keep:
+        for i, x in enumerate(n.input):
+            if x in rename:
+                n.input[i] = rename[x]
+    del g.node[:]
+    g.node.extend(keep)
+    used = {x for n in keep for x in n.input}
+    kept_inits = [t for t in g.initializer if t.name not in gone or t.name in used]
+    del g.initializer[:]
+    g.initializer.extend(kept_inits)
+
+
+def _node_attrs(n: onnx.NodeProto) -> Tuple[Tuple[str, str], ...]:
+    return tuple(
+        sorted((a.name, repr(onnx.helper.get_attribute_value(a))) for a in n.attribute)
+    )
+
+
+def _zp_dtype(inits: Dict[str, onnx.TensorProto], n: onnx.NodeProto) -> int:
+    if len(n.input) >= 3 and n.input[2] in inits:
+        return inits[n.input[2]].data_type
+    return 0
+
+
+Stage = Tuple[str, tuple, Tuple[onnx.NodeProto, ...]]
+
+
+def _with_node_names(model: onnx.ModelProto) -> onnx.ModelProto:
+    if all(n.name for n in model.graph.node):
+        return model
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    taken = {n.name for n in m.graph.node if n.name}
+    for i, n in enumerate(m.graph.node):
+        if not n.name:
+            name = f"{n.op_type}_{i}"
+            while name in taken:
+                name += "_"
+            taken.add(name)
+            n.name = name
+    return m
+
+
+def apply_mixed_block_format(
+    model: onnx.ModelProto,
+    block_dtype: str,
+    exclude: Sequence[str] = (),
+    target_ops: Sequence[str] = PROMOTABLE_OPS,
+    include_layers: Sequence[str] = (),
+    exclude_layers: Sequence[str] = (),
+) -> onnx.ModelProto:
+    """Quark's ``BF16_MIXED_<block_dtype>``: a bfloat16 fake-quantized model
+    (biases left alone) whose ``Conv`` / ``ConvTranspose`` / ``Gemm`` /
+    ``MatMul`` nodes are promoted to ``block_dtype`` (``"bfp16"`` or
+    ``"mxint8"``), with dual nodes at the precision boundaries.
+
+    Promotion: for each target node, the quantizer feeding input 0 and input 1
+    (weight or second activation) is replaced by a block-format node (default
+    block axis, attributes of the format); the bias and the outputs are left.
+    Boundaries: for every other node, each tensor edge whose quantizer differs
+    from the node's *template* gets a copy of the template inserted --
+    the template of a promoted node is its first edge that carries a promoted
+    tensor, the template of any other node is its first edge that does not.
+    So a promoted node's output into a bfloat16 quantizer gets a block node in
+    front of it, and a bfloat16 node reading a promoted tensor gets a
+    bfloat16 pair behind the block node.
+    """
+    # Quark identifies candidate layers by node name (and misbehaves on unnamed
+    # nodes); give every unnamed node a unique name so that all are promoted.
+    model = _with_node_names(model)
+    float_names = (
+        {o for n in model.graph.node for o in n.output}
+        | {v.name for v in model.graph.input}
+        | {v.name for v in model.graph.output}
+    )
+    m = apply_fake_quant_format(
+        model, "bfloat16", exclude=exclude, quantize_all_ops=False
+    )
+    _drop_bias_quantizers(m)
+    g = m.graph
+    inits = {t.name: t for t in g.initializer}
+    nodes: List[onnx.NodeProto] = list(g.node)
+    node_names = {n.name for n in nodes if n.name}
+    tensor_names = (
+        {x for n in nodes for x in list(n.input) + list(n.output) if x}
+        | set(inits)
+        | {v.name for v in g.input}
+        | {v.name for v in g.output}
+    )
+    excluded = set(exclude)
+
+    def unique(base: str, existing: Set[str]) -> str:
+        name, i = base, 1
+        while name in existing:
+            name = f"{base}_{i}"
+            i += 1
+        existing.add(name)
+        return name
+
+    producer = {o: n for n in nodes for o in n.output}
+    promoted_nodes: Set[str] = set()
+    promoted_tensors: Set[str] = set()
+    removed: Set[int] = set()
+    replaced_at: Dict[int, onnx.NodeProto] = {}  # id(old DQ) -> its block node
+
+    # -- promotion -----------------------------------------------------------------
+    for n in nodes:
+        if n.op_type not in target_ops or n.name in excluded:
+            continue
+        if (
+            include_layers and n.name not in include_layers
+        ) or n.name in exclude_layers:
+            continue
+        promoted_nodes.add(n.name or n.op_type)
+        for slot in (0, 1):
+            if slot >= len(n.input) or not n.input[slot]:
+                continue
+            prod = producer.get(n.input[slot])
+            if prod is None:
+                continue
+            if prod.op_type in _DQ_OPS:
+                q = producer.get(prod.input[0])
+                if q is None or q.op_type not in _Q_OPS or id(prod) in removed:
+                    continue
+                fn = _make_node(block_dtype, q.input[0], prod.output[0], 1, "")
+                fn.name = prod.name + "_Mixed_fn"
+                removed.update((id(q), id(prod)))
+                replaced_at[id(prod)] = fn
+                producer[prod.output[0]] = fn
+                promoted_tensors.add(q.input[0])
+            elif prod.op_type in _FN_OPS and prod.domain == COP_DOMAIN:
+                promoted_tensors.add(prod.input[0])
+    if not promoted_nodes:
+        return m
+    nodes = [
+        replaced_at.get(id(n), n)
+        for n in nodes
+        if id(n) not in removed or id(n) in replaced_at
+    ]
+
+    # -- dual nodes at the precision boundaries ------------------------------------
+    producer = {o: n for n in nodes for o in n.output}
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for n in nodes:
+        for x in n.input:
+            consumers.setdefault(x, []).append(n)
+
+    def q_sig(q: onnx.NodeProto) -> tuple:
+        return ("quant", f"{q.domain or 'ai.onnx'}::{q.op_type}", _zp_dtype(inits, q))
+
+    def fn_sig(f: onnx.NodeProto) -> tuple:
+        return ("fn", f"{f.domain}::{f.op_type}", _node_attrs(f))
+
+    def upstream(x: str) -> Optional[Stage]:
+        """The quantizer behind tensor ``x`` (``nodes`` = its Q+DQ, or the block node)."""
+        prod = producer.get(x)
+        if prod is not None and prod.op_type in _DQ_OPS:
+            q = producer.get(prod.input[0])
+            if q is not None and q.op_type in _Q_OPS:
+                return "pair", q_sig(q), (q, prod)
+        elif prod is not None and prod.op_type in _FN_OPS and prod.domain == COP_DOMAIN:
+            return "fn", fn_sig(prod), (prod,)
+        return None
+
+    def downstream(c: onnx.NodeProto) -> Optional[Stage]:
+        """The quantizer ``c`` starts, if it is one."""
+        if c.op_type in _Q_OPS:
+            dq = next(
+                (d for d in consumers.get(c.output[0], []) if d.op_type in _DQ_OPS),
+                None,
+            )
+            return ("pair", q_sig(c), (c, dq)) if dq is not None else None
+        if c.op_type in _FN_OPS and c.domain == COP_DOMAIN:
+            return "fn", fn_sig(c), (c,)
+        return None
+
+    def override(*names: str) -> Optional[str]:
+        return next((x for x in names if x and x in promoted_tensors), None)
+
+    infos_by_node: Dict[str, List[Dict]] = {}
+    for idx, n in enumerate(nodes):
+        if n.op_type in _Q_OPS + _DQ_OPS + _FN_OPS:
+            continue
+        infos: List[Dict] = infos_by_node.setdefault(f"{n.name or n.op_type}_{idx}", [])
+        disp = n.name or n.op_type
+        for ii, x in enumerate(n.input):
+            st = upstream(x) if x else None
+            if st is None:
+                continue
+            source = st[2][0].input[0]  # the float tensor the quantizer reads
+            if source in inits:
+                continue
+            infos.append(
+                dict(
+                    node=disp,
+                    kind=st[0],
+                    sig=st[1],
+                    nodes=st[2],
+                    tensor=x,
+                    override=override(x, source),
+                    calib=source,
+                    index=ii,
+                    target=n,
+                    template=-1,
+                )
+            )
+        for oi, y in enumerate(n.output):
+            for c in consumers.get(y, []):
+                st = downstream(c)
+                if st is None:
+                    continue
+                after = st[2][-1].output[0]
+                infos.append(
+                    dict(
+                        node=disp,
+                        kind=st[0],
+                        sig=st[1],
+                        nodes=st[2],
+                        tensor=y,
+                        override=override(y, after),
+                        calib=after,
+                        index=oi,
+                        target=c,
+                        template=-1,
+                    )
+                )
+
+    def find_template(cur: List[Dict]) -> Optional[Dict]:
+        """A node surrounded only by promoted tensors borrows the template of
+        a neighbour that shares the tensor."""
+        for st in cur:
+            for infos in infos_by_node.values():
+                for info in infos:
+                    if info["override"] == st["override"] and (
+                        info["tensor"] == st["override"]
+                        or info["override"] == st["tensor"]
+                    ):
+                        if info["template"] < 0:
+                            continue
+                        return infos[info["template"]]
+        return None
+
+    inserts: Dict[int, List[onnx.NodeProto]] = {}  # id(target) -> nodes in front of it
+    done: Set[Tuple[str, str, str]] = set()
+    for infos in infos_by_node.values():
+        if not infos:
+            continue
+        nname = infos[0]["node"]
+        t_idx = -1
+        for k, info in enumerate(infos):
+            if nname not in promoted_nodes:
+                if not info["override"]:
+                    t_idx = k
+                    break
+            elif info["override"]:
+                t_idx = k
+                break
+        tmpl = infos[t_idx] if t_idx >= 0 else find_template(infos)
+        if tmpl is None:
+            continue
+        for info in infos:
+            if info is tmpl or info["sig"] == tmpl["sig"]:
+                continue
+            info["template"] = t_idx
+            tgt = info["target"]
+            tname = tgt.name or tgt.op_type
+            if (nname, info["tensor"], tname) in done:
+                continue
+            done.add((nname, info["tensor"], tname))
+            primary = info["override"] or info["tensor"]
+            # Quark names the extra pair's parameters after a calibrated (i.e.
+            # original float-model) tensor
+            qparam = primary if primary in float_names else info["calib"]
+            scope = f"{qparam}_{nname}_{info['index']}_{tname}"
+            if tmpl["kind"] == "pair":
+                tq, tdq = tmpl["nodes"]
+                nq, ndq = onnx.NodeProto(), onnx.NodeProto()
+                nq.CopyFrom(tq)
+                ndq.CopyFrom(tdq)
+                nq.name = unique(f"{scope}_additional_{tq.op_type}", node_names)
+                ndq.name = unique(f"{scope}_additional_{tdq.op_type}", node_names)
+                qout = unique(f"{nq.name}_output", tensor_names)
+                last = unique(f"{ndq.name}_output", tensor_names)
+                sc = unique(f"{qparam}_additional_scale", tensor_names)
+                zp = unique(f"{qparam}_additional_zero_point", tensor_names)
+                g.initializer.append(
+                    numpy_helper.from_array(np.array(1.0, np.float32), sc)
+                )
+                g.initializer.append(
+                    onnx.helper.make_tensor(zp, inits[tq.input[2]].data_type, [], [0.0])
+                )
+                nq.input[:] = [info["tensor"], sc, zp]
+                nq.output[0] = qout
+                ndq.input[:] = [qout, sc, zp]
+                ndq.output[0] = last
+                new = [nq, ndq]
+            else:
+                fnode = onnx.NodeProto()
+                fnode.CopyFrom(tmpl["nodes"][0])
+                fnode.name = unique(f"{scope}_additional_{fnode.op_type}", node_names)
+                last = unique(f"{fnode.name}_output", tensor_names)
+                fnode.input[0] = info["tensor"]
+                fnode.output[0] = last
+                new = [fnode]
+            for i, x in enumerate(tgt.input):
+                if x == info["tensor"]:
+                    tgt.input[i] = last
+            inserts.setdefault(id(tgt), []).extend(new)
+    final: List[onnx.NodeProto] = []
+    for n in nodes:
+        final.extend(inserts.get(id(n), []))
+        final.append(n)
+    del g.node[:]
+    g.node.extend(final)
+    return m
+
+
+# -- S16S16_MIXED_S8S8 ------------------------------------------------------------
+
+
+def promoted_activations(
+    model: onnx.ModelProto,
+    target_ops: Sequence[str] = PROMOTABLE_OPS,
+    include_layers: Sequence[str] = (),
+    exclude_layers: Sequence[str] = (),
+) -> Set[str]:
+    """The activation tensors Quark's AutoMixprecision re-quantizes when it
+    promotes every ``target_ops`` node: the data input and the second operand
+    (when it is not a constant) of each. Outputs are never promoted."""
+    consts = {t.name for t in model.graph.initializer}
+    out: Set[str] = set()
+    for n in model.graph.node:
+        if n.op_type not in target_ops:
+            continue
+        if (
+            include_layers and n.name not in include_layers
+        ) or n.name in exclude_layers:
+            continue
+        out.update(x for x in n.input[:2] if x and x not in consts)
+    return out
+
+
+def requantize_biases_int8(
+    model: onnx.ModelProto,
+    float_model: onnx.ModelProto,
+    target_ops: Sequence[str] = PROMOTABLE_OPS,
+    include_layers: Sequence[str] = (),
+    exclude_layers: Sequence[str] = (),
+    power_of_two: bool = False,
+) -> onnx.ModelProto:
+    """Replace the int32 bias (``input_scale * weight_scale``) of every
+    promoted node by Quark's int8 form: symmetric per tensor, scale
+    ``max|b| / 127`` (rounded up to a power of two with ``power_of_two``, as
+    Quark's ``VINT8``), zero point 0. The codes come from the float model's
+    bias (the int32 form is too coarse to recover them from)."""
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    g = m.graph
+    inits = {t.name: t for t in g.initializer}
+    float_inits = {t.name: t for t in float_model.graph.initializer}
+    dq_by_out = {
+        n.output[0]: n for n in g.node if n.op_type == "DequantizeLinear" and n.output
+    }
+    drop: Set[str] = set()
+    for n in g.node:
+        if n.op_type not in target_ops or len(n.input) < 3:
+            continue
+        if (
+            include_layers and n.name not in include_layers
+        ) or n.name in exclude_layers:
+            continue
+        dq = dq_by_out.get(n.input[2])
+        if dq is None or dq.input[0] not in inits:
+            continue
+        q = inits[dq.input[0]]
+        if q.data_type != onnx.TensorProto.INT32:
+            continue
+        base = dq.input[0].rsplit("/", 2)[0]  # "b1/qdq8/int32" -> "b1"
+        if base in float_inits:
+            b = numpy_helper.to_array(float_inits[base]).astype(np.float64)
+        else:
+            b = numpy_helper.to_array(q).astype(np.float64) * numpy_helper.to_array(
+                inits[dq.input[1]]
+            ).astype(np.float64)
+        amax = float(np.max(np.abs(b))) if b.size else 0.0
+        scale = np.float32(amax / 127.0) if amax > 0 else np.float32(1.0)
+        if power_of_two and amax > 0:
+            scale = np.float32(2.0 ** np.ceil(np.log2(float(scale))))
+        names = (base + "_quantized", base + "_scale", base + "_zero_point")
+        g.initializer.extend(
+            [
+                numpy_helper.from_array(
+                    np.clip(np.round(b / scale), -128, 127).astype(np.int8), names[0]
+                ),
+                numpy_helper.from_array(np.array(scale, np.float32), names[1]),
+                numpy_helper.from_array(np.array(0, np.int8), names[2]),
+            ]
+        )
+        drop.update(dq.input)
+        dq.input[:] = list(names)
+        del dq.attribute[:]
+    used = {x for node in g.node for x in node.input} | {o.name for o in g.output}
+    kept = [t for t in g.initializer if t.name in used or t.name not in drop]
+    del g.initializer[:]
+    g.initializer.extend(kept)
+    return m
+
+
+# -- VINT8 ---------------------------------------------------------------------------
+
+
+def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Quark's ``DedicatedQDQPair``: an activation ``Q -> DQ`` pair read by
+    several nodes is replaced by one pair (same scale and zero point) per
+    consumer, so each consumer owns the quantizer in front of it. The DQ of a
+    graph output stays as it is."""
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    g = m.graph
+    nodes = list(g.node)
+    inits = {t.name for t in g.initializer}
+    outputs = {o.name for o in g.output}
+    q_by_out = {
+        n.output[0]: n
+        for n in nodes
+        if n.op_type == "QuantizeLinear" and n.input[0] not in inits
+    }
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for n in nodes:
+        for x in n.input:
+            consumers.setdefault(x, []).append(n)
+    taken = {x for n in nodes for x in list(n.input) + list(n.output)} | inits
+    drop: Set[int] = set()
+    inserts: Dict[int, List[onnx.NodeProto]] = {}  # id(consumer) -> nodes before it
+    for dq in nodes:
+        if dq.op_type != "DequantizeLinear" or dq.input[0] not in q_by_out:
+            continue
+        q = q_by_out[dq.input[0]]
+        users = list({id(u): u for u in consumers.get(dq.output[0], [])}.values())
+        if len(users) < 2 or dq.output[0] in outputs:
+            continue
+        drop.update((id(q), id(dq)))
+        for k, u in enumerate(users, 1):
+            qn, dqn = onnx.NodeProto(), onnx.NodeProto()
+            qn.CopyFrom(q)
+            dqn.CopyFrom(dq)
+            qn.name, dqn.name = f"{q.name}_{k}", f"{dq.name}_{k}"
+            qn.output[0] = f"{q.output[0]}_{k}"
+            dqn.input[0] = qn.output[0]
+            dqn.output[0] = f"{dq.output[0]}_{k}"
+            if qn.output[0] in taken or dqn.output[0] in taken:
+                raise ValueError(f"tensor name clash while duplicating {dq.name}")
+            for i, x in enumerate(u.input):
+                if x == dq.output[0]:
+                    u.input[i] = dqn.output[0]
+            inserts.setdefault(id(u), []).extend([qn, dqn])
+    if not drop:
+        return m
+    final: List[onnx.NodeProto] = []
+    for n in nodes:
+        if id(n) in drop:
+            continue
+        # the new pairs go in front of their consumer; the source tensor is
+        # produced earlier (the dropped Q sat between producer and consumer)
+        final.extend(inserts.get(id(n), []))
+        final.append(n)
+    del g.node[:]
+    g.node.extend(final)
+    return m
+
+
+__all__ = [
+    "PROMOTABLE_OPS",
+    "dedicate_qdq_pairs",
+    "promoted_activations",
+    "requantize_biases_int8",
+    "apply_block_activations_int8_constants",
+    "apply_mixed_block_format",
+]

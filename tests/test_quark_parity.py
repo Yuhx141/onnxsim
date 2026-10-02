@@ -47,26 +47,11 @@ from onnxsim.quark_fakequant_graph import apply_fake_quant_format  # noqa: E402
 # Quark presets onnxsim does not implement (NPU CNN/transformer quantizers,
 # MatMulNBits, dynamic/VINT8, mixed block formats, ...).
 KNOWN_MISSING = {
-    "BF16_ADAQUANT",
-    "BF16_BFP16",
-    "BF16_MIXED_BFP16",
-    "BF16_MIXED_BFP16_ADAQUANT",
-    "BF16_MIXED_MXINT8",
-    "BF16_MIXED_MXINT8_ADAQUANT",
-    "BF16_MXINT8",
-    "FP16_ADAQUANT",
-    "INT16_CNN_ACCURATE",
-    "INT16_CNN_DEFAULT",
     "INT16_TRANSFORMER_ACCURATE",
     "INT16_TRANSFORMER_DEFAULT",
-    "INT8_CNN_ACCURATE",
-    "INT8_CNN_DEFAULT",
     "INT8_TRANSFORMER_ACCURATE",
     "INT8_TRANSFORMER_DEFAULT",
     "MATMUL_NBITS",
-    "MX9_INT8",
-    "S16S16_MIXED_S8S8",
-    "VINT8",
 }
 # onnxsim-only presets (Quark has no ADAROUND/ADAQUANT variant for U8U8_AAWA).
 KNOWN_EXTRA = {"U8U8_AAWA_ADAQUANT", "U8U8_AAWA_ADAROUND"}
@@ -172,6 +157,10 @@ def _run(model, x):
     import onnxruntime as ort
 
     so = ort.SessionOptions()
+    # No graph optimizations: ORT would otherwise fuse DQ -> MatMul/Conv -> Q into
+    # integer kernels that saturate on x86 CPUs without VNNI (CI runners), making
+    # results depend on the host rather than on the quantization.
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     lib = _ops_lib()
     if lib:
         so.register_custom_ops_library(lib)
@@ -1919,3 +1908,381 @@ def test_calibration_methods_match_quark_per_preset(
     _check_cal_parity(
         model, shape, preset, tmp_path, rtol, zp_atol, constants=preset != "U8U8_AAWA"
     )
+
+
+# -- preset combinations: mixed formats and mixed precision -------------------------
+#
+# BF16_BFP16 / BF16_MXINT8 (bfloat16 activations over block-format constants),
+# MX9_INT8 (block-format activations over int8 constants) and the
+# BF16_MIXED_BFP16 / BF16_MIXED_MXINT8 AutoMixprecision presets. Quark's mixed
+# presets pick candidate layers by *node name*, so these models name every node.
+
+
+def _named(model):
+    for i, n in enumerate(model.graph.node):
+        n.name = f"{n.op_type}_{i}"
+    return model
+
+
+def _transformer():
+    """Attention + MLP block. No ``MatMul`` -> ``Add(const)`` (Quark's
+    pre-processing would fuse that into a ``Gemm``)."""
+    rng = np.random.default_rng(11)
+    d = 16
+    m = parser.parse_model(
+        f"""
+        <ir_version: 9, opset_import: ["": 20]>
+        g (float[1,4,{d}] x) => (float[1,4,{d}] y) {{
+            q = MatMul(x, wq)
+            k = MatMul(x, wk)
+            v = MatMul(x, wv)
+            kt = Transpose<perm=[0,2,1]>(k)
+            s0 = MatMul(q, kt)
+            s1 = Mul(s0, scale)
+            p = Softmax<axis=-1>(s1)
+            c = MatMul(p, v)
+            o = MatMul(c, wo)
+            r = Add(x, o)
+            n = LayerNormalization<axis=-1, epsilon=1e-5>(r, g1, b1)
+            h = MatMul(n, w1)
+            ge = Gelu(h)
+            f = MatMul(ge, w2)
+            y = Add(n, f)
+        }}
+        """
+    )
+    m.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(_w(rng, d, d), "wq"),
+            onnx.numpy_helper.from_array(_w(rng, d, d), "wk"),
+            onnx.numpy_helper.from_array(_w(rng, d, d), "wv"),
+            onnx.numpy_helper.from_array(_w(rng, d, d), "wo"),
+            onnx.numpy_helper.from_array(np.array(0.25, np.float32), "scale"),
+            onnx.numpy_helper.from_array(np.ones(d, np.float32), "g1"),
+            onnx.numpy_helper.from_array(np.zeros(d, np.float32), "b1"),
+            onnx.numpy_helper.from_array(_w(rng, d, 32), "w1"),
+            onnx.numpy_helper.from_array(_w(rng, 32, d), "w2"),
+        ]
+    )
+    return m, (1, 4, d)
+
+
+def _branchy():
+    """A residual ``Add`` reading a tensor that also feeds a ``Gemm``, a
+    Gemm -> Gemm chain without activation in between, and a ``MatMul`` last."""
+    rng = np.random.default_rng(12)
+    m = parser.parse_model(
+        """
+        <ir_version: 9, opset_import: ["": 17]>
+        g (float[3,16] x) => (float[3,16] y) {
+            a = Gemm(x, w1, b1)
+            b = Gemm(a, w2, b2)
+            r = Add(x, b)
+            y = MatMul(r, w3)
+        }
+        """
+    )
+    m.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(_w(rng, 16, 16), "w1"),
+            onnx.numpy_helper.from_array(_w(rng, 16), "b1"),
+            onnx.numpy_helper.from_array(_w(rng, 16, 16), "w2"),
+            onnx.numpy_helper.from_array(_w(rng, 16), "b2"),
+            onnx.numpy_helper.from_array(_w(rng, 16, 16), "w3"),
+        ]
+    )
+    return m, (3, 16)
+
+
+MIXED_MODELS = {**MODELS, "branchy": _branchy, "transformer": _transformer}
+_MIXED_FORMATS = ["BF16_BFP16", "BF16_MXINT8", "MX9_INT8"]
+_MIXED_PRECISION = ["BF16_MIXED_BFP16", "BF16_MIXED_MXINT8"]
+
+
+def _mixed_pair(preset, model_name, tmp_path):
+    model, shape = MIXED_MODELS[model_name]()
+    _named(model)
+    return (
+        quark_quantize(model, preset, shape, tmp_path, f"{model_name}_{preset}"),
+        mine_quantize(model, preset, shape),
+        shape,
+    )
+
+
+@pytest.mark.parametrize("model_name", sorted(MIXED_MODELS))
+@pytest.mark.parametrize("preset", _MIXED_FORMATS + _MIXED_PRECISION)
+def test_mixed_preset_graph_matches_quark(preset, model_name, tmp_path):
+    """Same custom-op / (Extended)Q/DQ placement, attributes, block axes and
+    even the names of the dual nodes Quark inserts at precision boundaries."""
+    q, m, _ = _mixed_pair(preset, model_name, tmp_path)
+    assert _cop_map(m) == _cop_map(q)
+    assert _op_counts(m) == _op_counts(q)
+
+
+@pytest.mark.skipif(_ops_lib() is None, reason="Quark's custom-op library is not built")
+@pytest.mark.parametrize("model_name", sorted(MIXED_MODELS))
+@pytest.mark.parametrize("preset", _MIXED_FORMATS + _MIXED_PRECISION)
+def test_mixed_preset_outputs_match_quark(preset, model_name, tmp_path):
+    q, m, shape = _mixed_pair(preset, model_name, tmp_path)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32) * 2
+    np.testing.assert_allclose(_run(m, x), _run(q, x), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "conv", "transformer"])
+def test_mx9_int8_constants_are_bit_identical(model_name, tmp_path):
+    """The int8 codes, scales and zero points of the constants (weights *and*
+    biases: symmetric per tensor, ``max|w| / 127``) equal Quark's."""
+    q, m, _ = _mixed_pair("MX9_INT8", model_name, tmp_path)
+
+    def consts(model):
+        return {
+            i.name: onnx.numpy_helper.to_array(i)
+            for i in model.graph.initializer
+            if i.name.endswith(("_quantized", "_scale", "_zero_point"))
+        }
+
+    theirs, ours = consts(q), consts(m)
+    assert theirs and set(ours) == set(theirs)
+    for name in theirs:
+        assert ours[name].dtype == theirs[name].dtype, name
+        np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
+
+
+@pytest.mark.parametrize("preset", _MIXED_FORMATS + _MIXED_PRECISION)
+def test_mixed_preset_single_op_placement_matches_quark(preset, tmp_path):
+    """Quark's op coverage, op by op, for the combined presets: the op counts
+    (nodes, custom ops, Q/DQ) agree on every single-op graph Quark accepts."""
+    diffs = []
+    for name, case in _single_op_cases().items():
+        case = dict(case, op=case.get("op", name))
+        model = _named(_single_op_model(case))
+        try:
+            q = quark_quantize(model, preset, case["shapes"][0], tmp_path, name)
+        except Exception:  # Quark itself rejects this graph
+            continue
+        m = mine_quantize(model, preset, case["shapes"][0])
+        got, want = _op_counts(m), _op_counts(q)
+        if got != want and name not in KNOWN_GRAPH_DIFF:
+            diffs.append((name, got, want))
+    assert not diffs, json.dumps(diffs, indent=1)
+
+
+def test_mixed_precision_keeps_biases_float_and_matches_quark(tmp_path):
+    """Quark's default ``metric_threshold=0`` promotes every Conv / Gemm /
+    MatMul; the biases stay float constants (``QuantizeBias=False``)."""
+    model, shape = _mlp()
+    _named(model)
+    q = quark_quantize(model, "BF16_MIXED_BFP16", shape, tmp_path, "promote")
+    m = mine_quantize(model, "BF16_MIXED_BFP16", shape)
+    for out in (q, m):
+        reads = {i for n in out.graph.node if n.op_type == "Gemm" for i in n.input}
+        assert {"b1", "b2"} <= reads  # read straight from the float initializers
+    assert _cop_map(m) == _cop_map(q)
+
+
+@pytest.mark.parametrize("preset", ["FP16_ADAQUANT", "BF16_ADAQUANT"])
+def test_half_adaquant_graph_matches_quark(preset, tmp_path):
+    """Quark's FP16/BF16 AdaQuant presets emit the plain FP16/BF16 graph (the
+    algorithm only retunes initializer values; it also fails outright on a
+    graph whose last op is a pooling, so only the MLP is probed). onnxsim has
+    no AdaQuant for float formats: the preset exists, and runs only when told
+    to ignore the algorithm."""
+    model, shape = _mlp()
+    q = quark_quantize(model, preset, shape, tmp_path, preset)
+    cfg = qc.QConfig.get_default_config(preset)
+    with pytest.raises(NotImplementedError):
+        qc.ModelQuantizer(cfg).quantize_model(model, calibration_data_reader=None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=None, ignore_unsupported_algos=True
+        )
+    assert _ext_map(m) == _ext_map(q)
+    assert _op_counts(m) == _op_counts(q)
+
+
+@pytest.mark.parametrize(
+    "preset", ["BF16_MIXED_BFP16_ADAQUANT", "BF16_MIXED_MXINT8_ADAQUANT"]
+)
+def test_mixed_adaquant_graph_matches_quark(preset, tmp_path):
+    model, shape = _mlp()
+    _named(model)
+    q = quark_quantize(model, preset, shape, tmp_path, preset)
+    cfg = qc.QConfig.get_default_config(preset)
+    with pytest.raises(NotImplementedError):
+        qc.ModelQuantizer(cfg).quantize_model(model)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = qc.ModelQuantizer(cfg).quantize_model(model, ignore_unsupported_algos=True)
+    assert _cop_map(m) == _cop_map(q)
+    assert _op_counts(m) == _op_counts(q)
+
+
+@pytest.mark.parametrize("model_name", ["branchy", "transformer"])
+@pytest.mark.parametrize("preset", _BLOCK + _HALF)
+def test_block_and_half_presets_match_quark_on_transformer_graphs(
+    preset, model_name, tmp_path
+):
+    """The single-format presets on the attention block (``LayerNormalization``
+    is quantized end to end when its input already is, scale / bias included)
+    and the residual graph."""
+    q, m, _ = _mixed_pair(preset, model_name, tmp_path)
+    assert _cop_map(m) == _cop_map(q)
+    assert _ext_map(m) == _ext_map(q)
+    assert _op_counts(m) == _op_counts(q)
+
+
+# -- integer presets: the CNN presets and the mixed int16 / int8 preset ---------------
+
+
+def _qdq_params(model):
+    """``(activations, weights, int8_biases)``: every activation
+    ``QuantizeLinear``'s ``(scale, zero_point, dtype)``, each weight's
+    ``(max scale, dtype)`` (int8 / int16 codes of rank >= 2) and the int8
+    bias codes by name."""
+    inits = {i.name: onnx.numpy_helper.to_array(i) for i in model.graph.initializer}
+    acts, weights, biases = [], [], {}
+    for n in model.graph.node:
+        if n.op_type == "QuantizeLinear" and n.input[1] in inits:
+            zp = inits[n.input[2]]
+            acts.append((float(inits[n.input[1]]), int(zp), str(zp.dtype)))
+        elif n.op_type == "DequantizeLinear" and n.input[0] in inits:
+            q = inits[n.input[0]]
+            if q.dtype in (np.int8, np.int16) and q.ndim >= 2:
+                weights.append((float(np.max(inits[n.input[1]])), str(q.dtype)))
+            elif q.dtype == np.int8:
+                key = n.input[0].replace("_quantized", "").split("/")[0]
+                biases[key] = (q, float(inits[n.input[1]]))
+    return sorted(acts), sorted(weights), biases
+
+
+def _quantize_int_pair(preset, model_name, tmp_path):
+    model, shape = MIXED_MODELS[model_name]()
+    _named(model)
+    q = quark_quantize(model, preset, shape, tmp_path, f"{model_name}_{preset}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # INT16_CNN_ACCURATE's AdaRound cannot run on int16 weights
+        m = qc.ModelQuantizer(qc.QConfig.get_default_config(preset)).quantize_model(
+            model,
+            calibration_data_reader=_reader(shape)(),
+            ignore_unsupported_algos=True,
+        )
+    return model, q, m, shape
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "conv", "gemm_transb", "branchy"])
+@pytest.mark.parametrize("preset", ["INT8_CNN_DEFAULT", "INT16_CNN_DEFAULT"])
+def test_cnn_default_presets_match_quark_exactly(preset, model_name, tmp_path):
+    """Plain min/max calibration, asymmetric uint8 / uint16 activations,
+    per-tensor int8 / int16 weights: the same quantization parameters, and the
+    same outputs, as Quark."""
+    _, q, m, shape = _quantize_int_pair(preset, model_name, tmp_path)
+    q_acts, q_w, _ = _qdq_params(q)
+    m_acts, m_w, _ = _qdq_params(m)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_array_equal([a[1] for a in m_acts], [a[1] for a in q_acts])
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=1e-5
+    )
+    assert [w[1] for w in m_w] == [w[1] for w in q_w]
+    np.testing.assert_allclose([w[0] for w in m_w], [w[0] for w in q_w], rtol=1e-6)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    np.testing.assert_allclose(_run(m, x), _run(q, x), rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "conv", "gemm_transb"])
+@pytest.mark.parametrize("preset", ["INT8_CNN_ACCURATE", "INT16_CNN_ACCURATE"])
+def test_cnn_accurate_presets_match_quark_parameters(preset, model_name, tmp_path):
+    """Percentile 99.9999 calibration: activation parameters agree up to
+    histogram binning, weight scales exactly. AdaRound only changes weight
+    codes (and runs for int8 weights only: with int16 weights the preset
+    raises unless ``ignore_unsupported_algos``)."""
+    model, q, m, shape = _quantize_int_pair(preset, model_name, tmp_path)
+    q_acts, q_w, _ = _qdq_params(q)
+    m_acts, m_w, _ = _qdq_params(m)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_allclose(
+        [a[1] for a in m_acts], [a[1] for a in q_acts], atol=40 if "16" in preset else 2
+    )
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
+    )
+    np.testing.assert_allclose([w[0] for w in m_w], [w[0] for w in q_w], rtol=1e-6)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    ref = _run(model, x)
+
+    def rel(a):
+        return float(np.linalg.norm(a - ref) / np.linalg.norm(ref))
+
+    assert rel(_run(m, x)) < max(3 * rel(_run(q, x)), 0.05)
+
+
+def test_int16_cnn_accurate_needs_ignore_flag_for_adaround():
+    model, shape = _mlp()
+    cfg = qc.QConfig.get_default_config("INT16_CNN_ACCURATE")
+    with pytest.raises(NotImplementedError, match="adaround"):
+        qc.ModelQuantizer(cfg).quantize_model(
+            model, calibration_data_reader=_reader(shape)()
+        )
+
+
+@pytest.mark.parametrize("model_name", ["mlp", "conv", "gemm_transb", "branchy"])
+def test_s16s16_mixed_s8s8_matches_quark(model_name, tmp_path):
+    """int16 everywhere, every Conv / Gemm / MatMul promoted to int8 inputs,
+    weights and (int8, per-tensor) biases; the promoted layers' outputs stay
+    int16 and no convert pairs appear."""
+    model, q, m, shape = _quantize_int_pair("S16S16_MIXED_S8S8", model_name, tmp_path)
+    # (Quark keeps a Relu behind its producer; onnxsim folds it into the Q)
+    assert {k: v for k, v in _op_counts(m).items() if k != "Relu"} == {
+        k: v for k, v in _op_counts(q).items() if k != "Relu"
+    }
+    q_acts, q_w, q_b = _qdq_params(q)
+    m_acts, m_w, m_b = _qdq_params(m)
+    assert [a[2] for a in m_acts] == [a[2] for a in q_acts]
+    np.testing.assert_allclose([a[1] for a in m_acts], [a[1] for a in q_acts], atol=40)
+    np.testing.assert_allclose(
+        [a[0] for a in m_acts], [a[0] for a in q_acts], rtol=2e-3
+    )
+    assert m_w == q_w
+    assert set(m_b) == set(q_b) and q_b
+    for k in q_b:  # biases: scale max|b|/127, codes equal (up to a rounding tie)
+        np.testing.assert_allclose(m_b[k][1], q_b[k][1], rtol=1e-6)
+        np.testing.assert_allclose(m_b[k][0], q_b[k][0], atol=1)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    ref = _run(model, x)
+
+    def rel(a):
+        return float(np.linalg.norm(a - ref) / np.linalg.norm(ref))
+
+    assert rel(_run(m, x)) < max(2 * rel(_run(q, x)), 0.02)
+    assert float(np.linalg.norm(_run(m, x) - _run(q, x)) / np.linalg.norm(ref)) < 0.02
+
+
+@pytest.mark.parametrize("model_name", sorted(MIXED_MODELS))
+def test_vint8_matches_quark(model_name, tmp_path):
+    """Signed power-of-two int8 everywhere: Quark's ``VINT8`` quantizes every
+    activation (no Relu folding, one dedicated Q/DQ pair per consumer) and
+    stores weights *and biases* as per-tensor int8. Same graph structure and
+    weight / bias parameters; activation scales are powers of two that may sit
+    one octave off (Quark searches the MSE-best power of two, onnxsim rounds
+    up)."""
+    model, q, m, shape = _quantize_int_pair("VINT8", model_name, tmp_path)
+    assert _op_counts(m) == _op_counts(q)
+    q_acts, q_w, q_b = _qdq_params(q)
+    m_acts, m_w, m_b = _qdq_params(m)
+    assert [(a[1], a[2]) for a in m_acts] == [(0, "int8")] * len(q_acts)
+    assert len(m_acts) == len(q_acts)
+    log2 = lambda acts: np.log2([a[0] for a in acts])  # noqa: E731
+    assert np.all(log2(m_acts) == np.round(log2(m_acts)))
+    assert np.all(np.abs(log2(m_acts) - log2(q_acts)) <= 1)
+    assert m_w == q_w
+    assert set(m_b) == set(q_b)
+    if model_name != "transformer":  # (there the constants are activation-path ones)
+        for k in q_b:
+            assert m_b[k][1] == q_b[k][1], k
+            np.testing.assert_array_equal(m_b[k][0], q_b[k][0], err_msg=k)
+    x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
+    ref = _run(model, x)
+    err = float(np.linalg.norm(_run(m, x) - _run(q, x)) / np.linalg.norm(ref))
+    assert err < 0.1
