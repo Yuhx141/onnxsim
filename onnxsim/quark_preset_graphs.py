@@ -198,6 +198,7 @@ def apply_mixed_block_format(
     target_ops: Sequence[str] = PROMOTABLE_OPS,
     include_layers: Sequence[str] = (),
     exclude_layers: Sequence[str] = (),
+    dual_nodes: bool = True,
 ) -> onnx.ModelProto:
     """Quark's ``BF16_MIXED_<block_dtype>``: a bfloat16 fake-quantized model
     (biases left alone) whose ``Conv`` / ``ConvTranspose`` / ``Gemm`` /
@@ -213,7 +214,9 @@ def apply_mixed_block_format(
     tensor, the template of any other node is its first edge that does not.
     So a promoted node's output into a bfloat16 quantizer gets a block node in
     front of it, and a bfloat16 node reading a promoted tensor gets a
-    bfloat16 pair behind the block node.
+    bfloat16 pair behind the block node. ``dual_nodes=False`` (Quark's
+    ``DualQuantNodes=False``, and the model its sensitivity analysis scores)
+    skips the boundaries and only swaps the promoted nodes' own slots.
     """
     # Quark identifies candidate layers by node name (and misbehaves on unnamed
     # nodes); give every unnamed node a unique name so that all are promoted.
@@ -279,6 +282,9 @@ def apply_mixed_block_format(
                 producer[prod.output[0]] = fn
                 promoted_tensors.add(q.input[0])
             elif prod.op_type in _FN_OPS and prod.domain == COP_DOMAIN:
+                # a second consumer promoting a shared tensor swaps the block
+                # node for a fresh one (Quark names it ``<old name>_Mixed``)
+                prod.name += "_Mixed"
                 promoted_tensors.add(prod.input[0])
     if not promoted_nodes:
         return m
@@ -287,6 +293,10 @@ def apply_mixed_block_format(
         for n in nodes
         if id(n) not in removed or id(n) in replaced_at
     ]
+    if not dual_nodes:  # Quark's ``DualQuantNodes=False``: the promoted slots only
+        del g.node[:]
+        g.node.extend(nodes)
+        return m
 
     # -- dual nodes at the precision boundaries ------------------------------------
     producer = {o: n for n in nodes for o in n.output}
@@ -465,29 +475,7 @@ def apply_mixed_block_format(
     return m
 
 
-# -- S16S16_MIXED_S8S8 ------------------------------------------------------------
-
-
-def promoted_activations(
-    model: onnx.ModelProto,
-    target_ops: Sequence[str] = PROMOTABLE_OPS,
-    include_layers: Sequence[str] = (),
-    exclude_layers: Sequence[str] = (),
-) -> Set[str]:
-    """The activation tensors Quark's AutoMixprecision re-quantizes when it
-    promotes every ``target_ops`` node: the data input and the second operand
-    (when it is not a constant) of each. Outputs are never promoted."""
-    consts = {t.name for t in model.graph.initializer}
-    out: Set[str] = set()
-    for n in model.graph.node:
-        if n.op_type not in target_ops:
-            continue
-        if (
-            include_layers and n.name not in include_layers
-        ) or n.name in exclude_layers:
-            continue
-        out.update(x for x in n.input[:2] if x and x not in consts)
-    return out
+# -- Int32Bias=False (S16S16_MIXED_S8S8, VINT8) -------------------------------------
 
 
 def requantize_biases_int8(
@@ -497,12 +485,21 @@ def requantize_biases_int8(
     include_layers: Sequence[str] = (),
     exclude_layers: Sequence[str] = (),
     power_of_two: bool = False,
+    dtype: str = "int8",
 ) -> onnx.ModelProto:
     """Replace the int32 bias (``input_scale * weight_scale``) of every
-    promoted node by Quark's int8 form: symmetric per tensor, scale
-    ``max|b| / 127`` (rounded up to a power of two with ``power_of_two``, as
-    Quark's ``VINT8``), zero point 0. The codes come from the float model's
-    bias (the int32 form is too coarse to recover them from)."""
+    promoted node by Quark's ``Int32Bias=False`` form: the bias quantized like
+    a weight of ``dtype`` (``"int8"`` or ``"int16"``), symmetric per tensor,
+    scale ``max|b| / qmax`` (rounded up to a power of two with
+    ``power_of_two``, as Quark's ``VINT8``), zero point 0. The codes come from
+    the float model's bias (the int32 form is too coarse to recover them
+    from)."""
+    qmax = {"int8": 127, "int16": 32767}[dtype]
+    np_dt = {"int8": np.int8, "int16": np.int16}[dtype]
+    opset = next(
+        (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")), 0
+    )
+    ms = dtype == "int16" and opset < 21
     m = onnx.ModelProto()
     m.CopyFrom(model)
     g = m.graph
@@ -533,22 +530,26 @@ def requantize_biases_int8(
                 inits[dq.input[1]]
             ).astype(np.float64)
         amax = float(np.max(np.abs(b))) if b.size else 0.0
-        scale = np.float32(amax / 127.0) if amax > 0 else np.float32(1.0)
+        scale = np.float32(amax / qmax) if amax > 0 else np.float32(1.0)
         if power_of_two and amax > 0:
             scale = np.float32(2.0 ** np.ceil(np.log2(float(scale))))
         names = (base + "_quantized", base + "_scale", base + "_zero_point")
         g.initializer.extend(
             [
                 numpy_helper.from_array(
-                    np.clip(np.round(b / scale), -128, 127).astype(np.int8), names[0]
+                    np.clip(np.round(b / scale), -qmax - 1, qmax).astype(np_dt),
+                    names[0],
                 ),
                 numpy_helper.from_array(np.array(scale, np.float32), names[1]),
-                numpy_helper.from_array(np.array(0, np.int8), names[2]),
+                numpy_helper.from_array(np.array(0, np_dt), names[2]),
             ]
         )
         drop.update(dq.input)
         dq.input[:] = list(names)
         del dq.attribute[:]
+        dq.domain = "com.microsoft" if ms else ""
+    if ms and not any(o.domain == "com.microsoft" for o in m.opset_import):
+        m.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
     used = {x for node in g.node for x in node.input} | {o.name for o in g.output}
     kept = [t for t in g.initializer if t.name in used or t.name not in drop]
     del g.initializer[:]
@@ -619,10 +620,75 @@ def dedicate_qdq_pairs(model: onnx.ModelProto) -> onnx.ModelProto:
     return m
 
 
+def dedicate_dq_nodes(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Quark's ``DedicateDQNode`` post-processing: a DequantizeLinear read by
+    several nodes (a graph output counts as a reader) is copied so that each
+    reader has its own (``<name>_1``, ``<name>_2``, ... -- the first reader
+    keeps the original); the Q of a constant (a shared weight) is copied too.
+    Only block / half-type pairs matter here, but any Q/DQ pair is handled."""
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    g = m.graph
+    nodes = list(g.node)
+    inits = {t.name for t in g.initializer}
+    outputs = {o.name for o in g.output}
+    producer = {o: n for n in nodes for o in n.output}
+    readers: Dict[str, List[onnx.NodeProto]] = {}
+    for n in nodes:
+        for x in n.input:
+            readers.setdefault(x, []).append(n)
+    after: Dict[int, List[onnx.NodeProto]] = {}  # id(node) -> copies to put behind it
+    for dq in nodes:
+        if dq.op_type not in _DQ_OPS or not dq.output:
+            continue
+        children = readers.get(dq.output[0])
+        if not children:
+            continue
+        users: List[Optional[onnx.NodeProto]] = (
+            [None] if dq.output[0] in outputs else []
+        )
+        users += children
+        if len(users) < 2:
+            continue
+        parent = producer.get(dq.input[0])
+        if parent is None or parent.op_type not in _Q_OPS:
+            continue
+        copy_q = parent.input[0] in inits
+        for index, user in enumerate(users):
+            if index == 0:
+                continue
+            post = f"_{index}"
+            new_dq = onnx.NodeProto()
+            new_dq.CopyFrom(dq)
+            new_dq.name = dq.name + post
+            new_dq.output[0] = dq.output[0] + post
+            if copy_q:
+                new_q = onnx.NodeProto()
+                new_q.CopyFrom(parent)
+                new_q.name = parent.name + post
+                new_q.output[0] = parent.output[0] + post
+                new_dq.input[0] = new_q.output[0]
+                after.setdefault(id(parent), []).append(new_q)
+            after.setdefault(id(dq), []).append(new_dq)
+            if user is not None:
+                for i, x in enumerate(user.input):
+                    if x == dq.output[0]:
+                        user.input[i] = new_dq.output[0]
+    if not after:
+        return m
+    final: List[onnx.NodeProto] = []
+    for n in nodes:
+        final.append(n)
+        final.extend(after.get(id(n), []))
+    del g.node[:]
+    g.node.extend(final)
+    return m
+
+
 __all__ = [
     "PROMOTABLE_OPS",
+    "dedicate_dq_nodes",
     "dedicate_qdq_pairs",
-    "promoted_activations",
     "requantize_biases_int8",
     "apply_block_activations_int8_constants",
     "apply_mixed_block_format",
