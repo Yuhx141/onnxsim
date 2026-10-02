@@ -319,6 +319,7 @@ def quantize_full_qdq(
     unshared_ops: Iterable[str] = (),
     quantize_bias: bool = True,
     weight_symmetric: bool = True,
+    shared_ops: Iterable[str] = (),
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -425,6 +426,9 @@ def quantize_full_qdq(
             non-zero zero point; Quark's ``WeightSymmetric=False``).
             ``weight_dtype="uint8"`` is asymmetric unsigned like Quark's
             ``U8U8_AAWA`` weights, or the centred unsigned grid when symmetric
+    :param shared_ops: further op types whose output reuses the input's
+            quantization parameters (on top of the data-movement ops), e.g.
+            ``AveragePool`` under ONNX Runtime's plain QDQ quantizer
     :returns: the quantized ModelProto
     """
     if weight_dtype not in ("int8", "int16", "uint8"):
@@ -527,6 +531,7 @@ def quantize_full_qdq(
     # Relu folding: producer -> Relu becomes producer -> Q(range of the Relu output, lo = 0).
     removed = set()
     unshared = set(unshared_ops)
+    shared = set(shared_ops)
     folded = set()  # outputs of removed Relu / Clip nodes, now their producers'
     centred = sym or any(tensor_symmetric.values())
     quark_rules = remove_qdq_after is not None
@@ -621,7 +626,11 @@ def quantize_full_qdq(
     for n in g.node:
         if id(n) in removed:
             continue
-        if n.op_type in _SHARED_QPARAM_OPS and id(n) in qnode_ids and n.input[0] in qp:
+        if (
+            (n.op_type in _SHARED_QPARAM_OPS or n.op_type in shared)
+            and id(n) in qnode_ids
+            and n.input[0] in qp
+        ):
             for o in n.output:
                 # a folded Relu / Clip gives its producer's output the node's
                 # own range: sharing the input's parameters would lose the clamp

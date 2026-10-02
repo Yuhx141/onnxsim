@@ -1013,6 +1013,7 @@ def collect_calibration_stats(
     pof2_histograms: bool = False,
     quark_hist: Optional[Tuple[bool, int]] = None,
     moving_average: bool = False,
+    exact_session: bool = False,
 ) -> CalibrationStats:
     """Run the float ``model`` over ``calibration_data`` once and record what
     every calibration method needs (see :class:`CalibrationStats`): pass 1
@@ -1025,7 +1026,11 @@ def collect_calibration_stats(
     histograms ``method="minmse_pof2"`` needs. ``quark_hist=(absolute,
     num_bins)`` records :class:`onnxsim.quark_calibration.QuarkHistogram`
     histograms of that layout (the ``"quark_*"`` methods) and
-    ``moving_average=True`` the per-batch mean of each tensor's min / max."""
+    ``moving_average=True`` the per-batch mean of each tensor's min / max.
+    ``exact_session=True`` runs the model with ONNX Runtime's graph
+    optimizations off (as Quark's calibrators do): fused kernels differ from
+    the unfused ones in the last float bit, which can move a histogram count
+    across a bin edge."""
     import onnxruntime as ort
 
     if isinstance(model, str):
@@ -1075,8 +1080,12 @@ def collect_calibration_stats(
         if name not in existing_outputs:
             calib_model.graph.output.append(onnx.ValueInfoProto(name=name))
 
+    so = ort.SessionOptions()
+    if exact_session:
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     sess = ort.InferenceSession(
         calib_model.SerializeToString(),
+        so,
         providers=list(providers) if providers else None,
     )
     output_names = [o.name for o in sess.get_outputs()]
@@ -1410,6 +1419,7 @@ def _calibrate_quark(
         extra_tensor_names=extra_tensor_names,
         histograms=False,
         quark_hist=(absolute, bins),
+        exact_session=True,
     )
     keep = set(minmax_tensor_names or ())
     out: Dict[str, Tuple[float, float]] = {}

@@ -236,6 +236,8 @@ def _activation_rules(
         # outputs calibrated on their own: Slice always, Split except under the
         # plain quantizer (ONNX Runtime's Split shares the input's parameters)
         "unshared_ops": ("Slice", "Split") if extended or pof2 else ("Slice",),
+        # ... and ONNX Runtime's plain quantizer gives AveragePool its input's
+        "shared_ops": () if extended or pof2 else ("AveragePool",),
     }
 
 
