@@ -651,18 +651,36 @@ def test_auto_mixprecision_threshold_none_is_sensitivity_only():
         ({"target_layer_config": []}, ValueError, "list must not be empty"),
         ({"target_layer_config": "uint16"}, TypeError, "must be a QLayerConfig"),
         ({"shared_param_mode": "nope"}, ValueError, "shared_param_mode"),
-        ({"subgraph_json": "does-not-exist.json"}, FileNotFoundError, "does-not"),
-        (
-            {"target_layer_config": qc.QLayerConfig(qc.UInt8Spec(), qc.Int8Spec())},
-            ValueError,
-            "nothing to mix",
-        ),
     ],
 )
 def test_auto_mixprecision_invalid_forms_are_refused(params, error, match):
     q = qc.ModelQuantizer(_amp_config(**params))
     with pytest.raises(error, match=match):
         q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
+
+
+def test_auto_mixprecision_missing_subgraph_json_is_ignored_like_quark():
+    # Quark checks ``Path(subgraph_json).exists()`` and falls back to layer-wise
+    # candidates (the same result as no ``subgraph_json`` at all)
+    model, data = _two_layer_model(), _batches((4, 8))
+    q = qc.ModelQuantizer(_amp_config(subgraph_json="does-not-exist.json"))
+    with pytest.warns(UserWarning, match="does not exist"):
+        out = q.quantize_model(model, calibration_data_reader=data)
+    ref = qc.ModelQuantizer(_amp_config())
+    with pytest.warns(UserWarning):
+        want = ref.quantize_model(model, calibration_data_reader=_batches((4, 8)))
+    assert out.SerializeToString() == want.SerializeToString()
+
+
+def test_auto_mixprecision_same_precision_target_is_not_an_error_like_quark():
+    # Quark never rejects it: the layers are still re-quantized (per-tensor
+    # weights, refreshed bias scales)
+    q = qc.ModelQuantizer(
+        _amp_config(target_layer_config=qc.QLayerConfig(qc.UInt8Spec(), qc.Int8Spec()))
+    )
+    with pytest.warns(UserWarning, match="AutoMixprecision"):
+        q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))
+    assert q.last_auto_mixprecision is not None
 
 
 def test_auto_mixprecision_state_is_reset_between_runs():

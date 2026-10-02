@@ -175,7 +175,10 @@ def _qparams(
         if not scale > 0:
             return 1.0, zp
         return (_pof2(scale) if power_of_two else scale), zp
-    scale = (hi - lo) / (qmax - qmin)
+    # Quark's compute_scale_zp: the range is float32 and its width is taken in
+    # float32 before the float64 division
+    lo32, hi32 = np.float32(lo), np.float32(hi)
+    scale = float(np.float64(hi32 - lo32) / np.float64(qmax - qmin))
     if not scale > 0:
         return 1.0, qmin
     if power_of_two:
@@ -1047,7 +1050,14 @@ def quantize_full_qdq(
                     continue  # weight or input not quantized: keep a float bias
                 s = (sx * np.broadcast_to(ws, w.shape)).astype(np.float32)
                 s = np.maximum(s, 1e-30)
-                q = np.clip(np.round(w / s), -(2**31) + 1, 2**31 - 1).astype(np.int32)
+                # float64 division, as ONNX Runtime's quantize_bias_static does: a
+                # float32 quotient loses integer precision above 2**24 (int16 x
+                # int16 scales)
+                q = np.clip(
+                    np.round(w.astype(np.float64) / s.astype(np.float64)),
+                    -(2**31) + 1,
+                    2**31 - 1,
+                ).astype(np.int32)
                 base = fresh(x)
                 add_init(base + "/int32", q)
                 add_init(base + "/scale", s)
