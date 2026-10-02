@@ -758,6 +758,21 @@ def _make_block(
         if act is None or fcons is None or fcons.op_type != cons.op_type:
             return None
         f_end, tail = fcons.output[0], cons.output[0]
+    elif cons.op_type == "QuantizeLinear" and len(cons.input) > 2:
+        # A Relu folded into the output quantizer (``fold_relu``: the Q range
+        # starts at 0): Quark's own graphs keep the Relu node, so the block it
+        # trains is conv + Relu against the float *Relu* output
+        fcons = f_cons.get(fn.output[0])
+        zp = q_inits.get(cons.input[2])
+        if (
+            fcons is not None
+            and fcons.op_type == "Relu"
+            and zp is not None
+            and zp.data_type in _RANGES
+            and float(numpy_helper.to_array(zp).reshape(-1)[0])
+            == _RANGES[zp.data_type][0]
+        ):
+            act, f_end = _Relu(), fcons.output[0]
     if opt.output_qdq:
         nxt = q_cons.get(tail)
         if nxt is not None and nxt.op_type == "QuantizeLinear":
@@ -934,6 +949,8 @@ def _train_block(
     opt: FinetuneOptions,
     perm_fn: Callable[[int], np.ndarray],
     rng: np.random.Generator,
+    trace: Optional[List[Tuple[int, float, float]]] = None,
+    rand_fn: Optional[Callable[[Tuple[int, ...]], np.ndarray]] = None,
 ) -> _Trained:
     qw = blk.qw
     s_total = xq.shape[0]
@@ -1007,7 +1024,8 @@ def _train_block(
             x_in = pre_mixed[idx]
         else:
             xqb, xfb = xq[idx], xf[idx]
-            x_in = in_fq(np.where(rng.random(xqb.shape) < opt.drop_ratio, xqb, xfb))
+            u = rand_fn(xqb.shape) if rand_fn is not None else rng.random(xqb.shape)
+            x_in = in_fq(np.where(u < opt.drop_ratio, xqb, xfb))
         y_ref = yf[idx]
 
         if adaround:
@@ -1049,6 +1067,8 @@ def _train_block(
             if len(params) > 1:
                 grads.append(db * bmask)  # type: ignore[operator]
 
+        if trace is not None:
+            trace.append((it, recons, round_loss))
         # Quark's early-stop rule, verbatim (it reuses num_batches / warm_start)
         if opt.early_stop and it >= ws_iter:
             if it % es_window == es_window - 1:
@@ -1111,6 +1131,9 @@ def finetune(
     options: Optional[FinetuneOptions] = None,
     providers: Optional[Sequence[str]] = None,
     perm_fn: Optional[Callable[[int], np.ndarray]] = None,
+    trace: Optional[List[List[Tuple[int, float, float]]]] = None,
+    rand_fn: Optional[Callable[[Tuple[int, ...]], np.ndarray]] = None,
+    block_hook: Optional[Callable[[int, str], None]] = None,
 ) -> Tuple[onnx.ModelProto, List[LayerReport]]:
     """Quark ``FastFinetune`` over a QDQ model (see the module docstring).
 
@@ -1122,7 +1145,11 @@ def finetune(
     ``perm_fn(n)`` returns a permutation of ``range(n)``; the first
     ``batch_size`` entries are an iteration's mini-batch. The default is a
     seeded numpy generator; pass torch's ``randperm`` stream to replay Quark's
-    mini-batches exactly.
+    mini-batches exactly. ``trace``, if a list, receives one list of
+    ``(iteration, reconstruction loss, rounding loss)`` per trained block;
+    ``rand_fn(shape)`` replaces the uniform draw behind ``drop_ratio`` mixing
+    and ``block_hook(i, name)`` is called before each block trains (both let
+    a test replay Quark's torch random stream).
     """
     opt = options or FinetuneOptions()
     if opt.algorithm not in ("adaround", "adaquant"):
@@ -1197,7 +1224,13 @@ def finetune(
             ]
         if xq.shape != xf.shape or not _shape_ok(blk, xq):
             continue
-        res = _train_block(blk, xq, xf, yf, opt, perm_fn, mix_rng)
+        layer_trace: Optional[List[Tuple[int, float, float]]] = None
+        if trace is not None:
+            layer_trace = []
+            trace.append(layer_trace)
+        if block_hook is not None:
+            block_hook(blocks.index(blk), blk.name)
+        res = _train_block(blk, xq, xf, yf, opt, perm_fn, mix_rng, layer_trace, rand_fn)
 
         x_eval = xq if blk.in_q is None else blk.in_q.fq(xq)
         qw, qb = blk.qw, blk.qb
