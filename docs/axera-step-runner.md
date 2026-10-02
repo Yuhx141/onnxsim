@@ -829,3 +829,43 @@ recalibrated at every step, none refused**:
 Delayed (the previous step's ranges times 1.3) matches exact, and both match the
 static step-0 templates (0.9953 / 0.9962 / 0.9975): on these four steps recalibration
 costs nothing and the machinery is in place for ranges that move more.
+
+### Longer runs: the static templates drift, recalibration holds
+
+`--train-steps` over twelve steps (the four real batches three times, the weights
+and Adam state evolving on the device), with `--train-validate` comparing the
+gradients at the device's own state against a float step on that state:
+
+| n | batch | static: gradient cosine | static: loss error |
+|---|---|---|---|
+| 0 / 1 / 2 / 3 | 0 / 1 / 2 / 3 | 0.9969 / 0.9961 / 0.9962 / 0.9980 | -0.017 / +0.009 / +0.038 / +0.025 |
+| 4 / 5 / 6 / 7 | 0 / 1 / 2 / 3 | 0.977 / 0.945 / 0.913 / 0.573 | +0.024 / -0.005 / -0.018 / +0.005 |
+| 8 / 9 / 10 / 11 | 0 / 1 / 2 / 3 | 0.150 / 0.449 / 0.184 / 0.677 | -0.029 / -0.099 / -0.116 / -0.058 |
+
+The loss follows float, but the gradients stop being right: the 16-bit chains are
+calibrated on step 0's ranges and, as the state evolves, backward tensors leave
+those ranges and clip. The four-step recalibration test could not show this: it
+used the dataset's own trajectory, where the ranges barely move.
+`--train-recal static|delayed|exact` (with `--train-steps`) moves the 61 chains per
+step onto scales predicted from the state the step starts from (`exact`) or from the
+previous step's ranges times `--u16-margin-factor` (`delayed`). The ranges come from
+a float step on the downloaded state, so this is a measurement, not a fast path.
+First eight steps, gradient cosine at the device's state (loss error within 0.01
+throughout for the recalibrated runs):
+
+| step n | static | exact | delayed (x1.3) |
+|---|---|---|---|
+| 4 | 0.977 | 0.994 | 0.989 |
+| 5 | 0.945 | 0.996 | 0.996 |
+| 6 | 0.913 | 0.996 | 0.994 |
+| 7 | 0.573 | 0.989 | 0.977 |
+
+Exact recalibration removes the degradation (the chains all moved, none refused), and
+delayed scaling recovers most of it with only the previous step's ranges. A long
+run on the device therefore needs per-step ranges for each chain's tensors (the
+chain input, the weight, the bias, the MatMul output and the output) without
+downloading the state: device-side min/max reductions are the missing piece.
+`session.exec_by_tag` attributes engine time to segments: of the 3.85 s per step,
+the largest are `MatMul_471` (the stem convolution's weight gradient, FP32: 0.37 s),
+the three stage-4 forward Convs (about 0.2 s each), `Gather_457` (0.19 s) and
+`MatMul_121` (0.17 s).
