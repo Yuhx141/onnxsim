@@ -14,9 +14,35 @@ import collections
 
 import numpy as np
 import onnx
+import pytest
 from onnx import parser
 
 import onnxsim
+
+ort = pytest.importorskip("onnxruntime")
+
+
+def _run(model, feeds):
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    session = ort.InferenceSession(
+        model.SerializeToString(),
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
+    )
+    return session.run(None, feeds)
+
+
+def _assert_ort_equivalent(model, simplified, feeds, *, rtol=1e-5, atol=1e-6):
+    expected = _run(model, feeds)
+    actual = _run(simplified, feeds)
+    assert len(actual) == len(expected)
+    for expected_value, actual_value in zip(expected, actual):
+        np.testing.assert_allclose(
+            actual_value, expected_value, rtol=rtol, atol=atol, equal_nan=True
+        )
 
 
 def _simplify(model, **kwargs):
@@ -114,6 +140,8 @@ def test_fuse_mul_into_conv_singleton_rank_scale_keeps_bias_rank_one():
     conv = next(n for n in sim.graph.node if n.op_type == "Conv")
     bias = next(t for t in sim.graph.initializer if t.name == conv.input[2])
     assert list(bias.dims) == [2]
+    x = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+    _assert_ort_equivalent(model, sim, {"X": x})
 
 
 # --------------------------------------------------------------------------- #

@@ -144,8 +144,14 @@ def _op_counts(model):
 
 
 def _run(model, feeds):
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
     sess = ort.InferenceSession(
-        model.SerializeToString(), providers=["CPUExecutionProvider"]
+        model.SerializeToString(),
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
     )
     return sess.run(None, feeds)
 
@@ -253,6 +259,8 @@ def test_fuse_gqa_declines_finite_causal_penalty():
     simplified, ok = onnxsim.simplify(model)
     assert ok
     assert _op_counts(simplified)["GroupQueryAttention"] == 0
+    x = np.random.default_rng(9).standard_normal((B, S, NH * Dh)).astype(np.float32)
+    _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
 
 
 def test_fuse_gqa_declines_runtime_mask():

@@ -164,8 +164,14 @@ def _op_counts(model):
 
 
 def _run(model, feeds):
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
     sess = ort.InferenceSession(
-        model.SerializeToString(), providers=["CPUExecutionProvider"]
+        model.SerializeToString(),
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
     )
     return sess.run(None, feeds)
 
