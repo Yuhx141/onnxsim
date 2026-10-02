@@ -225,7 +225,7 @@ def test_validation_errors(model, data):
     with pytest.raises(ValueError, match="differ"):
         _run(model, data, base_dtype="uint8", target_dtype="uint8")
     with pytest.raises(ValueError, match="dtypes"):
-        _run(model, data, base_dtype="int8", target_dtype="uint16")
+        _run(model, data, base_dtype="float16", target_dtype="uint16")
     with pytest.raises(ValueError, match="optimize"):
         _run(model, data, base_dtype="uint8", target_dtype="uint16", optimize="x")
     with pytest.raises(ValueError, match="calibration_data"):

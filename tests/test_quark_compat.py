@@ -647,21 +647,11 @@ def test_auto_mixprecision_threshold_none_is_sensitivity_only():
 @pytest.mark.parametrize(
     "params, error, match",
     [
-        (
-            {
-                "target_layer_config": {
-                    qc.QLayerConfig(qc.UInt16Spec(), qc.Int8Spec()): []
-                }
-            },
-            NotImplementedError,
-            "single QLayerConfig",
-        ),
-        ({"subgraph_json": "x.json"}, NotImplementedError, "subgraph_json"),
-        (
-            {"sensitivity_cache_file": "c.json"},
-            NotImplementedError,
-            "sensitivity_cache_file",
-        ),
+        ({"target_layer_config": {}}, ValueError, "dict must not be empty"),
+        ({"target_layer_config": []}, ValueError, "list must not be empty"),
+        ({"target_layer_config": "uint16"}, TypeError, "must be a QLayerConfig"),
+        ({"shared_param_mode": "nope"}, ValueError, "shared_param_mode"),
+        ({"subgraph_json": "does-not-exist.json"}, FileNotFoundError, "does-not"),
         (
             {"target_layer_config": qc.QLayerConfig(qc.UInt8Spec(), qc.Int8Spec())},
             ValueError,
@@ -669,7 +659,7 @@ def test_auto_mixprecision_threshold_none_is_sensitivity_only():
         ),
     ],
 )
-def test_auto_mixprecision_unsupported_forms_are_refused(params, error, match):
+def test_auto_mixprecision_invalid_forms_are_refused(params, error, match):
     q = qc.ModelQuantizer(_amp_config(**params))
     with pytest.raises(error, match=match):
         q.quantize_model(_two_layer_model(), calibration_data_reader=_batches((4, 8)))

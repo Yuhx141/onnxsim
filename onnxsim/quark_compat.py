@@ -1088,6 +1088,46 @@ class ModelQuantizer:
             return spec.dtype
         raise NotImplementedError(f"activation dtype {spec.dtype} unsupported")
 
+    def _amp_targets(
+        self, target: Any, base_dtype: str
+    ) -> "tuple[List[tuple[str, bool]], Dict[str, tuple[str, bool]]]":
+        """``(targets, pinned)`` of an ``AutoMixprecisionConfig.target_layer_config``:
+        a single :class:`QLayerConfig`, a list of them (the best-scoring one
+        is used per candidate) or ``{QLayerConfig: [node names]}`` (the named
+        nodes use their entry; the others the entry with ``[]``, or the first
+        entry when there is none)."""
+
+        def spec_of(cfg: Any) -> "tuple[str, bool]":
+            if not isinstance(cfg, QLayerConfig):
+                raise TypeError(
+                    "target_layer_config must be a QLayerConfig, a list of "
+                    f"them or a dict {{QLayerConfig: [names]}}, got {cfg!r}"
+                )
+            if (cfg.weight or Int8Spec()).dtype not in ("int8", "uint8"):
+                raise NotImplementedError("target_layer_config weight must be int8")
+            if cfg.activation is None:
+                raise ValueError("target_layer_config needs an activation spec")
+            return self._int_act_dtype(cfg.activation), cfg.activation.symmetric
+
+        if isinstance(target, dict):
+            if not target:
+                raise ValueError("target_layer_config dict must not be empty")
+            fallback = [c for c, names in target.items() if not names]
+            default = fallback[0] if fallback else next(iter(target))
+            pinned = {n: spec_of(c) for c, names in target.items() for n in names}
+            return [spec_of(default)], pinned
+        if isinstance(target, (list, tuple)):
+            if not target:
+                raise ValueError("target_layer_config list must not be empty")
+            return [spec_of(c) for c in target], {}
+        dtype, sym = spec_of(target)
+        if dtype == base_dtype:
+            raise ValueError(
+                "AutoMixprecision target activation precision equals the base "
+                f"precision ({base_dtype}); nothing to mix"
+            )
+        return [(dtype, sym)], {}
+
     def _auto_mixprecision(
         self,
         model: onnx.ModelProto,
@@ -1096,32 +1136,20 @@ class ModelQuantizer:
         act: QSpec,
         exclude: List[str],
         algo: AlgoConfig,
+        quantize_kwargs: Optional[Dict[str, Any]] = None,
     ) -> onnx.ModelProto:
         from onnxsim.quark_auto_mixprecision import auto_mixprecision
 
         p = algo.params
-        target = p.get("target_layer_config")
-        if not isinstance(target, QLayerConfig):
-            raise NotImplementedError(
-                "AutoMixprecisionConfig needs a single QLayerConfig as "
-                "target_layer_config (the dict / list multi-config forms are "
-                "not supported)"
-            )
-        for key in ("subgraph_json", "sensitivity_cache_file"):
-            if p.get(key) is not None:
-                raise NotImplementedError(
-                    f"AutoMixprecisionConfig.{key} is not supported"
-                )
-        if (target.weight or Int8Spec()).dtype not in ("int8", "uint8"):
-            raise NotImplementedError("target_layer_config weight must be int8")
-        if target.activation is None:
-            raise ValueError("target_layer_config needs an activation spec")
-        target_dtype = self._int_act_dtype(target.activation)
-        if target_dtype == base_dtype:
-            raise ValueError(
-                "AutoMixprecision target activation precision equals the base "
-                f"precision ({base_dtype}); nothing to mix"
-            )
+        targets, pinned = self._amp_targets(p.get("target_layer_config"), base_dtype)
+        subgraphs = None
+        if p.get("subgraph_json") is not None:
+            from onnxsim.quark_auto_mixprecision import parse_subgraph_json
+
+            specs = parse_subgraph_json(p["subgraph_json"], model, model)
+            subgraphs = [(s.name, s.resolved_nodes) for s in specs]
+        if p.get("shared_param_mode", "propagate") not in ("propagate", "unshare"):
+            raise ValueError("shared_param_mode must be 'propagate' or 'unshare'")
         self._approx(
             "AutoMixprecision mixes activation precision only (weights stay int8)"
         )
@@ -1130,7 +1158,14 @@ class ModelQuantizer:
             model,
             calibration,
             base_dtype=base_dtype,
-            target_dtype=target_dtype,
+            targets=targets,
+            candidate_targets=pinned,
+            subgraphs=subgraphs,
+            cache_file=p.get("sensitivity_cache_file"),
+            worker_num=p.get("worker_num", 1),
+            no_input_qdq_shared=bool(p.get("no_input_qdq_shared", False)),
+            dual_quant_nodes=bool(p.get("dual_quant_nodes", False)),
+            quantize_kwargs=quantize_kwargs,
             target_op_types=tuple(
                 p.get("target_op_type") or ("Conv", "Gemm", "MatMul")
             ),
@@ -1206,6 +1241,28 @@ class ModelQuantizer:
         if work is not model:
             float_model = work
 
+        qkw: Dict[str, Any] = dict(
+            calibration_data=calibration,
+            activation_dtype=act_dtype,
+            exclude_nodes=exclude,
+            method=act.calibration_method,
+            symmetric_activations=act.symmetric,
+            power_of_two=act.pof2 or wt.pof2,
+            per_channel=per_channel,
+            weight_dtype="int16" if wt.dtype == "int16" else "int8",
+            fold_relu=bool(opts.get("RemoveQDQConvRelu", True)),
+            # Quark's XINT8 (power-of-2 weights): MinMSE scale search on
+            # weights and int8 biases (``Int32Bias=True`` keeps int32)
+            pof2_mode="minmse" if wt.pof2 else "ceil",
+            int8_bias=wt.pof2 and not self.config.extra_options.get("Int32Bias"),
+            int8_constants=True,
+            align_eltwise_dtype=bool(
+                self.config.extra_options.get("AlignEltwiseQuantType")
+            ),
+            softmax_unit_range=not act.pof2,
+            tensor_dtypes=t_dtypes or None,
+            tensor_symmetric=t_sym or None,
+        )
         mixed_algo = by_name.get("auto_mixprecision")
         if mixed_algo is not None and self._promotes_int16_to_int8(act, mixed_algo):
             quantized = self._promote_all_int16_to_int8(
@@ -1213,32 +1270,16 @@ class ModelQuantizer:
             )
         elif mixed_algo is not None:
             quantized = self._auto_mixprecision(
-                work, calibration, act_dtype, act, exclude, by_name["auto_mixprecision"]
+                work,
+                calibration,
+                act_dtype,
+                act,
+                exclude,
+                by_name["auto_mixprecision"],
+                qkw,
             )
         else:
-            quantized = quantize_full_qdq(
-                work,
-                calibration_data=calibration,
-                activation_dtype=act_dtype,
-                exclude_nodes=exclude,
-                method=act.calibration_method,
-                symmetric_activations=act.symmetric,
-                power_of_two=act.pof2 or wt.pof2,
-                per_channel=per_channel,
-                weight_dtype="int16" if wt.dtype == "int16" else "int8",
-                fold_relu=bool(opts.get("RemoveQDQConvRelu", True)),
-                # Quark's XINT8 (power-of-2 weights): MinMSE scale search on
-                # weights and int8 biases (``Int32Bias=True`` keeps int32)
-                pof2_mode="minmse" if wt.pof2 else "ceil",
-                int8_bias=wt.pof2 and not self.config.extra_options.get("Int32Bias"),
-                int8_constants=True,
-                align_eltwise_dtype=bool(
-                    self.config.extra_options.get("AlignEltwiseQuantType")
-                ),
-                softmax_unit_range=not act.pof2,
-                tensor_dtypes=t_dtypes or None,
-                tensor_symmetric=t_sym or None,
-            )
+            quantized = quantize_full_qdq(work, **qkw)
             if opts.get("Int32Bias", True) is False:
                 from onnxsim.quark_preset_graphs import requantize_biases_int8
 
