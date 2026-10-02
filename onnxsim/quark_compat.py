@@ -84,10 +84,8 @@ names and preset *meanings*, not copied.
   quantization. Note Quark enables CLE implicitly in *every* preset
   (``include_cle=True``) while onnxsim only runs it when ``CLEConfig`` is
   listed, so a preset's weights differ from Quark's wherever a CLE pattern
-  exists; AdaQuant (``num_iterations``, ``learning_rate``,
-  ``reg_param``) and BiasCorrection run after it, against the float model.
-  AdaQuant only reoptimizes MatMul/Gemm layers whose output is not folded
-  with a following Relu, and leaves the rest as calibrated.
+  exists; AdaRound / AdaQuant and BiasCorrection run after it, against the
+  float model.
   AutoMixprecision replaces the plain quantization step with
   :func:`onnxsim.quark_auto_mixprecision.auto_mixprecision`: a single
   ``target_layer_config`` whose *activation* is the other of ``uint8`` /
@@ -95,13 +93,45 @@ names and preset *meanings*, not copied.
   ``subgraph_json`` and ``sensitivity_cache_file`` raise, and ``dual_quant_nodes``
   / ``no_input_qdq_shared`` / ``shared_param_mode`` / ``worker_num`` have no
   effect (every tensor already has its own Q/DQ pair; analysis is serial).
-  AdaRound and GPTQ refine the weight codes layer by layer
-  (:mod:`onnxsim.quark_weight_rounding`; Conv / Gemm / MatMul, guarded so a
-  layer's reconstruction error never gets worse). AdaRound honours
-  ``drop_ratio`` (QDrop-style mixing of quantized and float layer inputs),
-  ``selective_update``, ``lr_adjust`` and ``data_size``; ``update_bias`` is
-  accepted and ignored, as in Quark (only AdaQuant reads it); ``early_stop`` /
-  ``output_qdq`` / ``batch_size`` / ``num_batches`` have no effect. GPTQ with
+  AdaRound and AdaQuant are Quark's ``FastFinetune``
+  (:mod:`onnxsim.quark_finetune`, a numpy port of ``quark.onnx.algorithm.
+  finetuning``): per Conv / ConvTranspose / Gemm / MatMul / InstanceNorm /
+  LayerNorm *block* (input Q/DQ, op, bias, a following Relu / LeakyRelu / Clip /
+  Sigmoid / Tanh / Gelu / Softmax, optionally the output Q/DQ), in graph order,
+  the quantized model's layer input is re-captured after every update
+  (``parallel=True``: once up front), mini-batches of ``batch_size`` samples are
+  drawn each iteration, and Quark's loss, ``early_stop`` rule, cosine ``beta``
+  schedule, ``lr_adjust``, ``drop_ratio`` (default 1.0, as in Quark),
+  ``selective_update`` (end-to-end L2 over ``output_index``), ``output_qdq``,
+  ``num_batches``, ``data_size``, ``target_op_type``, ``select_max_mem_layer``,
+  ``fixed_seed`` and ``QuantizationPreference="accuracy"`` are implemented;
+  AdaQuant trains the float weight (and, with ``update_bias``, the quantized
+  bias) straight-through at ``learning_rate=1e-5`` and re-quantizes it. The
+  presets carry the ``FastFinetune`` dict of Quark's (``batch_size=2``,
+  ``early_stop=True``, ``data_size=1000``, ...). Given Quark's own random
+  stream the integer codes are identical to Quark's for AdaRound (and for short
+  AdaQuant runs), see ``tests/test_quark_finetune_parity.py``; with numpy's
+  stream the result agrees statistically (the optimization is stochastic in
+  Quark too). Exactly like Quark 0.13, the config fields ``reg_param`` /
+  ``beta_range`` / ``warm_start`` / ``parallel`` / ``output_index`` /
+  ``ref_model_path`` / ``dynamic_batch`` are *not* forwarded (only
+  ``extra_options["FastFinetune"]`` reaches them) and ``update_bias`` only
+  matters to AdaQuant; ``extra_options["FastFinetune"]`` keys override the
+  config. No effect on the numbers, so accepted and ignored: ``optim_device`` /
+  ``infer_device`` / ``num_workers`` / ``pin_memory`` / ``use_gds`` /
+  ``log_period`` / ``cache_dir`` / ``dynamic_batch`` / ``mem_opt_level`` /
+  ``SaveAndRestore``. ``ref_model_path`` must be a float model. Not replicated:
+  layers Quark cannot convert are skipped (``auto_pad``, ``ConvTranspose`` with
+  groups / ``output_padding``, 3-D convolutions, ``Gemm`` with ``transA``,
+  ``PRelu``); weights stay *per tensor* here too (Quark's default), unlike the
+  GPTQ and legacy AdaQuant paths. onnxsim additions: ``guard`` (default on:
+  keep a layer's new codes only if its block error did not rise; ``False`` is
+  Quark's behaviour) and ``AdaQuantConfig(legacy_engine=True)`` for the older
+  :func:`onnxsim.apply_adaquant` (a different algorithm: rounding relaxation
+  plus a learnable activation range). GPTQ is in
+  :mod:`onnxsim.quark_weight_rounding` (Conv / Gemm / MatMul, guarded so a
+  layer's reconstruction error never gets worse).
+  GPTQ with
   ``bits`` / ``group_size`` / ``per_channel`` / ``mse`` / ``weight_symmetric``
   set re-grids the weights the way Quark's GPTQ does (``bits``-bit codes,
   per-tensor / per-channel / per-group scales, scales and zero points written

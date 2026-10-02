@@ -647,7 +647,9 @@ def _make_block(
     t = qn.op_type
     # -- the weight: DequantizeLinear over an integer initializer ---------------------
     wdq = q_prod.get(qn.input[1])
-    qw = None if wdq is None else _qconst(wdq, q_inits)
+    if wdq is None:
+        return None
+    qw = _qconst(wdq, q_inits)
     if (
         qw is None
         or use_count.get(qw.name, 0) != 1
