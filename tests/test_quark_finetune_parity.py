@@ -263,11 +263,18 @@ def _quark_quantize(model, data, preset="A8W8", **finetune):
     cfg.global_quant_config.include_cle = False
     ff = cfg.global_quant_config.extra_options.get("FastFinetune")
     if ff is not None:
-        ff["EarlyStop"] = False
+        # other test modules edit Quark's shared preset dicts in place: start from
+        # a known state, not whatever they left
+        ff.clear()
+        ff.update(_ff(ff_algorithm(preset)))
         ff.update(finetune)
     with _Quiet() as buf:
         ModelQuantizer(cfg).quantize_model(d + "/m.onnx", d + "/q.onnx", R(data))
     return onnx.load(d + "/q.onnx"), buf.getvalue()
+
+
+def ff_algorithm(preset):
+    return "adaround" if "ADAROUND" in preset or "ACCURATE" in preset else "adaquant"
 
 
 _CACHE = {}
