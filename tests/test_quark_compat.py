@@ -438,9 +438,9 @@ def _conv_model():
         <ir_version: 10, opset_import: ["": 17]>
         agraph (float[1,3,8,8] x) => (float[1,4,8,8] y)
         {
-            h = Conv<pads=[1,1,1,1]>(x, w1, b1)
+            h = Conv<group=1, pads=[1,1,1,1]>(x, w1, b1)
             r = Relu(h)
-            y = Conv<pads=[1,1,1,1]>(r, w2, b2)
+            y = Conv<group=1, pads=[1,1,1,1]>(r, w2, b2)
         }
         """
     )

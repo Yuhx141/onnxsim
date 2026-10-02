@@ -1188,18 +1188,21 @@ class ModelQuantizer:
         # the transformed model; the untouched one stays the reference).
         float_model = model
         work = model
+        # Quark's order: CLE (stem equalization first), SmoothQuant, Quarot
+        if "cle" in by_name:
+            from onnxsim.quark_equalization import apply_cle_config
+
+            work = apply_cle_config(
+                work, by_name["cle"].params, opts, exclude=list(exclude)
+            )
+        if "smooth_quant" in by_name:
+            from onnxsim.quark_smoothquant import apply_smooth_quant_config
+
+            work = apply_smooth_quant_config(
+                work, by_name["smooth_quant"].params, opts, calibration
+            )
         if "quarot" in by_name:
             work = self._quarot(work, by_name["quarot"])
-        if "smooth_quant" in by_name:
-            from onnxsim.smoothquant import apply_smoothquant
-
-            alpha = by_name["smooth_quant"].params.get("alpha", 0.5)
-            work = apply_smoothquant(work, calibration_data=calibration, alpha=alpha)
-        if "cle" in by_name:
-            from onnxsim.onnx_simplifier import cross_layer_equalize
-            from onnxsim.quark_cle import equalize_linear_layers
-
-            work = equalize_linear_layers(cross_layer_equalize(work))
         if work is not model:
             float_model = work
 
