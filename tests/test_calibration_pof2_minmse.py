@@ -397,17 +397,18 @@ def test_calib_method_enum_maps_to_onnxsim_methods():
     }
     for member, name in names.items():
         assert qc.Int8Spec(calibration_method=member).calibration_method == name
-    with pytest.raises(ValueError):
-        _quantize(
+    # Distribution / LayerwisePercentile are Quark's calibrators now
+    # (tests/test_quark_calibration_methods.py): they run instead of raising
+    for member in (qc.CalibMethod.Distribution, qc.CalibMethod.LayerwisePercentile):
+        out = _quantize(
             qc.QConfig(
                 qc.QLayerConfig(
-                    activation=qc.Int8Spec(
-                        calibration_method=qc.CalibMethod.Distribution
-                    ),
+                    activation=qc.Int8Spec(calibration_method=member),
                     weight=qc.Int8Spec(),
                 )
             )
         )
+        assert any(n.op_type == "QuantizeLinear" for n in out.graph.node)
 
 
 def test_user_built_pof2_config_uses_minmse():

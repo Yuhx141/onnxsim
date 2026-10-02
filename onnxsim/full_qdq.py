@@ -23,6 +23,10 @@ MaxPool in between) runs in fp16 instead, with conversions on both sides.
   exact and need no requantization;
 - a Relu right after a quantized producer is folded into that producer's
   output quantization (a uint8 Q with zero point 0 already clamps at 0);
+- ``remove_qdq_after`` / ``fold_activation`` / ``adjust_activation_ranges`` /
+  ``align_ops`` / ``unshared_ops`` / ``shared_ops`` / ``weight_symmetric`` /
+  ``quantize_bias`` reproduce AMD Quark's graph-placement and quantizer
+  options (:mod:`onnxsim.quark_compat` sets them from ``extra_options``);
 - nodes can be left in float (``op_types`` include list, ``exclude_op_types``,
   ``exclude_nodes``): mixed precision, e.g. keeping LayerNorm/Softmax and
   sampling coordinates in fp16 while the Linear layers run in int8.
@@ -36,6 +40,7 @@ Calibration reuses :func:`onnxsim.calibration.calibrate` (every calibration
 method it supports is available through ``method``).
 """
 
+import warnings
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -108,6 +113,17 @@ _NEVER_QUANTIZED = {
 }
 
 _WEIGHT_AXIS_OPS = {"Conv", "ConvTranspose", "Gemm", "MatMul"}
+#: producers whose output Quark leaves un-Q/DQ'd before a Relu-like consumer
+QUARK_QDQ_PRODUCERS = (
+    "Conv",
+    "Add",
+    "MaxPool",
+    "AveragePool",
+    "GlobalAveragePool",
+    "MatMul",
+    "Gemm",
+    "ConvTranspose",
+)
 _ELTWISE_OPS = {"Add", "Sub", "Mul", "Div", "Min", "Max"}
 
 _DTYPES = {
@@ -143,6 +159,17 @@ def _qparams(
     if symmetric:
         absmax = max(-lo, hi)
         half = qmax if qmin < 0 else (qmax - qmin) // 2
+        if qmin >= 0 and not power_of_two and absmax > 0:
+            # Quark's unsigned symmetric grid spans the whole code range
+            # (scale 2 * absmax / qmax) with the zero point rounded (half to
+            # even, in float32 / float64 like its compute_scale_zp) to the
+            # middle; uint8's 127 is bumped to 128
+            a32 = np.float32(absmax)
+            scale64 = np.float64(a32 + a32) / np.float64(qmax - qmin)
+            zp = int(np.round(np.float64(qmin) + np.float64(a32) / scale64))
+            if qmax - qmin == 255 and zp == 127:
+                zp = 128
+            return float(np.float32(scale64)), zp
         scale = absmax / half
         zp = 0 if qmin < 0 else half + 1
         if not scale > 0:
@@ -155,6 +182,47 @@ def _qparams(
         scale = _pof2(scale)
     zp = int(np.clip(round(qmin - lo / scale), qmin, qmax))
     return scale, zp
+
+
+_CLIP_BOUNDS = {(0.0, 6.0), (0.0, 1.0)}
+
+
+def _clip_bounds(
+    n: onnx.NodeProto, inits: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[float, float]]:
+    """``(min, max)`` of a ``Clip`` with constant, scalar bounds (Quark's
+    ``is_clip_with_min_max`` tolerance: 1e-6 relative to 1), else ``None``."""
+    if len(n.input) != 3 or n.input[1] not in inits or n.input[2] not in inits:
+        return None
+    try:
+        lo = float(numpy_helper.to_array(inits[n.input[1]]).item())
+        hi = float(numpy_helper.to_array(inits[n.input[2]]).item())
+    except ValueError:
+        return None
+    for want in _CLIP_BOUNDS:
+        if abs(lo - want[0]) < 1e-6 and abs(hi - want[1]) < 1e-6:
+            return want
+    return (lo, hi)
+
+
+def _weight_qparams(
+    lo: object, hi: object, qmin: int, qmax: int, symmetric: bool
+) -> Tuple[np.float32, int]:
+    """``(scale, zero_point)`` of a weight tensor (or channel) on the
+    ``[qmin, qmax]`` grid, in the dtypes Quark's ``compute_scale_zp`` uses:
+    float32 range, float64 scale and zero point, float32 scale stored."""
+    lo32 = np.minimum(np.float32(lo), np.float32(0))
+    hi32 = np.maximum(np.float32(hi), np.float32(0))
+    if symmetric:
+        a = np.maximum(np.abs(lo32), np.abs(hi32))
+        lo32, hi32 = -a, a
+    scale = np.float64(hi32 - lo32) / np.float64(qmax - qmin)
+    if scale < np.finfo(np.float32).tiny:
+        return np.float32(1.0), 0
+    zp = int(np.round(np.float64(qmin) - np.float64(lo32) / scale))
+    if symmetric and qmin == 0 and qmax == 255 and zp == 127:
+        zp = 128
+    return np.float32(scale), zp
 
 
 def _weight_axis(node: onnx.NodeProto, rank: int) -> Optional[int]:
@@ -265,6 +333,17 @@ def quantize_full_qdq(
     softmax_unit_range: bool = False,
     align_eltwise_dtype: bool = False,
     tensor_symmetric: Optional[Dict[str, bool]] = None,
+    calibrate_options: Optional[Dict[str, object]] = None,
+    remove_qdq_after: Optional[Iterable[str]] = None,
+    remove_qdq_producers: Iterable[str] = QUARK_QDQ_PRODUCERS,
+    fold_activation: Optional[bool] = None,
+    adjust_activation_ranges: bool = False,
+    quantize_prelu_slope: bool = False,
+    align_ops: Optional[Iterable[str]] = None,
+    unshared_ops: Iterable[str] = (),
+    quantize_bias: bool = True,
+    weight_symmetric: bool = True,
+    shared_ops: Iterable[str] = (),
     float_clamp_input: bool = False,
 ) -> onnx.ModelProto:
     """
@@ -302,7 +381,7 @@ def quantize_full_qdq(
             ``tensor_dtypes``
     :param power_of_two: round every activation and weight scale up to a
             power of two (fixed-point friendly, as Quark's ``XINT8``)
-    :param weight_dtype: ``"int8"`` (default) or ``"int16"`` for the symmetric
+    :param weight_dtype: ``"int8"`` (default), ``"int16"`` or ``"uint8"`` for the
             Conv / ConvTranspose / Gemm / MatMul weights (int16 weights use
             ``com.microsoft`` Q/DQ below opset 21, like the 16-bit activations)
     :param convert_inputs: re-quantize an input whose dtype differs from its
@@ -331,6 +410,50 @@ def quantize_full_qdq(
     :param softmax_unit_range: calibrate every Softmax output to exactly
             ``(0, 1)`` instead of its observed range (what ONNX Runtime's QDQ
             quantizer, and so Quark's non-power-of-two presets, do)
+    :param calibrate_options: extra keyword arguments for
+            :func:`onnxsim.calibration.calibrate` (``range_symmetric``,
+            ``moving_average``, ``quark_num_bins``, ...)
+    :param remove_qdq_after: switches on Quark's rule for dropping the Q/DQ
+            pair of an activation: the output of a ``remove_qdq_producers``
+            node that has exactly one consumer, of one of these op types
+            (``"Relu"``, ``"LeakyRelu"``, ``"PRelu"``, ``"Gelu"`` and
+            ``"Clip"`` -- the latter only with constant bounds ``(0, 6)`` or
+            ``(0, 1)``), stays float. ``None`` (default) keeps the older
+            Relu-only behaviour of ``fold_relu``.
+    :param remove_qdq_producers: producer op types of ``remove_qdq_after``
+            (Quark's: Conv, Add, MaxPool, AveragePool, GlobalAveragePool,
+            MatMul, Gemm, ConvTranspose; ``RemoveQDQInstanceNorm`` adds
+            InstanceNormalization)
+    :param fold_activation: with ``remove_qdq_after``: drop a Relu / Clip node
+            that follows a quantized single-consumer producer, the producer
+            quantizing straight to the node's output range (what ONNX Runtime's
+            QDQ quantizer does for asymmetric activations). ``None``: only for
+            non-symmetric activations, like ``fold_relu``
+    :param adjust_activation_ranges: give the input of a single-consumer Relu /
+            Clip the calibrated range of its output (ONNX Runtime's
+            ``adjust_tensor_ranges``, which Quark inherits)
+    :param quantize_prelu_slope: quantize a ``PRelu`` slope like a weight (int8,
+            per tensor) even when the PRelu's input is left float (Quark does so
+            for symmetric activations)
+    :param align_ops: Quark's ``Align*`` options, by op type: after the
+            parameters are chosen, ``Concat`` / ``Pad`` / ``Transpose`` /
+            ``Reshape`` give their input the output's quantization parameters,
+            and ``MaxPool`` / ``AveragePool`` / ``GlobalAveragePool`` /
+            ``Slice`` give their output(s) the input's (up to five rounds, in
+            Quark's order, so chains settle)
+    :param unshared_ops: ops that would reuse their input's parameters (the
+            data-movement ops) but calibrate their output on its own instead --
+            Quark's behaviour for ``Slice`` and ``Split``
+    :param quantize_bias: False leaves Conv / ConvTranspose / Gemm biases float
+            (Quark's ``QuantizeBias=False``)
+    :param weight_symmetric: False quantizes the Conv / ConvTranspose / Gemm /
+            MatMul weights asymmetrically (scale over the observed range,
+            non-zero zero point; Quark's ``WeightSymmetric=False``).
+            ``weight_dtype="uint8"`` is asymmetric unsigned like Quark's
+            ``U8U8_AAWA`` weights, or the centred unsigned grid when symmetric
+    :param shared_ops: further op types whose output reuses the input's
+            quantization parameters (on top of the data-movement ops), e.g.
+            ``AveragePool`` under ONNX Runtime's plain QDQ quantizer
     :param float_clamp_input: leave the output of a quantized node float when
             its only consumer is a Relu / LeakyRelu / PRelu / Clip(0, 6 or 1)
             that is *not* itself quantized (outside ``op_types``) -- Quark's
@@ -338,7 +461,7 @@ def quantize_full_qdq(
             scheme. (``fold_relu`` handles the quantized-Relu case.)
     :returns: the quantized ModelProto
     """
-    if weight_dtype not in ("int8", "int16"):
+    if weight_dtype not in ("int8", "int16", "uint8"):
         raise ValueError(f"unsupported weight_dtype: {weight_dtype!r}")
     if activation_dtype not in _DTYPES:
         raise ValueError(f"unsupported activation_dtype: {activation_dtype!r}")
@@ -423,6 +546,7 @@ def quantize_full_qdq(
             extra_tensor_names=missing,
             activation_type=activation_dtype,
             tensor_dtypes=tensor_dtypes,
+            **(calibrate_options or {}),  # type: ignore[arg-type]
         )
         ranges = {**calibrated, **ranges}
 
@@ -436,11 +560,28 @@ def quantize_full_qdq(
 
     # Relu folding: producer -> Relu becomes producer -> Q(range of the Relu output, lo = 0).
     removed = set()
+    unshared = set(unshared_ops)
+    shared = set(shared_ops)
+    folded = set()  # outputs of removed Relu / Clip nodes, now their producers'
     centred = sym or any(tensor_symmetric.values())
-    if fold_relu and not centred:
-        producer = {o: n for n in g.node for o in n.output}
+    quark_rules = remove_qdq_after is not None
+    fold_node = (
+        (fold_relu and not centred) if fold_activation is None else fold_activation
+    )
+    producer = {o: n for n in g.node for o in n.output}
+    if adjust_activation_ranges:
         for r in qnodes:
-            if r.op_type != "Relu":
+            if (
+                r.op_type in ("Relu", "Clip")
+                and len(consumers[r.input[0]]) == 1
+                and r.input[0] in ranges
+                and r.output[0] in ranges
+            ):
+                ranges[r.input[0]] = ranges[r.output[0]]
+    if fold_node and (fold_relu or quark_rules):
+        fold_ops = ("Relu", "Clip") if quark_rules else ("Relu",)
+        for r in qnodes:
+            if r.op_type not in fold_ops:
                 continue
             src = r.input[0]
             p = producer.get(src)
@@ -455,19 +596,52 @@ def quantize_full_qdq(
             for k, o in enumerate(p.output):
                 if o == src:
                     p.output[k] = r.output[0]
-            ranges[r.output[0]] = (0.0, max(ranges[r.output[0]][1], 0.0))
+            if not quark_rules:
+                ranges[r.output[0]] = (0.0, max(ranges[r.output[0]][1], 0.0))
+            elif r.op_type == "Relu" and ranges[r.output[0]][0] < 0:
+                # Quark's own behaviour: a calibrator that reports a range
+                # below zero for a Relu output (Distribution) leaves the
+                # folded model without the clamp
+                warnings.warn(
+                    f"Relu {r.name!r} is folded onto the range "
+                    f"{ranges[r.output[0]]}, which reaches below zero: the "
+                    "quantized model no longer clamps negative values (as in "
+                    "Quark)",
+                    UserWarning,
+                    stacklevel=2,
+                )
             removed.add(id(r))
+            folded.add(r.output[0])
         acts = [
             a
             for a in acts
             if not any(id(r) in removed and r.input[0] == a for r in consumers[a])
         ]
 
-    elif fold_relu:
+    if quark_rules:
+        # Quark's "remove Q/DQ between producer and activation": the producer's
+        # output stays float when its single consumer is one of these ops
+        consumer_ops = set(remove_qdq_after or ())
+        producer_ops = set(remove_qdq_producers)
+        skip = set()
+        for c in g.node:
+            if c.op_type not in consumer_ops or not c.input or id(c) in removed:
+                continue
+            src = c.input[0]
+            p = producer.get(src)
+            if (
+                p is not None
+                and p.op_type in producer_ops
+                and p.output[0] == src
+                and len(consumers[src]) == 1
+                and (c.op_type != "Clip" or _clip_bounds(c, inits) in _CLIP_BOUNDS)
+            ):
+                skip.add(src)
+        acts = [a for a in acts if a not in skip]
+    elif fold_relu and centred:
         # A centred zero point cannot clamp at zero, so the Relu stays; instead
         # the tensor between a quantized producer and its Relu is left float
         # (Quark's "remove Q/DQ between conv and relu").
-        producer = {o: n for n in g.node for o in n.output}
         skip = set()
         for r in qnodes:
             src = r.input[0] if r.op_type == "Relu" else None
@@ -511,13 +685,28 @@ def quantize_full_qdq(
     for n in g.node:
         if id(n) in removed:
             continue
-        if n.op_type in _SHARED_QPARAM_OPS and id(n) in qnode_ids and n.input[0] in qp:
+        if (
+            (n.op_type in _SHARED_QPARAM_OPS or n.op_type in shared)
+            and id(n) in qnode_ids
+            and n.input[0] in qp
+        ):
             for o in n.output:
-                if o and o in floats and o not in tensor_dtypes:
+                # a folded Relu / Clip gives its producer's output the node's
+                # own range: sharing the input's parameters would lose the clamp
+                if (
+                    o
+                    and o in floats
+                    and o not in tensor_dtypes
+                    and o not in folded
+                    and n.op_type not in unshared
+                ):
                     qp[o], qdt[o] = qp[n.input[0]], qdt[n.input[0]]
         for x in list(n.input) + list(n.output):
             if x in seen and x not in qp and x in ranges and x not in inits:
                 set_qp(x)
+
+    if align_ops:
+        _align_qparams(g, set(align_ops), set(acts) | graph_inputs, qp, qdt)
 
     opset = next((o.version for o in m.opset_import if o.domain in ("", "ai.onnx")), 0)
     if opset < 13:
@@ -655,7 +844,30 @@ def quantize_full_qdq(
 
     def int8_tensor_dq(x: str, w: np.ndarray) -> str:
         """``int8`` + per-tensor symmetric scale (+ DQ) for a weight-like
-        constant ``x``; returns the DQ output name."""
+        constant ``x``; returns the DQ output name. With asymmetric (or uint8)
+        weights it is the weights' grid instead (Quark treats these constants
+        as weights)."""
+        if not p2 and (not weight_symmetric or weight_dtype == "uint8"):
+            dt = "uint8" if weight_dtype == "uint8" else "int8"
+            lo, hi = _DTYPES[dt][2:]
+            s32, z = _weight_qparams(w.min(), w.max(), lo, hi, weight_symmetric)
+            # (Quark clips to the symmetric code range, so a grid's lowest code
+            # -128 is never produced)
+            q = np.clip(np.round(w / s32) + z, max(lo, -hi), hi).astype(_DTYPES[dt][1])
+            base = fresh(x)
+            add_init(base + f"/{dt}", q)
+            add_init(base + "/scale", np.array(s32, np.float32))
+            add_init(base + "/zp", np.array(z, _DTYPES[dt][1]))
+            out = base + "/dq"
+            act_nodes.append(
+                helper.make_node(
+                    "DequantizeLinear",
+                    [base + f"/{dt}", base + "/scale", base + "/zp"],
+                    [out],
+                    name=out,
+                )
+            )
+            return out
         if p2_search:
             s = pof2_minmse_weight_scale(w)
         else:
@@ -689,14 +901,35 @@ def quantize_full_qdq(
     for n in qnodes:
         if id(n) in removed:
             continue
+        slope_only = False
         if not all(
             x in act_set and x in qp
             for x in _data_inputs(n)
             if x in floats and x not in inits
         ):
-            continue
+            if not (quantize_prelu_slope and n.op_type == "PRelu"):
+                continue
+            slope_only = True
         data = set(_data_inputs(n))
         for k, x in enumerate(list(n.input)):
+            if slope_only and k != 1:
+                continue
+            if (
+                quark_rules
+                and not quantize_prelu_slope
+                and n.op_type == "PRelu"
+                and k == 1
+            ):
+                continue  # Quark's plain quantizer leaves the slope float
+            if (
+                not quantize_bias
+                and k == 2
+                and (
+                    n.op_type in ("Conv", "ConvTranspose", "Gemm")
+                    or (n.op_type == "InstanceNormalization" and int8_constants)
+                )
+            ):
+                continue  # the bias stays float
             if (
                 x not in inits
                 or x not in data
@@ -710,7 +943,33 @@ def quantize_full_qdq(
                 if key not in cache:
                     w_np = _DTYPES[weight_dtype][1]
                     w_max = _DTYPES[weight_dtype][3]
-                    if axis is None:
+                    if not weight_symmetric or weight_dtype == "uint8":
+                        wmin, wmax = _DTYPES[weight_dtype][2:]
+                        clip_lo = max(wmin, -w_max)  # Quark: symmetric code range
+                        if axis is None:
+                            s32, z = _weight_qparams(
+                                w.min(), w.max(), wmin, wmax, weight_symmetric
+                            )
+                            s, zp = np.array(s32, np.float32), np.array(z, w_np)
+                            q = np.clip(np.round(w / s) + z, clip_lo, wmax).astype(w_np)
+                        else:
+                            chans = np.moveaxis(w, axis, 0).reshape(w.shape[axis], -1)
+                            sz = [
+                                _weight_qparams(
+                                    c.min(), c.max(), wmin, wmax, weight_symmetric
+                                )
+                                for c in chans
+                            ]
+                            s = np.array([a for a, _ in sz], np.float32)
+                            zp = np.array([b for _, b in sz], w_np)
+                            shape = [1] * w.ndim
+                            shape[axis] = -1
+                            q = np.clip(
+                                np.round(w / s.reshape(shape)) + zp.reshape(shape),
+                                clip_lo,
+                                wmax,
+                            ).astype(w_np)
+                    elif axis is None:
                         s = np.array(max(np.abs(w).max(), 1e-12) / w_max, np.float32)
                         if p2_search and weight_dtype == "int8":
                             s = np.array(pof2_minmse_weight_scale(w), np.float32)
@@ -769,9 +1028,8 @@ def quantize_full_qdq(
                 n.input[k] = cache[key]
             elif (
                 n.op_type in ("Conv", "ConvTranspose", "Gemm")
-                and k == 2
-                and w.ndim == 1
-            ):
+                or (n.op_type == "InstanceNormalization" and int8_constants)
+            ) and (k == 2 and w.ndim == 1):
                 w_dq = n.input[1]
                 sx = act_scale(n.input[0])
                 w_scale_name = (
@@ -815,7 +1073,9 @@ def quantize_full_qdq(
             else:
                 key = ("c", x, None)
                 if key not in cache:
-                    s, zp = _qparams(w.min(), w.max(), qmin, qmax, sym, p2)
+                    s, zp = _qparams(
+                        w.min(), w.max(), qmin, qmax, sym and weight_symmetric, p2
+                    )
                     q = np.clip(np.round(w / s) + zp, qmin, qmax).astype(act_np)
                     base = fresh(x)
                     add_init(base + "/q", q)
@@ -851,6 +1111,59 @@ def quantize_full_qdq(
     del g.value_info[:]
     _toposort(g)
     return m
+
+
+# Quark's Align* passes, in its order: (op types, copy output -> inputs?)
+_ALIGN_PASSES = (
+    (("Concat",), True),
+    (("MaxPool", "AveragePool", "GlobalAveragePool"), False),
+    (("Pad",), True),
+    (("Slice",), False),
+    (("Transpose",), True),
+    (("Reshape",), True),
+)
+
+
+def _align_qparams(
+    g: onnx.GraphProto,
+    ops: set,
+    has_qdq: set,
+    qp: Dict[str, Tuple[float, int]],
+    qdt: Dict[str, str],
+) -> None:
+    """Quark's ``align_quantize_info`` on the chosen parameters (see
+    ``quantize_full_qdq``'s ``align_ops``)."""
+
+    def copy(src: str, dst: str) -> bool:
+        if (
+            src not in has_qdq
+            or dst not in has_qdq
+            or src not in qp
+            or dst not in qp
+            or qdt[src] != qdt[dst]
+            or qp[src] == qp[dst]
+        ):
+            return False
+        qp[dst] = qp[src]
+        return True
+
+    for _ in range(5):
+        changed = False
+        for pass_ops, out_to_in in _ALIGN_PASSES:
+            for n in g.node:
+                if n.op_type not in pass_ops or n.op_type not in ops:
+                    continue
+                if out_to_in:
+                    if not n.output or n.output[0] not in has_qdq:
+                        continue
+                    ins = n.input if n.op_type == "Concat" else n.input[:1]
+                    for x in ins:
+                        changed |= copy(n.output[0], x)
+                elif n.input and n.input[0] in has_qdq:
+                    for o in n.output:
+                        changed |= copy(n.input[0], o)
+        if not changed:
+            return
 
 
 def _toposort(g: onnx.GraphProto) -> None:

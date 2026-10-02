@@ -41,7 +41,7 @@ precision, serial analysis.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 import onnx
@@ -240,6 +240,7 @@ def auto_mixprecision(
     per_channel: bool = True,
     method: str = "minmax",
     providers: Optional[Sequence[str]] = None,
+    calibrate_options: Optional[Dict[str, Any]] = None,
 ) -> AutoMixprecisionResult:
     """Mixed-precision quantization of ``model`` (see the module docstring).
 
@@ -294,6 +295,7 @@ def auto_mixprecision(
         providers=providers,
         method=method,
         extra_tensor_names=acts,
+        **{"activation_type": base_dtype, **(calibrate_options or {})},
     )
 
     def quantize(moved_tensors: Set[str]) -> onnx.ModelProto:
@@ -307,6 +309,7 @@ def auto_mixprecision(
             providers=providers,
             ranges=ranges,
             tensor_dtypes={t: target_dtype for t in moved_tensors} or None,
+            calibrate_options=calibrate_options,
         )
 
     def score_of(moved_tensors: Set[str]):
