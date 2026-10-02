@@ -121,9 +121,9 @@ names and preset *meanings*, not copied.
   documents the layout, numerics and limits); no activation calibration.
   ``MatMulNBitsParams`` (``GroupSize`` 128, ``Symmetric`` True, ``Bits`` 4,
   ``AccuracyLevel`` 1, ``Algorithm`` DEFAULT / HQQ / GPTQ) and ``GPTQParams``
-  (also fed by a ``GPTQConfig`` in ``algo_config``, which as in Quark does not
-  select GPTQ by itself) are read; packed weights, scales, zero points and
-  attributes are identical to Quark's for all three algorithms
+  are read (a ``GPTQConfig`` in ``algo_config`` is ignored, as in Quark);
+  packed weights, scales, zero points and attributes are identical to Quark's
+  for all three algorithms
   (``tests/test_quark_parity.py``). Differences: ``Bits != 4`` raises (Quark
   emits an unrunnable model), MatMul + Add pairs that Quark's ONNX Runtime
   pre-processing would fuse into an unquantized Gemm are converted
@@ -765,8 +765,8 @@ class ModelQuantizer:
         :mod:`onnxsim.quark_matmul_nbits`). Options as Quark reads them:
         ``MatMulNBitsParams`` (``GroupSize``, ``Symmetric``, ``Bits``,
         ``AccuracyLevel``, ``Algorithm`` = DEFAULT / HQQ / GPTQ) and, for GPTQ,
-        ``GPTQParams`` (also filled from a ``GPTQConfig`` in ``algo_config``,
-        which -- as in Quark -- does not by itself select the GPTQ algorithm)."""
+        ``GPTQParams``; a ``GPTQConfig`` in ``algo_config`` is ignored, as in
+        Quark."""
         from onnxsim.quark_matmul_nbits import quantize_matmul_nbits
 
         cfg = self.config
@@ -781,20 +781,11 @@ class ModelQuantizer:
                 f"algo_config [{', '.join(others)}] is not applied to MatMulNBits; "
                 "pass ignore_unsupported_algos=True to quantize without it"
             )
-        names = {
-            "block_size": "BlockSize",
-            "perc_damp": "PercDamp",
-            "group_size": "GroupSize",
-            "act_order": "ActOrder",
-            "per_channel": "PerChannel",
-            "weight_symmetric": "WeightSymmetric",
-            "mse": "MSE",
-        }
-        for a in cfg.algo_config:
-            if a.name == "gptq":
-                for key, val in a.params.items():
-                    if key in names:
-                        gptq.setdefault(names[key], val)
+        if any(a.name == "gptq" for a in cfg.algo_config):
+            self._approx(
+                "GPTQConfig is not read by MATMUL_NBITS (as in Quark): set "
+                "extra_options['GPTQParams'] and MatMulNBitsParams['Algorithm']"
+            )
         algorithm = str(mm.get("Algorithm", "DEFAULT"))
         calibration = None
         if algorithm.upper() == "GPTQ":

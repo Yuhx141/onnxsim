@@ -441,12 +441,14 @@ def test_gptq_needs_calibration_and_unshared_weights():
 # -- the compat layer ----------------------------------------------------------------
 
 
-def _quantize(cfg, model, **kw):
-    x = np.random.default_rng(1).standard_normal((3, 64)).astype(np.float32)
+def _quantize(cfg, model, reader=None, **kw):
+    if reader is None:
+        x = np.random.default_rng(1).standard_normal((3, 64)).astype(np.float32)
+        reader = [{"x": x}]
     q = qc.ModelQuantizer(cfg)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        out = q.quantize_model(model, calibration_data_reader=[{"x": x}], **kw)
+        out = q.quantize_model(model, calibration_data_reader=reader, **kw)
     return q, out
 
 
@@ -510,10 +512,16 @@ def test_preset_algorithms_and_algo_config():
     cfg.extra_options["MatMulNBitsParams"]["Algorithm"] = "GPTQ"
     cfg.algo_config = [qc.GPTQConfig(group_size=32, per_channel=True)]
     q = qc.ModelQuantizer(cfg)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    with pytest.warns(UserWarning, match="GPTQConfig is not read"):
         out = q.quantize_model(model, calibration_data_reader=[{"x": x}])
-    assert _inits(out)["w_scales"].shape == (48, 4)  # grouped
+    assert _inits(out)["w_scales"].shape == (48, 1)  # ignored: ungrouped defaults
+
+    # GPTQParams is what configures it
+    cfg = qc.QConfig.get_default_config("MATMUL_NBITS")
+    cfg.extra_options["MatMulNBitsParams"]["Algorithm"] = "GPTQ"
+    cfg.extra_options["GPTQParams"] = {"GroupSize": 32, "PerChannel": True}
+    _, out = _quantize(cfg, model, [{"x": x}])
+    assert _inits(out)["w_scales"].shape == (48, 4)
 
     cfg.algo_config = [qc.CLEConfig()]
     with pytest.raises(NotImplementedError, match="MatMulNBits"):
