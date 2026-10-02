@@ -33,24 +33,67 @@ names and preset *meanings*, not copied.
   zero points match Quark's for the probed models
   (``tests/test_quark_parity.py``). Calibration follows the preset: MinMax
   (``A8W8``, ``A16W8``), Percentile (99.999; ``S8S8_AAWS`` 99.9999; the
-  ``Int8Spec`` family's default, as in Quark; agrees with Quark to histogram
-  binning, ~5e-4) and, for ``XINT8``, Quark's power-of-two MinMSE
-  (``method="minmse_pof2"`` in :func:`onnxsim.calibration.calibrate`): the same
-  2048-bin histogram and five candidate scales, so activation scales are
-  identical to Quark's, and weights and biases get the same MinMSE search --
-  biases are **int8** with a per-tensor power-of-two scale like Quark's
+  ``Int8Spec`` family's default, as in Quark) and, for ``XINT8``, Quark's
+  power-of-two MinMSE (``method="minmse_pof2"`` in
+  :func:`onnxsim.calibration.calibrate`): the same 2048-bin histogram and five
+  candidate scales, so activation scales are identical to Quark's, and
+  weights and biases get the same MinMSE search -- biases are **int8** with a
+  per-tensor power-of-two scale like Quark's
   (``extra_options={"Int32Bias": True}`` keeps int32). Like Quark, every
   non-weight constant of a quantized node (LayerNorm scale, Mul operand, ...)
   is quantized as an int8 weight (activation dtype for Add / Sub / Mul / Div /
   Min / Max constants under ``A16W8``'s ``AlignEltwiseQuantType``), and
   Softmax outputs are calibrated to the fixed range (0, 1) except under
-  ``XINT8``. Not matched: Quark's ``Entropy`` (a different algorithm than
-  :func:`onnxsim.calibration.calibrate`'s ``"entropy"``; inner scales differ by
-  up to ~30% on the probed MLP), ``Distribution`` / ``LayerwisePercentile``
-  (``CalibMethod`` members that raise), and its non-power-of-two ``MinMSE``
-  (Quark's ``CalibMethod.MinMSE`` is the power-of-two search, which is what
-  :class:`CalibMethod` maps it to). Quark's NPU graph rewrites for ``XINT8``
-  (shift/cut adjustment, ...) did not change any probed scale.
+  ``XINT8``.
+  Every other :class:`CalibMethod` is Quark's calibrator, scale for scale
+  (:mod:`onnxsim.quark_calibration`: Quark's growing-histogram layout and
+  its search, so ranges agree to float32 rounding -- exact, not to histogram
+  binning): ``Percentile`` (symmetric absolute-value histogram, or the
+  two-sided one with ``CalibTensorRangeSymmetric=False``), ``Entropy``
+  (128 bins / 128 quantized bins by default, ``NumBins`` /
+  ``NumQuantizedBins``), ``Distribution`` (the histogram extent) and
+  ``LayerwisePercentile`` (``LWPMetric``, ``PercentileCandidates``). The
+  ``calibration_method`` strings ``"entropy"``, ``"percentile[:p]"``,
+  ``"distribution"`` and ``"layerwise_percentile"`` mean the same;
+  ``"onnxsim:entropy"`` etc. select onnxsim's own variants. Calibration
+  ``extra_options`` read: ``Percentile``, ``CalibTensorRangeSymmetric``,
+  ``CalibMovingAverage`` (mean of the per-batch ranges), ``CalibDataSize``,
+  ``NumBins``, ``NumQuantizedBins``, ``LWPMetric``, ``PercentileCandidates``
+  (``Scenario`` only changes Distribution's float-8 statistics; ``CalibWorkerNum``
+  / ``CalibOptimizeMem`` / ``LWPUseHistogram`` have no effect). Distribution
+  reports ``(-T, T)`` for a post-Relu tensor; for uint8 activations Quark then
+  folds the Relu node onto that centred grid, which no longer clamps -- onnxsim
+  reproduces the graph and warns. Not matched: Quark's non-power-of-two
+  ``MinMSE`` (Quark's ``CalibMethod.MinMSE`` is the power-of-two search, which
+  is what :class:`CalibMethod` maps it to). Quark's NPU graph rewrites for
+  ``XINT8`` (shift/cut adjustment, ``AlignConcat`` between pof2 grids,
+  ``AveragePool`` -> Mul) are not reproduced.
+- Q/DQ placement and quantizer options follow Quark's rules
+  (:func:`onnxsim.full_qdq.quantize_full_qdq`, ``tests/test_quark_parity.py``):
+  the Q/DQ pair between a Conv / Add / MaxPool / AveragePool /
+  GlobalAveragePool / MatMul / Gemm / ConvTranspose (and, with
+  ``RemoveQDQInstanceNorm``, InstanceNormalization) and its single consumer is
+  dropped when the consumer is a Relu (``RemoveQDQConvRelu``), Clip with
+  bounds (0, 6) or (0, 1) (``RemoveQDQConvClip``), LeakyRelu
+  (``RemoveQDQConvLeakyRelu``), PRelu (``RemoveQDQConvPRelu``) or, opt-in, Gelu
+  (``RemoveQDQConvGelu``); a Relu / Clip node whose input range Quark inherits
+  from its output keeps its own Q/DQ with that range when the pair stays. For
+  asymmetric activations the Relu / Clip node itself folds into its producer
+  (always under the plain QDQ quantizer; under the extended one -- Quark's
+  ``A8W8`` and 16-bit presets, ``QConfig.quant_format`` -- only with
+  ``FoldRelu``). ``ActivationSymmetric`` / ``WeightSymmetric`` override the
+  specs' symmetry (asymmetric or uint8 weights included; Quark clips weight
+  codes to the symmetric code range), ``QuantizeBias=False`` keeps biases
+  float, and the extended quantizer's ``AlignConcat`` / ``AlignPool`` /
+  ``AlignPad`` / ``AlignSlice`` / ``AlignTranspose`` / ``AlignReshape`` copy
+  quantization parameters (Concat / Pad / Transpose / Reshape inputs from their
+  output, Pool / Slice outputs from their input). Quark's ``Slice`` (and, under
+  the extended quantizer, ``Split``) outputs are calibrated on their own, its
+  plain quantizer's ``AveragePool`` shares its input's parameters, and an
+  InstanceNormalization bias is an int32 bias. Not implemented: ``ReduceRange``
+  (a legacy ``QuantizationConfig`` attribute, not an option), ``AlignEltwise``
+  beyond ``AlignEltwiseQuantType``, the ``Convert*`` / ``Adjust*`` NPU rewrites,
+  and the 16-bit ``AlignPool`` etc. for ``XINT8``.
 - Per-layer overrides: ``layer_type_config`` then ``specific_layer_config``
   (which wins) retarget the *activation* dtype / symmetry of a layer's inputs
   (``input_tensors``, or the deprecated ``activation``) and outputs
@@ -138,9 +181,14 @@ names and preset *meanings*, not copied.
   ``algo_config`` that cannot run for a preset (block formats, FP16 / BF16)
   raises ``NotImplementedError`` unless ``ignore_unsupported_algos=True``.
 - ``extra_options`` are stored, not interpreted -- except ``PerChannel``,
-  ``Int32Bias``, ``AlignEltwiseQuantType``, ``CalibMovingAverage`` (integer
-  presets only), ``MatMulConstBOnly`` (the transformer presets) and the
-  block-format options above.
+  ``Int32Bias``, ``AlignEltwiseQuantType``, ``MatMulConstBOnly`` (the
+  transformer presets), the block-format options above, and, for the integer
+  presets, the calibration options (``Percentile``, ``CalibTensorRangeSymmetric``,
+  ``CalibMovingAverage``, ``CalibDataSize``, ``NumBins``, ``NumQuantizedBins``,
+  ``LWPMetric``, ``PercentileCandidates``), ``RemoveQDQConv{Relu,Clip,LeakyRelu,
+  PRelu,Gelu}``, ``RemoveQDQInstanceNorm``, ``FoldRelu``, ``Align{Concat,Pool,
+  Pad,Slice,Transpose,Reshape}``, ``ActivationSymmetric``, ``WeightSymmetric``
+  and ``QuantizeBias`` (see above).
 """
 
 from __future__ import annotations
@@ -1339,6 +1387,8 @@ class ModelQuantizer:
         ``CalibMovingAverage`` extra option applied to min / max calibration
         (the mean of the per-batch ranges instead of the global range)."""
         method = act.calibration_method
+        if isinstance(method, CalibMethod):  # assigned after construction
+            method = _CALIB_NAMES[method]
         moving = self.config.extra_options.get("CalibMovingAverage")
         if method == "minmax" and moving:
             return "minmax_mean"

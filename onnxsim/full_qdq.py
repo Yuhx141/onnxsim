@@ -23,6 +23,10 @@ MaxPool in between) runs in fp16 instead, with conversions on both sides.
   exact and need no requantization;
 - a Relu right after a quantized producer is folded into that producer's
   output quantization (a uint8 Q with zero point 0 already clamps at 0);
+- ``remove_qdq_after`` / ``fold_activation`` / ``adjust_activation_ranges`` /
+  ``align_ops`` / ``unshared_ops`` / ``shared_ops`` / ``weight_symmetric`` /
+  ``quantize_bias`` reproduce AMD Quark's graph-placement and quantizer
+  options (:mod:`onnxsim.quark_compat` sets them from ``extra_options``);
 - nodes can be left in float (``op_types`` include list, ``exclude_op_types``,
   ``exclude_nodes``): mixed precision, e.g. keeping LayerNorm/Softmax and
   sampling coordinates in fp16 while the Linear layers run in int8.
@@ -36,6 +40,7 @@ Calibration reuses :func:`onnxsim.calibration.calibrate` (every calibration
 method it supports is available through ``method``).
 """
 
+import warnings
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -593,6 +598,18 @@ def quantize_full_qdq(
                     p.output[k] = r.output[0]
             if not quark_rules:
                 ranges[r.output[0]] = (0.0, max(ranges[r.output[0]][1], 0.0))
+            elif r.op_type == "Relu" and ranges[r.output[0]][0] < 0:
+                # Quark's own behaviour: a calibrator that reports a range
+                # below zero for a Relu output (Distribution) leaves the
+                # folded model without the clamp
+                warnings.warn(
+                    f"Relu {r.name!r} is folded onto the range "
+                    f"{ranges[r.output[0]]}, which reaches below zero: the "
+                    "quantized model no longer clamps negative values (as in "
+                    "Quark)",
+                    UserWarning,
+                    stacklevel=2,
+                )
             removed.add(id(r))
             folded.add(r.output[0])
         acts = [
@@ -834,7 +851,9 @@ def quantize_full_qdq(
             dt = "uint8" if weight_dtype == "uint8" else "int8"
             lo, hi = _DTYPES[dt][2:]
             s32, z = _weight_qparams(w.min(), w.max(), lo, hi, weight_symmetric)
-            q = np.clip(np.round(w / s32) + z, lo, hi).astype(_DTYPES[dt][1])
+            # (Quark clips to the symmetric code range, so a grid's lowest code
+            # -128 is never produced)
+            q = np.clip(np.round(w / s32) + z, max(lo, -hi), hi).astype(_DTYPES[dt][1])
             base = fresh(x)
             add_init(base + f"/{dt}", q)
             add_init(base + "/scale", np.array(s32, np.float32))
@@ -896,9 +915,19 @@ def quantize_full_qdq(
             if slope_only and k != 1:
                 continue
             if (
+                quark_rules
+                and not quantize_prelu_slope
+                and n.op_type == "PRelu"
+                and k == 1
+            ):
+                continue  # Quark's plain quantizer leaves the slope float
+            if (
                 not quantize_bias
                 and k == 2
-                and n.op_type in ("Conv", "ConvTranspose", "Gemm")
+                and (
+                    n.op_type in ("Conv", "ConvTranspose", "Gemm")
+                    or (n.op_type == "InstanceNormalization" and int8_constants)
+                )
             ):
                 continue  # the bias stays float
             if (
@@ -916,12 +945,13 @@ def quantize_full_qdq(
                     w_max = _DTYPES[weight_dtype][3]
                     if not weight_symmetric or weight_dtype == "uint8":
                         wmin, wmax = _DTYPES[weight_dtype][2:]
+                        clip_lo = max(wmin, -w_max)  # Quark: symmetric code range
                         if axis is None:
                             s32, z = _weight_qparams(
                                 w.min(), w.max(), wmin, wmax, weight_symmetric
                             )
                             s, zp = np.array(s32, np.float32), np.array(z, w_np)
-                            q = np.clip(np.round(w / s) + z, wmin, wmax).astype(w_np)
+                            q = np.clip(np.round(w / s) + z, clip_lo, wmax).astype(w_np)
                         else:
                             chans = np.moveaxis(w, axis, 0).reshape(w.shape[axis], -1)
                             sz = [
@@ -936,7 +966,7 @@ def quantize_full_qdq(
                             shape[axis] = -1
                             q = np.clip(
                                 np.round(w / s.reshape(shape)) + zp.reshape(shape),
-                                wmin,
+                                clip_lo,
                                 wmax,
                             ).astype(w_np)
                     elif axis is None:
@@ -998,9 +1028,8 @@ def quantize_full_qdq(
                 n.input[k] = cache[key]
             elif (
                 n.op_type in ("Conv", "ConvTranspose", "Gemm")
-                and k == 2
-                and w.ndim == 1
-            ):
+                or (n.op_type == "InstanceNormalization" and int8_constants)
+            ) and (k == 2 and w.ndim == 1):
                 w_dq = n.input[1]
                 sx = act_scale(n.input[0])
                 w_scale_name = (
