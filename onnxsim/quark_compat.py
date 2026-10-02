@@ -145,8 +145,11 @@ class QSpec:
     dtype: str = "int8"
     symmetric: bool = True
     pof2: bool = False
-    #: ``"minmax"``, ``"percentile[:p]"``, ``"entropy"``, ``"mse"``,
-    #: ``"minmse_pof2"`` (Quark's MinMSE) or a :class:`CalibMethod`
+    #: ``"minmax"``, ``"percentile[:p]"``, ``"entropy"``, ``"distribution"``,
+    #: ``"layerwise_percentile"`` (Quark's calibrators of those names, see
+    #: :mod:`onnxsim.quark_calibration`), ``"minmse_pof2"`` (Quark's MinMSE),
+    #: ``"mse"`` / ``"onnxsim:<method>"`` (onnxsim's own methods, e.g.
+    #: ``"onnxsim:entropy"``) or a :class:`CalibMethod`
     calibration_method: Any = "minmax"
     is_dynamic: bool = False
 
@@ -158,7 +161,8 @@ class QSpec:
 class CalibMethod(Enum):
     """Quark's ``CalibMethod`` (``quark.onnx.CalibMethod``). ``MinMSE`` is its
     power-of-two MinMSE search (:mod:`onnxsim.calibration` ``"minmse_pof2"``);
-    ``Distribution`` / ``LayerwisePercentile`` are not implemented."""
+    ``Percentile`` / ``Entropy`` / ``Distribution`` / ``LayerwisePercentile``
+    are Quark's histogram calibrators (:mod:`onnxsim.quark_calibration`)."""
 
     MinMax = 0
     MinMSE = 1
@@ -176,6 +180,43 @@ _CALIB_NAMES = {
     CalibMethod.LayerwisePercentile: "layerwise_percentile",
     CalibMethod.Distribution: "distribution",
 }
+
+
+def _calibration_args(
+    method: str, opts: Dict[str, Any]
+) -> "tuple[str, Dict[str, Any]]":
+    """``(method, calibrate_options)`` for :func:`onnxsim.calibration.calibrate`
+    from a spec's ``calibration_method`` string and Quark's calibration
+    ``extra_options`` (``Percentile``, ``CalibTensorRangeSymmetric``,
+    ``CalibMovingAverage``, ``NumBins``, ``NumQuantizedBins``, ``LWPMetric``,
+    ``PercentileCandidates``). ``"entropy"`` / ``"percentile"`` /
+    ``"distribution"`` / ``"layerwise_percentile"`` are Quark's algorithms;
+    ``"onnxsim:<method>"`` selects onnxsim's own variant of the same name."""
+    kw: Dict[str, Any] = {}
+    if method.startswith("onnxsim:"):
+        return method[len("onnxsim:") :], kw
+    base, _, arg = method.partition(":")
+    if base in ("entropy", "percentile", "distribution", "layerwise_percentile"):
+        method = "quark_" + method
+    elif base not in ("minmax", "mse", "minmse_pof2", "auto") and not base.startswith(
+        "quark_"
+    ):
+        raise ValueError(f"unknown calibration method: {method!r}")
+    if method.startswith("quark_percentile") and "Percentile" in opts:
+        method = f"quark_percentile:{float(opts['Percentile'])}"
+    if "CalibTensorRangeSymmetric" in opts:
+        kw["range_symmetric"] = bool(opts["CalibTensorRangeSymmetric"])
+    if opts.get("CalibMovingAverage"):
+        kw["moving_average"] = True
+    if "NumBins" in opts:
+        kw["quark_num_bins"] = int(opts["NumBins"])
+    if "NumQuantizedBins" in opts:
+        kw["num_quantized_bins"] = int(opts["NumQuantizedBins"])
+    if "LWPMetric" in opts:
+        kw["lwp_metric"] = str(opts["LWPMetric"])
+    if "PercentileCandidates" in opts:
+        kw["percentile_candidates"] = tuple(opts["PercentileCandidates"])
+    return method, kw
 
 
 def _spec(
@@ -1012,12 +1053,16 @@ class ModelQuantizer:
         tensor_dtypes = {
             t: "int8" for t in promoted_activations(model, ops, include, drop)
         }
+        cal_method, cal_options = _calibration_args(
+            act.calibration_method, self.config.extra_options
+        )
         quantized = quantize_full_qdq(
             model,
             calibration_data=calibration,
             activation_dtype="int16",
             exclude_nodes=exclude,
-            method=act.calibration_method,
+            method=cal_method,
+            calibrate_options=cal_options,
             symmetric_activations=act.symmetric,
             per_channel=per_channel,
             weight_dtype="int8",
@@ -1126,6 +1171,9 @@ class ModelQuantizer:
             "AutoMixprecision mixes activation precision only (weights stay int8)"
         )
         optimize = p.get("metric_optimize_object", "speed")
+        cal_method, cal_options = _calibration_args(
+            act.calibration_method, self.config.extra_options
+        )
         res = auto_mixprecision(
             model,
             calibration,
@@ -1144,7 +1192,8 @@ class ModelQuantizer:
             optimize=optimize,
             metric_output_index=p.get("metric_output_index", 0),
             data_size=p.get("data_size", 0),
-            method=act.calibration_method,
+            method=cal_method,
+            calibrate_options=cal_options,
         )
         self.last_auto_mixprecision = res
         return res.model
@@ -1213,12 +1262,15 @@ class ModelQuantizer:
                 work, calibration, act_dtype, act, exclude, by_name["auto_mixprecision"]
             )
         else:
+            cal_method, cal_options = _calibration_args(act.calibration_method, opts)
+            cal_size = int(opts.get("CalibDataSize") or 0)
             quantized = quantize_full_qdq(
                 work,
-                calibration_data=calibration,
+                calibration_data=calibration[:cal_size] if cal_size else calibration,
                 activation_dtype=act_dtype,
                 exclude_nodes=exclude,
-                method=act.calibration_method,
+                method=cal_method,
+                calibrate_options=cal_options,
                 symmetric_activations=act.symmetric,
                 power_of_two=act.pof2 or wt.pof2,
                 per_channel=per_channel,

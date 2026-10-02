@@ -246,6 +246,7 @@ def quantize_full_qdq(
     softmax_unit_range: bool = False,
     align_eltwise_dtype: bool = False,
     tensor_symmetric: Optional[Dict[str, bool]] = None,
+    calibrate_options: Optional[Dict[str, object]] = None,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -311,6 +312,9 @@ def quantize_full_qdq(
     :param softmax_unit_range: calibrate every Softmax output to exactly
             ``(0, 1)`` instead of its observed range (what ONNX Runtime's QDQ
             quantizer, and so Quark's non-power-of-two presets, do)
+    :param calibrate_options: extra keyword arguments for
+            :func:`onnxsim.calibration.calibrate` (``range_symmetric``,
+            ``moving_average``, ``quark_num_bins``, ...)
     :returns: the quantized ModelProto
     """
     if weight_dtype not in ("int8", "int16"):
@@ -398,6 +402,7 @@ def quantize_full_qdq(
             extra_tensor_names=missing,
             activation_type=activation_dtype,
             tensor_dtypes=tensor_dtypes,
+            **(calibrate_options or {}),  # type: ignore[arg-type]
         )
         ranges = {**calibrated, **ranges}
 
