@@ -222,6 +222,29 @@ def _build(kind):
             _w(rng, "b2", 8, scale=0.1),
         ]
         shape = (4, 4, 9, 9)
+    elif (
+        kind == "F"
+    ):  # MatMul-Relu-MatMul on [N, K] (the model of test_quark_gptq_parity)
+        model = parser.parse_model(
+            """
+            <ir_version: 10, opset_import: ["": 21]>
+            g (float[N,32] x) => (float[N,16] y)
+            {
+                h = MatMul(x, w1)
+                t = Relu(h)
+                y = MatMul(t, w2)
+            }
+            """
+        )
+        inits = [
+            numpy_helper.from_array(
+                rng.standard_normal((32, 32)).astype(np.float32), "w1"
+            ),
+            numpy_helper.from_array(
+                rng.standard_normal((32, 16)).astype(np.float32), "w2"
+            ),
+        ]
+        shape = (16, 32)
     else:  # "E": 1-D Conv, Clip, Gemm with alpha / beta
         model = parser.parse_model(
             """
@@ -389,6 +412,8 @@ _ADAROUND_CASES = [
     ("D", dict(OutputQDQ=True, BatchSize=3), 0.0),
     ("E", {}, 0.0),
     ("E", dict(OutputQDQ=True, BatchSize=3), 0.0),
+    ("F", {}, 0.0),
+    ("F", dict(OutputQDQ=True, BatchSize=4, DropRatio=0.5), 0.0),
 ]  # fmt: skip
 
 
@@ -445,6 +470,7 @@ _ADAQUANT_EXACT = [
     ("A", dict(UpdateBias=True, LearningRate=1e-3, NumIterations=30, BatchSize=2)),
     ("A", dict(UpdateBias=True, LearningRate=1e-4, NumIterations=20, BatchSize=4)),
     ("E", dict(UpdateBias=True, LearningRate=1e-3, NumIterations=30, BatchSize=4)),
+    ("F", dict(LearningRate=1e-3, NumIterations=30, BatchSize=4)),
 ]
 
 
@@ -636,6 +662,35 @@ def test_adaquant_end_to_end_error_tracks_quarks(update_bias):
     )  # fmt: skip
     mine = _e2e(model, out, x_test)
     assert mine == pytest.approx(quark, rel=0.15)
+
+
+@pytest.mark.parametrize("lr", [1e-5, 1e-3])
+def test_adaquant_end_to_end_error_tracks_quarks_on_an_mlp(lr):
+    """The onnxsim AdaQuant of old (``legacy_engine``) is another algorithm and
+    lands elsewhere; this port tracks Quark's, also where Quark's own
+    straight-through training makes the model *worse* than round-to-nearest
+    (lr 1e-3)."""
+    model, _ = _build("F")
+    rng = np.random.default_rng(3)
+    data = [{"x": rng.standard_normal((16, 32)).astype(np.float32)} for _ in range(8)]
+    x_test = np.random.default_rng(99).standard_normal((256, 32)).astype(np.float32)
+    quark = _e2e(
+        model,
+        _quark_quantize(
+            model, data, "A8W8_ADAQUANT", NumIterations=500, LearningRate=lr,
+            UpdateBias=False, BatchSize=4,
+        )[0],
+        x_test,
+    )  # fmt: skip
+    out, _ = _mine_quantize(
+        model,
+        data,
+        qc.AdaQuantConfig,
+        num_iterations=500,
+        learning_rate=lr,
+        batch_size=4,
+    )
+    assert _e2e(model, out, x_test) == pytest.approx(quark, rel=0.1)
 
 
 def test_layer_reconstruction_errors_track_quarks():
