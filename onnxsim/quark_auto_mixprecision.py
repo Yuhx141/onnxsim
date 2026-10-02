@@ -61,7 +61,18 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import onnx
@@ -456,7 +467,7 @@ def auto_mixprecision(
     method: str = "minmax",
     providers: Optional[Sequence[str]] = None,
     targets: Optional[Sequence[Target]] = None,
-    candidate_targets: Optional[Dict[str, Target]] = None,
+    candidate_targets: Optional[Mapping[str, Target]] = None,
     subgraphs: Optional[Sequence[Tuple[str, Sequence[str]]]] = None,
     cache_file: Optional[Union[str, Path]] = None,
     worker_num: int = 1,
