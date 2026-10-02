@@ -135,14 +135,14 @@ struct EliminateLoopWithConstTripCount final : public PredicateBasedPass {
       return false;  // unexpected body signature
     }
     // copyAttributes does not rewrite lexical captures inside nested graph
-    // attributes. Decline until recursive capture remapping is implemented.
-    for (const Node *body_node : body->nodes()) {
-      for (const Symbol attr : body_node->attributeNames()) {
-        const auto kind = body_node->kindOf(attr);
-        if (kind == AttributeKind::g || kind == AttributeKind::gs) {
-          return false;
-        }
-      }
+    // attributes. The IR tracks subgraph-bearing nodes sparsely, so use its
+    // graph walk instead of scanning every body node and attribute.
+    bool has_nested_graph = false;
+    body->forSelfAndEachSubGraph([&](Graph *graph) {
+      has_nested_graph = has_nested_graph || graph != body.get();
+    });
+    if (has_nested_graph) {
+      return false;
     }
 
     if (has_cond) {
