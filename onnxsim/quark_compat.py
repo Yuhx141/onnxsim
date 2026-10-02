@@ -932,7 +932,9 @@ class ModelQuantizer:
         :mod:`onnxsim.quark_finetune`; ``extra_options["FastFinetune"]`` keys
         override the config's params, and ``QuantizationPreference="accuracy"``
         applies Quark's own overrides (``EarlyStop`` off, ``UpdateBias`` and
-        ``OutputQDQ`` on)."""
+        ``OutputQDQ`` on). ``guard`` (an onnxsim addition, default on) keeps a
+        layer's new codes only if its block reconstruction error did not get
+        worse; ``guard=False`` is Quark's behaviour."""
         from onnxsim.quark_finetune import TARGET_OPS, FinetuneOptions, finetune
 
         p = dict(algo.params)
@@ -977,6 +979,7 @@ class ModelQuantizer:
             select_max_mem_layer=bool(p.get("select_max_mem_layer", False)),
             target_ops=targets,
             seed=int(p.get("fixed_seed", 1705472343)),
+            guard=bool(p.get("guard", True)),
         )
         self._approx(
             f"{name} is a numpy port of Quark's FastFinetune loop: mini-batches "
