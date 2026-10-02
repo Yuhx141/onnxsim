@@ -159,6 +159,14 @@ def block_quantize_int4(
     valid = np.zeros((n, blocks * block_size), dtype=bool)
     valid[:, :k] = True
     codes = np.where(valid.reshape(n, blocks, block_size), codes, 0).astype(np.uint8)
+    # The MLAS kernel quantizes rows in pairs; with an odd number of rows left
+    # in the last block the unused high nibble keeps the previous pair's second
+    # code (scratch the kernel never reads: reproduced for >= 3 rows left, left
+    # 0 for a single leftover row, where ORT leaves a value carried over from
+    # the previously processed block).
+    last = k - (blocks - 1) * block_size
+    if last % 2 and last >= 3:
+        codes[:, -1, last] = codes[:, -1, last - 2]
     packed = pack_int4(codes)
     zero_points = None
     if not symmetric:
